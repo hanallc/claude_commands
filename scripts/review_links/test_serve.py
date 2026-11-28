@@ -4,8 +4,6 @@ from __future__ import annotations
 from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
-from scripts.lib.checkout_test_support import python_tool_source
-
 import contextlib
 import errno
 import fcntl
@@ -12828,6 +12826,9 @@ class ServerCodeRestartTests(unittest.TestCase):
         server_file = checkout / "scripts/review_links/serve.py"
         server_file.parent.mkdir(parents=True)
         _ = server_file.write_text("# The server uses this temporary checkout.\n")
+        other_launcher = checkout / "scripts/lib/py"
+        other_launcher.parent.mkdir()
+        other_launcher.touch()
         module_file = checkout / "review_restart_fixture.py"
         _ = module_file.write_text("VALUE = 'before'\n")
         _ = write_config_fixture(checkout / "review_links.conf", "code_check_seconds=0.05\n")
@@ -12835,7 +12836,7 @@ class ServerCodeRestartTests(unittest.TestCase):
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
         driver = checkout / "driver.py"
-        _ = driver.write_text(python_tool_source('''import importlib.util
+        _ = driver.write_text('''import importlib.util
 import os
 import sys
 import time
@@ -12846,6 +12847,7 @@ from scripts.production import record_store
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent
+assert Path(serve.__file__).resolve() == Path.cwd() / "scripts/review_links/serve.py"
 if serve.LISTEN_FD in os.environ:
     # Hold the restart open, so the test sends a request before the new server starts.
     print(f"restarting {os.getpid()}", file=sys.__stdout__, flush=True)
@@ -12869,11 +12871,12 @@ class ObservedServer(serve.ReviewLinksServer):
 serve.ReviewLinksServer = ObservedServer
 with patch.object(record_store, "configured_review_vaults", return_value=()), redirect_stdout(sys.stderr):
     raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
-'''))
+''')
         errors_path = checkout / "errors.txt"
         errors = self.enterContext(errors_path.open("w"))
         child: subprocess.Popen[str] = subprocess.Popen(
-            [str(source / "scripts/lib/py"), "-P", "-B", str(driver)],
+            [str(source / "scripts/lib/py"), "--isolated", "-B", "-c",
+             "import runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__')", str(driver)],
             cwd=source, env={**os.environ, "CONF_DIR": str(checkout), "REVIEW_LINKS_ROOT": str(root),
                                "SHOWRUNNER_STATE_DIR": str(checkout / "state"),
                                "STAFF_FILE": str(checkout / "staff.json"),
