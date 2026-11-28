@@ -26,6 +26,8 @@ Item 191 B3 will keep the Mac claim at the unreachable bound until the guest pro
 The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the last part of the Git origin path without the `.git` suffix. The local alias for `claude_commands` is `claude`. The path has no showrunner component.
 
 The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
+The Mac Linux guest stores its affected-module fact cache under `<build root>/claude/main/gate/affected-module-facts.sqlite` and holds the main output lease during use.
+The guest copies the cache through the default gate state folder in the run. It skips the cache when `GATE_STATE_DIR` is set.
 Each numbered copy uses its own real `target` directory.
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
@@ -150,7 +152,17 @@ It checks all these paths for process use.
 
 Migration scans the sources together and checks each source again before source relocation. The scan cannot stop a process that enters the source after the scan. The pass ends with `moved N, kept in use M, kept K`. The dry run uses `would move`. Run the same command again later to move kept folders.
 
-Linux migration checks the working directory of each live thread. It checks for live threads when the thread leader is a zombie. After `EACCES`, it checks whom the working directory link in `/proc` belongs to. It also checks whether the process has a permitted capability the caller lacks. Either cause can account for the missing paths. Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process. Other read errors for processes of the current user keep every candidate. An incomplete process scan keeps every candidate on either host.
+Linux migration uses `process_paths` to scan each live process and its threads.
+On the live `/proc`, the scan can skip a thread after it reads the leader without errors or ignored descriptors.
+It skips the thread only when `kcmp` confirms that it shares the leader's descriptor table and filesystem state.
+The comparison runs before the scan reads the thread's status.
+The scan reads the other threads if the leader has exited or the comparison fails.
+After `EACCES`, the scan checks the owner of the working directory link in `/proc`.
+It also checks whether the process has a permitted capability the caller lacks.
+Either check can explain why the kernel hides the paths.
+Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process.
+Other read errors for processes of the current user keep every candidate.
+An incomplete process scan keeps every candidate on either host.
 
 Migration holds busy claims and copy leases through source relocation. A copy request waits for another process to release the unit allocation lock. A second request from the same process fails immediately.
 

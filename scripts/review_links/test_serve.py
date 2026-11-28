@@ -178,7 +178,8 @@ _SEND_REVIEW_MESSAGE = change_page.send_message
 
 
 @contextmanager
-def new_item_notice_log(folder: Path, keeper: staff.StaffId) -> Generator[Path]:
+def new_item_notice_log(folder: Path, keeper: staff.StaffId, *, recorded: threading.Event | None = None
+                        ) -> Generator[Path]:
     """Run a local sender that records the notice and the List rows it can see."""
     log = folder / "new-item-notices.jsonl"
     sender = folder / "record-new-item-notice.py"
@@ -195,8 +196,17 @@ with Path({str(log)!r}).open("a") as stream:
     print(json.dumps(notice), file=stream)
 print("SENT: recorded by the fixture")
 """)
+
+    def send_notice(recipient: str, sender: str, message: str, *, key: str = "",
+                    recipient_key: str = "") -> Literal["skipped", "pending"] | None:
+        try:
+            return _SEND_REVIEW_MESSAGE(recipient, sender, message, key=key, recipient_key=recipient_key)
+        finally:
+            if recorded is not None:
+                recorded.set()
+
     with (patch.object(session_send, "SEND_SCRIPT", sender),
-          patch.object(change_page, "send_message", _SEND_REVIEW_MESSAGE)):
+          patch.object(change_page, "send_message", send_notice)):
         yield log
 
 
@@ -3106,7 +3116,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             stored = serve.PageCaptures(self.root / serve.PAGE_CAPTURE_FOLDER)
             saved_key = next(iter(stored.bound_work()))[2]
             self.assertEqual(saved_key.item_id, saved["id"])
-            with self.assertRaises(new_item_dialog.SubmissionConflict):
+            with self.assertRaises(record_store.SubmissionConflict):
                 _ = stored.bind(pending, attempt.request_id, replace(saved_key, item_id="I999"))
 
             server.capture_page(pending, "/test/firefox", url, FIXTURE_CAPTURE)

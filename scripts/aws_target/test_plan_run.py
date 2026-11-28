@@ -12,7 +12,7 @@ from typing import Literal, cast, final, override
 from unittest import mock
 
 from scripts.aws_target.aws_cli import AwsUnavailable
-from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_image, hana_placement, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target import admin_secrets, aws_trial, deploy, gate_source, hana_box, hana_image, hana_placement, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
@@ -748,6 +748,7 @@ class GatePlanTests(CostFixture):
         _ = conf.path('cloud_gate').write_text(f'''\
 regions={' '.join(self.regions)}
 instance_types=m7a.8xlarge
+packages=git python3
 credential_file={self.credentials_path}
 hana_gpu_instance_types={GATE_HANA_GPU_TYPE}
 hana_gpu_spot_max_usd_per_hour={json.dumps({GATE_HANA_GPU_TYPE: '0.5'})}
@@ -1174,6 +1175,7 @@ shared_usd_per_month=1
             with (mock.patch.object(subject.admin, 'get', return_value=credentials), redirect_stdout(StringIO())):
                 if command == 'gate-up':
                     with (mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'),
+                          mock.patch.object(gate_source, 'prepare_tools', return_value=('/nix/store/' + 'a' * 32 + '-fixture',)),
                           mock.patch.object(deploy, 'gate_subnets', return_value=[{'id': 'subnet-fixture', 'zone': GATE_HOME + 'a'}]),
                           mock.patch.object(subject, '_fill_prices'),
                           mock.patch.object(subject, '_probe_gate_gpu', return_value=True)):

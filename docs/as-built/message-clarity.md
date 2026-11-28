@@ -444,7 +444,7 @@ New escalate holds retain their registered template and values.
   Silence keeps only the newest push and delivers it when silence ends.
   The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
-  A run that never reaches merge_gate.py sends no push unless the timer script sends one.
+  The timer script handles notifications for failures before `gate.py` starts.
 - `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.
   Title: `{sender}: {session} {noun} refused`. The first body line is `Session: {session}`.
   Action: `On {machine}, in the {session} pane, type: Go: run the refused {noun}`.
@@ -611,6 +611,8 @@ The `start` and `fixed` commands send no follow-up push.
     A stored text that fails the check prints `questions: reword — <text>: …` but permits the write.
     Read-time checks were removed on 2026-10-18 because one stored word blocked every update to hana's list.
   - Each new question is reviewed once with `review.review_question(QuestionKey(name, text), question, revision=False) -> QuestionOutcome`. This uses guide tags `question,all`, no push header parsing, no length limits and no `withhold`.
+  - The Console question review reuses approval when the key, title, body, Console kind, rules, caption layout, date, and time zone match.
+    The review reads saved approval before it selects the account, binary, or model.
   - Outcomes:
     - `QuestionAccepted(question)`: the original, or the rewrite if it passed a second check.
     - `QuestionAwaitingFacts(question, questions)`

@@ -50,8 +50,12 @@ from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_copies import CopyGitFailure, source_checkout
 from scripts.build_queue import first_step
+from scripts.build_queue.admission_records import (
+    ACTIVE_GATES as ACTIVE_GATES, COPY_ERROR_STATUS as COPY_ERROR_STATUS, OWNER,
+    ActiveGate, CopyError as CopyError, checked_owner, recorded_owner as recorded_owner,
+)
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
+    GATE_SCRIPTS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
     parse_command_program, read_step_names, verify_command,
 )
@@ -67,22 +71,9 @@ if TYPE_CHECKING:
 # Checksums skip equal files. Changed files get the receiver write time.
 RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
-OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
 PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
-
-
-@dataclass(frozen=True)
-class ActiveGate:
-    """The caller holds the copy for the gate."""
-
-    tree: Path
-    source: Path
-    owner: str
-
-
-ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
 
 
 @dataclass(frozen=True)
@@ -94,15 +85,6 @@ class AdmissionSourceCopy:
 
 
 ADMISSION_SOURCE_COPIES: ContextVar[tuple[AdmissionSourceCopy, ...]] = ContextVar("admission_source_copies", default=())
-
-COPY_ERROR_STATUS = 2
-
-
-class CopyError(Exception):
-    """An invalid request or an unavailable checkout."""
-
-    exit_code: int = COPY_ERROR_STATUS
-
 
 # Git's exit status when `git remote get-url` names no configured remote.
 NO_SUCH_REMOTE = 2
@@ -466,28 +448,6 @@ def source_owner(source: Path) -> str:
     return recorded_owner(source) or fallback_owner("verify")
 
 
-def recorded_owner(source: Path, *,
-                   intent: scratch.RemovalIntentAccess = scratch.RemovalIntentAccess.RECOVER) -> str:
-    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
-    for active in reversed(ACTIVE_GATES.get()):
-        if active.tree == source.resolve():
-            return active.owner
-    record = scratch.task_of(source, intent=intent)
-    if isinstance(record, copy_record.Registered):
-        owner = record.fields.get("owner_unit")
-        if isinstance(owner, str):
-            return checked_owner(owner)
-    from scripts.production import staff
-    from scripts.agents.remote import local_machine
-    try:
-        member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
-        if member is not None:
-            return str(member.id)
-    except staff.StaffUnreadable:
-        pass
-    return ""
-
-
 def fallback_owner(role: str) -> str:
     """Use a configured role owner when the caller has no production context."""
     path, values = config_settings()
@@ -582,12 +542,6 @@ def repository_name(source: Path) -> str:
 def main_checkout(source: Path) -> Path:
     """Keep the public copies API for the shared checkout reader."""
     return source_checkout(source)
-
-
-def checked_owner(owner: str) -> str:
-    if not OWNER.fullmatch(owner):
-        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
-    return owner
 
 
 def holder(tree: Path) -> KnownHolder | UnreadableHolder:
@@ -1580,9 +1534,9 @@ def gate_command_source_check(command: Sequence[str], *,
         return None
     script, arguments = program
     launcher = Path(script)
-    if launcher.name not in MERGE_GATE_PROGRAMS:
+    if launcher.name not in GATE_SCRIPTS:
         return None
-    relative = Path(GATE_SCRIPT).with_name(launcher.name)
+    relative = Path(GATE_SCRIPT)
     launcher_checkout = None
     if launcher.is_absolute():
         from scripts.lib.python_startup.sitecustomize import checkout_root
@@ -1599,7 +1553,7 @@ def gate_command_source_check(command: Sequence[str], *,
         path = parser_root / GATE_SCRIPT
         if path.resolve() != path:
             raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
-        if launcher_checkout is None and launcher.name == "gate.py":
+        if launcher_checkout is None:
             expanded = [part.replace("{tree}", str(source)) for part in command] if numbered_copy else command
             if not first_step.canonical_gate_command(expanded, source):
                 return
@@ -2466,10 +2420,13 @@ def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) 
 
 def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
     """Build the remote command with one mirror identity."""
-    arguments = [action, "--path", mirror.path, "--owner", mirror.owner]
+    mirror_word = (shlex.quote(mirror.path) if mirror.path.startswith("/")
+                   else quote_shell_path_parts(mirror.path))
+    arguments = ["--owner", mirror.owner]
     for option, value in (("--repository", mirror.repository.name), ("--session", mirror.session)):
         arguments.extend([f"{option}={value}"] if value.startswith("-") else [option, value])
-    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([*arguments, *tail])
+    return ("~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py "
+            + f"{shlex.quote(action)} --path {mirror_word} " + shlex.join([*arguments, *tail]))
 
 
 def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str]) -> list[str]:
@@ -2487,18 +2444,31 @@ def remote_use_command(mirror: RemoteMirror, command: str) -> str:
     return remote_copies_command("mirror-use", mirror, "--", "sh", "-c", command)
 
 
-def mirror_probe_setup(path: str) -> str:
+def quote_shell_path_parts(path: str) -> str:
+    """Quote each path component so the process selector skips the shell."""
+    return "/".join("'" + part.replace("'", "'\"'\"'") + "'" for part in path.split("/"))
+
+
+def mac_mirror_shell_path(path: str) -> str:
+    """Quote a mirror path below the Mac home folder."""
+    return '"$HOME"/' + quote_shell_path_parts(path)
+
+
+def mirror_probe_setup(path: str, *, encode_path: bool = False) -> str:
     """Create a marked probe copy through the registered remote kind."""
+    argument = path.encode().hex() if encode_path else path
+    decode = "bytes.fromhex(sys.argv[1]).decode()" if encode_path else "sys.argv[1]"
     program = "\n".join((
         "import sys",
         "from scripts.copies import copies",
-        "copies.probe_remote_folder(sys.argv[1])",
+        f"copies.probe_remote_folder({decode})",
     ))
-    relative = path.removeprefix("~/")
-    mark = shlex.quote(str(Path(relative) / floor_claims.MIRROR_MARK))
-    shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
+    mark = Path(path.removeprefix("~/")) / floor_claims.MIRROR_MARK
+    shell_mark = shlex.quote(str(mark))
+    if not mark.is_absolute():
+        shell_mark = mac_mirror_shell_path(str(mark)) if encode_path else '"$HOME"/' + shell_mark
     return ("test -f " + shell_mark + ' || "$HOME"/.claude/scripts/lib/py -c ' + shlex.quote(program) + " " +
-            shlex.quote(path) + " || exit 1")
+            shlex.quote(argument) + " || exit 1")
 
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
@@ -2758,6 +2728,15 @@ def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
 
 def mirror_remove(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
+    with ExitStack() as hold:
+        try:
+            _ = hold.enter_context(build_folders.mac_mirror_hold(tree, build_folders.MacMirrorHold.EXCLUSIVE))
+        except BlockingIOError as error:
+            raise CopyError(f"{tree}: busy; a Mac run or the floor sweep holds the mirror") from error
+        return remove_leased_mirror(tree, args)
+
+
+def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
@@ -2852,7 +2831,7 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     program = parse_command_program(command)
-    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
+    if not isinstance(program, OtherCommand) and program[0] in GATE_SCRIPTS:
         arguments = program[1]
         if "-h" not in arguments and "--help" not in arguments:
             error = first_step.gate_module_mode_error(
@@ -3235,10 +3214,17 @@ def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], enviro
 
 def mirror_run(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
-    with local_mirror_lease(tree, args.session, create_tree=args.action != "mirror-receive"):
+    receiving = args.action == "mirror-receive"
+    with ExitStack() as leases:
+        floor = leases.enter_context(build_folders.mac_mirror_hold(tree, build_folders.MacMirrorHold.SHARED))
+        _ = leases.enter_context(local_mirror_lease(tree, args.session, create_tree=not receiving))
         with mirror_metadata_locks(tree):
-            if args.action == "mirror-receive":
-                receive_metadata(tree, args)
+            if receiving:
+                if isinstance(floor, int) and floor_claims.removal_authority_path(tree).exists():
+                    with build_folders.mac_mirror_hold(tree, build_folders.MacMirrorHold.UPGRADE, shared=floor):
+                        receive_metadata(tree, args)
+                else:
+                    receive_metadata(tree, args)
             else:
                 mark_mirror(tree, args.owner, args.repository, args.session,
                             last_use=time.time(), process_group=os.getpgrp())
@@ -3246,8 +3232,10 @@ def mirror_run(args: CopyArguments) -> int:
         if not command:
             raise CopyError("remote mirror requires a command")
         descriptors = COMMAND_LOCKS.get()
-        if args.action == "mirror-use":
+        if not receiving:
             descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
+        if isinstance(floor, int) and floor not in descriptors:
+            descriptors = (*descriptors, floor)
         environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
         if args.action == "mirror-receive":
             return run_mirror_receiver(command, descriptors, environment)
