@@ -1455,7 +1455,7 @@ class HostEvidenceWorker:
         self.clock: Clock = clock
         self.wake: int = wake
         self.interval: float = interval
-        self.lock: threading.Lock = threading.Lock()
+        self.lock: threading.RLock = threading.RLock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.guest_outages: dict[str, GuestProbeOutage] = {}
         self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
@@ -1644,7 +1644,13 @@ class HostEvidenceWorker:
                 evidence = replace(evidence, observed_at=min(evidence.observed_at, observed_at))
         except Exception as error:
             evidence = placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
+        guest = is_mac_linux_guest(key.destination)
         with self.lock:
+            if self.subscriptions.get(key) is not subscription:
+                return True
+            if guest:
+                # Record the guest answer before settlement can delay it.
+                self._publish_evidence(evidence)
             dispatches = tuple((attempt, probe) for attempt, probe in self.dispatch_probes.items() if probe.key == key)
         dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
         for attempt, probe in dispatches:
@@ -1656,7 +1662,8 @@ class HostEvidenceWorker:
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
-            self._publish_evidence(evidence)
+            if not guest:
+                self._publish_evidence(evidence)
             for attempt, probe, observed in dispatches_read:
                 if (self.dispatch_probes.get(attempt) is probe
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
@@ -5105,13 +5112,13 @@ class AdmissionServer:
                 mode = SuiteMode.TARGETED if SuiteMode.step(key.step) == SuiteMode.TARGETED.value else SuiteMode.GATE
                 eligibility = scaler_availability(mode)
             return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
+        if is_mac_linux_guest(destination):
+            return self._read_mac_linux_guest(key)
         request = self.host_requests.get(key)
         if request is None:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "the placement request is unavailable")
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
-        if destination.provider == "ssh" and destination.target == "mac-linux":
-            return self._read_mac_linux_guest(key)
         target = records.effective_target(destination.target, key.settings)
         if isinstance(target, records.UnregisteredTarget):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
@@ -5263,14 +5270,26 @@ class AdmissionServer:
         block = mac_test.blocking_claim_block(mac_test.state_paths(), key.session)
         if not isinstance(block, mac_test.NoMacBlock):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("blocked"))
+        declined = placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
+        answered = False
         try:
             _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry),
                                         wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
         except (mac_linux.GuestConnectionFailed, subprocess.TimeoutExpired):
-            return MacLinuxProbeFailureEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
-        except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
-            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
-        return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost(), probe_answered=True)
+            return MacLinuxProbeFailureEvidence(key, started_at, "", declined)
+        except mac_linux.GuestUnavailable as error:
+            # A failed command can still prove that the guest answered. SSH exit 255 is ambiguous.
+            message = str(error)
+            prefix = "guest main probe exited "
+            status, separator, _ = message.removeprefix(prefix).partition(":")
+            answered = (message == "the guest main probe returned an invalid commit ID"
+                        or message.startswith(prefix) and separator == ":"
+                        and status.isascii() and status.isdecimal() and 0 < int(status) < 255)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        else:
+            return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost(), probe_answered=True)
+        return placement.FreshHostEvidence(key, started_at, "", declined, probe_answered=answered)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     claim_path: Path, record: RemoteJobClaim,
@@ -6908,9 +6927,7 @@ done
         settlement = None if probe is None else probe[0].dispatch_settlement(probe[1])
         if (settlement is None
                 or (settled_at := self._guest_settlement_ready_at(saved, settlement.observed_at)) is None):
-            if (probe is not None and not self._awaits_mac_report(saved)
-                    and (loss := self._guest_outage_loss(saved, probe[0])) is not None):
-                self._close_lost_attempt(saved, loss, self.clock.now())
+            if probe is not None and not self._awaits_mac_report(saved) and self._close_guest_outage(saved, probe[0]):
                 return
             self.assignments[attempt_key] = self._expire_guest_replacement(saved)
             return
@@ -6934,8 +6951,7 @@ done
                           and (assignment.owner != submitted.owner or assignment.since != submitted.since) else terminal)
         self._close_for_report(replace(expired, terminal_report=saved_terminal), terminal, persist_change=False)
 
-    def _guest_outage_loss(self, saved: records.SavedPlacementAssignment,
-                           worker: HostEvidenceWorker) -> placement.AttemptLost | None:
+    def _close_guest_outage(self, saved: records.SavedPlacementAssignment, worker: HostEvidenceWorker) -> bool:
         """Require a full outage and a confirmed coordinator exit."""
         assignment = saved.assignment
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
@@ -6943,16 +6959,22 @@ done
         if (self.current_assignments.get(assignment.episode) != attempt or attempt in self.manual_guest_settlement
                 or isinstance(report, placement.TerminalAttemptReport)
                 and isinstance(report.outcome, placement.AttemptCompleted)):
-            return None
-        outage = worker.guest_outage(assignment.destination.host)
+            return False
+        host = assignment.destination.host
+        outage = worker.guest_outage(host)
         if outage is None:
-            return None
+            return False
         limit = _guest_wait_limit()
         owner = assignment.owner
         if (not isinstance(limit, int) or self.clock.monotonic() < outage.started_monotonic + limit
                 or owner.host != self.host or owner_may_be_live(self.proc.owner_start(owner.pid), owner.start_time)):
-            return None
-        return placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage.fence.reported_at)
+            return False
+        with worker.lock:
+            if worker.guest_outage(host) is not outage:
+                return False
+            loss = placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage.fence.reported_at)
+            self._close_lost_attempt(saved, loss, self.clock.now())
+        return True
 
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
