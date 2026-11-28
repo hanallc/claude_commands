@@ -394,12 +394,21 @@ class CopyOrderTests(unittest.TestCase):
         path = self.root / "bump.json"
         checkpoint_gate.save_record(path, record)
         self.queue.hold_starts()
+
+        def observe(reply: wire.Wait, *, since: float | None = None) -> None:
+            self.assertIsNotNone(since)
+            self.assertGreater(reply.snapshot.peak.bytes, 0)
+            self.assertFalse(self.copy_root.exists(), f"the waiting caller created a copy: {self.copy_root}")
+            self.assertEqual(list(self.copy_root.glob("*.lease.json")), [])
+            raise AdmissionWaitReached("the private admission wait has no copy")
+
         with (mock.patch.dict(os.environ, {**environment, "MERGE_CHECKPOINT_VERIFY": str(CHECKOUT / "scripts/direct/verify.sh")}),
               mock.patch.object(bump_gate, "run_checkpoint_test_steps",
                   side_effect=AssertionError("the bump command started before admission")),
               mock.patch.object(bump_gate, "complete_gate",
                   side_effect=AssertionError("the pending bump gate sent a result")),
-              self.assertRaises(AdmissionWaitReached), stop_before_copy(self, self.copy_root)):
+              self.assertRaises(AdmissionWaitReached),
+              mock.patch.object(client.WaitOutput, "__call__", new=staticmethod(observe))):
             _ = bump_gate.run_gate(path)
         request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
         self.assertEqual(request.constraints.package, "sample")

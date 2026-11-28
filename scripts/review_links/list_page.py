@@ -577,8 +577,8 @@ def item_log(record: ListRecord, today: datetime, names: staff_names.StaffNames,
     return ItemLog(''.join(markup for _, markup in rows), url_candidates)
 
 
-def item_link(keeper: staff.StaffId, number: int) -> str:
-    return page_frame.list_item_fragment(keeper, number)
+def item_link(keeper: staff.StaffId, number: int, *, only_item: bool = False) -> str:
+    return page_frame.list_item_fragment(keeper, number, only_item=only_item)
 
 
 @dataclass(frozen=True)
@@ -3388,6 +3388,7 @@ async function saveListTag(key,edit,draft,undo){
 # Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + review_legacy.SHOW_ALIAS_SCRIPT
+          + review_page.REVIEW_SAVE_REPORTS_SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
 ''' + question_path.queue_script() + TAG_SCRIPT + '''
 const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
@@ -4989,6 +4990,7 @@ async function refresh(_supersede=false,current=()=>true){
  const requestStarted=performance.now();
  const response=await fetch(location.pathname+query,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
+ void linkedReviewSaveReports.flush();
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
@@ -5056,7 +5058,11 @@ const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
  ? window.frameElement : null;
 let activeReview,refreshingReview=false;
-const savedReviews=new Set(),returnedReviews=[];
+const savedReviews=new Set(),returnedReviews=[],linkedReviewDrafts=new Map();
+const linkedReviewSaveReports=createReviewSaveReports(linkedReviewDrafts,listRequestSignal,(key,draft,result)=>{
+ for(const frame of reviewDialog.querySelectorAll('iframe')) frame.reviewDraft?.settled(key,draft,result);
+});
+addEventListener('online',()=>void linkedReviewSaveReports.flush());
 const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
@@ -5101,6 +5107,7 @@ function restoreReviewLink({key,selector,detail,position}){
 function showReviewCard(card){
  activeReview=card;
  card.frame.hidden=false;
+ card.frame.reviewDraft?.reveal();
  card.restoreHost=fitReviewDialog();
  reviewClose.disabled=card.frame.hasAttribute('data-saving');
  reviewDialog.showModal();
@@ -5111,6 +5118,7 @@ function showReviewCard(card){
 }
 function hideReviewCard(card){
  if(activeReview!==card) return;
+ card.frame.reviewDraft?.hide(reviewRefreshError);
  activeReview=null;
  reviewDialog.close();
  card.restoreHost();
@@ -5125,6 +5133,7 @@ function closeReviewCard(){
  if(!card || card.frame.hasAttribute('data-saving')) return;
  reviewMotion.finish();
  hideReviewCard(card);
+ card.frame.reviewDraft?.release();
  card.frame.remove();
  reviewClose.disabled=false;
  reopenReturnedReview();
@@ -5150,10 +5159,7 @@ async function refreshSavedReview(){
 }
 if(listHost) new MutationObserver(()=>{
  if(!listHost.hidden) return;
- const doc=activeReview?.frame.contentDocument;
- const form=doc?.querySelector('[data-review-form]');
- if(!form?.elements.feedback?.value && !form?.elements.later?.value && !doc?.querySelector('[data-review-draft]'))
-  closeReviewCard();
+ if(!activeReview?.frame.reviewDraft?.hasDraft()) closeReviewCard();
 }).observe(listHost,{attributes:true,attributeFilter:['hidden']});
 bindConsoleDialog(reviewDialog,closeReviewCard);
 document.addEventListener('click',event=>{
@@ -5164,6 +5170,8 @@ document.addEventListener('click',event=>{
  if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
  const frame=document.createElement('iframe');
  frame.title='Review card';
+ frame.linkedReviewDrafts=linkedReviewDrafts;
+ frame.linkedReviewSaveReports=linkedReviewSaveReports;
  frame.src=href;
  const card={frame,link:reviewLinkPlace(link)};
  activeReview=card;
@@ -5196,6 +5204,10 @@ document.addEventListener('click',event=>{
   reviewSaveVersion++;
   savedReviews.add(card);
   refreshAfterListSave(false);
+ });
+ frame.addEventListener('review-card-saved-with-draft',()=>{
+  reviewSaveVersion++;
+  refreshAfterListSave(true);
  });
  reviewDialog.append(frame);
  showReviewCard(card);

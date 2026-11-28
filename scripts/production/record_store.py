@@ -19,7 +19,7 @@ from io import StringIO
 from itertools import chain
 from pathlib import Path
 from threading import Lock
-from typing import NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, existing_writer_lock, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
@@ -34,6 +34,16 @@ from scripts.production.production_doc import (
 )
 
 from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
+
+
+class SubmissionError(ValueError):
+    """The request cannot be saved or applied to this item."""
+
+
+class SubmissionConflict(SubmissionError):
+    """The request ID already names different item data."""
+
+    status: Literal[409] = 409
 
 
 class RecordText(NamedTuple):
@@ -928,26 +938,31 @@ def _review_publication(path: Path) -> ReviewPublication | None:
 
 def create_record_text(path: Path, text: str) -> None:
     """Publish a new record without replacing a peer's file."""
-    with prepared_replacement(path, text, mode=0o600) as temporary:
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            if (path.is_file() and not path.is_symlink()
-                    and (request := _review_publication(temporary)) is not None
-                    and (existing := _review_publication(path)) is not None
-                    and request.request_id == existing.request_id):
-                if request.digest != existing.digest:
-                    from scripts.review_links.new_item_dialog import SubmissionConflict
-
-                    raise SubmissionConflict("This request ID already has different item data.") from error
-                raise ReusedReviewRecord(str(path)) from error
-            raise OccupiedRecordPath(str(path)) from error
-        try:
-            sync_folder(path.parent)
-        except OSError:
-            if not path.is_symlink() and path.exists() and path.samefile(temporary):
-                path.unlink()
+    published = False
+    try:
+        with prepared_replacement(path, text, mode=0o600) as temporary:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as error:
+                if (path.is_file() and not path.is_symlink()
+                        and (request := _review_publication(temporary)) is not None
+                        and (existing := _review_publication(path)) is not None
+                        and request.request_id == existing.request_id):
+                    if request.digest != existing.digest:
+                        raise SubmissionConflict("This request ID already has different item data.") from error
+                    raise ReusedReviewRecord(str(path)) from error
+                raise OccupiedRecordPath(str(path)) from error
+            try:
                 sync_folder(path.parent)
+            except OSError:
+                if not path.is_symlink() and path.exists() and path.samefile(temporary):
+                    path.unlink()
+                    sync_folder(path.parent)
+                raise
+            published = True
+    except OSError:
+        # The record is durable. Keep its proof when temporary file cleanup fails.
+        if not published:
             raise
 
 

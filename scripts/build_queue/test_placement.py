@@ -43,6 +43,7 @@ from scripts.build_targets import mac_linux, target_config
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
+from scripts.lint.memory_test_support import write_config_fixture as write_config_fixture
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.production import gate as production_gate
@@ -61,16 +62,7 @@ ALLOWED_HOST = placement.AllowedHost()
 HANA_REPOSITORY = "https://github.com/hanallc/hana"
 FIXTURE_MAC_SCOPE = RepositoryScope("hana")
 SCALER_TARGET_NAME = "claude-aws"
-
-
-# The mac_test settings these tests depend on. A tune of the repository settings must not change a test.
-MAC_TEST_PINS = "offload=on\nprobe_timeout_s=15\nlinux_only.hana=hana_video,hana_clerestory\n"
-
-
-def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Write a fixture settings file. A new mac_test file gets the pins in place of the repository values."""
-    pins = MAC_TEST_PINS if (template or path.stem) == "mac_test" and not path.exists() else ""
-    return memory_test_support.write_config_fixture(path, pins + overrides, template=template)
+FIXTURE_GUEST_ROUTE = service.GuestProbeRoute(("fixture-mac", "fixture-guest"), "fixture")
 
 
 class PlacementFixture(AdmissionFixture):
@@ -80,7 +72,6 @@ class PlacementFixture(AdmissionFixture):
 
     def __init__(self, *, private_child_starts: bool = False) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
-        self.settings_pinned: bool = False
         super().__init__(private_child_starts=private_child_starts)
 
     @override
@@ -94,10 +85,6 @@ class PlacementFixture(AdmissionFixture):
         settings = conf.path("mac_test")
         if settings.parent != self.root:
             raise AssertionError(f"a placement test must not read the live settings: {settings}")
-        if not self.settings_pinned:
-            settings.unlink(missing_ok=True)
-            _ = write_config_fixture(settings)
-            self.settings_pinned = True
         server = super().new_server(start=False)
         self.read_host_evidence = server.read_provider_evidence
         server.host_probe = self.read_provider
@@ -169,7 +156,15 @@ def publish_candidate(fixture: PlacementFixture, request: wire.PlacementRequest,
                       claims: tuple[placement.AdoptedProviderClaim, ...] = ()) -> placement.FreshHostEvidence:
     destination = request.constraints.candidates[0].destination
     key = fixture.server.host_evidence_key(request, destination)
-    evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", eligibility, claims)
+    values = (key, fixture.clock.now(), "host-generation-a", eligibility, claims)
+    answered = isinstance(eligibility, placement.AllowedHost)
+    evidence: placement.FreshHostEvidence
+    if destination.target != "mac-linux":
+        evidence = placement.FreshHostEvidence(*values, probe_answered=answered)
+    elif eligibility == placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER):
+        evidence = service.MacLinuxProbeFailureEvidence(*values, route=FIXTURE_GUEST_ROUTE)
+    else:
+        evidence = service.MacLinuxProbeEvidence(*values, route=FIXTURE_GUEST_ROUTE, probe_answered=answered)
     fixture.provider_evidence[key] = evidence
     fixture.server.publish_host_evidence(evidence)
     return evidence
@@ -279,12 +274,25 @@ def consume_guest_permission(fixture: PlacementFixture, assignment: placement.Pl
 
 
 def write_guest_no_start_proof(fixture: PlacementFixture, claim: placement.ProviderClaimReference) -> None:
+    write_guest_proof(fixture, claim, result="not started", detail="The guest confirmed no start")
+
+
+def write_guest_proof(fixture: PlacementFixture, claim: placement.ProviderClaimReference, *,
+                      result: str, detail: str, **fields: object) -> None:
     journal = mac_linux_end_proof_journal()
     row = {"attempt": execution_identity.attempt_key(claim.episode, claim.attempt), "claim": claim.claim_id,
-           "result": "not started", "detail": "The guest confirmed no start", "written_at": fixture.clock.now()}
+           "result": result, "detail": detail, "written_at": fixture.clock.now(), **fields}
     journal.parent.mkdir(parents=True, exist_ok=True)
     with journal.open("a") as stream:
         _ = stream.write(json.dumps(row) + "\n")
+
+
+def write_guest_launch(fixture: PlacementFixture, claim: placement.ProviderClaimReference, holder: wire.Owner) -> None:
+    mac, guest = FIXTURE_GUEST_ROUTE.ssh_hops
+    write_guest_proof(fixture, claim, result="awaiting arm", detail="The gate prepared to request launch permission",
+        mac_host=mac, guest_host=guest, guest_user=FIXTURE_GUEST_ROUTE.guest_user,
+        guest_checkout={"machine_id": "guest-machine", "path": "/fixture"},
+        holder={"pid": holder.pid, "start": holder.start_time})
 
 
 def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementRequest, hana.HanaControlTransport]:
@@ -328,6 +336,27 @@ def adopt_assignment(fixture: PlacementFixture, request: wire.PlacementRequest,
                                              destination.host, "host-generation-a")
     _ = publish_candidate(fixture, request, claims=(adopted,))
     return reference
+
+
+def authorize_mac(fixture: PlacementFixture, request: wire.PlacementRequest) -> wire.FirstAuthorization:
+    _ = publish_candidate(fixture, request)
+    assignment = assignment_for(fixture, request)
+    claim = adopt_assignment(fixture, request, assignment)
+    authorized, = fixture.server.handle_request(consume_permission("launch", assignment, claim))
+    assert isinstance(authorized, wire.FirstAuthorization), authorized
+    execution = execution_identity.ProcessExecution(assignment.destination.host, "host-generation-a", 700001, "start")
+    _ = fixture.server.handle_request(wire.ExecutionReport("running", assignment, claim,
+        execution_identity.ObservedExecution(execution)))
+    _ = fixture.run_pass()
+    return authorized
+
+
+def mac_outage_report(authorized: wire.FirstAuthorization, since: float) -> wire.ExecutionReport:
+    evidence = (placement.MacOutage.MAC_STATUS_MISSING if authorized.assignment.destination.provider == "mac"
+                else placement.MacOutage.GUEST_END_UNPROVEN)
+    return wire.ExecutionReport("lost", authorized.assignment, authorized.claim,
+        execution_identity.ExecutionEvidenceUnavailable("no verdict", since), placement.AttemptLost(evidence, since),
+        placement.DispatchPathPending("no remote end proof"))
 
 
 def with_cargo_folder(request: wire.PlacementRequest, path: str) -> str:
@@ -899,6 +928,28 @@ class PlacementTests(unittest.TestCase):
             self.assertIn(f"{command})", startup)
             self.assertEqual(messages, [("builds", startup)])
 
+    def test_guest_recovery_command_names_the_service_state_root(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(service, "send_admission_alert", return_value=True)):
+            root = fixture.root / "target state"
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}):
+                request = mac_linux_and_natedev_request(fixture, natedev=False)
+                _ = publish_candidate(fixture, request)
+                guest = assignment_for(fixture, request)
+                holder = guest_gate(fixture, guest)
+                self.assertIsInstance(consume_guest_permission(fixture, guest, holder)[0], wire.FirstAuthorization)
+                state = service.read_state(fixture.state_dir)
+                state.current_assignments[guest.episode] = "missing"
+                _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+
+                with redirect_stderr(io.StringIO()) as warnings:
+                    fixture.restart()
+            python = str(Path(service.__file__).resolve().parents[1] / "lib/py")
+            command = ["env", f"BUILD_TARGETS_STATE_DIR={root}", python, "-m", "scripts.build_targets.mac_linux",
+                       "--reconcile-end", guest.episode, str(int(guest.attempt, 16))]
+            self.assertIn(f"queue unit: run {shlex.join(command)})", warnings.getvalue())
+
     def test_startup_requires_manual_recovery_for_two_consumed_guests(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
         reconcile = mock.Mock()
@@ -1021,6 +1072,9 @@ class PlacementTests(unittest.TestCase):
                 assert isinstance(worker, ManualEvidenceWorker)
                 fallback = worker.probe_next()
                 self.assertEqual(fallback.configuration_generation, "")
+                _ = fixture.run_pass()
+                self.assertIsInstance(fixture.server.assignments[attempt].state, placement.CurrentAssignment)
+                fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
                 _ = fixture.run_pass()
             self.assertIsInstance(fixture.server.assignments[attempt].state, placement.ClosedAssignment)
             self.assertNotIn(fallback, fixture.server.host_readers)
@@ -4242,6 +4296,12 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                             else:
                                 pending.unlink()
                             _ = fixture.run_pass()
+                            self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                            self.assertIsInstance(fixture.server.assignments[key].terminal_report, placement.NoTerminalReport)
+                            _ = fixture.connect(wire.ExecutionReport("adapter-lost", assignment, reference,
+                                execution_identity.ExecutionNotStarted(), placement.AttemptDeclined("lost"),
+                                placement.DispatchPathSettled())).replies()
+                            _ = fixture.run_pass()
                             closed = fixture.server.assignments[key]
                             self.assertIsInstance(closed.state, placement.ClosedAssignment)
                             self.assertEqual(closed.terminal_report, placement.TerminalAttemptReport(
@@ -4786,19 +4846,42 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def test_mac_probe_recovers_the_committed_mirror_root(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
-            settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
+            settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
             _ = write_config_fixture(settings, "linux_only.hana=\n")
             mac_settings = fixture.root / "mac_test.conf"
             _ = write_config_fixture(mac_settings, "mirror_root=~/fixture-mirrors\n")
             self.commit_settings(mac_settings)
             _ = mac_settings.write_text(mac_settings.read_text().replace(
                 "mirror_root=~/fixture-mirrors", "mirror_root=/outside"))
-            reply = offload.CommandOutput(0, "free_gib=1000\nhost=fixture\nrc=0\n", "")
-            with mock.patch.object(offload.ProcessController, "capture", return_value=reply) as probe:
-                evidence = self.read_target(fixture, request)
+            reply = offload.CommandOutput(0, "mirror_setup=0\tready\nfree_gib=1000\nhost=fixture\nrc=0\n", "")
+            mirror = eligibility.LegacyMirrorName("hana")
+            probe_mac_host = offload.probe_mac_host
+
+            def check_setup(controller: offload.ProcessController, config: eligibility.SshProbeSettings,
+                            target: str, mirrors: Sequence[str], *,
+                            setup_mirrors: Sequence[eligibility.LegacyMirrorName] = ()) -> offload.MacHostProbeSnapshot:
+                probe = probe_mac_host(controller, config, target, mirrors, setup_mirrors=setup_mirrors)
+                assert isinstance(probe, offload.MacHostProbeSnapshot), probe
+                self.assertEqual(probe.setup, {mirror: offload.MacMirrorSetup.READY})
+                return probe
+
+            server = fixture.server
+            key = server.host_evidence_key(request, destination)
+            server.host_requests[key] = request
+            worker = ManualEvidenceWorker(key, fixture.read_host_evidence, fixture.clock, server.reading_events, 1)
+            try:
+                with (mock.patch.object(offload.ProcessController, "capture", return_value=reply) as capture,
+                      mock.patch.object(offload, "probe_mac_host", side_effect=check_setup)):
+                    worker.probe_mac_cycle()
+                    evidence = worker.evidence(key)
+            finally:
+                worker.close()
             assert isinstance(evidence, placement.FreshHostEvidence), evidence
             self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-            self.assertIn("fixture-mirrors/hana", str(probe.call_args))
+            capture.assert_called_once()
+            script = cast(list[str], capture.call_args.args[0])[-1]
+            self.assertIn("'fixture-mirrors'/'hana'", script)
+            self.assertIn("fixture-mirrors".encode().hex(), script)
             self.assertEqual(warnings.getvalue().count("mirror_root='/outside'"), 1)
 
     def test_edit_during_read_uses_the_stamp_of_the_read_contents(self) -> None:
@@ -5308,6 +5391,10 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
     def _read(self) -> None:
         return
 
+    def probe_mac_cycle(self) -> None:
+        if not self._probe_mac_cycle(self.key):
+            raise AssertionError("the Mac probe stopped")
+
     def probe_next(self) -> placement.HostEvidenceKey:
         with self.lock:
             ready = self._next_ready(float("inf"))
@@ -5315,6 +5402,909 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
             raise AssertionError("the worker has no key to probe")
         _ = self._probe(*ready)
         return ready[0]
+
+    def probe_mac(self, key: placement.HostEvidenceKey) -> None:
+        _ = self._probe_mac_cycle(key)
+
+
+class LostMacPlacementTests(unittest.TestCase):
+    def authorize_mac_child(self, fixture: PlacementFixture, request: wire.PlacementRequest
+                            ) -> tuple[wire.FirstAuthorization, wire.Owner]:
+        _ = publish_candidate(fixture, request)
+        assignment = assignment_for(fixture, request)
+        process = guest_gate(fixture, assignment)
+        holder = placement.ClaimHolderIdentity(assignment.owner.host, process.pid, process.start_time)
+        destination = assignment.destination
+        claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+            "claim", assignment.episode, assignment.attempt)
+        adopted = placement.AdoptedProviderClaim(claim, holder, assignment.session, destination.host,
+                                                  "host-generation-a")
+        _ = publish_candidate(fixture, request, claims=(adopted,))
+        authorized, = fixture.server.handle_request(wire.ConsumePermission("launch", assignment, claim, holder=holder))
+        assert isinstance(authorized, wire.FirstAuthorization), authorized
+        return authorized, process
+
+    def test_a_guest_answer_at_599_seconds_prevents_loss_at_600(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            outage = worker.guest_outage(FIXTURE_GUEST_ROUTE)
+            assert outage is not None
+            fixture.clock.advance(599)
+            outage_read = worker.guest_outage_for
+
+            def answer_after_read(saved: records.SavedPlacementAssignment) -> service.GuestProbeOutage | None:
+                current = outage_read(saved)
+                if current is outage:
+                    _ = publish_candidate(fixture, request)
+                    fixture.clock.advance(1)
+                return current
+
+            with mock.patch.object(worker, "guest_outage_for", side_effect=answer_after_read):
+                _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.clock.monotonic(), outage.started_monotonic + 600)
+            self.assertIsNone(worker.guest_outage(FIXTURE_GUEST_ROUTE))
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+
+    def test_a_failed_guest_probe_command_answers_without_allowing_placement(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+            _ = fixture.server.handle_request(request)
+            worker = fixture.server.host_readers[key].worker
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            self.assertIsNotNone(worker.guest_outage(FIXTURE_GUEST_ROUTE))
+            fixture.clock.advance(1)
+            fixture.server.host_probe = fixture.read_host_evidence
+            assert isinstance(worker, ManualEvidenceWorker)
+            unknown = subprocess.CompletedProcess(("ssh",), 255, "", "Permission denied (publickey).")
+            with mock.patch.object(mac_linux, "run_guest_ssh", return_value=unknown):
+                self.assertEqual(worker.probe_next(), key)
+            self.assertIsNotNone(worker.guest_outage(FIXTURE_GUEST_ROUTE))
+            fixture.clock.advance(1)
+            response = subprocess.CompletedProcess(("ssh",), 127, "", "bwrap is absent from the guest PATH.")
+            with mock.patch.object(mac_linux, "run_guest_ssh", return_value=response) as ssh:
+                self.assertEqual(worker.probe_next(), key)
+            ssh.assert_called_once()
+            evidence = worker.evidence(key)
+            assert isinstance(evidence, placement.FreshHostEvidence), evidence
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            self.assertTrue(evidence.probe_answered)
+            self.assertIsNone(worker.guest_outage(FIXTURE_GUEST_ROUTE))
+
+    def test_a_probe_for_another_guest_cannot_close_the_saved_attempt(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven"),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=mac_linux.GuestConnectionFailed("The guest did not answer")) as probe):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            settings = fixture.root / "mac_linux.conf"
+            _ = settings.write_text(settings.read_text().replace("fixture-guest", "other-guest"))
+
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            fixture.clock.advance(600)
+            _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertIsNone(worker.guest_outage(FIXTURE_GUEST_ROUTE))
+            probe.assert_not_called()
+
+    def test_a_guest_answer_after_a_wall_clock_step_prevents_loss(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven"),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=[mac_linux.GuestConnectionFailed("The guest did not answer"),
+                                             mac_linux.EmptyGuestMain()]) as probe):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            outage = worker.guest_outage(FIXTURE_GUEST_ROUTE)
+            assert outage is not None
+
+            fixture.clock.advance(599)
+            fixture.clock.epoch -= 601
+            self.assertLess(fixture.clock.now(), outage.fence.reported_at)
+            self.assertEqual(worker.probe_next(), key)
+            self.assertEqual(probe.call_count, 2)
+            fixture.clock.advance(1)
+            _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertIsNone(worker.guest_outage(FIXTURE_GUEST_ROUTE))
+
+    def test_a_probe_through_another_mac_cannot_close_the_saved_attempt(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven"),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=mac_linux.GuestConnectionFailed("The guest did not answer")) as probe):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            settings = fixture.root / "mac_linux.conf"
+            _ = settings.write_text(settings.read_text().replace("fixture-mac", "other-mac"))
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            probe.assert_called_once()
+            fixture.clock.advance(600)
+            _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+            self.assertIsInstance(fixture.server.assignments[attempt].terminal_report, placement.NoTerminalReport)
+
+    def test_after_replacement_and_restart_the_saved_guest_attempt_probes_without_a_request(self) -> None:
+        from scripts.build_queue.test_place_take import UNIT, JOB, place_rules, run_since
+
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven"),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=mac_linux.GuestConnectionFailed("The guest did not answer")) as guest_probe):
+            place_rules(fixture)
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            request = replace(request, identity=replace(request.identity, unit=UNIT, job=StepJob(JOB)))
+            _ = publish_candidate(fixture, request)
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            assert isinstance(request.run, wire.RunIdentity)
+            fixture.end_run(request.run)
+
+            fixture.clock.advance(10)
+            new = replace(placement_request(fixture), constraints=request.constraints)
+            new = replace(new, identity=replace(new.identity, unit=UNIT, job=StepJob(JOB)))
+            self.assertIsInstance(fixture.server.handle_request(new)[0], wire.PlacementWait)
+            assert isinstance(new.run, wire.RunIdentity)
+            self.assertEqual(run_since(fixture, new.run), request.since)
+            state = service.read_state(fixture.state_dir)
+            _ = state.placement_requests.pop(request.episode, None)
+            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+            fixture.restart()
+            self.assertNotIn(request.episode, fixture.server.placement_requests)
+            fixture.server.host_probe = fixture.read_host_evidence
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            key = fixture.server.settlement_host_keys[attempt]
+            self.assertNotIn(key, fixture.server.host_requests)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            guest_probe.assert_called_once()
+            outage = worker.guest_outage(FIXTURE_GUEST_ROUTE)
+            assert outage is not None
+
+            fixture.clock.advance(600)
+            _ = fixture.run_pass()
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
+            self.assertEqual(fixture.server.assignments[attempt].terminal_report, placement.TerminalAttemptReport(
+                placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage.fence.reported_at),
+                placement.DispatchPathSettled(), fixture.clock.now()))
+
+    def test_a_new_run_takes_the_place_of_a_dead_run_with_an_open_guest_attempt(self) -> None:
+        from scripts.build_queue.test_place_take import UNIT, JOB, place_rules, run_since
+
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            place_rules(fixture)
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            request = replace(request, identity=replace(request.identity, unit=UNIT, job=StepJob(JOB)))
+            _ = publish_candidate(fixture, request)
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            self.assertIsInstance(consume_guest_permission(fixture, guest, holder, proof_required=True)[0],
+                                  wire.FirstAuthorization)
+            assert isinstance(request.run, wire.RunIdentity)
+            fixture.end_run(request.run)
+
+            fixture.clock.advance(10)
+            new = mac_linux_and_natedev_request(fixture, natedev=False)
+            new = replace(new, identity=replace(new.identity, unit=UNIT, job=StepJob(JOB)))
+            _ = publish_candidate(fixture, new)
+            self.assertIsInstance(fixture.server.handle_request(new)[0], wire.PlacementWait)
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply), reply
+            waiter, = (step for step in reply.reading.view.waiting if step.pid == new.owner.pid)
+            self.assertEqual(waiter.took_place, "failed")
+            assert isinstance(new.run, wire.RunIdentity)
+            self.assertEqual(run_since(fixture, new.run), request.since)
+
+    def test_guest_end_proof_keeps_the_attempt_open_for_a_late_verdict(self) -> None:
+        settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(settlement=settle))):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            key = publish_candidate(fixture, request).key
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            authorized, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            fixture.end_owner(holder)
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            settle.return_value = placement.Settled()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), attempt)
+            self.assertIsInstance(fixture.server.assignments[attempt].terminal_report, placement.NoTerminalReport)
+
+            outcome = placement.AttemptCompleted(1)
+            verdict = wire.ExecutionReport("late-verdict", assignment, authorized.claim,
+                execution_identity.ExecutionEvidenceUnavailable("the guest start report is missing", fixture.clock.now()),
+                outcome, placement.DispatchPathSettled())
+            _ = fixture.server.handle_request(verdict)
+            _ = fixture.run_pass()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+            self.assertEqual(saved.terminal_report.outcome, outcome)
+
+    def test_guest_end_proof_after_resubmit_keeps_the_attempt_open_for_a_verdict(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            key = publish_candidate(fixture, request).key
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            authorized, = consume_guest_permission(fixture, assignment, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            fixture.end_owner(holder)
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            pending = fixture.server.assignments[attempt].terminal_report
+            assert isinstance(pending, placement.TerminalAttemptReport), pending
+            self.assertEqual(pending.outcome, service.GUEST_SETTLEMENT_REQUESTED)
+            write_guest_proof(fixture, authorized.claim, result="proven", detail="The guest confirmed the run ended")
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), attempt)
+            self.assertEqual(fixture.server.assignments[attempt].terminal_report, pending)
+
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[attempt].terminal_report, pending)
+            outcome = placement.AttemptCompleted(1)
+            verdict = wire.ExecutionReport("late-verdict", assignment, authorized.claim,
+                execution_identity.ExecutionEvidenceUnavailable("the guest start report is missing", fixture.clock.now()),
+                outcome, placement.DispatchPathSettled())
+            accepted, = fixture.server.handle_request(verdict)
+            assert isinstance(accepted, wire.DispatchStatus), accepted
+            self.assertEqual(accepted.reason, "")
+            _ = fixture.run_pass()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport), saved
+            self.assertEqual(saved.terminal_report.outcome, outcome)
+
+    def test_guest_loss_can_follow_an_expired_unproven_settlement_request(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            authorized, = consume_guest_permission(fixture, assignment, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.end_owner(holder)
+            self.assertIsInstance(fixture.server.handle_request(wire.SettlementRequest(assignment))[0], wire.Ok)
+
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            pending = fixture.server.assignments[key].terminal_report
+            assert isinstance(pending, placement.TerminalAttemptReport)
+            self.assertEqual(pending.outcome, service.GUEST_SETTLEMENT_REQUESTED)
+
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus), closed
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            replacement = assignment_for(fixture, request)
+            self.assertNotEqual(replacement.attempt, assignment.attempt)
+            self.assertIsInstance(consume_guest_permission(fixture, replacement, guest_gate(fixture, replacement))[0],
+                                  wire.FirstAuthorization)
+
+    def test_a_guest_outage_frees_the_slot_after_the_dead_coordinator_wait(self) -> None:
+        limit = 600
+        settings = mac_linux.GuestSettings(("fixture-mac", "fixture-guest"), "fixture", 8, 7200, limit)
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "read_settings", return_value=settings),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=mac_linux.GuestConnectionFailed("The guest did not answer")),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = write_config_fixture(fixture.root / "build_targets.conf", f"unreachable_wait_seconds={limit}\n")
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+
+            claim = authorized.claim
+            paths = claim_state.StatePaths(mac_linux_end_proof_journal().parent, "mac-linux", platform="linux")
+            pending = claim_state.pending_start_path(paths,
+                claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt))
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            pending.touch()
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            fixture.clock.advance(1)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            fixture.clock.advance(limit - 1)
+            fixture.restart()
+            fixture.server.host_probe = fixture.read_host_evidence
+            fixture.clock.advance(1)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            outage_since = fixture.clock.now()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+
+            fixture.clock.advance(limit - 1)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            fixture.clock.advance(1)
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            self.assertEqual(saved.state, placement.ClosedAssignment("lost"))
+            self.assertEqual(saved.terminal_report, placement.TerminalAttemptReport(
+                placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage_since),
+                placement.DispatchPathSettled(), fixture.clock.now()))
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
+            self.assertTrue(pending.is_file())
+
+    def test_a_dead_guest_coordinator_keeps_its_verdict_past_the_outage_deadline(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            outcome = placement.AttemptCompleted(1)
+            verdict = wire.ExecutionReport("verdict", guest, authorized.claim,
+                execution_identity.ExecutionEvidenceUnavailable("the start report is missing", fixture.clock.now()),
+                outcome, placement.DispatchPathSettled())
+            accepted, = fixture.server.handle_request(verdict)
+            assert isinstance(accepted, wire.DispatchStatus), accepted
+            self.assertEqual(accepted.reason, "")
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            pending = fixture.server.assignments[attempt].terminal_report
+            assert isinstance(pending, placement.TerminalAttemptReport), pending
+            self.assertEqual(pending.outcome, outcome)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+
+            write_guest_proof(fixture, authorized.claim, result="proven", detail="The guest confirmed the run ended")
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            self.assertEqual(saved.retry, placement.DoNotRetry("command result is final"))
+            self.assertEqual(saved.terminal_report, replace(pending, path=placement.DispatchPathSettled()))
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
+
+    def test_a_guest_answer_during_the_wait_leaves_closure_to_settlement(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven") as reconcile):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            write_guest_launch(fixture, authorized.claim, holder)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+
+            limit = memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS
+            fixture.clock.advance(limit / 2)
+            self.assertTrue(publish_candidate(fixture, request).probe_answered)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            reconcile.assert_called_with(guest.episode, int(guest.attempt, 16))
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+
+            fixture.clock.advance(limit / 2 + 1)
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertEqual(fixture.server.mac_outages, {})
+
+            write_guest_proof(fixture, authorized.claim, result="proven", detail="The guest confirmed the run ended")
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
+            self.assertIsInstance(fixture.server.assignments[attempt].state, placement.ClosedAssignment)
+            self.assertEqual(fixture.server.mac_outages, {})
+
+    def test_a_replacement_decline_returns_without_the_lost_run_pin(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            first = placement_request(fixture, since=now - 2, session=OwningSession("first-launch"))
+            first = replace(first, constraints=replace(first.constraints,
+                candidates=(*first.constraints.candidates, local_candidate(fixture))))
+            second = placement_request(fixture, since=now - 1, session=OwningSession("second-launch"))
+            first_auth = authorize_mac(fixture, first)
+            fixture.clock.advance(1)
+            second_auth = authorize_mac(fixture, second)
+            outage_since = fixture.clock.now()
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            older = replace(local_cargo_request(fixture), since=now - 3)
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.PlacementWait)
+            closed, = fixture.server.handle_request(mac_outage_report(first_auth, outage_since))
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, first)
+            replacement = assignment_for(fixture, first)
+            self.assertNotEqual(replacement.attempt, first_auth.assignment.attempt)
+            declined, = fixture.server.handle_request(wire.ClaimFailure("no-tests", replacement, "no_tests"))
+            assert isinstance(declined, wire.DispatchStatus)
+            self.assertEqual(declined.state, placement.ClosedAssignment("no_tests"))
+            closed, = fixture.server.handle_request(mac_outage_report(second_auth, outage_since))
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            _ = fixture.run_pass()
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([row.pid for row in view.reading.view.waiting],
+                             [second.owner.pid, older.owner.pid, first.owner.pid])
+
+    def test_an_unused_mac_offer_skips_the_claim_release_liveness_check(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            offer = assignment_for(fixture, request)
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            with mock.patch.object(fixture.server, "_placement_owner_live") as owner_live:
+                status, = fixture.server.handle_request(status_wire.PlacementStatusRequest(offer.episode, offer.attempt))
+            assert isinstance(status, status_wire.PlacementStatusReply)
+            assert isinstance(status.status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.status.state, placement.CurrentAssignment())
+            owner_live.assert_not_called()
+
+    def test_manual_mac_waits_until_a_probe_answers_after_loss(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, command_kind="run",
+                selection=placement.MacOnlyHost()))
+            authorized = authorize_mac(fixture, request)
+            report = mac_outage_report(authorized, fixture.clock.now())
+
+            fixture.server.host_probe = fixture.read_host_evidence
+            settings = conf.path("mac_test")
+            _ = write_config_fixture(settings, "offload=off\n")
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            destination = authorized.assignment.destination
+            key = fixture.server.host_evidence_key(request, destination)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            answer = offload.MacHostProbeSnapshot(offload.ProbeSnapshot(1000, "fixture-mac"), {}, {})
+            with mock.patch.object(offload, "probe_mac_host", return_value=answer) as probe:
+                worker.probe_mac(key)
+                probe.assert_not_called()
+                self.assertIsInstance(fixture.server.host_evidence(key), placement.FreshHostEvidence)
+                _ = fixture.server.handle_request(report)
+                fixture.clock.advance(1)
+                _ = fixture.run_pass()
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.PlacementWait), waiting
+                self.assertEqual(waiting.eligibility[0].eligibility,
+                                 placement.TemporaryExclusion(placement.MAC_OUTAGE_WAIT))
+
+                _ = write_config_fixture(settings, "offload=on\n")
+                fixture.clock.advance(1)
+                _ = fixture.run_pass()
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+                key = fixture.server.host_evidence_key(request, destination)
+                worker = fixture.server.host_readers[key].worker
+                assert isinstance(worker, ManualEvidenceWorker)
+                worker.probe_mac(key)
+                probe.assert_called_once()
+                _ = fixture.run_pass()
+                replacement = assignment_for(fixture, request)
+                self.assertEqual(replacement.destination, destination)
+                self.assertNotEqual(replacement.attempt, authorized.assignment.attempt)
+
+    def test_loss_report_restarts_the_attempt_before_the_claim_retires(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            request = placement_request(fixture, since=fixture.clock.now() - 1)
+            authorized, process = self.authorize_mac_child(fixture, request)
+            assignment = authorized.assignment
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.end_owner(process)
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+
+            older = replace(local_cargo_request(fixture), since=request.since - 1)
+            fixture.hold_starts()
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.PlacementWait)
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus), closed
+            self.assertEqual(closed.reason, "")
+            self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
+            terminal = fixture.server.assignments[key].terminal_report
+            assert isinstance(terminal, placement.TerminalAttemptReport)
+            self.assertEqual(terminal.outcome, report.outcome)
+            waiting, = fixture.server.handle_request(request)
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual((waiting.position, waiting.since), (1, request.since))
+            self.assertEqual(waiting.eligibility[0].eligibility, placement.TemporaryExclusion(placement.MAC_OUTAGE_WAIT))
+
+    def test_loss_report_refuses_an_attempt_closed_by_inference(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            authorized_request = placement_request(fixture)
+            authorized, process = self.authorize_mac_child(fixture, authorized_request)
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.end_owner(process)
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = publish_candidate(fixture, authorized_request, placement.TemporaryExclusion("unreachable"))
+            _ = fixture.server.handle_request(authorized_request)
+            assignment = authorized.assignment
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            saved = fixture.server.assignments[key]
+            self.assertEqual(saved.state, placement.ClosedAssignment("lost"))
+
+            refused, = fixture.server.handle_request(report)
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.reason, "the attempt is no longer current")
+            self.assertEqual(fixture.server.assignments[key], saved)
+            self.assertEqual(fixture.server.mac_outages, {})
+
+    def test_nonzero_mac_completion_survives_a_pass_after_claim_release(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = placement_request(fixture)
+            authorized, process = self.authorize_mac_child(fixture, request)
+            assignment = authorized.assignment
+            fixture.end_owner(process)
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            _ = fixture.run_pass()
+
+            outcome = placement.AttemptCompleted(1)
+            execution = execution_identity.ProcessExecution(assignment.destination.host, "host-generation-a", 700001, "start")
+            report = wire.ExecutionReport("completed", assignment, authorized.claim,
+                execution_identity.ObservedExecution(execution), outcome, placement.DispatchPathSettled())
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus), closed
+            self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            terminal = fixture.server.assignments[key].terminal_report
+            assert isinstance(terminal, placement.TerminalAttemptReport)
+            self.assertEqual(terminal.outcome, outcome)
+            _ = fixture.run_pass()
+            self.assertNotIn(request.episode, fixture.server.current_assignments)
+            self.assertEqual(len(fixture.server.assignments), 1)
+
+    def test_mac_outage_forces_a_probe_with_offload_off(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, command_kind="run",
+                selection=placement.MacOnlyHost()))
+            authorized = authorize_mac(fixture, request)
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus), closed
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            self.assertEqual(closed.reason, "")
+
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = write_config_fixture(conf.path("mac_test"), "offload=off\n")
+            fixture.clock.advance(1)
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            destination = authorized.assignment.destination
+            key = fixture.server.host_evidence_key(request, destination)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            with (mock.patch.object(offload, "probe_mac_host", return_value=offload.UnavailableProbe()) as probe,
+                  mock.patch.object(offload, "write_backoff")):
+                worker.probe_mac(key)
+                probe.assert_called_once()
+                _ = fixture.run_pass()
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.PlacementWait), waiting
+                self.assertEqual(waiting.eligibility[0].eligibility,
+                                 placement.TemporaryExclusion(placement.MAC_OUTAGE_WAIT))
+
+            fixture.clock.advance(1)
+            answer = offload.MacHostProbeSnapshot(offload.ProbeSnapshot(1000, "fixture-mac"), {}, {})
+            with mock.patch.object(offload, "probe_mac_host", return_value=answer) as probe:
+                worker.probe_mac(key)
+                probe.assert_called_once()
+                _ = fixture.run_pass()
+                replacement = assignment_for(fixture, request)
+                self.assertEqual(replacement.destination, destination)
+                self.assertNotEqual(replacement.attempt, authorized.assignment.attempt)
+
+    def test_loss_report_removes_the_running_row_with_a_cached_claim(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            request = placement_request(fixture)
+            authorized = authorize_mac(fixture, request)
+            assignment = authorized.assignment
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            claim = placement.AdoptedProviderClaim(authorized.claim, coordinator_holder(assignment),
+                assignment.session, assignment.destination.host, "host-generation-a")
+            evidence = publish_candidate(fixture, request, claims=(claim,))
+            _ = fixture.run_pass()
+            before, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(before, wire.ViewReply)
+            label = f"{assignment.episode}/{assignment.attempt}"
+            self.assertIn(label, [row.mac_placement for row in before.reading.view.running])
+
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            self.assertEqual(fixture.server.host_evidence(evidence.key), evidence)
+            after, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(after, wire.ViewReply)
+            self.assertNotIn(label, [row.mac_placement for row in after.reading.view.running])
+            _ = fixture.run_pass()
+            refreshed, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(refreshed, wire.ViewReply)
+            self.assertNotIn(label, [row.mac_placement for row in refreshed.reading.view.running])
+
+    def test_lost_guest_waits_for_the_deadline_then_restarts_on_natedev(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = mac_linux_and_natedev_request(fixture)
+            request = replace(request, since=fixture.clock.now() - 90, prerequisite=placement.TokenNotRequired())
+            fixture.hold_starts()
+            _ = publish_candidate(fixture, request)
+            guest = assignment_for(fixture, request)
+            authorized, = consume_guest_permission(fixture, guest, guest_gate(fixture, guest), proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            outage_since = fixture.clock.now()
+            report = mac_outage_report(authorized, outage_since)
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS - 1)
+            early, = fixture.server.handle_request(report)
+            assert isinstance(early, wire.DispatchStatus)
+            self.assertIn("wait has not expired", early.reason)
+            self.assertEqual(early.state, placement.CurrentAssignment())
+            self.assertIn(request.episode, fixture.server.current_assignments)
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            waiting, = fixture.server.handle_request(request)
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual(waiting.since, request.since)
+            self.assertEqual(waiting.eligibility[0].eligibility, placement.TemporaryExclusion(placement.MAC_OUTAGE_WAIT))
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertNotIn("mac-linux", [step.assignment_target for step in view.reading.view.running])
+            assert isinstance(waiting.wait, wire.Wait), waiting
+            with redirect_stderr(io.StringIO()) as output:
+                client.WaitOutput()(waiting.wait, since=waiting.since)
+            from scripts.lib.user_zone import user_zone
+
+            expected = datetime.fromtimestamp(request.since, user_zone()).strftime("%H:%M %Z")
+            self.assertIn("waiting for memory since " + expected, output.getvalue())
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            replacement, = fixture.server.handle_request(request)
+            assert isinstance(replacement, wire.LocalPlacementGranted), replacement
+            self.assertEqual(replacement.assignment.destination.target, "natedev")
+            self.assertEqual(replacement.assignment.episode, guest.episode)
+            self.assertEqual(replacement.assignment.source_key, guest.source_key)
+            self.assertNotEqual(replacement.assignment.attempt, guest.attempt)
+            late, = fixture.server.handle_request(report)
+            assert isinstance(late, wire.DispatchStatus)
+            self.assertIn("no longer current", late.reason)
+            self.assertEqual(fixture.server.placement_requests[request.episode].constraints, request.constraints)
+            key = execution_identity.attempt_key(guest.episode, guest.attempt)
+            assert isinstance(report.outcome, placement.AttemptLost)
+            self.assertEqual(fixture.server.assignments[key].terminal_report,
+                placement.TerminalAttemptReport(report.outcome, placement.DispatchPathSettled(),
+                                                outage_since + memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS))
+            other = mac_linux_and_natedev_request(fixture, natedev=False)
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, other)
+            next_guest = assignment_for(fixture, other)
+            self.assertIsInstance(consume_guest_permission(fixture, next_guest, guest_gate(fixture, next_guest))[0],
+                                  wire.FirstAuthorization)
+
+    def test_lost_runs_keep_authorization_order_ahead_of_head_moves(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            first = placement_request(fixture, since=now - 1, session=OwningSession("first-launch"))
+            second = placement_request(fixture, since=now - 2, session=OwningSession("second-launch"))
+            first_auth = authorize_mac(fixture, first)
+            fixture.clock.advance(1)
+            second_auth = authorize_mac(fixture, second)
+            self.assertEqual([place.move_id for place in fixture.server.places.values()], ["", ""])
+            outage_since = fixture.clock.now()
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            older = local_cargo_request(fixture)
+            older = replace(older, since=now - 3)
+            moved = local_cargo_request(fixture)
+            for request in (older, moved):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            line = view.reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            initial_move = wire.QueueMoveRequest("before-loss", line.members[-1].row_id,
+                                                 line.revision, wire.QueueHeadDrop())
+            self.assertIsInstance(fixture.server.handle_request(initial_move)[0], wire.QueueMoved)
+
+            for auth in (second_auth, first_auth):
+                status, = fixture.server.handle_request(mac_outage_report(auth, outage_since))
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertEqual(status.state, placement.ClosedAssignment("lost"))
+            _ = fixture.run_pass()
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([row.pid for row in view.reading.view.waiting],
+                             [first.owner.pid, second.owner.pid, moved.owner.pid, older.owner.pid])
+            line = view.reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            later_move = wire.QueueMoveRequest("after-loss", line.members[-1].row_id,
+                                               line.revision, wire.QueueHeadDrop())
+            result, = fixture.server.handle_request(later_move)
+            assert isinstance(result, wire.QueueMoved), result
+            self.assertEqual(result.new_place, 3)
+            self.assertEqual([item.row_id for item in result.line.members],
+                [line.members[index].row_id for index in (0, 1, 3, 2)])
+
+    def test_an_outage_revokes_an_unused_mac_offer(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            running = placement_request(fixture)
+            authorized = authorize_mac(fixture, running)
+            outage_since = fixture.clock.now()
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            waiting = placement_request(fixture, session=OwningSession("unused-offer"))
+            _ = publish_candidate(fixture, waiting)
+            offer = assignment_for(fixture, waiting)
+            claim = adopt_assignment(fixture, waiting, offer)
+
+            closed, = fixture.server.handle_request(mac_outage_report(authorized, outage_since))
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            refused, = fixture.server.handle_request(consume_permission("stale-offer", offer, claim))
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.state, placement.ClosedAssignment(placement.MAC_OUTAGE_WAIT))
 
 
 @dataclass(frozen=True)

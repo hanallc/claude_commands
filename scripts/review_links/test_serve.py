@@ -4,8 +4,6 @@ from __future__ import annotations
 from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
-from scripts.lib.checkout_test_support import python_tool_source
-
 import contextlib
 import errno
 import fcntl
@@ -47,7 +45,7 @@ from unittest.mock import ANY, Mock, call, patch
 
 
 from typing import IO, Literal, TextIO, TypedDict, cast, override
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree
@@ -75,7 +73,7 @@ from scripts.review_links import (
 )
 from scripts.review_links import (
     accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
-    placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
+    placement_disk, review_actions, review_events, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
 )
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
 from scripts.lib.process_group import run_process_group
@@ -277,6 +275,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults",
+                                           return_value=(temporary / "vault",)))
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
@@ -321,6 +321,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             def review_post(self) -> None:
                 with review_posts.running():
                     super().review_post()
+
+            @override
+            def review_delivery_retry_post(self, query: str) -> None:
+                with review_posts.running():
+                    super().review_delivery_retry_post(query)
 
             @override
             def new_item_post(self) -> None:
@@ -648,7 +653,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                     row = the_list.load(morty.id, f"L{saved['list_number']}")
                     self.assertEqual((row.owner, row.producer, row.unit, row.reviews),
                                      (assignee.id if assignee else producer.id, producer.id,
-                                      assignee.name if assignee else "", (saved["key"],)))
+                                      assignee.name if assignee else "", ()))
+                    self.assertIsInstance(row.report, the_list.ListReport)
+                    assert isinstance(row.report, the_list.ListReport)
+                    self.assertEqual(row.report.evidence_key, saved["key"])
+                    self.assertEqual((saved["list_owner"], saved["list_producer"]),
+                                     (assignee.name if assignee else producer.name, producer.name))
                     retry = self.new_item_http(body, finished=True)
                     self.assertEqual(retry.status, 200, retry.body)
                     self.assertEqual(json.loads(retry.body), saved)
@@ -662,6 +672,58 @@ class ReviewLinksServerTests(unittest.TestCase):
                         message = cast(str, copy.args[2])
                         self.assertTrue(message.endswith("\n\nNate's words:\n" + request.words))
                         self.assertNotIn("Answer with", message)
+
+    def test_builds_question_receipt_reads_the_saved_list_owner_and_producer(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        unit = case.fixture.unit
+        producer = fixture_member("producer", name="dwight")
+        keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\npage.builds.owner={unit.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = new_item_dialog.NewItemRequest(
+            "r6-" + uuid4().hex, new_item_dialog.SubmissionKind.QUESTION, producer.id,
+            "Which check should Builds run?", new_item_dialog.NoEvidence(), page="builds",
+            page_recipient=new_item_dialog.PageRecipient.PRODUCER, assignment=new_item_dialog.ChosenAssignee(unit.id))
+        body = self.new_item_body(request)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message")):
+            reply = self.new_item_http(body, finished=True)
+            self.assertEqual(reply.status, 200, reply.body)
+            saved = cast(dict[str, object], json.loads(reply.body))
+            row, = the_list.records(keeper.id)
+            self.assertEqual((row.owner, row.producer, row.reviews), (unit.id, producer.id, (saved["key"],)))
+            self.assertEqual((saved["list_number"], saved.get("list_owner"), saved.get("list_producer")),
+                             (row.number, unit.name, producer.name))
+
+            _ = the_list.update(keeper.id, row.id, {"owner": owner.id, "producer": keeper.id}, source="morty")
+            retry = self.new_item_http(body, finished=True)
+            self.assertEqual(retry.status, 200, retry.body)
+            saved = cast(dict[str, object], json.loads(retry.body))
+            self.assertEqual((saved["list_number"], saved.get("list_owner"), saved.get("list_producer")),
+                             (row.number, owner.name, keeper.name))
+
+    def test_builds_question_has_no_receipt_without_an_active_list_keeper(self) -> None:
+        case = self.review_fixture(list_keeper=False)
+        unit = case.fixture.unit
+        producer = fixture_member("producer", name="dwight")
+        _ = write_config_fixture(conf.path("console"), f"page.builds.owner={unit.id}\npage.list.owner=missing\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = new_item_dialog.NewItemRequest(
+            "r6-" + uuid4().hex, new_item_dialog.SubmissionKind.QUESTION, producer.id,
+            "Which check should Builds run?", new_item_dialog.NoEvidence(), page="builds",
+            page_recipient=new_item_dialog.PageRecipient.PRODUCER, assignment=new_item_dialog.ChosenAssignee(unit.id))
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message")):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(response.status, 200, response.body)
+        saved = cast(dict[str, str], json.loads(response.body))
+        self.assertEqual(set(saved), {"id", "key", "version"})
+        self.assertEqual(cache.get().records[saved["key"]].owner, producer.id)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_builds_bug_with_none_goes_to_morty_to_assign(self) -> None:
@@ -1113,7 +1175,7 @@ addEventListener('DOMContentLoaded', async () => {
         with (patch.object(server, "review_cache", cache),
               patch.object(server, "delivery_status", case.status),
               patch.object(change_page, "send_to_staff") as deliver):
-            with patch.object(review_actions, "prepare_submission_delivery", side_effect=OSError("Delivery setup stopped.")):
+            with patch.object(review_actions, "prepare_submission_deliveries", side_effect=OSError("Delivery setup stopped.")):
                 failed = self.new_item_http(body, finished=True)
             self.assertEqual(failed.status, 503, failed.body)
             original, = investigation.records(owner.id)
@@ -1455,7 +1517,8 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
             result = f"{send_hold.HOLD_PATH}/{hold_id}"
             self.assertEqual(self.held_http("GET", result, headers={"Origin": "https://elsewhere.invalid"})[0], 403)
-            self.assertEqual(self.held_http("GET", result)[::2], (404, {"reason": "This send was undone."}))
+            self.assertEqual(self.held_http("GET", result)[::2],
+                             (404, {"reason": "This send was undone.", "hold_state": "undone"}))
             self.assertEqual(self.request(result).headers.get("x-send-hold-outcome"), "undone")
             missing = self.request(f"{send_hold.HOLD_PATH}/{send_hold.new_hold_id()}")
             self.assertEqual((missing.status, missing.headers.get("x-send-hold-outcome")), (404, "missing"))
@@ -1594,6 +1657,7 @@ addEventListener('DOMContentLoaded', async () => {
             status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
             self.assertEqual((status, hold), (200, ""), answer)
             self.assertTrue({"answer", "version", "delivery_pending"} <= answer.keys(), answer)
+            self.assertIs(answer["words_saved"], True)
             self.assertTrue(self.review_posts.wait_until_none_run())
             save.assert_called_once()
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
@@ -1617,6 +1681,7 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertEqual((status, hold, answer.get("answer")), (200, "", "not works: The proof failed."))
             self.assertEqual(answer.get("send_failure"), "Delivery failed: The owner is offline.")
             self.assertFalse(answer["delivery_pending"])
+            self.assertIs(answer["words_saved"], True)
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
         self.assertEqual(rows["C1"]["Verdict"], "not works: The proof failed.")
         item, = the_list.records(keeper.id)
@@ -1843,7 +1908,7 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertEqual(output.getvalue(), "")
                 self.assertIn("The automatic retry could not connect.", errors.getvalue())
                 self.assertEqual(len(the_list.records(morty.id)), 1)
-                self.assertEqual(len(read_new_item_notices(log)), 1)
+                self.assertEqual(len(read_new_item_notices(log)), 2)
                 if change_mapping:
                     _ = conf.path("producer_map").write_text("", encoding="utf-8")
                 code = new_item.main(arguments)
@@ -1866,7 +1931,11 @@ addEventListener('DOMContentLoaded', async () => {
         title = filed_words.splitlines()[0]
         self.assertEqual((cache.get().records[key].title, cache.get().records[key].owner), (title, producer.id))
         item, = the_list.records(morty.id, include_closed=True)
-        notice, = read_new_item_notices(log)
+        notice, copy = read_new_item_notices(log)
+        self.assertEqual(copy["rows"], [item.id])
+        self.assertEqual(copy["address"], f"session:{unit.current_session}")
+        self.assertIn(words, copy["words"])
+        self.assertNotIn("answer-question --item", copy["words"])
         self.assertEqual(notice["rows"], [item.id])
         self.assertEqual(notice["address"], f"session:{producer.current_session}")
         self.assertIn(title, notice["words"])
@@ -1939,7 +2008,7 @@ addEventListener('DOMContentLoaded', async () => {
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
-        request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex,
                           page_recipient=new_item_dialog.PageRecipient.SELECTED)
         body = self.new_item_body(request)
@@ -1954,21 +2023,20 @@ addEventListener('DOMContentLoaded', async () => {
             before = the_list.records(morty.id, include_closed=True)
             self.assertEqual(len(before), 0 if stop_before_row else 1)
             self.assertEqual(read_new_item_notices(log), [])
-            original, = investigation.records(owner.id)
+            original, = update_registration.question_records_for_owner(owner.id, strict=True)
             expected_records = [original]
-            assert isinstance(original.submission, new_item_dialog.ReviewSubmission)
-            pending_request_id = original.submission.request_id
+            pending_request_id = update_registration.review_submission(original).request_id
             if retire_producer:
                 _ = staff.set_producer_retirement(owner.id, staff.RetiredProducer("claude:sonnet:high"))
 
             restarted = change_page.DeliveryStatus(case.root)
             change_page.recover_pending(restarted)
             if answered_marker:
-                waiting = case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
+                waiting = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
                 answered = review_submissions.submit(waiting, initial_delivery=review_submissions.InitialDelivery())
                 self.assertTrue(review_submissions.answer(answered.key, "The check passed.",
                                                           answered.details.reply_token))
-                expected_records = investigation.records(owner.id)
+                expected_records = update_registration.question_records_for_owner(owner.id, strict=True)
                 self.assertEqual(len(expected_records), 2)
                 pending = {item.address.request_id for item in review_submissions.pending_initial_deliveries(case.root)}
                 self.assertEqual(pending, {answered.request_id, pending_request_id})
@@ -1996,12 +2064,12 @@ addEventListener('DOMContentLoaded', async () => {
             retry = self.new_item_http(body, finished=True)
             self.assertEqual(retry.status, 200, retry.body)
         self.assertEqual(the_list.records(morty.id, include_closed=True), rows)
-        self.assertEqual(investigation.records(owner.id), expected_records)
+        self.assertEqual(update_registration.question_records_for_owner(owner.id, strict=True), expected_records)
         self.assertEqual(read_new_item_notices(log), [notice])
         receipt = cast(dict[str, object], json.loads(retry.body))
         if retire_producer:
             self.assertEqual(rows, [])
-            self.assertEqual(receipt["id"], original.id)
+            self.assertEqual(receipt["id"], original.item.get("review_id"))
             self.assertNotIn("list_number", receipt)
             self.assertEqual(errors.getvalue().count(f"{owner.name}: retired producer."), 1)
             return
@@ -2095,7 +2163,7 @@ addEventListener('DOMContentLoaded', async () => {
                       patch.object(change_page, "deliver_with_outcome", record_delivery),
                       patch.object(change_page, "send_message") as send,
                       patch.object(image_store, "register_file", wraps=image_store.register_file) as register):
-                    with patch.object(review_actions, "prepare_submission_delivery",
+                    with patch.object(review_actions, "prepare_submission_deliveries",
                                       side_effect=OSError("Delivery setup stopped.")):
                         self.assertEqual(self.new_item_http(body, finished=True).status, 503)
                     original, = update_registration.question_records_for_owner(owner.id, strict=True)
@@ -2293,7 +2361,8 @@ addEventListener('DOMContentLoaded', async () => {
     def test_migrated_list_feedback_retry_recovers_the_filing_without_a_notice(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        keeper = self.map_list_recipient(owner.id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r2-" + uuid4().hex)
@@ -2348,7 +2417,10 @@ addEventListener('DOMContentLoaded', async () => {
 
         send.assert_called_once()
         self.assertEqual([record.id for record in investigation.records(producer.id)], [saved["id"]])
-        self.assertEqual([row.reviews for row in the_list.records(keeper.id)], [(saved["key"],)])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.reviews, ())
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, saved["key"])
 
     def test_f014_standard_new_replays_the_item_filed_for_the_new_producer(self) -> None:
         case = self.review_fixture()
@@ -2519,9 +2591,10 @@ addEventListener('DOMContentLoaded', async () => {
         remote_owner = replace(owner, doc=staff.LiveDoc("natedev", remote_path))
         members = staff.local_snapshot()
         _ = staff.record_path().write_text(replace(members, rows=(remote_owner,)).encode())
+        keeper = self.map_list_recipient(owner.id)
         config = conf.path("console")
         _ = write_config_fixture(conf.path("machines"))
-        _ = write_config_fixture(config, f"page.review.owner={owner.id}\n")
+        _ = write_config_fixture(config, f"page.review.owner={owner.id}\npage.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(kind, owner.id), page="review", request_id="r2-" + uuid4().hex)
         body = json.dumps({**asdict(request), "token": self.server.new_item_token}).encode()
@@ -2540,13 +2613,16 @@ addEventListener('DOMContentLoaded', async () => {
             options = self.new_item_http(query="?page=review")
             self.assertEqual(options.status, 200, options.body)
             self.assertEqual(json.loads(options.body)["recipients"],
-                             [{"id": owner.id, "name": owner.name, "proposal": False}])
+                             [{"id": owner.id, "name": owner.name, "proposal": False},
+                              {"id": keeper.id, "name": keeper.name, "proposal": True}])
             _ = cache.create_submission(request)
             response = self.new_item_http(body, finished=True)
             self.assertEqual(response.status, 200, response.body)
             saved = cast(dict[str, str], json.loads(response.body))
             item = cache.get().records[saved["key"]]
             self.assertEqual((item.owner, item.state), (owner.id, review_items.ReviewState.WAITING))
+            if kind != new_item_dialog.SubmissionKind.QUESTION:
+                self.assertNotIn(saved["key"], {entry["key"] for entry in cache.get().entries})
             path = review_items.source_path(item)
             self.assertTrue(path.is_relative_to(record_store.state_root()))
             self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
@@ -2587,6 +2663,8 @@ addEventListener('DOMContentLoaded', async () => {
             answered = rebuilt.records[saved["key"]]
             self.assertEqual(review_items.source_path(answered), path)
             self.assertEqual(answered.state, review_items.ReviewState.OPEN)
+            if kind != new_item_dialog.SubmissionKind.QUESTION:
+                self.assertNotIn(saved["key"], {entry["key"] for entry in rebuilt.entries})
             self.assertIn("Answer: " + words, [event.words for event in answered.log])
             with patch.object(cache, "get", return_value=rebuilt):
                 card = self.request(review_page.PAGE_PATH + "?" + urlencode({"body": saved["key"]}))
@@ -2612,6 +2690,16 @@ addEventListener('DOMContentLoaded', async () => {
         lost: list[str] = []
         order: list[str] = []
         real_delivery = change_page.deliver_with_outcome
+        actual_deliveries: list[change_page.MessageDelivery] = []
+        deliver_result: Callable[[change_page.MessageDelivery, change_page.DeliveryStatus],
+                                 change_page.DeliveryOutcome] = lambda _delivery, _status: change_page.DeliveryConfirmed()
+
+        def record_delivery(delivery: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                            status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
+            if isinstance(delivery, change_page.NoMessageDelivery):
+                return real_delivery(delivery, status)
+            actual_deliveries.append(delivery)
+            return deliver_result(delivery, status)
 
         def lose_response(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object]) -> None:
             if active.path == review_page.NEW_ITEM_PATH and status == 200 and not lost:
@@ -2626,7 +2714,7 @@ addEventListener('DOMContentLoaded', async () => {
               patch.object(review_submissions, "local_machine", return_value="mac"),
               patch.object(record_store, "local_machine", return_value="mac"),
               patch.object(handler, "json_response", lose_response),
-              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed()) as deliver):
+              patch.object(change_page, "deliver_with_outcome", side_effect=record_delivery)):
             state = self.root / "state"
             with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
                 overlap = self.new_item_http(body, finished=True)
@@ -2635,8 +2723,8 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertFalse(state.exists())
             with self.assertRaises(RemoteDisconnected):
                 _ = self.new_item_http(body, finished=True)
-            deliver.assert_called_once()
-            first = cast(change_page.MessageDelivery, deliver.call_args.args[0])
+            self.assertEqual(len(actual_deliveries), 1)
+            first = actual_deliveries[-1]
             original_record, = update_registration.question_records_for_owner(owner.id, strict=True)
 
             def check_receipt(reply: HttpReply) -> None:
@@ -2645,7 +2733,7 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertEqual((fields["id"], fields["key"]), (original_record.item.get("review_id"), lost[0]))
                 self.assertEqual(update_registration.question_records_for_owner(owner.id, strict=True), [original_record])
 
-            deliver.reset_mock()
+            actual_deliveries.clear()
             _ = staff.record_path().write_text(replace(members, pending_retire=(owner.id,)).encode())
             key_file = reply_tokens.path()
             self.assertEqual(key_file, Path(os.environ["XDG_STATE_HOME"]) / "review-links" / "reply-token.key")
@@ -2669,10 +2757,10 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertEqual((unavailable.status, json.loads(unavailable.body)),
                                  (503, {"error": f"{reason} Try Send again."}))
                 self.assertEqual(key_file.read_bytes(), invalid)
-            deliver.assert_not_called()
+            self.assertEqual(actual_deliveries, [])
             _ = key_file.write_bytes(original)
 
-            deliver.side_effect = real_delivery
+            deliver_result = real_delivery
             transport_error = "Transport refused."
             with (patch.object(change_page, "send_to_staff",
                                side_effect=change_page.FinalSendFailure(transport_error)) as send,
@@ -2704,7 +2792,7 @@ addEventListener('DOMContentLoaded', async () => {
                 key_file.unlink()
                 return real_delivery(pending, status)
 
-            deliver.side_effect = lose_key_before_delivery
+            deliver_result = lose_key_before_delivery
             with patch.object(change_page, "send_to_staff") as send:
                 check_receipt(self.new_item_http(body, finished=True))
                 send.assert_not_called()
@@ -2714,14 +2802,14 @@ addEventListener('DOMContentLoaded', async () => {
                                  (first.attempt, "The local reply key is missing."))
                 _ = key_file.write_bytes(original)
                 key_file.chmod(0o600)
-                deliver.reset_mock(side_effect=True)
-                deliver.side_effect = real_delivery
+                actual_deliveries.clear()
+                deliver_result = real_delivery
                 response = self.new_item_http(body, finished=True)
                 send.assert_called_once()
             self.assertIsInstance(case.status.failed_delivery(first.page, first.row), change_page.NoFailedDelivery)
             self.assertEqual(response.status, 200, response.body)
-            deliver.assert_called_once()
-            retry = cast(change_page.MessageDelivery, deliver.call_args.args[0])
+            self.assertEqual(len(actual_deliveries), 1)
+            retry = actual_deliveries[-1]
             self.assertEqual(retry.attempt, first.attempt)
             saved = cast(dict[str, str], json.loads(response.body))
             self.assertEqual(lost, [saved["key"]])
@@ -2733,25 +2821,25 @@ addEventListener('DOMContentLoaded', async () => {
             assert command is not None
             self.assertTrue(review_submissions.answer(command["key"], "The owner replied.", token))
 
-            prepare = review_actions.prepare_submission_delivery
-            plans: list[change_page.MessageDelivery | change_page.NoMessageDelivery] = []
+            prepare = review_actions.prepare_submission_deliveries
+            plans: list[review_actions.SubmissionDeliveries] = []
 
             def prepare_after_reply(saved: review_submissions.SavedSubmission, words: str,
                                     status: change_page.DeliveryStatus, *, evidence_page: str,
                                     members: staff.StaffSnapshot | staff.ReadStaffAuthority,
-                                    claims: ExitStack) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+                                    claims: ExitStack) -> review_actions.SubmissionDeliveries:
                 plan = prepare(saved, words, status, evidence_page=evidence_page, members=members, claims=claims)
                 plans.append(plan)
                 return plan
 
-            deliver.reset_mock()
-            with patch.object(review_actions, "prepare_submission_delivery", prepare_after_reply):
+            actual_deliveries.clear()
+            with patch.object(review_actions, "prepare_submission_deliveries", prepare_after_reply):
                 after_reply = self.new_item_http(body, finished=True)
             self.assertEqual(after_reply.status, 200, after_reply.body)
             self.assertEqual(json.loads(after_reply.body)["key"], saved["key"])
             plan, = plans
-            self.assertIsInstance(plan, change_page.NoMessageDelivery)
-            deliver.assert_not_called()
+            self.assertEqual(plan, review_actions.SubmissionDeliveries())
+            self.assertEqual(actual_deliveries, [])
             self.assertFalse(key_file.exists())
 
     def test_f027_mac_question_send_uses_authoritative_retirement(self) -> None:
@@ -3343,7 +3431,7 @@ addEventListener('DOMContentLoaded', async () => {
             stored = serve.PageCaptures(self.root / serve.PAGE_CAPTURE_FOLDER)
             saved_key = next(iter(stored.bound_work()))[2]
             self.assertEqual(saved_key.item_id, saved["id"])
-            with self.assertRaises(new_item_dialog.SubmissionConflict):
+            with self.assertRaises(record_store.SubmissionConflict):
                 _ = stored.bind(pending, attempt.request_id, replace(saved_key, item_id="I999"))
 
             server.capture_queued_page(pending, "/test/firefox", url, live_capture())
@@ -5605,7 +5693,8 @@ addEventListener('DOMContentLoaded', async () => {
                     self.assertEqual(saved, json.loads(replies[1].body))
                     fields = {'id', 'key', 'version'}
                     if kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION):
-                        fields.add('list_number')
+                        fields.update(('list_number', 'list_owner', 'list_producer'))
+                        self.assertEqual((saved['list_owner'], saved['list_producer']), (owner.name, owner.name))
                         keeper = fixture_member('producer', name='morty')
                         row = the_list.load(keeper.id, f"L{saved['list_number']}")
                         assert isinstance(row.report, the_list.ListReport)
@@ -5634,6 +5723,64 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertEqual(len(cache.get().records), 4)
             self.assertEqual(send.call_count, 4)
         address.assert_called_once_with()
+
+    def test_report_receipt_read_failure_keeps_the_saved_number_and_delivery(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="item-producer")
+        keeper = fixture_member("producer", name="morty")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(review_actions, "submission_report_row", side_effect=OSError("List row unavailable.")) as read,
+              patch.object(change_page, "send_to_staff") as send):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+        read.assert_called_once()
+        self.assertEqual(response.status, 200, response.body)
+        saved = cast(dict[str, object], json.loads(response.body))
+        row, = the_list.records(keeper.id)
+        self.assertEqual(set(saved), {"id", "key", "version", "list_number"})
+        self.assertEqual(saved["list_number"], row.number)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, saved["key"])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], owner.id)
+
+    def test_report_receipt_reservation_failure_after_claim_keeps_delivery(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="item-producer")
+        keeper = fixture_member("producer", name="morty")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
+        prepare = review_actions.prepare_submission_deliveries
+        failed_lookup = Mock(side_effect=OSError("List reservation unavailable."))
+        with (ExitStack() as patches,
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "send_to_staff") as send):
+            def claim_then_fail_reservation(
+                saved: review_submissions.SavedSubmission, words: str, status: change_page.DeliveryStatus, *,
+                evidence_page: str, members: staff.StaffSnapshot, claims: ExitStack,
+            ) -> review_actions.SubmissionDeliveries:
+                deliveries = prepare(saved, words, status, evidence_page=evidence_page, members=members, claims=claims)
+                self.assertIsInstance(deliveries.primary, change_page.MessageDelivery)
+                _ = patches.enter_context(patch.object(review_submissions, "list_filing_reservation", failed_lookup))
+                return deliveries
+
+            _ = patches.enter_context(patch.object(
+                review_actions, "prepare_submission_deliveries", new=claim_then_fail_reservation))
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+        failed_lookup.assert_called_once()
+        self.assertEqual(response.status, 200, response.body)
+        saved = cast(dict[str, str], json.loads(response.body))
+        self.assertEqual(set(saved), {"id", "key", "version"})
+        row, = the_list.records(keeper.id)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, saved["key"])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], owner.id)
 
     def test_restart_recovers_a_new_item_when_the_first_claim_write_fails(self) -> None:
         case = self.review_fixture()
@@ -6601,6 +6748,36 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertEqual(json.loads(payload)["words_delivery"], "delivered")
         self.assertEqual(send.call_args_list, [first])
 
+    def test_review_words_retry_reports_saved_after_the_row_is_removed(self) -> None:
+        case = self.review_fixture()
+        record = case.investigation(False)
+        record = investigation.answer(record.owner, record.id, 'The first result passed.')
+        key = review_items.investigation_record_key(record)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        body = case.card_body(cache.get(), key, 'read', 'Keep the notes.')
+        _ = write_config_fixture(conf.path('review_links'), 'delivery_tries=1\ndelivery_pause_seconds=0\n')
+
+        with (patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'),
+              patch.object(self.server, 'review_cache', cache)):
+            with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')):
+                status, payload = self.post(review_page.PAGE_PATH, body)
+            self.assertEqual(status, 200)
+            first = cast(dict[str, object], json.loads(payload))
+            self.assertEqual(first['words_delivery'], 'failed')
+            self.assertNotIn(key, cache.get().records)
+
+            with patch.object(change_page, 'send_to_staff') as send:
+                status, payload = self.post(review_page.PAGE_PATH, body + '&feedback_retry=1')
+            self.assertEqual(status, 200)
+            saved = cast(dict[str, object], json.loads(payload))
+            self.assertEqual(saved['answer'], first['answer'])
+            self.assertEqual(saved['words_delivery'], 'delivered')
+            self.assertIs(saved['words_saved'], True)
+            self.assertIs(saved['detail_closed'], True)
+            self.assertNotIn('detail_unavailable', saved)
+            send.assert_called_once()
+
     def test_review_save_publishes_the_current_record_before_reply(self) -> None:
         case = self.review_fixture()
         proposal, _ = case.decisions()
@@ -6647,7 +6824,8 @@ addEventListener('DOMContentLoaded', async () => {
                                              case.card_body(cache.get(), key, outcome, words) + extra,
                                              headers={"Accept-Encoding": "gzip"})
                     self.assertEqual(status, 200, body)
-                    self.assertIsInstance(cast(object, json.loads(body)), dict)
+                    result = cast(dict[str, object], json.loads(body))
+                    self.assertIs(result['words_saved'], bool(words))
         self.assertNotIn(answer, cache.get().records)
         self.assertIsInstance(cache.get().records[later].times.later, datetime)
 
@@ -6908,6 +7086,1085 @@ addEventListener('DOMContentLoaded', async () => {
         self.assertEqual(question.question_id, asked.question_id)
         self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
 
+    def test_review_reports_whether_each_action_saved_words(self) -> None:
+        case = self.review_fixture(changes=2)
+        report = case.investigation()
+        investigation_key = f'investigation/{report.owner}/{report.id}'
+        question = case.question()
+        change = 'page-owner/C2'
+        delivery, _ = review_page.submit(case.root, case.body(change, 'question', 'Did the check pass?'), case.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        pending = case.status.slots(delivery.page, delivery.row).question
+        assert isinstance(pending, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(change, 'The check passed.', pending.question_id, case.status))
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_page, 'deliver')):
+            for key, action, words, expected in (
+                (investigation_key, 'read', 'I checked the repair.', True),
+                (question, 'answer', 'marked read', True),
+                (change, 'read', 'These words are still a draft.', False),
+            ):
+                with self.subTest(key=key, action=action):
+                    form = case.card_body(cache.get(), key, action, words)
+                    status, body = self.post(review_page.PAGE_PATH, form)
+                    self.assertEqual(status, 200, body)
+                    result = cast(dict[str, object], json.loads(body))
+                    self.assertEqual(result['answer'], 'marked read')
+                    self.assertIs(result.get('words_saved'), expected)
+            form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'The saved verdict.')
+            with patch.object(cache, 'publish_record', side_effect=OSError('Publication failed.')):
+                status, body = self.post(review_page.PAGE_PATH, form)
+            self.assertEqual(status, 200, body)
+            result = cast(dict[str, object], json.loads(body))
+            self.assertIs(result['detail_unavailable'], True)
+            self.assertIs(result.get('words_saved'), True)
+        saved = investigation.load(report.owner, report.id)
+        self.assertEqual(saved.log[-1].words, 'Marked read: I checked the repair.')
+        item = cache.get().records[change]
+        self.assertFalse(item.unread_answer)
+        self.assertNotIn('These words are still a draft.', [event.words for event in item.log])
+
+    def review_save_bug_fixture(self) -> tuple[staff.StaffRow, test_review_page.ReviewPageTests, review_page.ReviewSnapshotCache]:
+        case = self.review_fixture(changes=2)
+        morty = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        _ = self.enterContext(patch.object(self.server, 'review_cache', cache))
+        _ = self.enterContext(patch.object(self.server, 'delivery_status', case.status))
+        return morty, case, cache
+
+    def review_save_report(self, form: str, attempt: str, reason: str) -> tuple[int, dict[str, object]]:
+        fields = review_page.review_fields(form)
+        report = urlencode({**{field: fields[field][0] for field in ('row', 'token', 'feedback')},
+                            'reason': reason, 'failure_attempt': attempt})
+        status, body = self.post(review_page.SAVE_FAILURE_PATH, report, origin=f'http://127.0.0.1:{self.port}')
+        return status, cast(dict[str, object], json.loads(body))
+
+    @staticmethod
+    def review_bug_link(bug: investigation.Investigation) -> serve.FiledReviewSaveBug:
+        key = review_items.investigation_record_key(bug)
+        item, = (row for row in the_list.records(bug.owner) if key in row.reviews)
+        return {'label': f'Bug {item.number}',
+                'href': studio_page.PAGE_PATH + list_page.item_link(bug.owner, item.number, only_item=True)}
+
+    def test_review_refusal_arrives_while_the_bug_store_is_locked(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, words = 'page-owner/C1', 'Keep the stale verdict words.'
+        form = case.card_body(cache.get(), key, 'works', words)
+        form = re.sub(r'revision=[^&]+', 'revision=stale', form)
+        attempt = secrets.token_hex(16)
+        with contextlib.closing(HTTPConnection('127.0.0.1', self.port, timeout=3)) as connection:
+            try:
+                with investigation.recipient_locks(morty.id):
+                    connection.request('POST', review_page.PAGE_PATH, form, {
+                        'Content-Type': 'application/x-www-form-urlencoded', review_page.SAVE_ATTEMPT_HEADER: attempt})
+                    reply = connection.getresponse()
+                    self.assertEqual((reply.status, json.loads(reply.read())),
+                                     (409, {'reason': review_page.REVIEW_REVISION_CHANGED, 'failure_attempt': attempt}))
+                    self.assertEqual(investigation.records(morty.id), [])
+            finally:
+                self.assertTrue(self.review_posts.wait_until_none_run())
+        bug, = investigation.records(morty.id)
+        status, report = self.review_save_report(form, attempt, review_page.REVIEW_REVISION_CHANGED)
+        self.assertEqual((status, report['bug']), (200, self.review_bug_link(bug)))
+        self.assertEqual(investigation.records(morty.id), [bug])
+
+    def test_a_refused_review_save_files_a_bug_for_morty(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = the_list.add(morty.id, 'An unrelated item', owner=morty.id, source='nate', changes={}, number=555)
+        key = 'page-owner/C1'
+        words = 'Keep the title.\nMove the button.'
+        form = case.card_body(cache.get(), key, 'works', words)
+        attempt, reason = secrets.token_hex(16), review_page.REVIEW_REVISION_CHANGED
+        status, body = self.post(review_page.PAGE_PATH, re.sub(r'revision=[^&]+', 'revision=stale', form),
+                                 headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        self.assertEqual((status, json.loads(body)), (409, {'reason': reason, 'failure_attempt': attempt}))
+        bug, = investigation.records(morty.id)
+        status, result = self.review_save_report(form, attempt, reason)
+        self.assertEqual(status, 200)
+        self.assertEqual((bug.kind, bug.owner, bug.state),
+                         (investigation.InvestigationKind.BUG, morty.id, investigation.InvestigationState.OPEN))
+        link = cast(serve.FiledReviewSaveBug, result['bug'])
+        target = urlsplit(link['href'])
+        self.assertEqual((link['label'], target.path), ('Bug 556', studio_page.PAGE_PATH))
+        list_key = f'{morty.id}/L556'
+        self.assertEqual(parse_qs(target.fragment), {'item': [list_key], 'key': [list_key]})
+        self.assertNotEqual(bug.id, 'I556')
+        item = the_list.load(morty.id, 'L556')
+        self.assertEqual((item.title, item.owner, item.producer, item.reviews),
+                         (bug.title, morty.id, morty.id, (review_items.investigation_record_key(bug),)))
+        self.assertEqual(item.latest_status, bug.question)
+        listing = self.request(target.path)
+        self.assertEqual(listing.status, 200)
+        self.assertIn(b'aria-label="Show item 556"', listing.body)
+        self.assertIn(f'Page: {review_page.PAGE_PATH}\n', bug.question)
+        self.assertIn(f'Card: {key} · Numbered moves\n', bug.question)
+        self.assertIn(f'Refusal: "{result["reason"]}"\n', bug.question)
+        self.assertTrue(bug.question.endswith(words))
+
+    def test_review_save_report_completes_the_list_row_after_a_failed_write(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep these words.')
+        attempt, reason = secrets.token_hex(16), 'The connection dropped.'
+        with patch.object(the_list, 'add_review_item', side_effect=OSError('The List is unavailable.')):
+            self.assertEqual(self.review_save_report(form, attempt, reason),
+                             (200, {'outcome': 'missing', 'reason': reason}))
+        bug, = investigation.records(morty.id)
+        self.assertEqual(the_list.records(morty.id), [])
+        status, report = self.review_save_report(form, attempt, reason)
+        self.assertEqual((status, report['bug']), (200, self.review_bug_link(bug)))
+        self.assertEqual(self.review_save_report(form, attempt, reason), (status, report))
+        self.assertEqual(investigation.records(morty.id), [bug])
+
+    def test_repeated_review_save_refusals_append_one_line_per_attempt(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        first = case.card_body(cache.get(), 'page-owner/C1', 'works', 'First words.')
+        second = case.card_body(cache.get(), 'page-owner/C2', 'works', 'Second words.\nKeep this line.')
+        first_attempt, attempt = secrets.token_hex(16), secrets.token_hex(16)
+        with patch.object(cache, 'save', side_effect=review_items.ReviewRecordChanged('The card changed.')):
+            first_status, first_reply = self.post(review_page.PAGE_PATH, first,
+                                                 headers={review_page.SAVE_ATTEMPT_HEADER: first_attempt})
+            replies = [self.post(review_page.PAGE_PATH, second, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+                       for _ in range(2)]
+        bug, = investigation.records(morty.id)
+        for (status, reply), failed_attempt in zip([(first_status, first_reply), *replies],
+                                                   (first_attempt, attempt, attempt), strict=True):
+            self.assertEqual((status, json.loads(reply)),
+                             (409, {'reason': 'The card changed.', 'failure_attempt': failed_attempt}))
+        status, report = self.review_save_report(second, attempt, 'The card changed.')
+        self.assertEqual((status, report['bug']), (200, self.review_bug_link(bug)))
+        self.assertEqual(investigation.records(morty.id), [bug])
+        self.assertEqual(len(bug.log), 2)
+        self.assertIn('page-owner/C2', bug.log[-1].words)
+        self.assertIn(r'Second words.\nKeep this line.', bug.log[-1].words)
+        self.assertNotIn('\n', bug.log[-1].words)
+
+    def test_repeated_review_save_refusal_replaces_a_closed_list_bug(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        first = case.card_body(cache.get(), 'page-owner/C1', 'works', 'First words.')
+        second = case.card_body(cache.get(), 'page-owner/C2', 'works', 'Second words.')
+        third = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Third words.')
+        first_attempt, second_attempt, third_attempt = (secrets.token_hex(16) for _ in range(3))
+        reason = 'The card changed.'
+
+        def refuse(form: str, attempt: str) -> tuple[int, dict[str, object]]:
+            with patch.object(cache, 'save', side_effect=review_items.ReviewRecordChanged(reason)):
+                status, body = self.post(review_page.PAGE_PATH, form,
+                                         headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+            self.assertEqual((status, json.loads(body)), (409, {'reason': reason, 'failure_attempt': attempt}))
+            return self.review_save_report(form, attempt, reason)
+
+        status, first_report = refuse(first, first_attempt)
+        original, = investigation.records(morty.id)
+        item, = the_list.records(morty.id)
+        self.assertEqual((status, first_report['bug']), (200, self.review_bug_link(original)))
+        _ = the_list.close(morty.id, item.id, 'Removed by nate on the List page.', source=the_list.PAGE_SOURCE)
+        self.assertEqual(investigation.load(morty.id, original.id).state, investigation.InvestigationState.OPEN)
+
+        status, second_report = refuse(second, second_attempt)
+        self.assertNotEqual(second_report['bug'], first_report['bug'])
+        old, replacement = investigation.records(morty.id)
+        self.assertEqual(old, original)
+        self.assertTrue(replacement.question.endswith('Second words.'))
+        new_row, = the_list.records(morty.id)
+        self.assertGreater(new_row.number, item.number)
+        self.assertEqual((status, second_report['bug']), (200, self.review_bug_link(replacement)))
+        self.assertEqual(self.review_save_report(second, second_attempt, reason), (status, second_report))
+        self.assertEqual(self.review_save_report(first, first_attempt, reason),
+                         (200, {'outcome': 'refused', 'reason': reason}))
+
+        status, third_report = refuse(third, third_attempt)
+        old, repeated = investigation.records(morty.id)
+        self.assertEqual(old, original)
+        self.assertEqual((status, third_report), (200, second_report))
+        self.assertEqual(repeated.id, replacement.id)
+        self.assertIn(f'Save {third_attempt}:', repeated.log[-1].words)
+
+    def test_a_different_review_save_refusal_files_a_separate_bug(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Check the answer.')
+        attempts = (secrets.token_hex(16), secrets.token_hex(16))
+        with patch.object(cache, 'save', side_effect=(ValueError('First refusal.'), ValueError('Second refusal.'))):
+            replies = [self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+                       for attempt in attempts]
+        bugs = investigation.records(morty.id)
+        self.assertEqual(len(bugs), 2)
+        for (status, reply), bug, reason, attempt in zip(replies, bugs, ('First refusal.', 'Second refusal.'),
+                                                        attempts, strict=True):
+            self.assertEqual((status, json.loads(reply)), (400, {'reason': reason, 'failure_attempt': attempt}))
+            self.assertIn(f'Refusal: "{reason}"', bug.question)
+
+    def test_review_save_refusal_survives_a_failed_bug_write(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep these words.')
+        attempt, reason = secrets.token_hex(16), 'Review refused the save.'
+        with (patch.object(cache, 'save', side_effect=ValueError(reason)),
+              patch.object(review_submissions, 'submit', side_effect=OSError('The Bug store is unavailable.'))):
+            status, reply = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+            self.assertEqual((status, json.loads(reply)), (400, {'reason': reason, 'failure_attempt': attempt}))
+            self.assertEqual(self.review_save_report(form, attempt, reason), (200, {'outcome': 'refused', 'reason': reason}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_review_save_report_recovers_the_bug_after_a_lost_refusal_reply(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key = 'page-owner/C1'
+        form = case.card_body(cache.get(), key, 'works', 'Keep my words.')
+        attempt = secrets.token_hex(16)
+        with patch.object(cache, 'save', side_effect=OSError('The disk could not write.')):
+            status, reply = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        self.assertEqual((status, json.loads(reply)),
+                         (503, {'reason': 'The answer could not be saved.', 'failure_attempt': attempt}))
+        bug, = investigation.records(morty.id)
+        status, report = self.review_save_report(form, attempt, 'The connection dropped.')
+        self.assertEqual((status, report['bug']), (200, self.review_bug_link(bug)))
+        self.assertEqual(investigation.records(morty.id), [bug])
+        status, report = self.review_save_report(form, secrets.token_hex(16), 'The connection dropped.')
+        self.assertEqual(status, 200)
+        original, lost = investigation.records(morty.id)
+        self.assertEqual(original.id, bug.id)
+        self.assertEqual(report['bug'], self.review_bug_link(lost))
+        self.assertIn('The connection dropped.', lost.question)
+
+    def test_held_review_save_refusal_recovers_the_bug_after_a_lost_result(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=1\n')
+        key, words = 'page-owner/C1', 'Keep my held words.'
+        form = case.card_body(cache.get(), key, 'works', words)
+        form = re.sub(r'revision=[^&]+', 'revision=stale', form)
+        attempt = secrets.token_hex(16)
+        marked = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                  review_page.SAVE_ATTEMPT_HEADER: attempt}
+        with patch.object(send_hold, 'RELEASE_GRACE_SECONDS', 0.0):
+            status, hold, fields = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertEqual((status, hold), (202, 'held'))
+            self.assertEqual(investigation.records(morty.id), [])
+            status, hold, reply = self.held_http('GET', f"{send_hold.HOLD_PATH}/{fields['hold']}")
+        self.assertEqual((status, hold), (409, ''))
+        self.assertEqual(reply, {'reason': review_page.REVIEW_REVISION_CHANGED, 'failure_attempt': attempt})
+        self.assertTrue(self.review_posts.wait_until_none_run())
+        bug, = investigation.records(morty.id)
+        with patch.object(self.server.send_holds, 'result', return_value=send_hold.HoldState.MISSING):
+            status, hold, expired = self.held_http('GET', f"{send_hold.HOLD_PATH}/{fields['hold']}")
+        self.assertEqual((status, hold, expired), (404, '', {
+            'reason': 'This send was undone or its result expired.', 'hold_state': 'missing'}))
+        status, report = self.review_save_report(form, attempt, cast(str, expired['reason']))
+        self.assertEqual((status, report['bug']), (200, self.review_bug_link(bug)))
+        self.assertEqual(investigation.records(morty.id), [bug])
+
+    def test_lost_review_replies_wait_for_their_own_outcomes(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        first = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep the first words.')
+        second = case.card_body(cache.get(), 'page-owner/C2', 'works', 'Keep the second words.')
+        first_attempt, second_attempt = secrets.token_hex(16), secrets.token_hex(16)
+        lost = 'The connection dropped.'
+        entered = {first: threading.Event(), second: threading.Event()}
+        release = {first: threading.Event(), second: threading.Event()}
+
+        def refuse(body: str, _status: change_page.DeliveryStatus) -> review_page.ReviewSave:
+            entered[body].set()
+            self.assertTrue(release[body].wait(TEST_HANG_GUARD_SECS))
+            raise review_items.ReviewRecordChanged(
+                'The first card changed.' if body == first else 'The second card changed.')
+
+        with patch.object(cache, 'save', side_effect=refuse), ThreadPoolExecutor(max_workers=2) as worker:
+            requests = [worker.submit(self.post, review_page.PAGE_PATH, form,
+                                      headers={review_page.SAVE_ATTEMPT_HEADER: attempt}, wait_for_delivery=False)
+                        for form, attempt in ((first, first_attempt), (second, second_attempt))]
+            try:
+                for form, attempt in ((first, first_attempt), (second, second_attempt)):
+                    self.assertTrue(entered[form].wait(TEST_HANG_GUARD_SECS))
+                    self.assertEqual(self.review_save_report(form, attempt, lost), (202, {'outcome': 'pending'}))
+                    reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+                    self.assertIs(reopened.outcome(attempt, self.server.delivery_status), serve.ReviewSaveAttemptState.PENDING)
+                self.assertEqual(investigation.records(morty.id), [])
+                release[first].set()
+                self.assertEqual(requests[0].result(TEST_HANG_GUARD_SECS)[0], 409)
+                status, report = self.review_save_report(first, first_attempt, lost)
+                bug, = investigation.records(morty.id)
+                self.assertEqual((status, report), (200, {
+                    'outcome': 'refused', 'reason': 'The first card changed.', 'bug': self.review_bug_link(bug)}))
+                self.assertEqual(self.review_save_report(second, second_attempt, lost), (202, {'outcome': 'pending'}))
+                self.assertEqual(investigation.records(morty.id), [bug])
+            finally:
+                for ready in release.values():
+                    ready.set()
+            self.assertEqual(requests[1].result(TEST_HANG_GUARD_SECS)[0], 409)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        first_bug, second_bug = investigation.records(morty.id)
+        self.assertIn('Refusal: "The first card changed."', first_bug.question)
+        self.assertIn('Refusal: "The second card changed."', second_bug.question)
+
+    def test_lost_review_reply_uses_the_existing_refusal_bug(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        first = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep these words.')
+        second = case.card_body(cache.get(), 'page-owner/C2', 'works', 'Keep the other words.')
+        attempt, existing_attempt = secrets.token_hex(16), secrets.token_hex(16)
+        entered, release = threading.Event(), threading.Event()
+        lost, refused = 'The connection dropped.', 'The card changed.'
+
+        def refuse(body: str, _status: change_page.DeliveryStatus) -> review_page.ReviewSave:
+            if body == first:
+                entered.set()
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+            raise review_items.ReviewRecordChanged(refused)
+
+        with patch.object(cache, 'save', side_effect=refuse), ThreadPoolExecutor(max_workers=1) as worker:
+            pending = worker.submit(self.post, review_page.PAGE_PATH, first,
+                                    headers={review_page.SAVE_ATTEMPT_HEADER: attempt}, wait_for_delivery=False)
+            try:
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertEqual(self.review_save_report(first, attempt, lost), (202, {'outcome': 'pending'}))
+                status, _ = self.post(review_page.PAGE_PATH, second,
+                                      headers={review_page.SAVE_ATTEMPT_HEADER: existing_attempt}, wait_for_delivery=False)
+                self.assertEqual(status, 409)
+                self.assertEqual(self.review_save_report(second, existing_attempt, refused)[0], 200)
+                existing, = investigation.records(morty.id)
+            finally:
+                release.set()
+            self.assertEqual(pending.result(TEST_HANG_GUARD_SECS)[0], 409)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        status, report = self.review_save_report(first, attempt, lost)
+        self.assertEqual((status, report), (200, {
+            'outcome': 'refused', 'reason': refused, 'bug': self.review_bug_link(existing)}))
+        bug, = investigation.records(morty.id)
+        self.assertEqual(bug.question, existing.question)
+        self.assertIn('Keep these words.', bug.log[-1].words)
+        self.assertEqual(len(bug.log), 2)
+
+    def test_review_hold_size_refusal_reports_the_full_words(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=1\n')
+        words = 'Keep these words.\n' * 128
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', words)
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        reason = 'The send is empty or too large.'
+        with patch.object(serve, 'HELD_SEND_LIMIT', len(form.encode()) - 1):
+            status, hold, refusal = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+            self.assertEqual((status, hold, refusal['reason']), (400, '', reason))
+            status, report = self.review_save_report(form, cast(str, refusal.get('failure_attempt', attempt)), reason)
+        self.assertEqual(status, 200)
+        self.assertEqual(refusal['failure_attempt'], attempt)
+        bug, = investigation.records(morty.id)
+        self.assertEqual(report['bug'], self.review_bug_link(bug))
+        self.assertIn(reason, bug.question)
+        self.assertTrue(bug.question.endswith(words))
+
+    def test_lost_review_reply_without_a_receipt_files_the_connection_bug(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        words = 'Keep the words from the request that did not arrive.'
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', words)
+        lost = 'The connection dropped.'
+        attempt = secrets.token_hex(16)
+        status, report = self.review_save_report(form, attempt, lost)
+        bug, = investigation.records(morty.id)
+        self.assertEqual((status, report), (200, {'outcome': 'missing', 'reason': lost, 'bug': self.review_bug_link(bug)}))
+        self.assertIn(f'Refusal: "{lost}"', bug.question)
+        self.assertTrue(bug.question.endswith(words))
+        with patch.object(cache, 'save') as save:
+            status, _ = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        self.assertEqual(status, 404)
+        save.assert_not_called()
+        status, repeated = self.review_save_report(form, secrets.token_hex(16), lost)
+        self.assertEqual((status, repeated), (200, report))
+        grouped, = investigation.records(morty.id)
+        self.assertEqual(grouped.question, bug.question)
+        self.assertEqual(len(grouped.log), 2)
+
+    def test_lost_review_reply_after_a_save_files_no_bug(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep the saved verdict words.')
+        attempt = secrets.token_hex(16)
+        status, _ = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        self.assertEqual(status, 200)
+        folder = self.server.review_attempts.folder
+        _ = serve.sweep_snapshots(self.root, time.time() + 30 * 86400)
+        reopened = serve.ReviewSaveAttempts(folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            self.assertEqual(self.review_save_report(form, attempt, 'The connection dropped.'),
+                             (200, {'outcome': 'saved', 'words_saved': True}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_lost_review_mark_read_reply_confirms_the_action_without_the_words(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key = case.change_with_unread_answer()
+        words = 'Keep these unsent words.'
+        snapshot, _ = cache.publish_record(cache.get(), key)
+        form = case.card_body(snapshot, key, 'read', words)
+        attempt = secrets.token_hex(16)
+        status, _ = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        self.assertEqual(status, 200)
+        item = cache.get().records[key]
+        self.assertFalse(item.unread_answer)
+        self.assertNotIn(words, [event.words for event in item.log])
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            self.assertEqual(self.review_save_report(form, attempt, 'The connection dropped.'),
+                             (200, {'outcome': 'saved', 'words_saved': False}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_review_refuses_to_save_when_the_pending_receipt_cannot_persist(self) -> None:
+        _, case, cache = self.review_save_bug_fixture()
+        key = 'page-owner/C1'
+        form = case.card_body(cache.get(), key, 'works', 'Keep these verdict words.')
+        attempt = secrets.token_hex(16)
+        attempts = self.server.review_attempts
+        write_atomic = atomic_file.write_text_atomic
+
+        def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if attempts.folder in path.parents:
+                raise OSError('The receipt folder cannot be written.')
+            write_atomic(path, text, new_file_mode=new_file_mode)
+
+        with (patch.object(atomic_file, 'write_text_atomic', side_effect=fail_receipt),
+              patch.object(cache, 'save', wraps=cache.save) as save):
+            status, _ = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        reopened = serve.ReviewSaveAttempts(attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            _, report = self.review_save_report(form, attempt, 'The connection dropped.')
+        self.assertEqual(status, 503)
+        save.assert_not_called()
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+        self.assertEqual(report['outcome'], 'missing')
+
+    def test_review_restart_keeps_a_pending_receipt_when_completion_cannot_persist(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key = 'page-owner/C1'
+        form = case.card_body(cache.get(), key, 'works', 'Keep these saved words.')
+        attempt = secrets.token_hex(16)
+        attempts = self.server.review_attempts
+        write_atomic = atomic_file.write_text_atomic
+
+        def fail_completion(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if attempts.folder in path.parents and json.loads(text) != 'pending':
+                raise OSError('The completed receipt cannot be written.')
+            write_atomic(path, text, new_file_mode=new_file_mode)
+
+        with patch.object(atomic_file, 'write_text_atomic', side_effect=fail_completion):
+            status, _ = self.post(review_page.PAGE_PATH, form, headers={review_page.SAVE_ATTEMPT_HEADER: attempt})
+        self.assertEqual(status, 200)
+        self.assertNotIn(key, cache.get().records)
+        reopened = serve.ReviewSaveAttempts(attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            self.assertEqual(self.review_save_report(form, attempt, 'The connection dropped.'),
+                             (202, {'outcome': 'pending'}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_lost_held_review_reply_uses_the_saved_outcome_after_expiry(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep the held verdict words.')
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, hold, body = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual((status, hold), (202, 'held'))
+        hold_id = cast(str, body['hold'])
+        reason = 'The connection dropped.'
+        self.assertEqual(self.review_save_report(form, attempt, reason), (202, {'outcome': 'pending'}))
+        self.assertTrue(self.server.send_holds.send_now(hold_id))
+        self.assertEqual(self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')[0], 200)
+        with patch.object(self.server.send_holds, 'result', return_value=send_hold.HoldState.MISSING):
+            self.assertEqual(self.review_save_report(form, attempt, reason),
+                             (200, {'outcome': 'saved', 'words_saved': True, 'hold': hold_id}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_accepted_review_hold_survives_a_lost_reply_and_receipt_write_failure(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep the held verdict.')
+        attempt = secrets.token_hex(16)
+        hold_id = send_hold.new_hold_id()
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   send_hold.REQUEST_HEADER: hold_id, review_page.SAVE_ATTEMPT_HEADER: attempt}
+        folder = self.server.review_attempts.folder
+        hold_folder = self.server.store_folder / send_hold.HOLD_FOLDER
+        hold_file = hold_folder / f'{hold_id}.json'
+        write_atomic = atomic_file.write_text_atomic
+        handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
+        respond = handler.json_response
+
+        def fail_after_hold(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+            if folder in path.parents and hold_file.exists():
+                raise OSError('The attempt receipt cannot be written after the hold.')
+            write_atomic(path, words, new_file_mode=new_file_mode)
+
+        def lose_admission(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object], *,
+                           hold: send_hold.HoldHeader | None = None) -> None:
+            if active.path == review_page.PAGE_PATH and status == 202:
+                active.close_connection = True
+            else:
+                respond(active, status, fields, hold=hold)
+
+        with (patch.object(atomic_file, 'write_text_atomic', side_effect=fail_after_hold),
+              patch.object(handler, 'json_response', lose_admission)):
+            with self.assertRaises(RemoteDisconnected):
+                _ = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertTrue(hold_file.is_file())
+        self.assertTrue(self.server.send_holds.stop_if_idle())
+        restarted = send_hold.Holds(hold_folder, send_hold.replay_to('127.0.0.1', self.port))
+        self.addCleanup(restarted.stop_if_idle)
+        with (patch.object(self.server, 'review_attempts', serve.ReviewSaveAttempts(folder)),
+              patch.object(self.server, 'send_holds', restarted), patch.object(change_page, 'send_to_staff')):
+            restarted.recover()
+            self.assertEqual(self.review_save_report(form, attempt, 'The admission reply was lost.'),
+                             (202, {'outcome': 'pending'}))
+            self.assertTrue(restarted.send_now(hold_id))
+            self.assertEqual(self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')[0], 200)
+        rows = {row['#']: row for row in change_review.review_rows(case.fixture.review_list)}
+        self.assertEqual(rows['C1']['Verdict'], 'works: Keep the held verdict.')
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_review_refuses_a_hold_when_its_id_cannot_persist(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep these verdict words.')
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        with (patch.object(self.server.review_attempts, '_persist_pending', side_effect=OSError('Receipt write failed.')),
+              patch.object(self.server.send_holds, 'hold') as hold):
+            status, marker, reply = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual((status, marker, reply), (503, 'refused', {
+            'reason': 'The server could not record the hold.', 'failure_attempt': attempt}))
+        hold.assert_not_called()
+        self.assertEqual(self.hold_states(), [])
+        _, report = self.review_save_report(form, attempt, 'The admission reply was lost.')
+        bug, = investigation.records(morty.id)
+        self.assertEqual((report['outcome'], report['bug']), ('refused', self.review_bug_link(bug)))
+
+    def test_review_hold_release_write_failure_records_a_refusal_before_replay(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        key, attempt = 'page-owner/C1', secrets.token_hex(16)
+        words = 'Keep the unsent verdict.'
+        form = case.card_body(cache.get(), key, 'works', words)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        hold_id = cast(str, held['hold'])
+        with (patch.object(self.server.send_holds, '_write', side_effect=OSError('Release write failed.')),
+              patch.object(cache, 'save', wraps=cache.save) as save):
+            self.assertTrue(self.server.send_holds.send_now(hold_id))
+            status, _, reply = self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')
+            save.assert_not_called()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.hold_states(), [])
+        reason = 'The server could not release the hold.'
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            status, report = self.review_save_report(form, attempt, 'The held reply was lost.')
+            self.assertEqual(status, 200)
+            self.assertEqual(reply, {'reason': reason, 'failure_attempt': attempt})
+            bug, = investigation.records(morty.id)
+            self.assertEqual(report, {'outcome': 'refused', 'reason': reason, 'bug': self.review_bug_link(bug)})
+            self.assertTrue(bug.question.endswith(words))
+            self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'), (status, report))
+        self.assertEqual(investigation.records(morty.id), [bug])
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+
+    def test_review_records_a_refusal_when_the_replay_connection_cannot_open(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        key, attempt = 'page-owner/C1', secrets.token_hex(16)
+        words = 'Keep the verdict after the connection refusal.'
+        form = case.card_body(cache.get(), key, 'works', words)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        hold_id = cast(str, held['hold'])
+        connect = HTTPConnection.connect
+
+        def refuse_replay(connection: HTTPConnection) -> None:
+            if connection.timeout == send_hold.REPLAY_TIMEOUT_SECONDS:
+                raise ConnectionRefusedError('The replay connection was refused.')
+            connect(connection)
+
+        with patch.object(HTTPConnection, 'connect', refuse_replay):
+            self.assertTrue(self.server.send_holds.send_now(hold_id))
+            status, _, reply = self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')
+        self.assertEqual(status, 503)
+        self.assertEqual(reply.get('failure_attempt'), attempt)
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            status, report = self.review_save_report(form, attempt, 'The held reply was lost.')
+        self.assertEqual((status, report['outcome']), (200, 'refused'))
+        bug, = investigation.records(morty.id)
+        self.assertEqual(report['bug'], self.review_bug_link(bug))
+        self.assertTrue(bug.question.endswith(words))
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+
+    def test_read_only_hold_folder_records_the_refusal_and_blocks_recovery(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        key, attempt = 'page-owner/C1', secrets.token_hex(16)
+        words = 'Keep the verdict when the hold is read-only.'
+        form = case.card_body(cache.get(), key, 'works', words)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        hold_id = cast(str, held['hold'])
+        folder = self.server.store_folder / send_hold.HOLD_FOLDER
+        folder.chmod(0o500)
+        try:
+            self.assertTrue(self.server.send_holds.send_now(hold_id))
+            result = self.server.send_holds.result(hold_id, wait=1)
+            status, report = self.review_save_report(form, attempt, 'The held reply was lost.')
+            self.assertEqual((status, report['outcome']), (200, 'refused'))
+            self.assertEqual(self.hold_states(), ['pending'])
+            with patch.object(send_hold, 'RESULT_KEEP_SECONDS', -1):
+                self.server.send_holds.expire()
+            self.assertEqual(self.server.send_holds.result(hold_id, wait=0), result)
+        finally:
+            folder.chmod(0o700)
+        bug, = investigation.records(morty.id)
+        self.assertEqual(report['bug'], self.review_bug_link(bug))
+        self.assertTrue(bug.question.endswith(words))
+        self.assertIsInstance(result, send_hold.HeldResponse)
+        self.assertFalse(self.server.send_holds.send_now(hold_id))
+        self.assertTrue(self.server.send_holds.stop_if_idle())
+        restarted = send_hold.Holds(folder, send_hold.replay_to('127.0.0.1', self.port))
+        self.addCleanup(restarted.stop_if_idle)
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with (patch.object(self.server, 'send_holds', restarted),
+              patch.object(self.server, 'review_attempts', reopened)):
+            restarted.recover()
+            self.assertFalse(restarted.send_now(hold_id))
+            self.assertEqual(restarted.result(hold_id, wait=0), result)
+            self.assertEqual(self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}'),
+                             (503, '', {'reason': report['reason'], 'failure_attempt': attempt}))
+            self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'), (status, report))
+            with patch.object(send_hold, 'RESULT_KEEP_SECONDS', -1):
+                restarted.expire()
+            self.assertEqual(self.hold_states(), [])
+            self.assertIs(restarted.result(hold_id, wait=0), send_hold.HoldState.MISSING)
+        self.assertEqual(investigation.records(morty.id), [bug])
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+
+    def test_review_records_an_unknown_outcome_when_replay_transmission_fails(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'Keep the unconfirmed verdict.')
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        hold_id = cast(str, held['hold'])
+        send = HTTPConnection.send
+
+        def fail_replay_transmission(connection: HTTPConnection, data: bytes) -> None:
+            if connection.timeout == send_hold.REPLAY_TIMEOUT_SECONDS:
+                raise BrokenPipeError('Replay transmission stopped.')
+            send(connection, data)
+
+        with patch.object(HTTPConnection, 'send', fail_replay_transmission):
+            self.assertTrue(self.server.send_holds.send_now(hold_id))
+            status, _, reply = self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')
+        self.assertEqual((status, reply), (503, {'reason': send_hold.MAY_HAVE_LEFT}))
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'),
+                             (200, {'outcome': 'unknown'}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_review_restart_recovers_an_interrupted_hold_replay_as_unknown(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        key, attempt = 'page-owner/C1', secrets.token_hex(16)
+        hold_id = send_hold.new_hold_id()
+        form = case.card_body(cache.get(), key, 'works', 'Keep the verdict after the server stops.')
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt, send_hold.REQUEST_HEADER: hold_id}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        self.assertEqual(held['hold'], hold_id)
+        self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'),
+                         (202, {'outcome': 'pending'}))
+        self.assertTrue(self.server.send_holds.stop_if_idle())
+        folder = self.server.store_folder / send_hold.HOLD_FOLDER
+        guard = send_hold.released_file(send_hold.failed(send_hold.MAY_HAVE_LEFT))
+        atomic_file.write_text_atomic(folder / f'{hold_id}.json', json.dumps(guard))
+        attempts_folder = self.server.review_attempts.folder
+        recovered_attempts = serve.ReviewSaveAttempts(attempts_folder)
+        replay = Mock()
+        restarted = send_hold.Holds(folder, replay, record_replay=recovered_attempts.record_hold_replay)
+        self.addCleanup(restarted.stop_if_idle)
+        restarted.recover()
+        self.assertFalse(restarted.send_now(hold_id))
+        self.assertEqual(restarted.result(hold_id, wait=0), send_hold.failed(send_hold.MAY_HAVE_LEFT))
+        replay.assert_not_called()
+        with patch.object(send_hold, 'RESULT_KEEP_SECONDS', -1):
+            restarted.expire()
+        self.assertIs(restarted.result(hold_id, wait=0), send_hold.HoldState.MISSING)
+        with (patch.object(self.server, 'review_attempts', serve.ReviewSaveAttempts(attempts_folder)),
+              patch.object(self.server, 'send_holds', restarted)):
+            self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'),
+                             (200, {'outcome': 'unknown'}))
+            self.assertEqual(self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers),
+                             (202, 'held', {'hold': hold_id, 'seconds': 0}))
+            self.assertFalse(restarted.send_now(hold_id))
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_review_retries_a_refused_hold_with_a_new_id(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        key = 'page-owner/C1'
+        form = case.card_body(cache.get(), key, 'works', 'Keep the unsent verdict.')
+        attempt, hold_id = secrets.token_hex(16), send_hold.new_hold_id()
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   send_hold.REQUEST_HEADER: hold_id, review_page.SAVE_ATTEMPT_HEADER: attempt}
+        with patch.object(self.server.send_holds, '_write', side_effect=OSError('Hold write failed.')) as write:
+            status, marker, reply = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+            write.assert_called_once()
+        self.assertEqual((status, marker, reply), (503, 'refused', {
+            'reason': 'The server could not record the hold.', 'failure_attempt': attempt}))
+        self.assertEqual(self.hold_states(), [])
+        next_attempt, next_hold = secrets.token_hex(16), send_hold.new_hold_id()
+        with patch.object(send_hold, 'write_text_atomic', wraps=atomic_file.write_text_atomic) as write:
+            self.assertEqual(self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers),
+                             (status, marker, reply))
+            write.assert_not_called()
+            headers[send_hold.REQUEST_HEADER] = next_hold
+            headers[review_page.SAVE_ATTEMPT_HEADER] = next_attempt
+            self.assertEqual(self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers),
+                             (202, 'held', {'hold': next_hold, 'seconds': 30}))
+            write.assert_called_once()
+        with patch.object(change_page, 'send_to_staff'):
+            self.assertTrue(self.server.send_holds.send_now(next_hold))
+            self.assertEqual(self.held_http('GET', f'{send_hold.HOLD_PATH}/{next_hold}')[0], 200)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(self.review_save_report(form, next_attempt, 'The held reply was lost.'),
+                         (200, {'outcome': 'saved', 'words_saved': True, 'hold': next_hold}))
+        _, report = self.review_save_report(form, attempt, 'The admission reply was lost.')
+        bug, = investigation.records(morty.id)
+        self.assertEqual(report['bug'], self.review_bug_link(bug))
+
+    def test_review_undo_stays_confirmed_after_the_hold_expires(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        key, attempt = 'page-owner/C1', secrets.token_hex(16)
+        form = case.card_body(cache.get(), key, 'works', 'Keep the unsent words.')
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        self.assertEqual(self.held_http('POST', f"{send_hold.HOLD_PATH}/{held['hold']}/undo")[0], 200)
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with (patch.object(self.server, 'review_attempts', reopened),
+              patch.object(self.server.send_holds, 'result', return_value=send_hold.HoldState.MISSING) as hold_result):
+            self.assertEqual(self.review_save_report(form, attempt, 'The Undo reply was lost.'),
+                             (200, {'outcome': 'undone'}))
+            hold_result.assert_not_called()
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def answered_review_submission(self, case: test_review_page.ReviewPageTests, cache: review_page.ReviewSnapshotCache
+                                   ) -> tuple[str, staff.StaffRow, review_page.ReviewSnapshot]:
+        owner = fixture_member('producer', name='item-producer')
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        with capture_sender('send_to_staff'):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent['key']
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        reply_key = new_item_dialog.submission_key(kind, owner.id, sent['id'], request.request_id)
+        self.assertTrue(change_page.answer_item(reply_key, 'Use the wide layout.', origin.reply_token, case.status))
+        snapshot, _ = cache.publish_record(cache.get(), key)
+        return key, owner, snapshot
+
+    def test_direct_response_delivery_failure_files_the_bug_after_reply(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, _, snapshot = self.answered_review_submission(case, cache)
+        words = 'Thank you for the answer.\nKeep this line.'
+        form = case.card_body(snapshot, key, 'read', words)
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=0\n')
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', review_page.SAVE_ATTEMPT_HEADER: attempt}
+        with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')):
+            try:
+                with investigation.recipient_locks(morty.id):
+                    status, reply = self.post(review_page.PAGE_PATH, form, headers=headers, wait_for_delivery=False)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(investigation.records(morty.id), [])
+            finally:
+                self.assertTrue(self.review_posts.wait_until_none_run())
+        result = cast(dict[str, object], json.loads(reply))
+        self.assertEqual(result['send_failure'], 'Delivery failed: The owner is offline.')
+        self.assertIs(result['retry_delivery'], True)
+        bug, = investigation.records(morty.id)
+        self.assertTrue(bug.question.endswith(words))
+        _, report = self.review_save_report(form, attempt, 'The reply was lost.')
+        self.assertEqual(report['bug'], self.review_bug_link(bug))
+        self.assertEqual(investigation.records(morty.id), [bug])
+
+    def test_lost_held_response_reply_reports_the_delivery_failure_after_expiry(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, owner, snapshot = self.answered_review_submission(case, cache)
+        form = case.card_body(snapshot, key, 'read', 'Thank you for the answer.')
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, hold, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual((status, hold), (202, 'held'))
+        hold_id = cast(str, held['hold'])
+        reports: list[tuple[int, dict[str, object]]] = []
+        message_keys: set[object] = set()
+
+        def fail_delivery(*_args: object, **_kwargs: object) -> None:
+            message_keys.add(_kwargs.get('key'))
+            if not reports:
+                reports.append(self.review_save_report(form, attempt, 'The held reply was lost.'))
+            raise OSError('The owner is offline.')
+
+        with patch.object(change_page, 'send_to_staff', side_effect=fail_delivery):
+            try:
+                with investigation.recipient_locks(morty.id):
+                    self.assertTrue(self.server.send_holds.send_now(hold_id))
+                    status, _, reply = self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')
+                    self.assertEqual(investigation.records(morty.id), [])
+            finally:
+                self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(status, 200)
+        self.assertEqual(reports, [(202, {'outcome': 'pending'})])
+        self.assertEqual(reply['hold'], hold_id)
+        self.assertIs(reply['words_saved'], True)
+        self.assertEqual(reply['send_failure'], 'Delivery failed: The owner is offline.')
+        bug, = investigation.records(morty.id)
+        self.assertIn('Thank you for the answer.', bug.question)
+        self.assertIn('Delivery failed: The owner is offline.', bug.question)
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with (patch.object(self.server, 'review_attempts', reopened),
+              patch.object(self.server.send_holds, 'result', return_value=send_hold.HoldState.MISSING)):
+            self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'),
+                             (200, {'outcome': 'saved', 'words_saved': True, 'hold': hold_id,
+                                    'send_failure': reply['send_failure'], 'retry_delivery': True,
+                                    'bug': self.review_bug_link(bug)}))
+            self.assertNotIn(key, cache.get().records)
+            fields = review_page.review_fields(form)
+            retry = urlencode({'row': key, 'token': fields['token'][0], 'failure_attempt': attempt})
+            origin_url = f'http://127.0.0.1:{self.port}'
+            native_path = review_items.source_path(snapshot.records[key])
+            closed_response = native_path.read_bytes()
+            with (patch.object(cache, 'save') as save,
+                  patch.object(change_page, 'send_to_staff', return_value='sent') as send):
+                other = review_page.review_fields(case.card_body(snapshot, 'page-owner/C1', 'works'))
+                wrong_card = urlencode({'row': other['row'][0], 'token': other['token'][0], 'failure_attempt': attempt})
+                self.assertEqual(self.post(review_page.DELIVERY_RETRY_PATH, wrong_card, origin=origin_url)[0], 404)
+                self.assertEqual(self.post(review_page.DELIVERY_RETRY_PATH, retry)[0], 403)
+                send.assert_not_called()
+                for _ in range(2):
+                    status, result = self.post(review_page.DELIVERY_RETRY_PATH, retry, origin=origin_url)
+                    self.assertEqual((status, json.loads(result)),
+                                     (200, {'outcome': 'saved', 'words_saved': True, 'hold': hold_id}))
+                save.assert_not_called()
+                original_key, = message_keys
+                send.assert_called_once_with(owner.id, change_page.SENDER, ANY, key=original_key)
+                self.assertIn('Thank you for the answer.', cast(str, send.call_args.args[2]))
+            self.assertEqual(native_path.read_bytes(), closed_response)
+        self.assertEqual(investigation.records(morty.id), [bug])
+
+    def test_failed_got_it_retry_replies_while_the_bug_store_is_locked(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, _, snapshot = self.answered_review_submission(case, cache)
+        form = case.card_body(snapshot, key, 'read', 'Thank you for the answer.')
+        attempt = secrets.token_hex(16)
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=0\n')
+        headers = {send_hold.HOLD_HEADER: '1', review_page.SAVE_ATTEMPT_HEADER: attempt}
+        with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')):
+            self.assertEqual(self.post(review_page.PAGE_PATH, form, headers=headers)[0], 200)
+        original, = investigation.records(morty.id)
+        fields = review_page.review_fields(form)
+        retry = urlencode({'row': key, 'token': fields['token'][0], 'failure_attempt': attempt})
+        origin = f'http://127.0.0.1:{self.port}'
+        with (patch.object(change_page, 'send_to_staff', side_effect=OSError('The relay stopped.')),
+              ThreadPoolExecutor(max_workers=1) as worker):
+            with investigation.recipient_locks(morty.id):
+                reply = worker.submit(self.post, review_page.DELIVERY_RETRY_PATH, retry, origin=origin)
+                status, body = reply.result(timeout=2)
+                self.assertEqual(investigation.records(morty.id), [original])
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(status, 200)
+        result = cast(dict[str, object], json.loads(body))
+        self.assertEqual(result['send_failure'], 'Delivery failed: The relay stopped.')
+        self.assertNotIn('bug', result)
+        _, latest = investigation.records(morty.id)
+        self.assertEqual(self.review_save_report(form, attempt, 'The retry reply was lost.'), (200, {
+            **result, 'bug': self.review_bug_link(latest)}))
+
+    def test_response_delivery_survives_post_save_receipt_write_failures(self) -> None:
+        self.check_response_delivery_with_lost_receipt(preparation_fails=True)
+
+    def test_response_recovery_confirms_delivery_before_filing_a_bug(self) -> None:
+        self.check_response_delivery_with_lost_receipt(preparation_fails=False)
+
+    def check_response_delivery_with_lost_receipt(self, *, preparation_fails: bool) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, owner, snapshot = self.answered_review_submission(case, cache)
+        form = case.card_body(snapshot, key, 'read', 'Thank you for the answer.')
+        attempt = secrets.token_hex(16)
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=0\n')
+        headers = {send_hold.HOLD_HEADER: '1', review_page.SAVE_ATTEMPT_HEADER: attempt}
+        folder = self.server.review_attempts.folder
+        write_atomic = atomic_file.write_text_atomic
+        failed_writes: list[str] = []
+
+        def fail_after_native_save(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+            if folder in path.parents:
+                raw = cast(object, json.loads(words))
+                if (isinstance(raw, dict) and cast(dict[str, object], raw).get('outcome') == 'saved'
+                        and (preparation_fails or 'delivery_running' not in raw)):
+                    failed_writes.append(words)
+                    raise OSError('The Review outcome cannot be written.')
+            write_atomic(path, words, new_file_mode=new_file_mode)
+
+        handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
+        respond = handler.json_response
+
+        def lose_reply(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object], *,
+                       hold: send_hold.HoldHeader | None = None) -> None:
+            if active.path == review_page.PAGE_PATH and status == 200:
+                active.close_connection = True
+            else:
+                respond(active, status, fields, hold=hold)
+
+        with (patch.object(atomic_file, 'write_text_atomic', side_effect=fail_after_native_save),
+              patch.object(change_page, 'send_to_staff', return_value='sent') as send,
+              patch.object(handler, 'json_response', lose_reply)):
+            with self.assertRaises(RemoteDisconnected):
+                _ = self.post(review_page.PAGE_PATH, form, headers=headers)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(len(failed_writes), 2 if preparation_fails else 1)
+        send.assert_called_once_with(owner.id, change_page.SENDER, ANY, key=ANY)
+        self.assertNotIn(key, cache.get().records)
+        for _ in range(2):
+            reopened = serve.ReviewSaveAttempts(folder)
+            with patch.object(self.server, 'review_attempts', reopened):
+                self.assertEqual(self.review_save_report(form, attempt, 'The save reply was lost.'),
+                                 (200, {'outcome': 'saved', 'words_saved': True}))
+        self.assertEqual(investigation.records(morty.id), [])
+
+    def test_review_restart_can_retry_when_the_delivery_result_write_fails(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, _, snapshot = self.answered_review_submission(case, cache)
+        form = case.card_body(snapshot, key, 'read', 'Thank you for the answer.')
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        attempt = secrets.token_hex(16)
+        headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                   review_page.SAVE_ATTEMPT_HEADER: attempt}
+        status, _, held = self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)
+        self.assertEqual(status, 202)
+        hold_id = cast(str, held['hold'])
+        folder = self.server.review_attempts.folder
+        write_atomic = atomic_file.write_text_atomic
+        delivery_started = threading.Event()
+
+        def fail_completion(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+            if folder in path.parents and delivery_started.is_set():
+                raise OSError('The delivery result cannot be written.')
+            write_atomic(path, words, new_file_mode=new_file_mode)
+
+        def fail_delivery(*_args: object, **_kwargs: object) -> None:
+            delivery_started.set()
+            raise OSError('The owner is offline.')
+
+        with (patch.object(atomic_file, 'write_text_atomic', side_effect=fail_completion),
+              patch.object(change_page, 'send_to_staff', side_effect=fail_delivery)):
+            self.assertTrue(self.server.send_holds.send_now(hold_id))
+            status, _, reply = self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(status, 200)
+        self.assertIs(reply['retry_delivery'], True)
+        self.assertIn('The owner is offline.', cast(str, reply['send_failure']))
+        released = self.server.send_holds.result(hold_id, wait=0)
+        assert isinstance(released, send_hold.HeldResponse)
+        hold_payload = cast(dict[str, object], json.loads(released.body))
+        self.assertIs(hold_payload['review_save_record'], True)
+        self.assertTrue({'words_saved', 'send_failure', 'retry_delivery', 'hold'}.isdisjoint(hold_payload))
+        self.assertNotIn(key, cache.get().records)
+        bug, = investigation.records(morty.id)
+        with (patch.object(self.server, 'review_attempts', serve.ReviewSaveAttempts(folder)),
+              patch.object(self.server.send_holds, 'result', wraps=self.server.send_holds.result) as hold_result,
+              patch.object(change_page, 'send_to_staff', return_value='sent') as send):
+            status, report = self.review_save_report(form, attempt, 'The held reply was lost.')
+            self.assertEqual(status, 200)
+            self.assertIs(report.get('retry_delivery'), True)
+            self.assertIs(report['words_saved'], True)
+            self.assertEqual((report['send_failure'], report['bug']), (reply['send_failure'], self.review_bug_link(bug)))
+            fields = review_page.review_fields(form)
+            retry = urlencode({'row': key, 'token': fields['token'][0], 'failure_attempt': attempt})
+            status, result = self.post(review_page.DELIVERY_RETRY_PATH, retry, origin=f'http://127.0.0.1:{self.port}')
+            self.assertEqual((status, json.loads(result)),
+                             (200, {'outcome': 'saved', 'words_saved': True, 'hold': hold_id}))
+            hold_result.assert_not_called()
+            send.assert_called_once()
+        self.assertEqual(investigation.records(morty.id), [bug])
+
+    def test_review_failed_retries_file_for_each_cause_and_update_both_hold_attempts(self) -> None:
+        morty, case, cache = self.review_save_bug_fixture()
+        key, owner, snapshot = self.answered_review_submission(case, cache)
+        words = 'Thank you for the answer.\nKeep this line.'
+        form = case.card_body(snapshot, key, 'read', words)
+        _ = write_config_fixture(conf.path('review_links'), 'undo_seconds=30\n')
+        attempts = [secrets.token_hex(16), secrets.token_hex(16)]
+        hold_id = send_hold.new_hold_id()
+        for attempt in attempts:
+            headers = {send_hold.HOLD_HEADER: '1', 'Content-Type': 'application/x-www-form-urlencoded',
+                       send_hold.REQUEST_HEADER: hold_id, review_page.SAVE_ATTEMPT_HEADER: attempt}
+            self.assertEqual(self.held_http('POST', review_page.PAGE_PATH, form.encode(), headers=headers)[:2],
+                             (202, 'held'))
+        with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')) as send:
+            self.assertTrue(self.server.send_holds.send_now(hold_id))
+            self.assertEqual(self.held_http('GET', f'{send_hold.HOLD_PATH}/{hold_id}')[0], 200)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+            original_key = next(cast(str, call.kwargs['key']) for call in send.call_args_list if call.args[0] == owner.id)
+        first, = investigation.records(morty.id)
+        self.assertIn('The owner is offline.', first.question)
+        fields = review_page.review_fields(form)
+        retry = urlencode({'row': key, 'token': fields['token'][0], 'failure_attempt': attempts[1]})
+        origin = f'http://127.0.0.1:{self.port}'
+        with patch.object(change_page, 'send_to_staff', side_effect=OSError('The relay stopped.')) as send:
+            for _ in range(2):
+                status, result = self.post(review_page.DELIVERY_RETRY_PATH, retry, origin=origin)
+                self.assertEqual(status, 200)
+                failure = cast(dict[str, object], json.loads(result))
+                self.assertEqual(failure['send_failure'], 'Delivery failed: The relay stopped.')
+                self.assertNotIn('bug', failure)
+                self.assertTrue(self.review_posts.wait_until_none_run())
+                _, latest = investigation.records(morty.id)
+                _, report = self.review_save_report(form, attempts[1], 'The retry reply was lost.')
+                self.assertEqual(report['bug'], self.review_bug_link(latest))
+            self.assertTrue(all(call.kwargs['key'] == original_key for call in send.call_args_list
+                                if call.args[0] == owner.id))
+        _, latest = investigation.records(morty.id)
+        self.assertNotEqual(latest.id, first.id)
+        self.assertTrue(latest.question.endswith(words))
+        repeats = [event for event in latest.log if event.words.startswith('Save ')]
+        self.assertEqual(len(repeats), 1)
+        reopened = serve.ReviewSaveAttempts(self.server.review_attempts.folder)
+        with patch.object(self.server, 'review_attempts', reopened):
+            for attempt in attempts:
+                _, report = self.review_save_report(form, attempt, 'The held reply was lost.')
+                self.assertEqual((report['send_failure'], report['bug']),
+                                 ('Delivery failed: The relay stopped.', self.review_bug_link(latest)))
+        with patch.object(change_page, 'send_to_staff', return_value='sent') as send:
+            self.assertEqual(self.post(review_page.DELIVERY_RETRY_PATH, retry, origin=origin)[0], 200)
+            send.assert_called_once_with(owner.id, change_page.SENDER, ANY, key=original_key)
+        for attempt in attempts:
+            self.assertEqual(self.review_save_report(form, attempt, 'The held reply was lost.'),
+                             (200, {'outcome': 'saved', 'words_saved': True, 'hold': hold_id}))
+
     def test_response_followup_uses_the_same_owner_and_got_it_closes_the_question(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
@@ -6942,8 +8199,9 @@ addEventListener('DOMContentLoaded', async () => {
             post = case.card_body(response, key, 'question', followup)
             status, body = self.post(review_page.PAGE_PATH, post)
             self.assertEqual(status, 200, body)
-            result = cast(dict[str, str], json.loads(body))
+            result = cast(dict[str, object], json.loads(body))
             self.assertEqual((result['type'], result['state']), ('question', 'Waiting'))
+            self.assertIs(result['words_saved'], True)
             send.assert_called_once_with(owner.id, change_page.SENDER, ANY)
             message = cast(str, send.call_args.args[2])
             self.assertIn(followup, message)
@@ -6967,11 +8225,69 @@ addEventListener('DOMContentLoaded', async () => {
 
             status, body = self.post(review_page.PAGE_PATH, case.card_body(returned, key, 'read'))
             self.assertEqual(status, 200, body)
-            self.assertEqual(cast(dict[str, str], json.loads(body))['state'], 'Done')
+            result = cast(dict[str, object], json.loads(body))
+            self.assertEqual(result['state'], 'Done')
+            self.assertIs(result['words_saved'], False)
             self.assertNotIn(key, cache.get().records)
-            self.assertEqual(update_registration.read_review_question(path, owner.id).status, 'closed')
+            closed = update_registration.read_review_question(path, owner.id)
+            self.assertEqual(closed.status, 'closed')
+            self.assertEqual(review_events.decode(closed.item.get('review_log', ''))[-1].words, 'Marked read')
             self.assertEqual(self.request(card_url).status, 404)
             send.assert_called_once()
+
+    def test_response_got_it_sends_words_and_closes_the_question(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member('producer', name='item-producer')
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        created = cache.create_submission(request)
+        sent = created.saved
+        self.assertTrue(change_page.answer_item(sent.key, 'Use the wide layout.', sent.reply_token, case.status))
+        response, _ = cache.publish_record(cache.get(), created.key)
+        self.assertEqual(response.records[created.key].type, review_items.ReviewType.RESPONSE)
+
+        words = 'Thank you. I will use the wide layout.'
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              capture_sender('send_to_staff') as send):
+            status, body = self.post(review_page.PAGE_PATH, case.card_body(response, created.key, 'read', words))
+        self.assertEqual(status, 200, body)
+        result = cast(dict[str, object], json.loads(body))
+        self.assertEqual(result['state'], 'Done')
+        self.assertIs(result['words_saved'], True)
+        send.assert_called_once_with(owner.id, change_page.SENDER, ANY)
+        message = cast(str, send.call_args.args[2])
+        self.assertIn(words, message)
+        self.assertNotIn(' answer-question ', message)
+        self.assertNotIn(created.key, cache.get().records)
+        closed = update_registration.read_review_question(sent.path, owner.id)
+        self.assertEqual(closed.status, 'closed')
+        self.assertEqual(review_events.decode(closed.item.get('review_log', ''))[-1].words, 'feedback sent: '+words)
+
+    def test_response_reports_delivery_failure_with_undo_off(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member('producer', name='item-producer')
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=0\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        created = cache.create_submission(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        sent = created.saved
+        self.assertTrue(change_page.answer_item(sent.key, 'Use the wide layout.', sent.reply_token, case.status))
+        response, _ = cache.publish_record(cache.get(), created.key)
+        words = 'Thank you for the answer.'
+        form = case.card_body(response, created.key, 'read', words)
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "send_to_staff", side_effect=OSError("The owner is offline.")) as send):
+            status, hold, result = self.held_http("POST", review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual((status, hold), (200, ""), result)
+        self.assertEqual(result.get("send_failure"), "Delivery failed: The owner is offline.")
+        self.assertIs(result["delivery_pending"], False)
+        self.assertIs(result["words_saved"], True)
+        self.assertIn(words, cast(str, send.call_args.args[2]))
+        saved = update_registration.read_review_question(sent.path, owner.id)
+        self.assertEqual(review_events.decode(saved.item.get('review_log', ''))[-1].words, 'feedback sent: '+words)
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
@@ -7167,6 +8483,7 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertEqual(code, 200, body)
                 result = cast(dict[str, object], json.loads(body))
                 self.assertIn('Which check passed?', cast(str, result['detail_html']))
+                self.assertIs(result['words_saved'], True)
                 self.assertIs(result['delivery_pending'], True)
                 version_path = review_page.PAGE_PATH + '?' + urlencode({'version': '1', 'delivery': result['delivery']})
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
@@ -7427,7 +8744,10 @@ addEventListener('DOMContentLoaded', async () => {
               patch.object(change_page, 'send_to_staff') as send):
             status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 400, reply)
-            self.assertEqual(json.loads(reply), {'reason': reason})
+            fields = cast(dict[str, str], json.loads(reply))
+            self.assertEqual(fields.keys(), {'reason', 'failure_attempt'})
+            self.assertEqual(fields['reason'], reason)
+            self.assertTrue(re.fullmatch(r'[0-9a-f]{32}', fields['failure_attempt']))
             write.assert_called_once()
             send.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
@@ -7987,7 +9307,7 @@ addEventListener('DOMContentLoaded', async () => {
         self.addCleanup(cache.close)
         snapshot = cache.get()
         self.assertIn(b'<code>github-warmup</code>', snapshot.body(action.key))
-        request = case.card_body(snapshot, action.key, 'done')
+        request = case.card_body(snapshot, action.key, 'done', 'These words are not a completion note.')
         with (patch.object(self.server, 'review_cache', cache),
               patch.object(self.server, 'delivery_status', case.status)):
             status, reply = self.post(review_page.PAGE_PATH, request.replace('token=', 'token=wrong'))
@@ -7996,7 +9316,9 @@ addEventListener('DOMContentLoaded', async () => {
             with patch.object(atomic_file, 'sync_folder', side_effect=OSError('The action directory sync failed.')):
                 status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 200, reply)
-            self.assertEqual(json.loads(reply)['state'], 'Done')
+            result = cast(dict[str, object], json.loads(reply))
+            self.assertEqual(result['state'], 'Done')
+            self.assertIs(result['words_saved'], False)
             completed = store.get(action.key)
             self.assertEqual(completed.status, 'done')
             self.assertTrue(completed.completed_at)
@@ -8004,7 +9326,9 @@ addEventListener('DOMContentLoaded', async () => {
             with patch.object(ActionStore, 'mark_done', side_effect=AssertionError('Done must not write again.')):
                 status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 200, reply)
-            self.assertEqual(json.loads(reply)['state'], 'Done')
+            result = cast(dict[str, object], json.loads(reply))
+            self.assertEqual(result['state'], 'Done')
+            self.assertIs(result['words_saved'], False)
             self.assertEqual(store.get(action.key), completed)
         self.assertNotIn(b'value="done"', cache.get().body(action.key))
 
@@ -11290,6 +12614,7 @@ class ServerAddressHealthTests(unittest.TestCase):
         folder = Path(root)
         staff_file = folder / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults", return_value=()))
         self.elapsed = 100.0
         self.address_checks = []
         self.next_address = lambda: "127.0.0.1"
@@ -11304,6 +12629,7 @@ class ServerAddressHealthTests(unittest.TestCase):
         })))
         _ = self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.elapsed))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", side_effect=self.read_address))
+        _ = self.enterContext(patch.object(review_page.ReviewSnapshotCache, "start"))
         # The restart tests exercise scans of loaded modules.
         _ = self.enterContext(patch.object(serve, "loaded_module_stamps", return_value={}))
         observations = self
@@ -11497,10 +12823,14 @@ class ServerCodeHealthTests(unittest.TestCase):
 
 class ServerCodeRestartTests(unittest.TestCase):
     def test_a_changed_module_restarts_the_same_process_and_answers_a_request_sent_during_the_restart(self) -> None:
+        source = Path(__file__).resolve().parents[2]
         checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-restart-test-")))
         server_file = checkout / "scripts/review_links/serve.py"
         server_file.parent.mkdir(parents=True)
         _ = server_file.write_text("# The server uses this temporary checkout.\n")
+        other_launcher = checkout / "scripts/lib/py"
+        other_launcher.parent.mkdir()
+        other_launcher.touch()
         module_file = checkout / "review_restart_fixture.py"
         _ = module_file.write_text("VALUE = 'before'\n")
         _ = write_config_fixture(checkout / "review_links.conf", "code_check_seconds=0.05\n")
@@ -11508,15 +12838,18 @@ class ServerCodeRestartTests(unittest.TestCase):
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
         driver = checkout / "driver.py"
-        _ = driver.write_text(python_tool_source('''import importlib.util
+        _ = driver.write_text('''import importlib.util
 import os
 import sys
 import time
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
+from scripts.production import record_store
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent
+assert Path(serve.__file__).resolve() == Path.cwd() / "scripts/review_links/serve.py"
 if serve.LISTEN_FD in os.environ:
     # Hold the restart open, so the test sends a request before the new server starts.
     print(f"restarting {os.getpid()}", file=sys.__stdout__, flush=True)
@@ -11538,15 +12871,17 @@ class ObservedServer(serve.ReviewLinksServer):
         print(line, file=sys.__stdout__, flush=True)
 
 serve.ReviewLinksServer = ObservedServer
-with redirect_stdout(sys.stderr):
+with patch.object(record_store, "configured_review_vaults", return_value=()), redirect_stdout(sys.stderr):
     raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
-'''))
+''')
         errors_path = checkout / "errors.txt"
         errors = self.enterContext(errors_path.open("w"))
         child: subprocess.Popen[str] = subprocess.Popen(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-P", "-B", str(driver)],
-            cwd=checkout, env={**os.environ, "CONF_DIR": str(checkout), "REVIEW_LINKS_ROOT": str(root),
+            [str(source / "scripts/lib/py"), "--isolated", "-B", "-c",
+             "import runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__')", str(driver)],
+            cwd=source, env={**os.environ, "CONF_DIR": str(checkout), "REVIEW_LINKS_ROOT": str(root),
                                "SHOWRUNNER_STATE_DIR": str(checkout / "state"),
+                               "STAFF_FILE": str(checkout / "staff.json"),
                                "CLAUDE_PYTHON": sys.executable},
             stdout=subprocess.PIPE, stderr=errors, text=True,
         )
@@ -11584,6 +12919,9 @@ with redirect_stdout(sys.stderr):
             response = during.getresponse()
             self.assertEqual(response.status, 200)
             self.assertEqual(response.read().decode(), (root / "answer.txt").read_text())
+        except ConnectionError as error:
+            error.add_note(errors_path.read_text())
+            raise
         finally:
             during.close()
         second = read_start()

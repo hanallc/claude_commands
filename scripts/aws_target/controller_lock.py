@@ -11,12 +11,18 @@ from scripts.lib.file_lock import LockResult, exclusive
 
 # Commands that need both locks take the account stack lock before the Hana resource hold.
 @contextmanager
-def account_stack_lock(directory: Path) -> Generator[LockResult]:
+def account_stack_lock(directory: Path, *, shared: bool = False) -> Generator[LockResult]:
     """Take the account stack lock without waiting."""
     gate = directory / 'gate-up'
     gate.mkdir(parents=True, exist_ok=True)
-    with exclusive(gate / 'controller.lock', wait=False) as access:
-        yield access
+    with (gate / 'controller.lock').open('a') as lock:
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        try:
+            fcntl.flock(lock, mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield LockResult.BUSY
+            return
+        yield LockResult.ACQUIRED
 
 
 @contextmanager

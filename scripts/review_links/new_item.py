@@ -21,20 +21,37 @@ from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import atomic_file, conf, main_publish
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
-from scripts.production import investigation, producer_map, repeat_rule, staff, the_list, unrouted_alert
-from scripts.review_links import change_page, for_you, list_draft, new_item_dialog, review_page, review_submissions
+from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list, unrouted_alert
+from scripts.review_links import change_page, for_you, list_draft, new_item_dialog, review_items, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
 FORM = "/new_item <type> <assignee> <description> [extra, such as a time]"
 RESEND_FORM = "new_item.py resend-reply <item-id>"
 MAY_BE_FILED = "The item may be filed. Check the List before a retry."
+
+
+def file_review_save_bug(failure: review_submissions.ReviewSaveFailure) -> int:
+    """File a failed Review save for morty and return its List number."""
+    members = staff.snapshot()
+    owner = producer_map.find_member("morty", members, ("producer",))
+    if isinstance(owner, producer_map.UnknownMember) or owner.name != "morty":
+        raise record_store.SubmissionError("The Bug needs one active producer named morty.")
+    bug = review_submissions.file_review_save_bug(failure, owner.id, members)
+    origin = bug.submission
+    assert isinstance(origin, new_item_dialog.ReviewSubmission)
+    key = review_items.investigation_record_key(bug)
+    evidence = review_page.PAGE_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
+    return the_list.add_review_item(owner.id, bug.title, owner=owner.id, producer=owner.id,
+                                    unit="", words=bug.question, evidence=evidence, review_key=key,
+                                    source="nate via Review", reservation=review_submissions.list_filing_reservation(origin))
 
 
 class ItemType(StrEnum):
@@ -341,8 +358,12 @@ def assignment_receipt(item_type: ItemType | Literal["scheduled"], member: staff
     return f"{item_type.capitalize()} → {to}.{producer_line(member, mapped)}"
 
 
+def filing_number_label(number: int, *, label: Literal["List item", "Bug"] = "List item") -> str:
+    return f"{label} {number}"
+
+
 def filing_receipt(assignment: str, identity: str) -> str:
-    return f"{assignment} List item {identity.removeprefix('L')}."
+    return f"{assignment} {filing_number_label(int(identity.removeprefix('L')))}."
 
 
 def producer_line(member: staff.StaffRow, mapped: producer_map.MappedProducer) -> str:
@@ -575,7 +596,7 @@ class FilingRefusal(StrEnum):
     UNAVAILABLE_PRODUCER = "unavailable producer"
 
 
-class FilingRefused(new_item_dialog.SubmissionError):
+class FilingRefused(record_store.SubmissionError):
     """The filing checks failed before the item was saved."""
 
     def __init__(self, reason: FilingRefusal, message: str) -> None:
@@ -637,7 +658,7 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
         member, mapped = _assignment(assignee, members)
         try:
             review_submissions.require_available_recipient(member, members)
-        except new_item_dialog.SubmissionConflict as error:
+        except record_store.SubmissionConflict as error:
             raise FilingRefused(FilingRefusal.UNAVAILABLE_OWNER, str(error)) from error
     elif producer is None:
         member, mapped = assignee, _mapped_producer(assignee, members)
@@ -646,7 +667,7 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
     if member.id != mapped.producer.id:
         try:
             _ = review_submissions.selected_recipient(mapped.producer.id, members)
-        except new_item_dialog.SubmissionConflict as error:
+        except record_store.SubmissionConflict as error:
             raise FilingRefused(FilingRefusal.UNAVAILABLE_PRODUCER, str(error)) from error
     keeper = the_list.producer_id(members, "morty")
     run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
@@ -729,7 +750,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
             members = staff.snapshot()
             recipient = review_submissions.selected_recipient(request.recipient_id, members)
             if request.producer_route and recipient.kind != "producer":
-                raise new_item_dialog.SubmissionError("Pick a producer.")
+                raise record_store.SubmissionError("Pick a producer.")
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
             filing = prepare_scheduled(owner, request.words, members, producer=producer)
@@ -950,7 +971,7 @@ def main(arguments: list[str] | None = None) -> int:
         delivery = f" Reply command goes to {recipient_name}{session_label}."
     number = reply.fields.get("list_number")
     if type(number) is int and number > 0:
-        filed = f"List item {number}."
+        filed = f"{filing_number_label(number)}."
     else:
         review_id = reply.fields.get("id")
         saved = f"Filed as {review_id} in Review." if isinstance(review_id, str) and review_id else "Filed a Review item."

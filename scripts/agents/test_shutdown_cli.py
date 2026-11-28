@@ -30,6 +30,7 @@ from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
 from scripts.agents import set_model, status_entry, test_stop_resume, worker_lifecycle
+from scripts.build_queue import admission_records
 from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies import remote_test_support
@@ -222,7 +223,7 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
-        self.assertIn("clone NAME --as NEW", output)
+        self.assertIn("clone NAME NEW_NAME", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("set-model ROLE MODEL [EFFORT]", output)
@@ -1957,7 +1958,7 @@ fi
                           mock.patch.object(copies, "remove_trees", wraps=copies.remove_trees) as trees,
                           mock.patch.object(shutdown, "retirement_holds", wraps=shutdown.retirement_holds) as holds):
                         if failure == "copy":
-                            trees.side_effect = copies.CopyError("TEST copy removal failed")
+                            trees.side_effect = admission_records.CopyError("TEST copy removal failed")
                         if failure in ("ssh", "answer"):
                             ssh.side_effect = None
                             ssh.return_value = (255, "") if failure == "ssh" else (0, "unreadable answer")
@@ -2116,6 +2117,7 @@ fi
         mirror = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/alpha"), "alpha-session")
         with local_remote_transport(self.root):
+            _ = write_config_fixture(self.root / ".claude/config/mac_test.conf", "mirror_root=~/mirrors\n")
             self.assertEqual(publish_mirror(mirror), 0)
             code, output = self.retire()
         self.assertEqual(code, 0, output)

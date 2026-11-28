@@ -17,6 +17,7 @@ from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from scripts.production import staff
+from scripts.production.record_store import SubmissionConflict, SubmissionError
 from scripts.review_links import page_frame, reply_proofs, reply_tokens
 
 
@@ -36,16 +37,6 @@ MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
 BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
-
-
-class SubmissionError(ValueError):
-    """The request cannot be saved or applied to this item."""
-
-
-class SubmissionConflict(SubmissionError):
-    """The request ID already names different item data."""
-
-    status: Literal[409] = 409
 
 
 class SubmissionScreenshotExpired(SubmissionConflict):
@@ -1444,7 +1435,7 @@ function bindDraft(dialog, fresh = false) {
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '', launcherPage = '';
- const isListPage = () => ownerPage === 'studio' || ownerPage === 'list';
+ const isListPage = (page = ownerPage) => page === 'studio' || page === 'list';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
@@ -1857,10 +1848,18 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
  }
 
+ function listFilingReceipt({list_number: number, list_owner: owner, list_producer: producer}) {
+  if (!Number.isInteger(number) || number < 1) return '';
+  const item = 'List item ' + number + '.';
+  return typeof owner === 'string' && typeof producer === 'string'
+   ? item + ' Owner ' + owner + '. Producer ' + producer + '.' : item;
+ }
+
  async function post(payload, {keepalive = false, hold = false, receiver, signal, holdRequestId} = {}) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
                    body: JSON.stringify(payload), keepalive, signal};
-  const response = hold ? heldFetch(endpoint, {...options, holdRequestId}, receiver) : fetch(endpoint, options);
+  const response = hold ? heldFetch(endpoint, {...options, holdRequestId, filedReceipt: listFilingReceipt},
+                                   receiver) : fetch(endpoint, options);
   return response.then(reply => responseData(reply, 'Could not send this item.'));
  }
 
@@ -2677,9 +2676,9 @@ function bindDraft(dialog, fresh = false) {
    const data = await loadOptions(signal);
    if (signal.aborted) return;
    setOptions(data, newDraft && !original, recipientName);
+   if (focus === send && document.activeElement === initialFocus) send.focus({preventScroll: true});
    if (pageCapture.status === 'preparing') await pageCapture.ready;
    if (signal.aborted) return;
-   if (focus === send && document.activeElement === initialFocus) send.focus({preventScroll: true});
    startCapture();
    showSentDetails();
   } catch (failure) {
@@ -2789,7 +2788,7 @@ function bindDraft(dialog, fresh = false) {
     const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
                    includeScreenshot: includePage.checked, holdRequestId: heldFetch.newId()};
     if (separateFromNativeDraft && nativeListEdit) {
-     const files = await Promise.all(nativeListEdit.files.map(pastedData));
+     const files = await Promise.all(nativeListEdit.files.map(file => pastedData(file)));
      draft.nativeListEdit = {...nativeListEdit, files};
     }
     await storeSubmittedDraft(draft);

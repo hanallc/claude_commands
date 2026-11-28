@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from scripts.agents import detached_run_record
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 from scripts.build_hold import owning_session as session_owner
@@ -1778,9 +1779,7 @@ def stop_request_status(request: StopRequest) -> StopStatus | None:
     runner_record = request.get("runner_record")
     run = request["entry"].get("run")
     if runner_record and run is not None:
-        from scripts.agents import detached_runs
-
-        if detached_runs.confirms_hold_stop(Path(runner_record), run["id"], request["id"]):
+        if detached_run_record.confirms_hold_stop(Path(runner_record), run["id"], request["id"]):
             return "stopped"
         # Prune can copy the confirmation and remove the record during this read.
         return read_stop_confirmation(request["id"])

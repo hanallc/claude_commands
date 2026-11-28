@@ -2578,13 +2578,13 @@ def _submission_reply_target(path: Path, key: new_item_dialog.ScopedSubmissionKe
     current = read_review_question(path, owner)
     details = review_submission(current)
     if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
-        raise new_item_dialog.SubmissionError("The selected Question changed.")
+        raise record_store.SubmissionError("The selected Question changed.")
     new_item_dialog.require_reply_token(details, token)
     exchanges = current.item.get("followups", [])
     repeated = current.status == "open" and "followup" not in current.item and bool(
         exchanges and exchanges[-1]["reply"] == words)
     if not repeated and not pending_review_reply(current):
-        raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+        raise record_store.SubmissionError("This item no longer accepts this reply.")
     return current, repeated
 
 
@@ -2607,7 +2607,7 @@ def prepare_submission_reply(path: Path, key: new_item_dialog.ScopedSubmissionKe
             if same_answer:
                 return False
             if current != selected:
-                raise new_item_dialog.SubmissionError("The selected Question changed.")
+                raise record_store.SubmissionError("The selected Question changed.")
             record_followup_reply(current.item, words, current.owner, review_unavailable=unavailable)
             write_question_record(current)
             return True

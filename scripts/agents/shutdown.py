@@ -24,7 +24,7 @@ def _usage() -> str:
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
-  agents clone NAME --as NEW
+  agents clone NAME NEW_NAME
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
@@ -63,6 +63,7 @@ from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
+from scripts.build_queue import admission_records
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
@@ -764,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--account", dest="account")
     command = commands.add_parser("clone")
     _ = command.add_argument("session", metavar="NAME")
-    _ = command.add_argument("--as", dest="new", required=True, metavar="NEW")
+    _ = command.add_argument("new", metavar="NEW_NAME")
     command = commands.add_parser("remove-stray")
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("session", metavar="SESSION")
@@ -1799,7 +1800,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     except copies.RemoteMirrorKept as error:
         print(f"refused: {error}")
         return 1
-    except copies.CopyError as error:
+    except admission_records.CopyError as error:
         print(f"anomaly: {error}".replace("\n", " "))
         if require_cleanup:
             return 1
@@ -1852,7 +1853,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
                 return 1
         try:
             copies.remove_trees(str(row.id))
-        except copies.CopyError as error:
+        except admission_records.CopyError as error:
             print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
         retirement_close_idle_shell(pane, row, record)
@@ -2077,7 +2078,7 @@ def retire_named_unit(name: str) -> int:
             row = named_staff_unit(name, record)
             unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record)
             return retirement_retire(unit, settings=settings, record=record)
-        except (RetirementRefused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable,
+        except (RetirementRefused, Refusal, ValueError, OSError, admission_records.CopyError, conf.Unusable,
                 unit_config.ConfigRefused, subprocess.SubprocessError) as error:
             print(f"retire: {error}")
             return 1

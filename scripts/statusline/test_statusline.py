@@ -1923,7 +1923,7 @@ class CountsRowTests(ConfiguredShellTests):
         self.questions({"since": "2026-10-16T19:00", "text": "Check the layout"})
         path = self.home / ".local/state/showrunner" / OWNER.id / "questions/question-fixture-0.md"
         origin = new_item_dialog.ReviewSubmission(
-            f'r1-{"a" * 32}-question-{OWNER.id}', "b" * 64, new_item_dialog.NoEvidence(), (), "c" * 64)
+            f'r1-{"a" * 32}-question-{OWNER.id}', "b" * 64, new_item_dialog.NoEvidence(), ())
         header, _, saved = path.read_text().partition("registration: ")
         registration, _, body = saved.partition("\n")
         fields = cast(dict[str, object], json.loads(registration))
@@ -1941,7 +1941,7 @@ class CountsRowTests(ConfiguredShellTests):
         self.questions({"since": "2026-10-16T19:00", "text": "Check the layout"})
         path = self.cache.parent.parent / OWNER.id / "questions" / "question-fixture-0.md"
         origin = new_item_dialog.ReviewSubmission(
-            f'r1-{"a" * 32}-question-{OWNER.id}', "b" * 64, new_item_dialog.NoEvidence(), (), "c" * 64)
+            f'r1-{"a" * 32}-question-{OWNER.id}', "b" * 64, new_item_dialog.NoEvidence(), ())
         header, _, saved = path.read_text().partition("registration: ")
         registration, _, body = saved.partition("\n")
         fields = cast(dict[str, object], json.loads(registration))

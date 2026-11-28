@@ -889,7 +889,7 @@ class NewItemServerTests(unittest.TestCase):
                     if recover:
                         review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
                         self.assertEqual(len(the_list.records(keeper.id)), count + 1)
-                        send.assert_called_once()
+                        self.assertEqual([call.args[0] for call in send.call_args_list], [keeper.id, owner.id])
                     retry = server.new_item_http(server.new_item_body(request), finished=True)
                     self.assertEqual(retry.status, 200, retry.body)
                     destination = investigation.load(keeper.id, native.id).list_destination
@@ -901,7 +901,7 @@ class NewItemServerTests(unittest.TestCase):
                     if page == "list":
                         self.assertEqual(json.loads(retry.body)["list_number"], recovered.number)
                     self.assertEqual(len(the_list.records(keeper.id)), count + 1)
-                    send.assert_called_once()
+                    self.assertEqual([call.args[0] for call in send.call_args_list], [keeper.id, owner.id])
 
     def test_initial_report_delivery_checks_the_transferred_native_record(self) -> None:
         case = test_review_submissions.ReviewSubmissionTests()
@@ -932,7 +932,9 @@ class NewItemServerTests(unittest.TestCase):
         wrapped = case.wrap_fixture()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(case.tidy_fixture(wrapped), (0, ""))
-        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=replace(wrapped, rows=(*wrapped.rows, keeper))))
+        members = replace(wrapped, rows=(*wrapped.rows, keeper))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=members))
+        _ = self.enterContext(mock.patch.object(staff, "authority_snapshot", return_value=members))
         self.assertFalse(saved.path.exists())
         successor = test_review_submissions.PRODUCER
         with mock.patch.object(change_page, "send_to_staff") as send:
@@ -1131,11 +1133,19 @@ class ListFilingRecoveryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(self.server.server, "review_cache", cache))
         _ = self.enterContext(mock.patch.object(self.server.server, "delivery_status", case.status))
         self.notices = self.enterContext(test_serve.new_item_notice_log(self.server.root, self.keeper))
-        request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex,
                           page_recipient=new_item_dialog.PageRecipient.SELECTED)
-        fields = cast(dict[str, object], json.loads(self.server.new_item_body(request)))
-        self.body = json.dumps({**fields, "list_assignee": self.unit}).encode()
+        # A legacy List draft could file for a showrunner and route the List row to a producer.
+        saved = review_submissions.submit(request)
+        route = review_submissions.ListFilingRoute(keeper=self.keeper, owner=owner.id, producer=self.producer,
+                                                   unit="", unit_id=self.unit, source="nate via /new_item")
+        route_file = review_submissions.image_folder(saved).parent / "list-filing.json"
+        _ = route_file.write_text(json.dumps(route), encoding="utf-8")
+        marker = route_file.with_name("first-message.json")
+        _ = marker.write_text(json.dumps({"kind": saved.kind, "request_id": saved.request_id,
+                                          "evidence_origin": ""}), encoding="utf-8")
+        self.body = self.server.new_item_body(request)
 
     def stage_pending_filing(self) -> None:
         with mock.patch("scripts.production.the_list._save", side_effect=OSError("The List write stopped.")):

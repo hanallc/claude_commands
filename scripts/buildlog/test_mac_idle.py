@@ -75,7 +75,7 @@ class MacIdleTests(NotificationGuardedTestCase):
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
         _ = write_config_fixture(self.root / "mac_test.conf",
-                                 "offload=on\nalert_seconds=180\nstale_seconds=300\n")
+                                 "alert_seconds=180\nstale_seconds=300\n")
         _ = write_config_fixture(self.root / "build_targets.conf")
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()

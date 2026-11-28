@@ -24,8 +24,12 @@ LIST_PAGE_PATH = "/console/list.html"
 STUDIO_PAGE_PATH = "/console/studio.html"
 
 
-def list_item_fragment(keeper: str, number: int) -> str:
-    return "#" + urlencode({"item": f"{keeper}/L{number}"})
+def list_item_fragment(keeper: str, number: int, *, only_item: bool = False) -> str:
+    key = f"{keeper}/L{number}"
+    fields = {"item": key}
+    if only_item:
+        fields["key"] = key
+    return "#" + urlencode(fields)
 
 
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
@@ -1057,25 +1061,46 @@ function trackHeldRequest(key,id){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver,resumable){
- const {hold}=request,host=sendUndoHost();
- const view=host.defaultView;
+function createSendToast(){
+ const host=sendUndoHost(),view=host.defaultView;
  if(!view.getSendUndoStack){
   // Install the observer in the top window so it stays active after a frame closes.
   const script=host.createElement('script');script.textContent=SEND_UNDO_STACK_SCRIPT;
   host.head.append(script);script.remove();
  }
- const stack=view.getSendUndoStack();
- const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
- const bar=host.createElement('div');
+ const toast=host.createElement('div'),text=host.createElement('span');
+ toast.dataset.sendUndo='';toast.append(text);view.getSendUndoStack().append(toast);
+ return {host,view,toast,text};
+}
+function fadeSendToast(toast,duration){
+ return toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],{duration,easing:'linear',fill:'forwards'});
+}
+function filedReceiptText(response,result,filedReceipt){
+ return response?.ok && result && !result.send_failure && filedReceipt?.(result);
+}
+function showFiledReceipt(toast,text,message,remove){
+ text.textContent=message;toast.hidden=false;
+ fadeSendToast(toast,3000).finished.then(remove,remove);
+}
+async function showImmediateReceipt(request,response,filedReceipt){
+ if(!filedReceipt || !response.ok || request.closed) return;
+ const result=await response.clone().json().catch(()=>null);
+ const message=filedReceiptText(response,result,filedReceipt);
+ if(!message || request.closed) return;
+ const {toast,text}=createSendToast();
+ showFiledReceipt(toast,text,message,()=>toast.remove());
+}
+function showSendUndo(request,seconds,receiver,resumable,filedReceipt){
+ const {hold}=request,{host,view,toast,text}=createSendToast();
+ const button=host.createElement('button'),bar=host.createElement('div');
  const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
- toast.dataset.sendUndo='';text.textContent=receiver || receiver===null ? sent : 'Sending.';
+ text.textContent=receiver || receiver===null ? sent : 'Sending.';
  button.type='button';button.textContent='Undo';
- bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
- // The Undo stays clear for the first half of the time, then fades out until the send leaves.
+ bar.dataset.sendUndoBar='';toast.append(button,bar);
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
- const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
+ const countdown=fadeSendToast(toast,timing.duration);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
+ const removeUndo=()=>{button.remove();bar.remove();};
  return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
@@ -1090,6 +1115,13 @@ function showSendUndo(request,seconds,receiver,resumable){
   const reportResult=async(response,late=false,warning)=>{
    const result=await response?.clone().json().catch(()=>null);
    if(request.closed || !toast.parentNode) return;
+   const message=filedReceiptText(response,result,filedReceipt);
+   if(message){
+    removeUndo();
+    countdown.cancel();
+    showFiledReceipt(toast,text,(late ? 'Too late to undo. ' : '')+message,remove);
+    return;
+   }
    if(!late && !result?.send_failure && (!warning || response?.ok)){
     if(warning) warning.then(remove);
     else remove();
@@ -1099,7 +1131,7 @@ function showSendUndo(request,seconds,receiver,resumable){
     ? (result.no_message ? 'Saved.' : sent)
     : result?.send_failure || result?.reason || result?.error || 'The send result is unavailable.';
    text.textContent=(late ? 'Too late to undo. ' : '')+summary;
-   fade.cancel();toast.hidden=false;
+   countdown.cancel();toast.hidden=false;
    removalTimer=view.setTimeout(remove,3000);
   };
   const close=()=>{
@@ -1108,14 +1140,14 @@ function showSendUndo(request,seconds,receiver,resumable){
   };
   request.closeToast=close;
   window.addEventListener('pagehide',close);
-  fade.finished.then(()=>{
+  countdown.finished.then(()=>{
    if(done) return;
    done=true;
-   button.remove();bar.remove();toast.hidden=true;
+   removeUndo();toast.hidden=true;
    resolve(reportResult);
   },()=>{});
   button.addEventListener('click',async()=>{
-   button.disabled=true;fade.pause();shrink.pause();
+   button.disabled=true;countdown.pause();shrink.pause();
    const signal=resumable ? holdRequestSignal() : undefined;
    let answer=null;
    for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
@@ -1132,7 +1164,7 @@ function showSendUndo(request,seconds,receiver,resumable){
     return;
    }
    done=true;
-   button.remove();bar.remove();fade.cancel();
+   removeUndo();countdown.cancel();
    if(answer?.status===409){
     text.textContent='Too late to undo. Checking the result…';
     resolve(response=>reportResult(response,true));
@@ -1145,7 +1177,7 @@ function showSendUndo(request,seconds,receiver,resumable){
   });
  });
 }
-async function heldFetch(url,{holdRequestId,...init}={},receiver,onHold,holdId){
+async function heldFetch(url,{holdRequestId,filedReceipt,...init}={},receiver,onHold,holdId){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
  const key=holdId ?? holdRequestId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
@@ -1160,8 +1192,10 @@ async function heldFetch(url,{holdRequestId,...init}={},receiver,onHold,holdId){
   if(!keepalive) throw error;
   return post(false);
  });
- if(first.headers.get('X-Send-Hold')!=='held'){
-  if(!(first.status>=500)) request.finish();
+ const holdStatus=first.headers.get('X-Send-Hold');
+ if(holdStatus!=='held'){
+  if(first.status<500 || holdStatus==='refused') request.finish();
+  if(filedReceipt) await showImmediateReceipt(request,first,filedReceipt);
   return first;
  }
  const {hold,seconds}=await first.json();
@@ -1169,12 +1203,14 @@ async function heldFetch(url,{holdRequestId,...init}={},receiver,onHold,holdId){
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver,Boolean(holdId));
+  const shown=showSendUndo(request,seconds,receiver,Boolean(holdId),filedReceipt);
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
- return readHeldResult(hold,request,undo,Boolean(holdId));
+ const result=await readHeldResult(hold,request,undo,Boolean(holdId));
+ if(filedReceipt && !undo) await showImmediateReceipt(request,result,filedReceipt);
+ return result;
 }
 async function readHeldResult(hold,request,undo,resumable){
  // A server restart drops the connection; the held send waits in its file, so read its result again.
@@ -1204,15 +1240,17 @@ heldFetch.resume=id=>{
  return readHeldResult(request?.hold ?? id,request,false,true);
 };
 function sendActionReceiver(form,data){
- const action=data.get('outcome') ?? data.get('action');
- if(data.get('action')==='works') return null;
- if(data.get('action')==='not works') return form.dataset.repairReceiver;
- const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
+ const changeAction=data.get('action');
+ if(changeAction==='works') return null;
+ if(changeAction==='not works') return form.dataset.repairReceiver;
+ const action=data.get('outcome') ?? changeAction;
  if(action==='approve' && data.get('assignee')){
   const option=form.elements.assignee?.selectedOptions[0];
   return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
  }
- return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+ const labels=JSON.parse(form.dataset.sendLabels || '{}');
+ const withWords=action+'-with-words';
+ return labels[data.get('feedback')?.trim() && Object.hasOwn(labels,withWords) ? withWords : action];
 }
 window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
 })();

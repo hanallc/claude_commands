@@ -955,7 +955,11 @@ Changing the producer keeps **None** selected.
 The browser keeps the assignee choice in the submitted draft for recovery and Retry.
 **Undo** restores the assignee choice.
 **Send** closes the New item dialog at once.
-The user can work on the page while the fading **Undo** toast shows.
+The user can work on the page while the **Undo** toast shows.
+The toast fades during the Undo time for every send.
+If the reply includes a List number, the same toast shows the number and any owner and producer names.
+The receipt starts a new fade at full opacity.
+The server sends the notice even if it cannot read the receipt.
 **Undo** reopens the dialog with the same type, recipient, words, images and page capture.
 A failed send reopens the draft and shows the error.
 A retry after a lost response sends the original request again.
@@ -1039,9 +1043,11 @@ An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
 A Response shows the original Question, the owner's latest answer, its time and the log.
-**Got it** closes the native Question.
+**Got it** sends Your words to the owner as feedback and closes the native Question.
+With an empty field, **Got it** marks the Question read and closes it.
 **Ask a follow-up** sends Your words to the same owner with a new reply token for the same key.
-The Your words placeholder names **Ask a follow-up** as the action that sends the text.
+The Your words placeholder explains what each button does.
+When Undo is enabled, the Response stays visible until the follow-up Undo toast appears.
 The Question waits for that reply, then returns as a Response with the same key.
 Both actions retain the current filters.
 
@@ -3135,15 +3141,75 @@ The toast uses the console colors.
 The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
 Images, Review, and List hide the item while the Undo toast is available.
+A Response follow-up in a List dialog stays open until the Undo toast appears.
+The Review save response uses the Boolean `words_saved` to confirm that it saved the submitted words.
+A confirmed send clears only the draft that it sent.
+Review and the List keep newer words in the card or in a copy beside a notice.
 **Undo** posts `/send-hold/<id>/undo`. The server replaces the saved request with an undone mark and answers 200.
 A repeated Undo, after a lost answer, also gets 200.
 The page then shows "Undone. Edit and send again." and keeps the draft.
 **Undo** restores the item. If the item is still open, **Undo** focuses its editable draft field.
 A failed send restores the item and its draft with the failure message.
+Review keeps the draft when the server saves the record and reports a delivery failure.
+Response sends report delivery failures when Undo is off.
+When Review hides or removes a card, the notice shows its unsaved words.
+The notice uses the current draft. A confirmed retry clears the refusal for that draft.
+The **Not saved** button opens the list of unsent words. Each entry offers the original card action.
+A change to the card state, action, or recipient stops the retry.
+The entry shows **Open the card** and asks the user to choose again.
+When Review cannot save an action, it files a Bug for morty with the page, card, refusal, and submitted words.
+If delivery fails, Review sends the reply and then files a Bug for morty.
+The save report supplies a link to the Bug's List item after the first failure or a failed retry.
+The entry shows “Not saved. Bug 556 is filed.” when the report supplies a Bug.
+Without a Bug, the entry shows “Not saved.”
+The Bug number opens the List item in an overlay above Review.
+Closing the overlay returns focus to the Bug link and keeps the draft.
+The List item links to the native Bug and has its own number.
+Failures on the same page with the same cause reuse a Bug when the native Bug and its List item are open.
+Each repeat adds one line to the Bug log.
+Closing or removing the List item makes the next failure file a new Bug with a new List number.
+A repeat report for the same save attempt omits the link when its List item is closed.
+The card and its inline draft can show the refusal before Bug filing.
+The list entry stays visible if filing fails.
+A lost reply or an expired held result shows that the save outcome is unknown.
+The server keeps one record for each save. Review and the List use it to check the save outcome.
+The server refuses the action if it cannot persist the pending attempt before the save.
+Before it admits a hold, the server records the hold ID in the pending attempt.
+Browser attempts for the same hold refer to the same record.
+If a Review hold fails before replay sends any bytes, the server records a refusal.
+The save report uses that refusal to file a Bug.
+If the hold folder rejects the release write, the server records the result in the adjacent refusal folder.
+Recovery uses this result to block replay even if the pending file remains.
+If transmission fails after it starts, Review reports an unknown outcome until the save has a confirmed result.
+On restart, the replay guard changes an unresolved held attempt to unknown.
+The guard prevents another replay.
+A status check retries each pending or unknown report.
+A report ends when the server confirms the save, refusal, missing record, or Undo.
+A confirmed hold refusal retires the hold ID. The next send uses a new ID, even when the words match.
+The server records whether it saved the words and records the delivery ID before it sends the message.
+For Response feedback, it records the delivery ID and retry target before it saves the feedback.
+The server continues delivery if the attempt record write fails after the native save.
+The server updates the record with the delivery result. The Undo result uses that record to report the outcome.
+An attempt in progress stays pending. A refused attempt uses the Bug for its refusal.
+An interrupted write stays pending if the server cannot confirm the save.
+If the delivery result write fails for Response feedback, recovery checks the native delivery status.
+A confirmed delivery updates the attempt record, clears the entry, and files no Bug.
+A failed delivery can still retry with its original delivery ID.
+If the server has no record of the attempt, Review reports the connection error.
+The server does not accept a late request for an attempt it reported missing. A retry sends a new attempt.
+A saved attempt clears its Not saved entry when the outcome confirms that the server saved the words and reports no delivery failure.
+A recovered delivery failure keeps the draft and its retry action.
+**Got it** retries the saved feedback delivery, even after the closed Response leaves the index.
+The retry uses the original delivery ID. It clears the draft after delivery succeeds.
+Newer edits stay in the draft.
+The List keeps pending attempts when a linked card closes. A List refresh can check them with the card closed.
+Review reports refusals from the Undo checks with the submitted words.
+Confirmed Undo keeps the draft and files no Bug.
 The New item dialog and the linked Review card reopen with the draft.
 You can open a new draft or another linked card while a send waits.
 The List keeps a separate recovery slot for each unresolved draft in the browser tab.
-If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
+An unreadable save response keeps the draft and shows that the save is unconfirmed.
+If a confirmed save has unavailable detail, the List shows the refresh error.
 A successful List refresh clears the error.
 A change browser answer goes back in the list with an **Open it** button.
 **Undo** restores the Review or List row in the current sort order.

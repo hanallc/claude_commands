@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Self, TextIO, cast
+from typing import Callable, Literal, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
 from scripts.lib import user_zone as user_zone_config
@@ -44,9 +44,8 @@ from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
-from scripts.production import the_list
 from scripts.production.staff_test_support import fixture_member
-from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
+from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_path, question_record, review_link
 from scripts.review_links import list_page, staff_names, test_change_page
@@ -459,14 +458,18 @@ window.fetch=(url,options)=>{
   'The Response shows both labeled actions and Your words.');
  check(form.querySelector('.review-action-group:last-child [data-color-text="role.showrunner"]')?.textContent==='page-owner',
   'The Response action heading shows the showrunner color.');
- check(form.elements.feedback.placeholder==='Type your words for Ask a follow-up.',
-  'The placeholder says which action sends the words.');
+ check(form.elements.feedback.placeholder==='Got it sends your words and closes the item. Ask a follow-up sends a question.',
+  'The placeholder explains both actions.');
+ const data=new URLSearchParams({outcome:'read'});
+ check(sendActionReceiver(form,data)===null,'Got it without words has no receiver.');
+ data.set('feedback','Thank you.');
+ check(sendActionReceiver(form,data)==='page-owner','Got it with words names the owner.');
  const id=recordFromDetail(form).dataset.key;
  if(action==='question') form.elements.feedback.value='Can I use it on a phone?';
  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
  const motion=copy(id)?.getAnimations()[0];
  if(!motion || !posts.has(row.dataset.key)) throw new Error('The Response save must start the fade.');
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:action==='question',state,type:action==='read'?'response':'question',later:0})});
  motion.finish();await frame();
  check(postCount===1 && !rows().some(item=>item.dataset.type==='response'),
   'The Response leaves the view after one submit.');
@@ -474,6 +477,1228 @@ window.fetch=(url,options)=>{
   selected('type')===responses && selected('show')===chip('show','all') && words.value==='which layout',
   'The Response submit keeps each filter and the sort.');
 """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_response_followup_hides_the_card_when_undo_shows(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until}=fixtureUndo(),failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const respond=window.fetch;
+ let releaseHold;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST' && !String(url).endsWith('/undo'))
+   return new Promise(resolve=>{releaseHold=()=>resolve(respond(url,options));});
+  return respond(url,options);
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const row=()=>document.querySelector('[data-list-item][data-type="response"]');
+  row().querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row());
+  const words='Can I use it on a phone?';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(()=>releaseHold,'The follow-up did not request a hold.');
+  check(row()?.isConnected && recordIsOpen(row()),'The Response stays open until the Undo toast shows.');
+  releaseHold();
+  const toast=()=>window.top.document.querySelector('[data-send-undo]');
+  await until(()=>toast()?.querySelector('button'),'The follow-up Undo toast did not show.');
+  check(!row() && toast().querySelector('span').textContent==='Sent to page-owner.',
+   'The response leaves the table when the toast names the owner.');
+  check(toast().getAnimations().some(animation=>animation.effect.getKeyframes().at(-1).opacity==='0'),
+   'The toast fades out.');
+  toast().querySelector('button').click();
+  await until(()=>recordIsOpen(row()) && !toast(),'Undo did not return the Response.');
+  const restored=await readyReviewCard(row());
+  check(restored.elements.feedback.value===words && posts.length===1 && posts[0].get('outcome')==='question',
+   'Undo restores the draft and sends no second follow-up.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_response_delivery_failure_keeps_the_card_and_words(self) -> None:
+        self.check_response_delivery_failure(lost=False)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_lost_response_delivery_failure_keeps_the_card_words_and_retry(self) -> None:
+        self.check_response_delivery_failure(lost=True)
+
+    def check_response_delivery_failure(self, *, lost: bool) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),heldFetch=window.fetch,failures=[];
+ const content=document.querySelector('[data-review]'),message='Delivery failed: The owner is offline.';
+ const retryFailure='Delivery failed: The relay stopped.';
+ const lost=LOST;
+ let report,reported,retried,retries=0;
+ const row=()=>content.querySelector('[data-list-item][data-type="response"]');
+ const empty={version:'after-save',index:{n:[],r:[]},facts:pageRefreshFacts()};
+ window.fetch=(url,options)=>{
+  if(url===reviewSaveFailurePath) return new Promise(resolve=>{report=resolve;reported=new URLSearchParams(options.body);});
+  if(url==='/console/review-delivery-retry'){
+   retried=new URLSearchParams(options.body);
+   if(++retries===1) return Promise.resolve(Response.json({outcome:'saved',words_saved:true,
+    send_failure:retryFailure,retry_delivery:true}));
+   return Promise.resolve(Response.json({outcome:'saved',words_saved:true}));
+  }
+  if(String(url).endsWith('/'+'a'.repeat(24)))
+   return lost ? Promise.resolve(Response.json({hold_state:'missing'},{status:404})) :
+    Promise.resolve(Response.json({answer:'feedback sent',words_saved:true,detail_closed:true,send_failure:message}));
+  const query=new URL(url,location.href).searchParams;
+  if(query.get('version')==='1' || query.has('index')) return Promise.resolve(Response.json(empty));
+  return heldFetch(url,options);
+ };
+ try{
+  row().querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row()),words='Thank you for the answer.';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  const toast=()=>top.document.querySelector('[data-send-undo]');
+  await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
+  toast().getAnimations()[0].finish();
+  await until(()=>content.dataset.version===empty.version,'The refreshed index did not arrive.');
+  await until(()=>report,'Review did not check the delivery failure.');
+  report(Response.json({outcome:'saved',words_saved:true,send_failure:message,hold:'a'.repeat(24),
+   retry_delivery:true,bug:{label:'Bug 42',href:'/console/list.html#item=morty%2FL42'}}));
+  await until(()=>!reviewSaveReports.active,'The outcome check did not finish.');
+  const entry=document.querySelector('[data-draft-list-key]');
+  if(!entry?.textContent.includes('Bug 42')) failures.push('Not saved shows the Bug for the failed delivery.');
+  if(lost){
+   if(entry?.querySelector('textarea').value!==words || entry?.querySelector('p').textContent!=='Not saved. Bug 42 is filed.' ||
+    entry?.querySelector('button').textContent!=='Got it')
+    failures.push('The receipt keeps the words, the delivery failure, and Got it in Not saved.');
+  }
+  const current=row() && recordDetails(row()).querySelector('[data-review-form]');
+  if(!current?.isConnected || !recordIsOpen(row()) || current.elements.feedback.value!==words ||
+   current.querySelector('[data-send-status]').textContent!==message)
+   failures.push('A failed delivery keeps the Response, the words, and the failure after refresh.');
+  if(lost){
+   document.querySelector('[data-review-draft-toggle]').click();
+   const button=entry.querySelector('button');
+   if(button.disabled) failures.push('Got it remains enabled for the closed Response.');
+   const originalReport=reported;
+   report=null;
+   button.click();
+   await until(()=>retried,'Got it did not retry delivery.');
+   if(retried.get('row')!==originalReport.get('row') || retried.get('token')!==originalReport.get('token') ||
+    retried.get('failure_attempt')!==originalReport.get('failure_attempt') || retried.has('feedback'))
+    failures.push('Got it retries the signed delivery without submitting the feedback again.');
+   await until(()=>report && !button.disabled,'Got it did not report the failed retry.');
+   if(entry.textContent.includes('Bug 42') || entry.querySelector('p').textContent!=='Not saved.')
+    failures.push('Not saved clears the old Bug after the retry fails.');
+   report(Response.json({outcome:'saved',words_saved:true,send_failure:retryFailure,hold:'a'.repeat(24),
+    retry_delivery:true,bug:{label:'Bug 43',href:'/console/list.html#item=morty%2FL43'}}));
+   await until(()=>!reviewSaveReports.active,'The retry report did not finish.');
+   if(!entry.textContent.includes('Bug 43') || entry.textContent.includes('Bug 42') ||
+    entry.querySelector('p').textContent!=='Not saved. Bug 43 is filed.')
+    failures.push('Not saved shows the reason and Bug from the latest failed retry.');
+   button.click();
+   await until(()=>!document.querySelector('[data-draft-list-key]'),'A successful retry did not clear Not saved.');
+  }
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe.replace('LOST', json.dumps(lost))+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_words_require_explicit_save_confirmation(self) -> None:
+        ready = self.investigation()
+        investigation_key = f'investigation/{ready.owner}/{ready.id}'
+        question = self.question()
+        change = self.change_with_unread_answer()
+        markup = browser_markup(self.root)
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[];
+ const {key,action,words,result,expected}=CASE,content=document.querySelector('[data-review]');
+ const fetchPage=window.fetch;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST') return Promise.resolve(Response.json(result));
+  const query=new URL(url,location.href).searchParams;
+  if(query.get('version')==='1')
+   return Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));
+  return fetchPage(url,options);
+ };
+ try{
+  const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row),field=form.elements.feedback;
+  field.value=words;field.dispatchEvent(new Event('input',{bubbles:true}));
+  const button=form.querySelector('[value="'+action+'"]');
+  if(!button) throw new Error('The action is missing.');
+  form.requestSubmit(button);
+  await until(()=>!form.dataset.sending,'The save did not finish.');
+  const copy=()=>content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"] textarea');
+  if(expected==='retained') await until(copy,'The acknowledgement did not show the draft after the fade.');
+  if(expected==='cleared' && (field.value || copy()))
+   failures.push('The confirmed words clear from the field and the notice.');
+  if(expected==='retained' && copy()?.value!==words)
+   failures.push('The acknowledgement leaves the words in the notice.');
+  if(expected==='unconfirmed' && (!field.isConnected || field.value!==words ||
+    !form.querySelector('[data-send-status]').textContent.includes('The save outcome is not known yet.')))
+   failures.push('A missing or invalid confirmation keeps the form and its words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for key, action, words, fields, expected in (
+            (investigation_key, 'read', 'The repair passed.', {'words_saved': True}, 'cleared'),
+            (question, 'answer', 'marked read', {'words_saved': True}, 'cleared'),
+            (change, 'read', 'Keep this draft.', {'words_saved': False, 'state': 'Open'}, 'retained'),
+            (question, 'answer', 'Keep this answer.', {'answer': 'Keep this answer.'}, 'unconfirmed'),
+            (question, 'answer', 'Keep this reply.', {'answer': 'Keep this reply.', 'words_saved': 'true'}, 'unconfirmed'),
+        ):
+            with self.subTest(key=key, fields=fields, expected=expected):
+                result = {'answer': 'marked read', 'detail_closed': True, 'state': 'Done', **fields}
+                case = dict(key=key, action=action, words=words, result=result, expected=expected)
+                page = markup.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>')
+                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_refresh_keeps_unsent_words_when_a_response_disappears(self) -> None:
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[];
+ const content=document.querySelector('[data-review]');
+ const row=content.querySelector('[data-list-item][data-type="response"]');
+ const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+ const fresh={version:'after-close',index:{...index,r:index.r.filter(entry=>entry[0]!==row.dataset.key)},
+  facts:pageRefreshFacts()};
+ try{
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row),words='These words are still unsent.';
+  form.elements.feedback.value=words;
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  window.fetch=(url,options)=>{
+   const query=new URL(url,location.href).searchParams;
+   if(query.has('index') || query.get('version')==='1') return Promise.resolve(Response.json(fresh));
+   return realFetch(url,options);
+  };
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await until(()=>content.dataset.version===fresh.version,'The index did not refresh.');
+  const draft=content.querySelector('textarea[data-review-draft]');
+  if(form.isConnected || !draft?.getClientRects().length || draft.value!==words)
+   failures.push('Refresh shows the unsent words when the Response closes in another tab.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_missing_response_shows_the_refusal_with_a_copy_of_the_words(self) -> None:
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        markup = browser_markup(self.root)
+        probe = r"""<script>
+(async()=>{
+ const realFetch=window.fetch,failures=[],content=document.querySelector('[data-review]');
+ const reason='This item is already Done.',empty={version:'after-close',index:{n:[],r:[]},facts:pageRefreshFacts()};
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST') return Promise.resolve(Response.json({reason},{status:409}));
+  const query=new URL(url,location.href).searchParams;
+  if(query.get('version')==='1' || query.has('index')) return Promise.resolve(Response.json(empty));
+  return realFetch(url,options);
+ };
+ try{
+  const row=content.querySelector('[data-list-item][data-type="response"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row),words='Keep these words.\nAnd this second line.';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  const findDraft=()=>content.querySelector('textarea[data-review-draft]');
+  const end=performance.now()+8000;
+  while((content.dataset.version!==empty.version || !findDraft()?.closest('section')?.textContent.includes(reason))
+   && performance.now()<end)
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  const draft=findDraft();
+  if(form.isConnected || content.dataset.version!==empty.version || !draft?.getClientRects().length ||
+   !draft.readOnly || draft.value!==words ||
+   !draft.closest('section')?.textContent.includes(reason))
+   failures.push('When the stale card leaves Review, the refusal shows a visible copy of its words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_refused_response_shows_its_words_while_another_card_is_open(self) -> None:
+        self.check_response_refusal_notice(retry=False)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_confirmed_response_retry_removes_the_refusal_notice(self) -> None:
+        self.check_response_refusal_notice(retry=True)
+
+    def check_response_refusal_notice(self, *, retry: bool) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),heldFetch=window.fetch,failures=[];
+ const retry=RETRY,content=document.querySelector('[data-review]'),reason='This item changed.';
+ const responseRow=()=>content.querySelector('[data-list-item][data-type="response"]');
+ const first=responseRow(),key=first.dataset.key;
+ const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+ const fresh={version:'after-close',index:retry ? index : {...index,r:index.r.filter(row=>row[0]!==key)},facts:pageRefreshFacts()};
+ const other=()=>content.querySelector('[data-list-item][data-key="page-owner/C1"]');
+ const toast=()=>top.document.querySelector('[data-send-undo]');
+ let refused=false;
+ window.fetch=(url,options)=>{
+  if(String(url).endsWith('/'+'a'.repeat(24))){
+   if(refused) return Promise.resolve(Response.json({answer:'feedback sent',words_saved:true,detail_closed:true,state:'Done'}));
+   refused=true;
+   return Promise.resolve(Response.json({reason},{status:409}));
+  }
+  const query=new URL(url,location.href).searchParams;
+  if(refused && (query.has('index') || query.get('version')==='1')) return Promise.resolve(Response.json(fresh));
+  return heldFetch(url,options);
+ };
+ try{
+  first.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(first),words='These words belong to the Response.';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
+  other().querySelector('.list-toggle').click();
+  const otherForm=await readyReviewCard(other()),otherWords='These words belong to the Change.';
+  otherForm.elements.feedback.value=otherWords;
+  otherForm.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  toast().getAnimations()[0].finish();
+  await until(()=>content.dataset.version===fresh.version,'The index did not refresh after the refusal.');
+  const notice=()=>content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"]');
+  const draft=notice()?.querySelector('textarea[data-review-draft]');
+  if(!draft?.getClientRects().length || draft.value!==words || !draft.closest('section')?.textContent.includes(reason))
+   failures.push('The refused Response shows its words after the user opens another card.');
+  if(!recordIsOpen(other()) || recordDetails(other()).querySelector('[name="feedback"]').value!==otherWords)
+   failures.push('The other card keeps its own words.');
+  if(retry){
+   responseRow().querySelector('.list-toggle').click();
+   const recovered=await readyReviewCard(responseRow());
+   if(recovered.elements.feedback.value!==words) failures.push('The form restores the refused words.');
+   recovered.requestSubmit(recovered.querySelector('[value="read"]'));
+   await until(()=>toast()?.getAnimations().length,'The retry did not request a hold.');
+   await until(notice,'The retry did not show the draft after the fade.');
+   if(notice()?.querySelector('textarea')?.value!==words)
+    failures.push('The notice keeps the words until the retry is confirmed.');
+   toast().getAnimations()[0].finish();
+   await until(()=>!recovered.dataset.sending,'The retry did not finish.');
+   if(notice()) failures.push('The confirmed retry removes the refusal notice for its words.');
+  }
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe.replace('RETRY', json.dumps(retry))+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    def long_review_with_response(self) -> str:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=0\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        items = review_items.read(self.root)
+        change = next(item for item in items if item.type == review_items.ReviewType.CHANGE)
+        rows = [*items, *(replace(change, key=f'change-{number}', id=f'C{number}', title=f'Check layout change {number}')
+                          for number in range(4, 85))]
+        with patch.object(review_items, 'read', return_value=rows):
+            return browser_markup(self.root)
+
+    def change_with_unread_answer(self) -> str:
+        key = 'page-owner/C1'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Did the check pass?'), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        pending = self.status.slots(delivery.page, delivery.row).question
+        assert isinstance(pending, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(key, 'The check passed.', pending.question_id, self.status))
+        return key
+
+    def check_not_saved_list(self, steps: str, *, card_key: str = '', listing: bytes | None = None) -> None:
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[],content=document.querySelector('[data-review]');
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const requests=[],filings=[];
+ window.fetch=(url,options)=>{
+  if(url===reviewSaveFailurePath)
+   return new Promise(respond=>filings.push({respond,body:new URLSearchParams(options.body)}));
+  if(options?.method==='POST') return new Promise(resolve=>requests.push(resolve));
+  if(new URL(url,location.href).searchParams.get('version')==='1')
+   return Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));
+  return realFetch(url,options);
+ };
+ const refuse=(request,status,reason,failedAttempt)=>requests[request](Response.json({reason,failure_attempt:failedAttempt},{status}));
+ const row=key=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+ const open=async row=>{
+  row.querySelector('.list-toggle').click();
+  return readyReviewCard(row);
+ };
+ const draftButton=document.querySelector('[data-review-draft-toggle]');
+ const list=document.querySelector('#review-draft-list');
+ const inline=key=>content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"]');
+ const entry=key=>list.querySelector('[data-draft-list-key="'+CSS.escape(key)+'"]');
+ try{
+  top.document.body.style.margin='0';
+  frameElement.style.cssText='display:block;width:100vw;height:100vh;border:0';
+  await paint();
+  const cardKey=CARD_KEY;
+  const card=cardKey ? row(cardKey) : content.querySelector('[data-list-item][data-type="response"]');
+  const key=card.dataset.key,form=await open(card);
+  const words='Keep these draft words.';
+  form.elements.feedback.value=words;
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  STEPS
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        script = probe.replace('CARD_KEY', json.dumps(card_key)).replace('STEPS', steps)
+        markup = self.long_review_with_response().replace('</body>', script+'</body>')
+        if listing is None:
+            self.assertEqual(firefox_probe_results(markup.encode(), window_size=(1440, 900)), [[]])
+        else:
+            from scripts.review_links.test_page_frame import window_probe_results
+
+            pages = {review_page.PAGE_PATH: markup.encode(), list_page.PAGE_PATH: listing}
+            self.assertEqual(window_probe_results(pages, review_page.PAGE_PATH, 'firefox'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_shows_the_bug_number_on_the_card_line(self) -> None:
+        morty = fixture_member('producer', name='morty')
+        item = the_list.add(morty.id, 'Review save failed', owner=morty.id, source='nate', changes={}, number=42)
+        _ = the_list.add(morty.id, 'Another List item', owner=morty.id, source='nate', changes={})
+        listing = list_page.render(self.root, include_counts=False, status=self.status)
+        href = list_page.PAGE_PATH + list_page.item_link(morty.id, item.number, only_item=True)
+        bug = {'label': 'Bug 42', 'href': href}
+        steps = r"""
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  const failedAttempt='b'.repeat(32);
+  refuse(0,400,'Review refused the save.',failedAttempt);
+  await until(()=>filings.length===1 && entry(key),'The refusal did not reach the list.');
+  draftButton.click();
+  const message=entry(key).querySelector('p'),title=entry(key).querySelector('strong');
+  check(message.textContent==='Not saved.' && !message.querySelector('a'),'A pending filing shows only Not saved.');
+  check(filings[0].body.get('failure_attempt')===failedAttempt,'The report uses the attempt from the refusal.');
+  filings[0].respond(Response.json({outcome:'refused',bug:BUG_LINK}));
+  await until(()=>!reviewSaveReports.active,'The report did not finish.');
+  if(message.textContent!=='Not saved. Bug 42 is filed.')
+   throw new Error('The card line shows '+JSON.stringify({line:message.textContent,bug:reviewDrafts.get(key).filedBug}));
+  const link=message.querySelector('a');
+  check(link.textContent==='Bug 42' && link.getAttribute('href')===BUG_LINK.href,'The line links to the List item.');
+  check(title.nextElementSibling===message && entry(key).textContent.split('Bug 42').length===2,
+   'The title has no separate Bug label.');
+  check(entry(key).querySelector('textarea').value===words,'The entry keeps the submitted words.');
+  const place=location.href;
+  link.focus();
+  link.click();
+  const dialog=document.getElementById('review-bug-dialog'),frame=dialog.querySelector('iframe');
+  const opened=()=>frame.contentDocument?.readyState==='complete' &&
+   frame.contentDocument.querySelector('[data-number="42"] .list-toggle[aria-expanded="true"]');
+  await until(()=>dialog.open && opened(),'The List item did not open in the overlay.');
+  const listing=frame.contentDocument;
+  check(listing.body.innerText.includes('Review save failed') && !listing.body.innerText.includes('Another List item') &&
+   location.href===place,'The overlay shows only the linked List item and keeps the Review address.');
+  opened().dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  await until(()=>!dialog.open && document.activeElement===link,'Escape returns focus to the Bug link.');
+  link.click();
+  await until(()=>dialog.open && opened(),'The List item did not reopen.');
+  dialog.querySelector('[data-close]').click();
+  await until(()=>!dialog.open && document.activeElement===link,'Close returns focus to the Bug link.');
+  check(!list.hidden && entry(key).querySelector('textarea').value===words,'The overlay keeps the list and its draft.');
+ """
+        self.check_not_saved_list(steps.replace('BUG_LINK', json.dumps(bug)), listing=listing)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_shows_only_not_saved_when_bug_filing_fails(self) -> None:
+        self.check_not_saved_list(r"""
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  refuse(0,400,'The first save was refused.','b'.repeat(32));
+  await until(()=>filings.length===1,'The first report is missing.');
+  filings[0].respond(Response.json({outcome:'refused',bug:{label:'Bug 42',href:'/console/list.html#item=morty%2FL42'}}));
+  await until(()=>entry(key)?.textContent.includes('Bug 42') && !entry(key).querySelector('button').disabled,
+   'The first Bug number is missing.');
+  draftButton.click();
+  entry(key).querySelector('button').click();
+  await until(()=>requests.length===2,'The retry did not submit.');
+  refuse(1,400,'The retry was refused.','c'.repeat(32));
+  await until(()=>filings.length===2 && reviewDrafts.get(key)?.message.includes('The retry was refused.'),
+   'The card draft did not receive the new refusal.');
+  filings[1].respond(Response.json({outcome:'refused',reason:'The retry was refused.'}));
+  await until(()=>!reviewSaveReports.active,'The report did not finish.');
+  check(entry(key).querySelector('p').textContent==='Not saved.' && !entry(key).querySelector('a') &&
+   entry(key).querySelector('textarea').value===words && draftButton.textContent==='Not saved: 1',
+   'A filing failure leaves only Not saved and keeps the words.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_reports_a_lost_save_after_reconnect(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,attempts=[],reports=[];
+  let reachable=false;
+  window.fetch=async(url,options)=>{
+   if(String(url)===reviewSaveFailurePath){
+    reports.push(new URLSearchParams(options.body));
+    if(!reachable) throw new TypeError('Connection lost.');
+    return Response.json({outcome:'missing',reason:'Connection lost.',bug:{label:'Bug 43',href:'/console/list.html#item=morty%2FL43'}});
+   }
+   if(options?.method==='POST'){
+    attempts.push(new Headers(options.headers).get(reviewSaveAttemptHeader));
+    throw new TypeError('Connection lost.');
+   }
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reports.length>0 && !reviewSaveReports.active &&
+   reviewDrafts.get(key)?.message.includes('The save outcome is not known yet.'),
+   'The save did not fail before reconnect.');
+  const pending=reports.length;
+  reachable=true;
+  await reviewFetch(location.pathname+'?version=1');
+  await until(()=>entry(key).textContent.includes('Bug 43'),'The report did not return a Bug number.');
+  const report=reports.at(-1);
+  check(reports.length===pending+1 && report.get('failure_attempt')===attempts[0] && report.get('row')===key &&
+   report.get('feedback')===words && report.get('reason')==='Connection lost.',
+   'The report keeps the original attempt, card, words, and reason.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_waits_for_the_refusal_and_shows_its_bug(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,reason='The card changed while the save was in progress.';
+  let checks=0,refused=false;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath){
+    checks++;
+    return Promise.resolve(refused ? Response.json({outcome:'refused',reason,bug:{label:'Bug 42',href:'/console/list.html#item=morty%2FL42'}}) :
+     Response.json({outcome:'pending'},{status:202}));
+   }
+   if(options?.method!=='POST') return fixtureFetch(url,options);
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>checks>0 && entry(key) && !reviewSaveReports.active,'The outcome check did not finish.');
+  check(reviewDrafts.get(key).message.includes('The save outcome is not known yet.') &&
+   entry(key).querySelector('p').textContent==='Not saved.','The pending attempt keeps the draft without a Bug number.');
+  refused=true;
+  await reviewFetch(location.pathname+'?version=1');
+  await until(()=>entry(key).textContent.includes('Bug 42'),'Review did not show the existing Bug number.');
+  check(entry(key).querySelector('p').textContent==='Not saved. Bug 42 is filed.' &&
+   reviewDrafts.get(key).message==='Not saved: '+reason &&
+   entry(key).querySelector('textarea').value===words,'The refusal replaces the unknown message and keeps the words.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_removes_a_lost_reply_that_the_server_saved(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath || options?.method!=='POST') return fixtureFetch(url,options);
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>filings.length===1 && entry(key),'The lost save was not reported.');
+  check(reviewDrafts.get(key).message.includes('The save outcome is not known yet.'),
+   'The draft keeps the unknown outcome.');
+  filings[0].respond(Response.json({outcome:'saved',words_saved:true}));
+  await until(()=>!entry(key),'A saved attempt stayed in the list.');
+  check(!reviewDrafts.has(key) && !inline(key),'The draft and its inline copy are removed.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_checks_unknown_replay_until_the_save_finishes(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,hold='a'.repeat(24),reports=[];
+  let attempt,outcome='unknown';
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath){
+    reports.push(new URLSearchParams(options.body));
+    const result=outcome==='saved' ? {outcome,words_saved:true,hold} : {outcome};
+    return Promise.resolve(Response.json(result,{status:outcome==='pending' ? 202 : 200}));
+   }
+   if(options?.method==='POST'){
+    attempt=new Headers(options.headers).get(reviewSaveAttemptHeader);
+    return Promise.resolve(Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}}));
+   }
+   if(url==='/send-hold/'+hold)
+    return Promise.resolve(Response.json({reason:reviewSaveUnconfirmed},{status:503}));
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reports.length && entry(key) && !reviewSaveReports.active,'The first status check did not finish.');
+  check(entry(key)?.querySelector('textarea').value===words,'The unknown outcome keeps the draft.');
+  const unknownChecks=reports.length;
+  outcome='pending';
+  await reviewFetch(location.pathname+'?version=1');
+  if(reports.length<=unknownChecks) throw new Error('The refresh did not check the unknown outcome again.');
+  await until(()=>!reviewSaveReports.active,'The next status check did not finish.');
+  const pendingChecks=reports.length;
+  outcome='saved';
+  await reviewFetch(location.pathname+'?version=1');
+  if(reports.length<=pendingChecks) throw new Error('The refresh did not check the pending outcome again.');
+  await until(()=>!entry(key) && !reviewSaveReports.active,'The confirmed save did not clear the draft.');
+  check(reports.every(report=>report.get('failure_attempt')===attempt && report.get('feedback')===words),
+   'Each status check uses the original attempt and words.');
+  const finalChecks=reports.length;
+  await reviewFetch(location.pathname+'?version=1');
+  check(reports.length===finalChecks,'A confirmed save ends the status checks.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_keeps_words_after_a_lost_mark_read_reply(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath || options?.method!=='POST') return fixtureFetch(url,options);
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>filings.length===1 && entry(key),'The lost reply was not reported.');
+  filings[0].respond(Response.json({outcome:'saved',words_saved:false}));
+  await until(()=>!reviewSaveReports.active,'The outcome check did not finish.');
+  check(entry(key)?.querySelector('textarea').value===words && form.elements.feedback.value===words,
+   'Mark read leaves the draft in the list and the form.');
+  check(entry(key)?.querySelector('p').textContent==='Not saved.' &&
+   reviewDrafts.get(key).message==='Saved. Your words are still unsent.','The confirmed acknowledgement shows the draft without a Bug.');
+ """, card_key=self.change_with_unread_answer())
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_linked_review_card_reports_a_lost_save_after_it_reopens(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        key = 'page-owner/C1'
+        snapshot = review_page.build_snapshot(self.root)
+        card = snapshot.body(key, view=review_page.ReviewBodyView.CARD).decode()
+        card = card.replace('</head>', '<script>parent.installCardTransport(window);</script></head>', 1)
+        markup = '<dialog data-list-review-dialog open></dialog><script>' + UNDO_ACTION_SCRIPT + r"""
+const drafts=new Map(),reports=[],attempts=[];
+let reachable=false;
+function installCardTransport(view){
+ view.fetch=async(url,options)=>{
+  if(url==='/console/review-save-failure'){
+   reports.push(new URLSearchParams(options.body));
+   if(!reachable) throw new TypeError('Connection lost.');
+   return Response.json({outcome:'missing',reason:'Connection lost.',bug:{label:'Bug 43',href:'/console/list.html#item=morty%2FL43'}});
+  }
+  attempts.push(new Headers(options.headers).get('X-Review-Save-Attempt'));
+  throw new TypeError('Connection lost.');
+ };
+}
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[];
+ const dialog=document.querySelector('dialog');
+ const openCard=async()=>{
+  const frame=document.createElement('iframe');
+  frame.linkedReviewDrafts=drafts;
+  frame.src='/console/review.html?body=page-owner%2FC1';
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  dialog.append(frame);
+  await loaded;
+  return frame;
+ };
+ try{
+  const card=await openCard();
+  const form=card.contentDocument.querySelector('[data-review-form]');
+  const words='Keep the words from the closed card.';
+  form.elements.feedback.value=words;
+  form.elements.feedback.dispatchEvent(new card.contentWindow.Event('input',{bubbles:true}));
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  await until(()=>reports.length && !card.hasAttribute('data-saving') &&
+   card.contentDocument.querySelector('[data-review-card-notice]').textContent.includes('The save outcome is not known yet.'),
+   'The linked save failure did not show.');
+  card.reviewDraft.release();
+  card.remove();
+  const count=reports.length;
+  reachable=true;
+  const reopened=await openCard();
+  if(reopened.contentDocument.querySelector('[name="feedback"]').value!==words)
+   failures.push('The reopened card lost the draft.');
+  await until(()=>drafts.get('page-owner/C1')?.filedBug?.label==='Bug 43','The reopened card did not finish the report.');
+  const report=reports.at(-1);
+  if(reports.length!==count+1 || report.get('feedback')!==words || report.get('failure_attempt')!==attempts[0])
+   failures.push('The reopened card did not report the original attempt and words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        self.assertEqual(window_probe_results(
+            {'/list': markup.encode(), review_page.PAGE_PATH: card.encode()}, '/list', 'firefox'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_reports_an_undo_admission_refusal(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,reason='The send is empty or too large.';
+  let attempt;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath || options?.method!=='POST') return fixtureFetch(url,options);
+   const headers=new Headers(options.headers);
+   check(headers.get('X-Undo-Hold')==='1','The save requests Undo.');
+   attempt=headers.get(reviewSaveAttemptHeader);
+   return Promise.resolve(Response.json({reason,failure_attempt:attempt},{status:400}));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reviewDrafts.get(key)?.message.includes(reason),'The refusal is missing.');
+  await until(()=>filings.length===1,'The Undo admission refusal did not file a report.');
+  const report=filings[0];
+  check(report.body.get('feedback')===words && report.body.get('reason')===reason &&
+   report.body.get('failure_attempt')===attempt,'The report includes the refusal, original words, and attempt.');
+  report.respond(Response.json({outcome:'refused',reason,bug:{label:'Bug 45',href:'/console/list.html#item=morty%2FL45'}}));
+  await until(()=>entry(key).textContent.includes('Bug 45'),'The refusal has no Bug number.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_undo_refusal_retires_the_hold_for_the_same_words(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,ids=[];
+  const reason='The server could not record the hold.';
+  window.fetch=(url,options)=>{
+   if(url!==location.pathname || options?.method!=='POST') return fixtureFetch(url,options);
+   ids.push(new Headers(options.headers).get('X-Undo-Request'));
+   const headers=ids.length===2 ? {'X-Send-Hold':'refused'} : {};
+   return Promise.resolve(Response.json({reason},{status:503,headers}));
+  };
+  const init={method:'POST',body:new URLSearchParams({feedback:words})};
+  for(let index=0;index<3;index++) await heldFetch(location.pathname,init);
+  check(ids.length===3 && ids[0] && ids[0]===ids[1],
+   'An unconfirmed server failure keeps the hold ID.');
+  check(ids[2] && ids[2]!==ids[1],'A confirmed refusal gives the same words a new hold ID.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_reports_an_expired_held_result(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,reports=[],hold='a'.repeat(24);
+  const reason='This send was undone or its result expired.';
+  let attempt;
+  window.fetch=async(url,options)=>{
+   if(url===reviewSaveFailurePath){
+    reports.push(new URLSearchParams(options.body));
+    return Response.json({outcome:'missing',reason,bug:{label:'Bug 44',href:'/console/list.html#item=morty%2FL44'}});
+   }
+   if(options?.method==='POST'){
+    attempt=new Headers(options.headers).get(reviewSaveAttemptHeader);
+    return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+   }
+   if(url==='/send-hold/'+hold) return Response.json({reason,hold_state:'missing'},{status:404});
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reviewDrafts.get(key)?.message.includes(reason),'The expired result is missing.');
+  draftButton.click();
+  await until(()=>entry(key).innerText.includes('Bug 44'),'The expired result has no Bug number.');
+  check(reports.length===1 && reports[0].get('failure_attempt')===attempt && reports[0].get('reason')===reason &&
+   entry(key).querySelector('textarea').value===words,'The report uses the same attempt and keeps the words.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_keeps_an_undone_hold_without_a_bug(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,hold='a'.repeat(24);
+  let resultRead=false;
+  window.fetch=async(url,options)=>{
+   if(url===reviewSaveFailurePath) return fixtureFetch(url,options);
+   if(options?.method==='POST') return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+   if(url==='/send-hold/'+hold){
+    resultRead=true;
+    return Response.json({reason:'This send was undone.',hold_state:'undone'},{status:404});
+   }
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>resultRead && entry(key) && !entry(key).querySelector('button').disabled,'Undo did not finish.');
+  draftButton.click();
+  check(filings.length===0 && entry(key).querySelector('p').textContent==='Not saved.' && entry(key).querySelector('textarea').value===words,
+   'A confirmed Undo keeps the words without a save failure or Bug report.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_shows_the_new_400_after_the_card_reopens(self) -> None:
+        self.check_not_saved_list(r"""
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  refuse(0,400,'The first save was refused.');
+  draftButton.click();
+  await until(()=>reviewDrafts.get(key)?.message==='Not saved: The first save was refused.' &&
+   !entry(key).querySelector('button').disabled,'The list did not show the first refusal.');
+  entry(key).querySelector('button').click();
+  await until(()=>requests.length===2,'The list did not retry.');
+  const start=scrollY;
+  scrollBy(0,innerHeight+80);await paint();
+  check(scrollY-start>=innerHeight,'The page scrolls a viewport during the retry.');
+  const other=[...content.querySelectorAll('[data-list-item][data-type="change"]')]
+   .find(item=>item.getBoundingClientRect().top>200 && item.getBoundingClientRect().top<400);
+  await open(other);
+  await until(()=>row(key) || !content.querySelector('[data-record-motion]'),'The pending card did not settle.');
+  scrollTo(0,start);await paint();
+  await until(()=>row(key)?.querySelector('.list-toggle'),'The pending card did not return.');
+  const reopened=await open(row(key));
+  check(recordIsOpen(row(key)) && reopened.elements.feedback.value===words,'The reopened card shows the words.');
+  refuse(1,400,'The retry was refused for a different reason.');
+  await until(()=>!entry(key).querySelector('button').disabled,'The refusal did not settle.');
+  check(entry(key).querySelector('p').textContent==='Not saved.' &&
+   reviewDrafts.get(key).message==='Not saved: The retry was refused for a different reason.' &&
+   entry(key).querySelector('textarea').value===words,'The list shows the new refusal and the same words.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_inline_copy_shows_the_409_while_the_not_saved_list_stays_open(self) -> None:
+        self.check_not_saved_list(r"""
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  const other=content.querySelector('[data-list-item][data-type="change"]');
+  const otherForm=await open(other);
+  await until(()=>inline(key)?.getClientRects().length,'The first draft copy did not appear.');
+  draftButton.click();
+  check(entry(key).querySelector('p').textContent==='Not saved.',
+   'The list entry starts without a Bug.');
+  otherForm.requestSubmit(otherForm.querySelector('[value="works"]'));
+  const clip=content.querySelector('[data-record-motion-key="'+CSS.escape(other.dataset.key)+'"] .record-motion-clip');
+  const fade=clip?.getAnimations()[0];
+  if(!fade) throw new Error('The other card did not start to fade.');
+  fade.pause();fade.currentTime=0;
+  try{
+   refuse(0,409,'this item changed while Review was open.');
+   const expected='Not saved: this item changed while Review was open.';
+   await until(()=>inline(key).querySelector('p').textContent===expected,'The inline copy did not show the 409.');
+   check(clip.isConnected && fade.playState==='paused' && entry(key).querySelector('p').textContent==='Not saved.',
+    'The inline copy shows the refusal while the list keeps its summary.');
+  }finally{
+   fade.finish();
+  }
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_closes_on_escape_from_the_card_words(self) -> None:
+        self.check_not_saved_list(r"""
+  draftButton.click();
+  const wordsField=form.elements.feedback;
+  wordsField.focus();
+  check(!list.hidden && document.activeElement===wordsField,'The list is open and the card words have focus.');
+  wordsField.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  check(list.hidden && draftButton.getAttribute('aria-expanded')==='false' &&
+   document.activeElement===draftButton && wordsField.value===words,
+   'Escape closes the list and returns focus to its button.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_loads_a_new_revision_before_retrying_an_open_card(self) -> None:
+        self.check_not_saved_list(r"""
+  const posts=[],fixtureFetch=window.fetch,revision=form.elements.revision.value;
+  let fresh=false,bodyReads=0;
+  window.fetch=async(url,options)=>{
+   if(options?.method==='POST') posts.push(new URLSearchParams(options.body));
+   const response=await fixtureFetch(url,options);
+   if(!fresh || new URL(url,location.href).searchParams.get('body')!==key) return response;
+   bodyReads++;
+   const text=(await response.text()).replace(/name="revision" value="[^"]+"/,'name="revision" value="current"');
+   return {...response,text:async()=>text};
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  const other=content.querySelector('[data-list-item][data-type="change"]');
+  await open(other);
+  refuse(0,409,'this item changed while Review was open.');
+  draftButton.click();
+  await until(()=>reviewDrafts.get(key)?.message==='Not saved: this item changed while Review was open.' &&
+   !entry(key).querySelector('button').disabled,'The list did not show the 409.');
+  await until(()=>row(key),'The response did not return.');
+  const reopened=await open(row(key));
+  check(reopened.elements.revision.value===revision,'The open card still has the refused revision.');
+  fresh=true;
+  entry(key).querySelector('button').click();
+  await until(()=>requests.length===2,'The list did not retry.');
+  check(bodyReads===1 && posts[1].get('revision')==='current' && posts[1].get('outcome')==='read' &&
+   posts[1].get('feedback')===words,'The button loads the new revision and sends the action with its words.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_uses_the_card_action_label(self) -> None:
+        for outcome, label in (('feedback', 'Send feedback'), ('question', 'Ask question')):
+            with self.subTest(outcome=outcome):
+                self.check_not_saved_list(f'const outcome={json.dumps(outcome)},label={json.dumps(label)};'+r"""
+  const change=content.querySelector('[data-list-item][data-type="change"]');
+  const changeForm=await open(change),action=changeForm.querySelector('[value="'+outcome+'"]');
+  changeForm.elements.feedback.value=words;
+  changeForm.requestSubmit(action);
+  await until(()=>requests.length===1,'The card action did not submit.');
+  refuse(0,400,'The save was refused.');
+  draftButton.click();
+  const buttons=entry(change.dataset.key).querySelectorAll('button');
+  check(buttons.length===1 && buttons[0].textContent===label && action.textContent===label,
+   'The list has one button with the card action label.');
+""")
+
+    def check_not_saved_snapshot_retry(self, page: str, initial: dict[str, object], fresh: dict[str, object],
+                                       steps: str) -> None:
+        setup = r"""
+  const fetchSnapshot=window.fetch,posts=[],replies=[];
+  window.fetch=(url,options)=>{
+   if(options?.method!=='POST') return fetchSnapshot(url,options);
+   posts.push(new URLSearchParams(options.body));
+   return new Promise(resolve=>replies.push(resolve));
+  };
+  const card=key=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  const open=async key=>{
+   const row=card(key);
+   row.querySelector('.list-toggle').click();
+   return readyReviewCard(row);
+  };
+  const list=document.querySelector('#review-draft-list');
+  const refuse=async key=>{
+   await until(()=>posts.length===1,'the first POST');
+   await open('page-owner/C2');
+   shown='fresh';
+   replies[0](Response.json({reason:'this item changed while Review was open.'},{status:409}));
+   await until(()=>document.querySelector('[data-review]').dataset.version===snapshots.fresh.version,'the refreshed index');
+   document.querySelector('[data-review-draft-toggle]').click();
+   const entry=list.querySelector('[data-draft-list-key="'+CSS.escape(key)+'"]');
+   await until(()=>entry && !entry.querySelector('button').disabled,'the list action');
+   return entry;
+  };
+"""
+        self.assertEqual(firefox_probe_results(snapshot_probe_page(
+            page, {'initial': initial, 'fresh': fresh}, setup+steps)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_retries_the_original_later_deadline(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf',
+                                 'undo_seconds=0\nlater_soon_minutes=30\n')
+        key = 'page-owner/C1'
+        records = review_items.read(self.root)
+        page, initial = self.browser_snapshot(records)
+        change = next(item for item in records if item.key == key)
+        source = change.source
+        assert isinstance(source, review_items.ChangeSource)
+        updated = replace(change, source=replace(source, row={**source.row, 'Change': 'Updated summary'}))
+        _, fresh = self.browser_snapshot([updated if item.key == key else item for item in records])
+        self.assertNotEqual(initial['version'], fresh['version'])
+        self.check_not_saved_snapshot_retry(page, initial, fresh, r"""
+  const key='page-owner/C1',words='Read these notes in 30 minutes.';
+  const form=await open(key),soon=form.querySelector('[data-later-preset="soon"]');
+  const recipients=JSON.parse(form.dataset.reviewRecipients)['later-with-words'];
+  const start=Date.now();
+  form.elements.feedback.value=words;
+  form.querySelector('[data-later-toggle]').click();
+  check(soon.querySelector('span').textContent==='30 minutes','The open menu shows the configured preset.');
+  soon.click();
+  const entry=await refuse(key),action=entry.querySelector('button');
+  check(action.textContent==='30 minutes','The list shows the chosen preset label.');
+  check(Math.abs(Date.parse(posts[0].get('later'))-start-30*60000)<5000,'The first POST uses the 30 minute deadline.');
+  action.click();
+  await until(()=>posts.length===2 || action.textContent==='Open the card','the retry decision');
+  check(posts.length===2 && posts[1].get('outcome')==='later' && posts[1].get('later')===posts[0].get('later') &&
+   posts[1].get('feedback')===words && posts[1].get('revision')!==posts[0].get('revision') &&
+   recipients.length>0 && posts[1].get('retry_recipients')===JSON.stringify(recipients),
+   'Later retries with the original deadline and words on the new revision.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_requires_a_new_choice_for_a_changed_approval_recipient(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=0\n')
+        key, _ = self.decisions()
+        page, initial = self.browser_snapshot(review_items.read(self.root))
+        doc = self.fixture.temporary / 'destination.md'
+        _ = doc.write_text(self.fixture.production.read_text())
+        runner = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), doc))
+        _ = staff.move(self.fixture.unit.id, staff.ReportsTo(runner.id))
+        records = review_items.read(self.root)
+        self.assertEqual(next(item.owner for item in records if item.key == key), runner.id)
+        _, fresh = self.browser_snapshot(records)
+        self.assertNotEqual(initial['version'], fresh['version'])
+        steps = r"""
+  const key=KEY,words='Approve this proposal with these notes.',assignee=ASSIGNEE;
+  const form=await open(key);
+  check(form.elements.assignee.options[0].textContent==='page-owner decides','The original owner is the default recipient.');
+  form.elements.assignee.value=assignee;
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="approve"]'));
+  const entry=await refuse(key),action=entry.querySelector('button');
+  check(action.textContent==='Approve','The list shows the selected action.');
+  action.click();
+  await until(()=>posts.length===2 || (action.textContent==='Open the card' && !action.disabled),'the retry decision');
+  if(assignee){
+   check(posts.length===2 && posts[1].get('outcome')==='approve' && posts[1].get('assignee')===assignee &&
+    posts[1].get('feedback')===words && posts[1].get('retry_recipients')===JSON.stringify([assignee]),
+    'The same explicit recipient can receive the original approval.');
+  }else{
+   check(posts.length===1 && action.textContent==='Open the card' && !list.hidden &&
+    reviewDrafts.get(key)?.message==='Not saved: this item changed. Open the card to choose again.' &&
+    entry.querySelector('textarea').value===words,'A changed default recipient requires a new choice.');
+   if(action.textContent==='Open the card'){
+    action.click();
+    await until(()=>list.hidden && document.activeElement?.matches('[data-review-form] textarea'),'the card words field');
+    const current=document.activeElement.closest('form');
+    check(posts.length===1 && current.elements.assignee.selectedOptions[0].textContent==='destination decides' &&
+     current.elements.feedback.value===words,'The open card shows the new default recipient and the saved words.');
+   }
+  }
+"""
+        for assignee in ('', self.fixture.unit.id):
+            with self.subTest(assignee=assignee):
+                self.check_not_saved_snapshot_retry(page, initial, fresh, steps.replace(
+                    'KEY', json.dumps(key)).replace('ASSIGNEE', json.dumps(assignee)))
+
+    def test_review_draft_retry_refuses_a_recipient_change_after_the_card_loads(self) -> None:
+        key = 'page-owner/C1'
+        snapshot = review_page.build_snapshot(self.root)
+        request = self.card_body(snapshot, key, 'works', 'The layout works.')
+        recipients = (self.fixture.unit.id, self.fixture.showrunner_id)
+        retry = request+'&'+urlencode({'retry_recipients': json.dumps(recipients)})
+        doc = self.fixture.temporary/'destination.md'
+        _ = doc.write_text(self.fixture.production.read_text())
+        runner = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), doc))
+        _ = staff.move(self.fixture.unit.id, staff.ReportsTo(runner.id))
+        fresh = review_page.build_snapshot(self.root)
+        self.assertEqual(review_page.record_revision(snapshot.records[key], snapshot.assets),
+                         review_page.record_revision(fresh.records[key], fresh.assets))
+        with patch.object(change_browser, 'submit_review_change') as send:
+            with self.assertRaisesRegex(review_items.ReviewRecordChanged, 'Open the card to choose again'):
+                _ = review_page.submit(self.root, retry, self.status, snapshot=snapshot)
+            send.assert_not_called()
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_requires_the_original_card_state_and_action(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=0\n')
+        key = 'page-owner/C1'
+        records = review_items.read(self.root)
+        page, initial = self.browser_snapshot(records)
+        delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
+        change_page.deliver(delivery, self.status)
+        validating = review_items.read(self.root)
+        self.assertEqual(next(item.state for item in validating if item.key == key), review_items.ReviewState.VALIDATING)
+        _, fresh = self.browser_snapshot(validating)
+        fresh_bodies = cast(dict[str, str], fresh['bodies'])
+        initial_bodies = cast(dict[str, str], initial['bodies'])
+        state_changed = {**fresh, 'bodies': {**fresh_bodies, key: fresh_bodies[key].replace(
+            '>Ask a question</button>', '>Ask question</button>')}}
+        action_index = cast(dict[str, object], json.loads(cast(str, initial['index'])))
+        action_index['version'] = 'action-changed'
+        action_changed = {**initial, 'version': action_index['version'], 'index': json.dumps(action_index), 'bodies': {
+            **initial_bodies, key: initial_bodies[key].replace('<button name="outcome" value="question">Ask question</button>', '')}}
+        steps = r"""
+  const fetchSnapshot=window.fetch,posts=[];
+  window.fetch=(url,options)=>options?.method==='POST'
+   ? new Promise(resolve=>posts.push(resolve))
+   : fetchSnapshot(url,options);
+  const card=key=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  const open=async key=>{
+   const row=card(key);
+   row.querySelector('.list-toggle').click();
+   return readyReviewCard(row);
+  };
+  const key='page-owner/C1',words='Can you check the new layout?';
+  const form=await open(key),ask=form.querySelector('button[value="question"]');
+  check(card(key).dataset.state==='Open' && ask.textContent==='Ask question','The first card asks an open Change question.');
+  form.elements.feedback.value=words;
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  form.requestSubmit(ask);
+  await until(()=>posts.length===1,'the first question');
+  await open('page-owner/C2');
+  shown='fresh';
+  posts[0](Response.json({reason:'this item changed while Review was open.'},{status:409}));
+  const content=document.querySelector('[data-review]');
+  await until(()=>content.dataset.version===snapshots.fresh.version,'the refreshed index');
+  const toggle=document.querySelector('[data-review-draft-toggle]'),list=document.querySelector('#review-draft-list');
+  toggle.click();
+  const entry=list.querySelector('[data-draft-list-key="'+CSS.escape(key)+'"]');
+  const action=entry.querySelector('button'),notice=entry.querySelector('[data-review-choice-notice]');
+  check(action.textContent==='Ask question' && !action.disabled,'The list offers the recorded card action.');
+  action.click();
+  await until(()=>posts.length>1 || (action.textContent==='Open the card' && !action.disabled),'the decision about the retry');
+  check(posts.length===1,'The list sends nothing after the card changes.');
+  check(!list.hidden && !notice.hidden && action.textContent==='Open the card' &&
+   notice.textContent==='Not saved: this item changed. Open the card to choose again.' &&
+   entry.querySelector('textarea').value===words,'The list keeps the words and asks the user to choose again.');
+  if(action.textContent==='Open the card'){
+   action.click();
+   await until(()=>list.hidden && document.activeElement?.matches('[data-review-form] textarea'),'the card words field');
+   const current=document.activeElement.closest('form');
+   check(posts.length===1 && current.elements.feedback.value===words &&
+    card(key).dataset.state===STATE && (current.querySelector('button[value="question"]')?.textContent ?? null)===LABEL,
+    'The new card action and the saved words are visible before another send.');
+  }
+"""
+        for change, snapshot, state, label in (
+                ('state and action', fresh, 'Validating', 'Ask a question'),
+                ('state only', state_changed, 'Validating', 'Ask question'),
+                ('action removed', action_changed, 'Open', None)):
+            with self.subTest(change=change):
+                self.assertEqual(firefox_probe_results(snapshot_probe_page(
+                    page, {'initial': initial, 'fresh': snapshot},
+                    steps.replace('STATE', json.dumps(state)).replace('LABEL', json.dumps(label)))), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_retries_an_offscreen_refusal_through_the_card(self) -> None:
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch:fetchPage,until}=fixtureUndo(),failures=[],content=document.querySelector('[data-review]');
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const words='Use the compact layout on narrow screens.\nKeep the wide layout on desktop.';
+ const refusal='this item changed while Review was open.',laterRefusal='The item changed again.';
+ const indexData=JSON.parse(content.querySelector('[data-review-index]').textContent);
+ const area=document.querySelector('.review-drafts'),toggle=area?.querySelector('button'),list=area?.querySelector('ul');
+ const posts=[];
+ let version=content.dataset.version,completeSend,responseKey;
+ window.fetch=async(url,options)=>{
+  if(options?.method==='POST'){
+   posts.push(new URLSearchParams(options.body));
+   return new Promise(resolve=>{completeSend=resolve;});
+  }
+  const query=new URL(url,location.href).searchParams;
+  const facts=pageRefreshFacts();
+  if(query.has('index')) return Response.json({version,index:indexData,facts});
+  if(query.get('version')==='1') return Response.json({version,facts});
+  const response=await fetchPage(url,options);
+  if(!response.ok || query.get('body')!==responseKey || !version.startsWith('after-'))
+   return response;
+  const revision=version,text=(await response.text()).replace(/name="revision" value="[^"]+"/,
+   'name="revision" value="'+revision+'"');
+  response.headers.set('X-Review-Version',version);
+  return {...response,text:async()=>text};
+ };
+ function refuse(reason){
+  version='after-'+posts.length;
+  completeSend(Response.json({reason},{status:409}));
+ }
+ try{
+  top.document.body.style.margin='0';
+  frameElement.style.cssText='display:block;width:100vw;height:100vh;border:0';
+  await paint();
+  check(area?.hidden,'The count starts hidden.');
+  const sort=content.querySelector('[data-sort="1"]');
+  sort.click();
+  if(sort.closest('th').getAttribute('aria-sort')!=='descending') sort.click();
+  const response=content.querySelector('[data-list-item][data-type="response"]');
+  responseKey=response.dataset.key;
+  response.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(response);
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>posts.length===1,'Got it did not submit.');
+  scrollTo(0,1250);await paint();
+  const other=[...content.querySelectorAll('[data-list-item][data-type="change"]')]
+   .find(row=>row.getBoundingClientRect().top>200 && row.getBoundingClientRect().top<400);
+  other.querySelector('.list-toggle').click();
+  const otherForm=await readyReviewCard(other);
+  refuse(refusal);
+  const inline=()=>content.querySelector('[data-unsaved-review-key]');
+  await until(()=>inline()?.textContent.includes(refusal) && content.dataset.version===version,'The refusal did not appear.');
+  check(inline().getBoundingClientRect().bottom<0 && inline().querySelector('label').textContent==='Your words',
+   'The inline copy is above the viewport and uses the card label.');
+  if(!area || !toggle || !list) throw new Error('The fixed draft area is missing.');
+  const buttonBox=toggle.getBoundingClientRect();
+  check(!area.hidden && toggle.textContent==='Not saved: 1' && buttonBox.height>0 &&
+   Math.abs(buttonBox.right-document.documentElement.clientWidth+24)<1 &&
+   Math.abs(buttonBox.bottom-innerHeight+24)<1,
+   'The offscreen refusal has a fixed button at the bottom right.');
+  toggle.click();
+  const entry=list.firstElementChild;
+  const draft=entry.querySelector('textarea'),send=entry.querySelector('button');
+  check(!list.hidden && document.activeElement===list && entry.querySelector('strong').textContent.includes('Check the question record') &&
+   entry.querySelector('p').textContent==='Not saved.' && entry.querySelector('label').textContent==='Your words' &&
+   draft.readOnly && draft.value===words && send.textContent===form.querySelector('[value="read"]').textContent &&
+   entry.querySelectorAll('button').length===1 && !entry.querySelector('small'),
+   'The list shows the card, the refusal, the exact words and one Got it button.');
+  otherForm.elements.feedback.value='These words belong to another card.';
+  otherForm.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  check(toggle.textContent==='Not saved: 2' && list.children.length===2,'The count includes both cards.');
+  send.click();send.click();
+  await until(()=>posts.length===2,'Send from the list did not submit.');
+  check(posts[1].get('row')===posts[0].get('row') && posts[1].get('outcome')==='read' &&
+   posts[1].get('feedback')===words && posts[1].get('token')===posts[0].get('token') &&
+   posts[1].get('revision')==='after-1','The retry submits the card action, exact words, token, and current revision.');
+  refuse(laterRefusal);
+  await until(()=>reviewDrafts.get(responseKey)?.message.includes(laterRefusal) && !send.disabled &&
+   content.dataset.version===version,'The list did not show the new refusal.');
+  check(list.firstElementChild===entry && draft.value===words && toggle.textContent==='Not saved: 2',
+   'A refused retry keeps the entry and its words.');
+  send.click();
+  await until(()=>posts.length===3,'The next retry did not submit.');
+  check(posts[2].get('revision')==='after-2' && posts[2].get('feedback')===words,'The second retry uses the new revision.');
+  completeSend(Response.json({answer:'feedback sent',words_saved:true,state:'Done',detail_closed:true}));
+  await until(()=>!entry.isConnected,'The confirmed save did not remove the entry.');
+  check(toggle.textContent==='Not saved: 1' && list.children.length===1 &&
+   list.querySelector('textarea').value==='These words belong to another card.' &&
+   list.querySelector('button').textContent==='Open the card',
+   'A confirmed retry removes only its own entry and lowers the count.');
+  list.querySelector('button').click();
+  const otherWords=()=>document.activeElement?.matches('[data-review-form] textarea') && document.activeElement;
+  await until(()=>list.hidden && otherWords(),'The list did not open the card to choose its action.');
+  check(posts.length===3 && otherWords().value==='These words belong to another card.',
+   'A draft without a chosen action returns to its card with the words.');
+  otherWords().value=' \n ';
+  otherWords().dispatchEvent(new Event('input',{bubbles:true}));
+  check(area.hidden,'The count hides when the last card has only whitespace.');
+ }catch(error){failures.push(String(error));}
+ await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = self.long_review_with_response().replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode(), window_size=(1440, 900)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_keeps_undo_a_direct_child_of_the_page_and_modal(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[],host=top.document;
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  host.body.style.margin='0';
+  frameElement.style.cssText='display:block;width:100vw;height:100vh;border:0';
+  await paint();
+  const response=document.querySelector('[data-list-item][data-type="response"]');
+  response.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(response);
+  form.elements.feedback.value='Please check the narrow layout.';
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  const stack=()=>host.querySelector('[data-send-undo-stack]');
+  await until(()=>stack()?.querySelector('button'),'Undo did not show.');
+  await paint();
+  const undo=stack().querySelector('button'),before=stack().getBoundingClientRect();
+  const toggle=document.querySelector('[data-review-draft-toggle]');
+  if(!toggle?.getClientRects().length) throw new Error('The Not saved button is missing.');
+  toggle.click();await paint();
+  const area=toggle.parentElement.getBoundingClientRect(),after=stack().getBoundingClientRect();
+  check(stack().parentElement===host.body && area.bottom<=after.top &&
+   area.right>after.left && Math.abs(area.right-document.documentElement.clientWidth+16)<1 &&
+   before.top===after.top && before.left===after.left,
+   'The open list stays above the Undo stack and leaves it in place.');
+  const dialog=host.createElement('dialog');
+  host.body.append(dialog);dialog.showModal();
+  await until(()=>stack().parentElement===dialog,'Undo did not move directly into the modal.');
+  const box=undo.getBoundingClientRect();
+  check(host.elementFromPoint(box.left+box.width/2,box.top+box.height/2)===undo,'The modal Undo button stays clickable.');
+  dialog.close();
+  await until(()=>stack().parentElement===host.body,'Undo did not return directly to the page.');
+  undo.click();
+  await until(()=>!stack(),'Undo did not finish.');
+  check(toggle.textContent==='Not saved: 1','Undo keeps the draft in the list.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode(), window_size=(390, 330)), [[]])
 
     def test_page_feedback_uses_the_native_review_reply_and_keeps_its_data(self) -> None:
         owner = self.ready_submission_recipient()
@@ -1697,7 +2922,7 @@ window.fetch=(url,options)=>{
  const fetchPage=window.fetch,content=document.querySelector('[data-review]');
  const row=()=>content.querySelector('[data-list-item][data-key="page-owner/C1"]');
  const toggle=()=>row().querySelector('.list-toggle');
- const close=()=>toggle().click(),error=()=>row()?.querySelector('[data-record-error]');
+ const close=()=>toggle().click();
  let finishPost;
  window.fetch=(url,options)=>{
   if(options?.method==='POST') return new Promise(resolve=>{finishPost=resolve;});
@@ -1724,7 +2949,7 @@ window.fetch=(url,options)=>{
    ask(first);
    edit(words,'Which check ran?');edit(words,'Which check passed?');
    words.focus();words.setSelectionRange(3,7);
-   finishPost(Response.json({answer:'question saved'}));await settled(first);
+   finishPost(Response.json({answer:'question saved',words_saved:true}));await settled(first);
    check(words.value==='Which check passed?' && document.activeElement===words &&
     words.selectionStart===3 && words.selectionEnd===7,
     'A saved Ask preserves words edited during the save and keeps their selection.');
@@ -1748,18 +2973,18 @@ window.fetch=(url,options)=>{
   toggle().click();
   const reopened=await readyReviewCard(row());
   edit(reopened.elements.feedback,'Keep these later words.');
-  finishPost(Response.json({answer:'question saved'}));await settled(sent);
+  finishPost(Response.json({answer:'question saved',words_saved:true}));await settled(sent);
   check(recordIsOpen(row()) && reopened.elements.feedback.value==='Keep these later words.' &&
    !reopened.querySelector('[data-send-status]').textContent.includes('Saved:'),
    'A response from before Close leaves the reopened item and its draft in place.');
   if(VALIDATING){
    ask(reopened);edit(reopened.elements.feedback,'Keep the words after Ask.');
    finishPost(new Response('Unreadable result'));await settled(reopened);
-   check(!error().hidden && error().textContent==='Saved; the item could not refresh.' &&
+   check(reopened.querySelector('[data-send-status]').textContent.includes('The save outcome is not known yet.') &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
-    'An unreadable successful response reports a display error and keeps the draft.');
+    'An unreadable response reports an unconfirmed save and keeps the draft.');
    ask(reopened);finishPost(Response.json({reason:'The save failed.'},{status:400}));await settled(reopened);
-   check(error().hidden && reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
+   check(reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
     'A failed save reports a save error and keeps the draft.');
   }
@@ -1790,7 +3015,7 @@ window.fetch=(url,options)=>{
  window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
   if(options?.method==='POST') return Promise.resolve(Response.json({
-   answer:'question saved',version,detail_unavailable:true,delivery_pending:false}));
+   answer:'question saved',words_saved:true,version,detail_unavailable:true,delivery_pending:false}));
   if(query.has('body')){
    const saved=query.has('saved');
    if(!saved) bodyReads++;
@@ -1876,7 +3101,7 @@ window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
   if(options?.method==='POST'){
    pageVersion='own';
-   const reply={answer:'saved',version:'own',delivery_pending:true,delivery:'fixture-delivery',detail_revision:'own-revision'};
+   const reply={answer:'saved',words_saved:true,version:'own',delivery_pending:true,delivery:'fixture-delivery',detail_revision:'own-revision'};
    reply.state=completed ? 'Done' : action==='feedback' ? 'Waiting' : undefined;
    if(action==='feedback'){
     const saved=document.createElement('template');saved.innerHTML=body('own-revision','The saved words.');
@@ -1957,7 +3182,7 @@ window.fetch=(url,options)=>{
  const opened=()=>content.querySelector('[data-record-inline-view]');
  window.fetch=(url,options)=>{
   if(options?.method==='POST')
-   return Promise.resolve(Response.json({answer:'parked',detail_unavailable:true,delivery_pending:false}));
+   return Promise.resolve(Response.json({answer:'parked',words_saved:false,detail_unavailable:true,delivery_pending:false}));
   const query=new URL(url,location.href).searchParams;
   if(query.get('version')==='1')
    return Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));
@@ -2704,7 +3929,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   window.fetch=(url,options={})=>{
    const query=new URL(url,location.href).searchParams;
    if(options.method==='POST')
-    return new Promise(resolve=>{reply=()=>resolve(Response.json({answer:'saved',version:snapshots.fresh.version,
+    return new Promise(resolve=>{reply=()=>resolve(Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,
      state:validating ? 'Validating' : 'Waiting',detail_revision:'saved',delivery_pending:false}));});
    if(query.has('saved')){
     reads.push(query.get('saved'));
@@ -2898,7 +4123,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   window.fetch=async(url,options={})=>{
    if(options.method!=='POST') return pageFetch(url,options);
    shown='fresh';
-   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',REPLY});
+   return Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',REPLY});
   };
   row(2).querySelector('.list-toggle').click();
   const form=await readyReviewCard(row(2));
@@ -2952,7 +4177,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
    saved.content.querySelector('form').remove();
    saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
-   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+   return Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
     detail_html:saved.innerHTML});
   };
   row(15).querySelector('.list-toggle').click();
@@ -3011,7 +4236,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
    saved.content.querySelector('form').remove();
    saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
-   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+   return Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
     detail_html:saved.innerHTML});
   };
   OPENER
@@ -3064,7 +4289,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
    saved.content.querySelector('form').remove();
    saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
-   const reply=Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+   const reply=Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
     detail_html:saved.innerHTML});
    return new Promise(resolve=>{finishSave=()=>resolve(reply);});
   };
@@ -3472,7 +4697,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 window.copied='';
 Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{window.copied=text;}}});
 window.fetch=async(_url,options)=>options?.method==='POST'
- ? Response.json({answer:'Done',state:'Done'})
+ ? Response.json({answer:'Done',words_saved:false,state:'Done'})
  : new Response(null,{status:304});
 </script>""", 1)
         pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
@@ -4238,7 +5463,7 @@ window.clearInterval=()=>{};
 window.refreshRequests=[];
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST') return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};
+ if(options?.method==='POST') return {headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:true})};
  window.refreshRequests.push(url);
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  return {ok:true,text:async()=>showPages[show]};
@@ -4583,7 +5808,7 @@ const nativeFetch=fetch,nativeTimeout=setTimeout;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST'){window.didSave=true;return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};}
+ if(options?.method==='POST'){window.didSave=true;return {headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:true})};}
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  const page=new DOMParser().parseFromString(showPages[show],'text/html');
  if(window.didSave){const payload=page.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
@@ -4755,7 +5980,7 @@ window.fetch=async(url,options)=>{
  const refreshResponse=new Promise(resolve=>{releaseRefresh=resolve;});
  window.fetch=(url,options)=>{
   if(options?.method==='POST' && options.body.get('row')===answered && options.body.get('outcome')==='question')
-   return Promise.resolve(Response.json({answer:'question sent',state:'Waiting',type:'question',later:0}));
+   return Promise.resolve(Response.json({answer:'question sent',words_saved:true,state:'Waiting',type:'question',later:0}));
   const params=new URL(url,location.href).searchParams;
   if(params.has('version') && !params.has('body')) return refreshResponse;
   return fetchPage(url,options);
@@ -4842,7 +6067,7 @@ window.fetch=async(url,options)=>{
  const fetchPage=window.fetch;
  window.fetch=(url,options)=>{
   if(options?.method==='POST' && options.body.get('row')===question && options.body.get('outcome')==='later')
-   return Promise.resolve(Response.json({answer:'later',state:'Open',later:Date.now()+3600000}));
+   return Promise.resolve(Response.json({answer:'later',words_saved:false,state:'Open',later:Date.now()+3600000}));
   const params=new URL(url,location.href).searchParams;
   if(params.has('version') && !params.has('body'))
    return Promise.resolve(Response.json({version:review.dataset.version,facts:pageRefreshFacts()}));
@@ -5913,8 +7138,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                 self.assertEqual(waiting.actions, opened.actions)
-                self.assertEqual(review_page.form(waiting, browser, words_rows, 'fixture-revision'),
-                                 review_page.form(opened, browser, words_rows, 'fixture-revision'))
+                waiting_form = review_page.form(waiting, browser, words_rows, 'fixture-revision')
+                opened_form = review_page.form(opened, browser, words_rows, 'fixture-revision')
+                self.assertIn('data-review-state="Waiting"', waiting_form)
+                self.assertIn('data-review-state="Open"', opened_form)
+                self.assertEqual(waiting_form.replace('data-review-state="Waiting"', 'data-review-state="Open"', 1),
+                                 opened_form)
 
     def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
         """Use a fresh record for each action and check the displaced answer."""
@@ -7461,44 +8690,57 @@ window.fetch=async(url,options={})=>{
                 markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
                 self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
-    def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind, *, matches_filters: bool = False) -> bytes:
+    def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind | Literal['enhancement'], *,
+                             matches_filters: bool = False, hold_review_only: bool = False) -> bytes:
         owner = self.ready_submission_recipient()
         _ = self.question('Keep this question')
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         before = cache.get()
-        request = self.submission_request(kind, owner.id)
+        filed_kind = new_item_dialog.SubmissionKind.INVESTIGATION if kind == 'enhancement' else kind
+        request = replace(self.submission_request(filed_kind, owner.id), kind=kind)
         if matches_filters:
             request = replace(request, words='Keep this question too.')
         created = cache.create_submission(request)
         fresh = cache.get()
+        expect_report = filed_kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION)
         values: dict[str, object] = {
             'owner': owner.id, 'key': created.key, 'id': created.saved.id, 'kind': kind,
+            'held': expect_report or hold_review_only,
             'words': request.words, 'matches': matches_filters,
             'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
         }
         receipt: dict[str, object] = {'id': created.saved.id, 'key': created.key, 'version': fresh.version}
-        if kind in (new_item_dialog.SubmissionKind.INVESTIGATION, new_item_dialog.SubmissionKind.BUG):
+        if expect_report:
+            self.assertIsInstance(created.saved.record, investigation.Investigation)
             row = review_actions.submission_report_row(created.saved)
             assert isinstance(row, the_list.ListItem)
             assert isinstance(row.report, the_list.ListReport)
-            self.assertEqual((row.report.kind, row.report.evidence_key, row.report.words), (
-                the_list.ReportKind.BUG if kind == new_item_dialog.SubmissionKind.BUG
-                else the_list.ReportKind.INVESTIGATION, created.key, request.words))
+            self.assertEqual((row.report.kind.value.lower(), row.report.evidence_key, row.report.words),
+                             (kind, created.key, request.words))
             assert not isinstance(row.owner, the_list.UnassignedOwner)
             receipt.update(list_number=row.number, list_owner=review_items.name(row.owner, created.members),
                            list_producer=review_items.name(row.producer, created.members))
         values['receipt'] = receipt
         setup = r'''<script>
 const fixture=FIXTURE, nativeFetch=fetch;
+const hold='a'.repeat(24), filing=Promise.withResolvers(), confirmFiling=Promise.withResolvers();
 let sent=false;
 const selection={owner:fixture.owner,type:fixture.matches?fixture.kind:'question',
  show:fixture.matches?'all':'open',q:'keep this question'};
 history.replaceState(null,'','#'+new URLSearchParams(selection));
 window.fetch=async(url,options={})=>{
  const route=new URL(url,location.href);
+ if(route.pathname==='/send-hold/'+hold){
+  filing.resolve();
+  await confirmFiling.promise;
+  sent=true;
+  return Response.json(fixture.receipt);
+ }
  if(route.pathname==='/console/review/new-item'){
   if(options.method==='POST'){
    if(JSON.parse(options.body).page_capture) return Response.json({});
+   if(fixture.held && new Headers(options.headers).get('X-Undo-Hold')==='1')
+    return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
    sent=true;
    return Response.json(fixture.receipt);
   }
@@ -7517,6 +8759,9 @@ window.fetch=async(url,options={})=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const review=document.querySelector('[data-review]'), dialog=document.querySelector('#review-new-item');
  const params=()=>new URLSearchParams(location.hash.slice(1));
+ const host=window.top.document, toast=()=>host.querySelector('[data-send-undo]');
+ const visible=message=>toast()===message && !message.hidden && message.getClientRects().length>0 &&
+  host.defaultView.getComputedStyle(message).opacity==='1';
  try {
   const previous=history.length, previousHash=location.hash;
   check(params().get('owner')===fixture.owner, 'The original owner filter is active.');
@@ -7538,15 +8783,44 @@ window.fetch=async(url,options={})=>{
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
   const created=new Promise(resolve=>document.addEventListener('review-item-created',resolve,{once:true}));
+  const receipt=fixture.receipt;
+  let message;
+  const shown=fixture.held && new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(toast()?.querySelector('button')){observer.disconnect();resolve(toast());}
+   });
+   observer.observe(host.body,{childList:true,subtree:true});
+  });
   dialog.querySelector('[type="submit"]').click();
+  if(shown){
+   message=await shown;
+   check(visible(message) && message.querySelector('button').textContent==='Undo' &&
+         message.querySelector('span').textContent==='Sent to page-owner.', 'The hold shows the recipient and Undo.');
+   const [countdown]=message.getAnimations();
+   countdown.pause();
+   countdown.currentTime=29000;
+   const opacity=Number(host.defaultView.getComputedStyle(message).opacity);
+   check(!message.hidden && opacity>0 && opacity<.2 && message.querySelector('button')?.textContent==='Undo',
+         'The message fades during the hold and still offers Undo.');
+   countdown.finish();
+   await filing.promise;
+   check(message.hidden && !message.querySelector('button') &&
+         message.querySelector('span').textContent==='Sent to page-owner.',
+         'The message hides when the hold ends and the server still has no result.');
+   confirmFiling.resolve();
+  }
   const event=await created;
   check(!dialog.open && event.detail.id===fixture.id,'Send closes the dialog and reports the saved ID.');
-  const receipt=fixture.receipt;
   if(receipt.list_number){
    const text='List item '+receipt.list_number+'. Owner '+receipt.list_owner+'. Producer '+receipt.list_producer+'.';
-   check(window.top.document.querySelector('[data-report-receipt]')?.textContent===text,
-         'Send shows the saved List number, owner, and producer.');
-  }
+   check(visible(message) && !message.querySelector('button') && message.querySelector('span').textContent===text,
+         'The same message shows the saved List number, owner, and producer at full opacity.');
+   const [fade]=message.getAnimations();
+   check(fade.effect.getTiming().duration===3000,'The List receipt starts a new three-second fade.');
+   fade.finish();
+   await fade.finished;
+   check(!toast(), 'The List receipt fades.');
+  }else check(!toast(), 'A Review-only send leaves no List receipt.');
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -7584,9 +8858,16 @@ window.fetch=async(url,options={})=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_items_keep_every_review_filter(self) -> None:
-        for kind in new_item_dialog.SubmissionKind:
+        kinds: tuple[new_item_dialog.SubmissionKind | Literal['enhancement'], ...] = (
+            *new_item_dialog.SubmissionKind, 'enhancement')
+        for kind in kinds:
             with self.subTest(kind=kind):
                 self.assertEqual(firefox_probe_results(self.new_item_filter_page(kind)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_only_question_fades_during_undo(self) -> None:
+        page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, hold_review_only=True)
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:
@@ -7981,6 +9262,33 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(!copy(panel),'The summary copy disappears when the fade ends.');
  check(redraws===1,'The deferred redraw runs once after the fade.');
  observer.disconnect();
+ const bottomFade=async words=>{
+  scrollTo(0,document.scrollingElement.scrollHeight);await frame();
+  const last=rows().at(-1),lastForm=await openCard(last);
+  lastForm.elements.feedback.value=words;
+  scrollTo(0,document.scrollingElement.scrollHeight);await frame();
+  send(lastForm);
+  const key=motionKey(last),clip=copy(key),exit=clip.getAnimations()[0];
+  scrollTo(0,document.scrollingElement.scrollHeight);await frame();
+  const bottom=scrollY,position=top(clip);
+  check(near(bottom,document.scrollingElement.scrollHeight-innerHeight),'The paused fade is at the page bottom.');
+  return {key,exit,stays:()=>near(top(clip),position) && scrollY===bottom};
+ };
+ const words='Keep the words from the bottom of Review.';
+ const first=await bottomFade(words),notice=document.querySelector('[data-review-notice]');
+ const draft=()=>document.querySelector('[data-unsaved-review-key="'+CSS.escape(first.key)+'"]');
+ showReviewDraftNotice(first.key,notice);
+ await frame();
+ check(!draft() && first.stays(),'Inserting a draft copy waits until the fade ends.');
+ first.exit.finish();await first.exit.finished;await frame();
+ check(draft()?.previousElementSibling===notice && draft().querySelector('textarea').value===words,
+  'The draft copy shows after the Review notice when the fade ends.');
+ const second=await bottomFade('');
+ hideReviewDraftNotice(first.key);
+ await frame();
+ check(draft() && second.stays(),'Removing a draft copy waits until the fade ends.');
+ second.exit.finish();await second.exit.finished;await frame();
+ check(!draft(),'The draft copy disappears after the fade.');
 """)
 
     def last_owner_card_markup(self) -> str:
@@ -8014,7 +9322,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const clip=copy(panel),exit=clip.getAnimations()[0];
  halfway(exit);
  const position=top(clip);
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'later',words_saved:false,state:'Open',later:Date.now()+3600000})});
  await frame();
  check(selected()===owner && !owner.hidden,'The last owner stays selected and visible during the fade.');
  check(copy(panel)===clip && near(top(clip),position) && !rows().length,
@@ -8056,7 +9364,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const staysOpen=['feedback','question'].includes(action.outcome);
  if(!posts.has(row.dataset.key) || (staysOpen ? !recordIsOpen(row) : !motion))
   throw new Error('The save did not start with the expected row state.');
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:Boolean(form.elements.feedback.value.trim()),state:action.state,later:0})});
  motion?.finish();await frame();
  if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
   'The completed item leaves Review.');
@@ -8204,7 +9512,7 @@ window.fetch=async(url,options)=>{
  posts.push(new URLSearchParams(options.body));
  if(posts.length===1)
   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
- return Response.json({answer:'works',state:'Done',later:0});
+ return Response.json({answer:'works',words_saved:true,state:'Done',later:0});
 };
 </script>"""
         probe = r"""<script>
@@ -8365,7 +9673,7 @@ window.fetch=async(url,options)=>{
  halfway(exit);
  const position=top(clip),following=top(next);
  check(top(first)<position && position<following,'The departing card starts between its neighbors.');
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',words_saved:true,state:'Done',later:0})});
  await frame();
  check(copy(panel)===clip && near(top(clip),position),'The saved card keeps its position during the fade.');
  check(near(top(next),following),'The next card keeps its position when the save completes.');
@@ -8396,7 +9704,7 @@ window.fetch=async(url,options)=>{
  if(!remounted || remounted===row) throw new Error('The pending row must mount again.');
  const form=await readyReviewCard(remounted);
  check(form.dataset.sending==='true','The remounted form shows the pending save.');
- posts.get(key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',words_saved:true,state:'Done',later:0})});
  await frame();
  check(!current(),'The completed row leaves the table.');
  const exit=copy(panel)?.getAnimations()[0];
@@ -8450,7 +9758,7 @@ Element.prototype.animate=function(...args){
 const sendProbe=fetch;
 window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
- if(options.method==='POST') return Promise.resolve(Response.json({answer:'works'}));
+ if(options.method==='POST') return Promise.resolve(Response.json({answer:'works',words_saved:true}));
  return sendProbe(url,options);
 };
 if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#'+new URLSearchParams({item:INITIAL_ITEM}));
@@ -8592,7 +9900,7 @@ let finishSave,savedState;
 window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
  if(options.method!=='POST') return sendProbe(url,options);
- return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',state:savedState}));});
+ return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',words_saved:true,state:savedState}));});
 };
 </script>"""
         probe = r"""<script>
@@ -8693,7 +10001,7 @@ window.fetch=(url,options={})=>{
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   return form;
  }
- async function settle(key,form,response=Response.json({answer:'saved',state:'Done'})){
+ async function settle(key,form,response=Response.json({answer:'saved',words_saved:true,state:'Done'})){
   finishSave.get(key)(response);
   while(form.dataset.sending) await new Promise(resolve=>requestAnimationFrame(resolve));
  }
@@ -8822,10 +10130,10 @@ window.fetch=(url,options={})=>{
  if(options.method!=='POST') return nativeFetch(url,options);
  const fields=new URLSearchParams(options.body);
  if(fields.get('row').startsWith('question/') && fields.get('outcome')==='answer')
-  return Promise.resolve(Response.json({answer:'answered',state:'Done'}));
+  return Promise.resolve(Response.json({answer:'answered',words_saved:true,state:'Done'}));
  if(!['page-owner/C1','page-owner/C2'].includes(fields.get('row')) || fields.get('outcome')!=='works')
   throw new Error('The form did not submit a verdict for the expected Change.');
- const result=()=>Response.json({answer:'works',state:'Done'});
+ const result=()=>Response.json({answer:'works',words_saved:true,state:'Done'});
  if(fields.get('row')==='page-owner/C1') return new Promise(resolve=>{finishVerdict=()=>resolve(result());});
  return Promise.resolve(result());
 };
@@ -8992,9 +10300,10 @@ window.posts=[];
 let nextPost;
 window.fetch=async(_url,options={})=>{
  if(options.method==='POST'){
-  window.posts.push(new URLSearchParams(options.body));
+  const form=new URLSearchParams(options.body);
+  window.posts.push(form);
   if(nextPost){const post=nextPost;nextPost=null;return post;}
-  return {headers:new Headers(),ok:true,json:async()=>({answer:'works'})};
+  return {headers:new Headers(),ok:true,json:async()=>({answer:'works',words_saved:Boolean(form.get('feedback').trim())})};
  }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
 };
@@ -9007,7 +10316,8 @@ window.fetch=async(_url,options={})=>{
  const shown=()=>rows().filter(row=>!row.hidden);
  const holdPost=()=>{
   let finish;nextPost=new Promise(resolve=>{finish=resolve;});
-  return {save:()=>finish({headers:new Headers(),ok:true,json:async()=>({answer:'works'})}),
+  return {save:()=>finish({headers:new Headers(),ok:true,json:async()=>({
+     answer:'works',words_saved:Boolean(window.posts.at(-1).get('feedback').trim())})}),
    refuse:reason=>finish({headers:new Headers(),ok:false,json:async()=>({reason})})};
  };
  const visibleStatus=text=>[...document.querySelectorAll('[data-send-status],[data-hidden-action-status]')]
@@ -9392,7 +10702,7 @@ window.setInterval=()=>0;
 Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
 window.fetch=async(_url,options={})=>{
  if(options.method==='POST') posts.push(new URLSearchParams(options.body));
- return {ok:true,json:async()=>({answer:'later'})};
+ return {ok:true,json:async()=>({answer:'later',words_saved:false})};
 };
 </script>"""
         probe = r"""<script>
@@ -9464,7 +10774,7 @@ window.setInterval=()=>0;window.clearInterval=()=>{};
 window.posts=[];
 window.fetch=async(_url,options={})=>{
  if(options.method==='POST'){
-  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later'})};
+  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later',words_saved:false})};
  }
  return {ok:true,text:async()=>MARKUP};
 };
@@ -9513,7 +10823,8 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
     (gap ? 'Hides until Sun 14 Mar 03:30' : 'Hides until Sun 7 Nov 01:30'),
     'F005: '+SCENARIO+' summary shows the saved instant');
    form().requestSubmit(form().querySelector('[value="later"]'));await flush();
-   check(window.posts.at(-1)?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
+   const save=window.posts.findLast(post=>post.get('outcome')==='later');
+   check(save?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});

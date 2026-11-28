@@ -238,6 +238,9 @@ class ProtocolTests(unittest.TestCase):
                 (placement.AttemptOutcomeUnavailable("unreachable"),
                     execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
                     placement.DispatchPathPending("start child has no result")),
+                (placement.AttemptLost(placement.MacOutage.MAC_STATUS_MISSING, NOW),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", NOW),
+                    placement.DispatchPathSettled()),
             ):
                 requests.append(wire.ExecutionReport("typed-outcome", assignment, claim, evidence, outcome, path))
             for message in requests:
