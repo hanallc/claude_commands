@@ -18,7 +18,7 @@ Use the `agents` program.
   A production pause reports each refusal and pauses the other selected directors.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
-- `agents clone NAME --as NEW`: fork a live Claude or Codex session beside its source tab.
+- Use `agents clone NAME NEW_NAME` to fork a live Claude or Codex session beside its source tab.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
@@ -27,6 +27,7 @@ Use the `agents` program.
 - Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
+  A stop of a closed worker ends its open passes as canceled.
   SESSION can be a staff path, such as `assembly/fix2` or `hana/assembly/fix2`. A unit path stops the unit and its workers.
   A path that matches no staff row goes to the native session stop, which can match a saved session name such as `review/x`.
   A path that matches more than one staff row stops nothing.

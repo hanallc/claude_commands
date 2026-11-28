@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -54,9 +55,20 @@ class ImageRecord(ImageReference, ImageHeading):
     questions: NotRequired[list[question_record.StoredQuestion]]
 
 
+class SignedImageAnswer(TypedDict):
+    answer: str
+    feedback: str
+    time: str
+    round_id: str
+    previous_answer_key: NotRequired[str]
+    form_request_key: NotRequired[str]
+
+
 class ImageAnswer(TypedDict):
     message: str
     words: NotRequired[str]
+    signed_answer: NotRequired[SignedImageAnswer]
+    form_request_keys: NotRequired[list[str]]
     answered: list[str]
     recipients: list[str]
     confirmed: list[str]
@@ -64,6 +76,8 @@ class ImageAnswer(TypedDict):
 
 class ImageAnswers(ImageReference):
     heading: NotRequired[ImageHeading]
+    deleted_feedback_round: NotRequired[str]
+    stale_form_request_keys: NotRequired[list[str]]
     attempts: dict[str, ImageAnswer]
 
 
@@ -131,6 +145,24 @@ def _image_heading(title: object, lines: object, identity: str) -> ImageHeading:
     return {"title": title, "look_for": cast(list[str], lines)}
 
 
+def _signed_image_answer(value: object, identity: str) -> SignedImageAnswer:
+    match value:
+        case {"answer": str(answer), "feedback": str(feedback), "time": str(stamp), "round_id": str(round_id)} if (
+                answer in ("approved", "feedback")):
+            if datetime.fromisoformat(stamp).utcoffset() == UTC.utcoffset(None):
+                signed: SignedImageAnswer = {"answer": answer, "feedback": feedback, "time": stamp, "round_id": round_id}
+                fields = cast(dict[str, object], value)
+                for key in ("previous_answer_key", "form_request_key"):
+                    if (reference := fields.get(key)) is not None:
+                        if not isinstance(reference, str) or re.fullmatch(r"review:[0-9a-f]{64}", reference) is None:
+                            raise ValueError(f"{identity}: Invalid signed image answer.")
+                        signed[key] = reference
+                return signed
+        case _:
+            pass
+    raise ValueError(f"{identity}: Invalid signed image answer.")
+
+
 def read_answers(directory: Path, identity: str) -> ImageAnswers:
     """Read the saved picture reference and answer attempts."""
     fields = delivery_state.read_fields(_answers_path(directory, identity))
@@ -144,6 +176,13 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
             raise ValueError(f"{identity}: invalid image heading")
         heading = cast(dict[str, object], value)
         answers["heading"] = _image_heading(heading.get("title"), heading.get("look_for"), identity)
+    if "deleted_feedback_round" in fields:
+        round_id = fields["deleted_feedback_round"]
+        if not isinstance(round_id, str) or re.fullmatch(r"[0-9a-f]{64}", round_id) is None:
+            raise ValueError(f"{identity}: Invalid feedback round for the removed image.")
+        answers["deleted_feedback_round"] = round_id
+    if "stale_form_request_keys" in fields:
+        answers["stale_form_request_keys"] = _texts(fields["stale_form_request_keys"])
     for key, attempt in cast(dict[str, object], attempts).items():
         if not isinstance(attempt, dict):
             raise ValueError(f"{identity}: invalid image answer attempt")
@@ -158,8 +197,26 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
             if not isinstance(words, str):
                 raise ValueError(f"{identity}: invalid image answer words")
             saved["words"] = words
+        if "signed_answer" in fields:
+            saved["signed_answer"] = _signed_image_answer(fields["signed_answer"], identity)
+        if "form_request_keys" in fields:
+            saved["form_request_keys"] = _texts(fields["form_request_keys"])
         answers["attempts"][key] = saved
     return answers
+
+
+class ImageAnswersUnavailable(Enum):
+    UNAVAILABLE = "the answer record is absent or unreadable"
+
+
+def find_answers(directory: Path, identity: str) -> ImageAnswers | ImageAnswersUnavailable:
+    """Read the server answer for one image without following a symlink."""
+    try:
+        if not directory.is_symlink() and not _answers_path(directory, identity).is_symlink():
+            return read_answers(directory, identity)
+    except (OSError, ValueError):
+        pass
+    return ImageAnswersUnavailable.UNAVAILABLE
 
 
 def write_answers(directory: Path, answers: ImageAnswers) -> None:
