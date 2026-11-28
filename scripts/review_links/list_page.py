@@ -3049,7 +3049,7 @@ function bindFeedbackForm(form){
    const post=async()=>{
     const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
     const receiver=action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
-    const response=await (usesWords || saveAction
+    const response=await (usesWords || heldSave
      ? hold.post(actionPath,options,saveAction ? null : receiver)
      : fetch(actionPath,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
