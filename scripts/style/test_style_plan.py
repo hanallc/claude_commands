@@ -8,7 +8,6 @@ from scripts.style.style_config import StyleUnitAssignment
 import fcntl
 import io
 import os
-import shutil
 import socket
 import subprocess
 import tempfile
@@ -28,6 +27,7 @@ from scripts.style import unit_plans
 from scripts.style import style_proposals
 
 from scripts.lib import berth_board
+from scripts.lib.socket_test_support import STYLE_SOCKET_LEAF, STYLE_SOCKET_PREFIX, short_socket_directory, socket_address
 from scripts.style import rules
 from scripts.style import style_ledger
 
@@ -89,10 +89,9 @@ class StyleCargoAdmissionTests(unittest.TestCase):
 @final
 class StyleQueueIsolationTests(unittest.TestCase):
     def test_the_style_fixture_replaces_an_inherited_admission_socket(self) -> None:
-        directory = Path(tempfile.mkdtemp(prefix="style-socket-"))
-        self.addCleanup(shutil.rmtree, directory)
+        directory = Path(self.enterContext(short_socket_directory(STYLE_SOCKET_PREFIX)))
         with socket.socket(socket.AF_UNIX) as outside:
-            inherited = directory / "outside.sock"
+            inherited = socket_address(directory, STYLE_SOCKET_LEAF)
             outside.bind(str(inherited))
             outside.listen(1)
             with mock.patch.dict(os.environ, {"ADMISSION_SOCKET": str(inherited)}):

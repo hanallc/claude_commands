@@ -14,7 +14,8 @@ import tempfile
 import time
 import unittest
 
-from scripts.lib import removal_guard
+from scripts.lib import conf, removal_guard
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.conf_reads import CONF_READ_LOG, CONF_SHIFT_READ_LOG
 from scripts.lib.removal_bwrap_test_support import LINUX_CHECKOUT, BuildMount, RemovalSandbox
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -84,6 +85,7 @@ class RemovalProofTests(unittest.TestCase):
         mirror = home / "mirrors"
         mirror.mkdir(parents=True)
         environment = config_environment(base)
+        write_private_build_roots(Path(environment["CONF_DIR"]) / "build_folders.conf", home, conf.local_host_key_name())
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "mac_test.conf",
                                  "mirror_root=~/mirrors\n# range: 5e-324..\nmac_budget_gib.recent=0.0001\n")
         program = """

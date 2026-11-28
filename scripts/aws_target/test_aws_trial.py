@@ -70,7 +70,7 @@ class GuestTests(unittest.TestCase):
             + '# range: 0..\nindex_touch_minutes=60\n'
             + '# whole: 1..\nindex_spill_pages=65536\n')
         _ = (root / 'build_folders.conf').write_text(
-            f'roots.system={root}\nroots.gate={root}\nroots.build={root / "build"}\n'
+            f'roots.system={root}\nroots.build={root / "build"}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'
             + 'names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n'
             + 'patterns.legacy-unique={purpose}{suffix}\n'
@@ -403,7 +403,8 @@ class PairedTrialTests(CostFixture):
         (self.repo / 'scripts/production').mkdir(exist_ok=True)
         _ = (self.repo / 'scripts/production/gate.py').write_text(
             "def test_module_environment(root, environment):\n"
-            + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
+            + "    return {**environment, 'TMPDIR': str(root), 'MERGE_GATE_MODULE_DIR': str(root), "
+            + "'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
             + "def process_memory_mib(roots):\n"
             + "    return {pid: 0.0 for pid in roots}\n")
         (self.repo / 'config').mkdir(exist_ok=True)

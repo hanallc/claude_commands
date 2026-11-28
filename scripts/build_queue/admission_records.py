@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from contextvars import ContextVar
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -31,7 +30,6 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
-from scripts.buildlog.store import host_name
 from scripts.lib import conf, copy_record
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.process_stat import PROC_ROOT, process_fields
@@ -754,6 +752,7 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
+    gate_targets: NotRequired[placement.GateTargets]
     # The caller's own text for the work, such as the mac_queue_run --what text.
     what: NotRequired[str]
 
@@ -1327,6 +1326,7 @@ class WaitingStep:
     ci_job_start: CiJobStart = field(default=NO_JOB_START, kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
     # "failed" or "waiting": the run took the place of an older run of its unit (rules 13 and 20).
     took_place: str = field(default="", kw_only=True)
@@ -1358,6 +1358,7 @@ class RunningStep:
     assignment_host: str = ""
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
     confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
     counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
@@ -2227,21 +2228,6 @@ def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
     return QueueCaller("", owner, unit)
 
 
-OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
-
-
-@dataclass(frozen=True)
-class ActiveGate:
-    """The caller holds the copy for the gate."""
-
-    tree: Path
-    source: Path
-    owner: str
-
-
-ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
-
-
 COPY_ERROR_STATUS = 2
 
 
@@ -2252,39 +2238,29 @@ class CopyError(Exception):
 
 
 def checked_owner(owner: str) -> str:
-    if not OWNER.fullmatch(owner):
-        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
-    return owner
+    """Return a valid copy owner name."""
+    from scripts.lib import copy_owner
+
+    try:
+        return copy_owner.checked_owner(owner)
+    except copy_owner.InvalidCopyOwner as error:
+        raise CopyError(str(error)) from error
 
 
 def recorded_owner(source: Path, *,
                    intent: copy_record.RemovalIntentAccess = copy_record.RemovalIntentAccess.RECOVER) -> str:
-    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
-    for active in reversed(ACTIVE_GATES.get()):
-        if active.tree == source.resolve():
-            return active.owner
-    from scripts.lib import scratch
+    """Read the active gate owner, the copy owner, or the staff ID in that order."""
+    from scripts.lib import copy_owner
 
-    record = scratch.task_of(source, intent=intent)
-    if isinstance(record, copy_record.Registered):
-        owner = record.fields.get("owner_unit")
-        if isinstance(owner, str):
-            return checked_owner(owner)
     try:
-        snapshot = staff.local_snapshot()
-        machine = host_name() or ("mac" if sys.platform == "darwin" else "natedev")
-        member = snapshot.by_worktree(machine, source.resolve())
-        if member is not None:
-            return str(member.id)
-    except staff.StaffUnreadable:
-        pass
-    return ""
+        return copy_owner.recorded_owner(source, intent=intent)
+    except copy_owner.InvalidCopyOwner as error:
+        raise CopyError(str(error)) from error
 
 
 def folder_owner(worktree: Path) -> str:
-    """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
+    """Read the worktree owner without recovering a removal intent."""
     try:
-        # The queue request reads the owner only; it never clears a stale removal intent.
         return recorded_owner(worktree, intent=copy_record.RemovalIntentAccess.READ_ONLY)
     except (CopyError, OSError):
         return ""

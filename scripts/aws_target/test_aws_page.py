@@ -15,6 +15,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.socket_test_support import browser_socket_environment
 from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, quota_requests, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
@@ -360,12 +361,13 @@ class AwsCombinedTableTests(PageCostFixture):
 })();
 </script>"""
         _ = page.write_text(page.read_text().replace('</body>', probe + '</body>', 1))
-        result = run_process_group([
-            'google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
-            '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND', f'--user-data-dir={self.root / "chrome"}',
-            '--window-size=760,1000',
-            '--dump-dom', page.as_uri() + query,
-        ], timeout=TEST_HANG_GUARD_SECS)
+        with browser_socket_environment() as browser_env:
+            result = run_process_group([
+                'google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking',
+                '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND', f'--user-data-dir={self.root / "chrome"}',
+                '--window-size=760,1000',
+                '--dump-dom', page.as_uri() + query,
+            ], timeout=TEST_HANG_GUARD_SECS, env=browser_env)
         result.check_returncode()
         marker = re.search(r'<p id="table-checks">(.*?)</p>', result.stdout)
         assert marker is not None, 'The browser must finish the table checks.'

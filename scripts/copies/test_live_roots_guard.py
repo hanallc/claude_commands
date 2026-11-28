@@ -36,7 +36,7 @@ class LiveRootsGuardTests(unittest.TestCase):
         caller_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         _ = cast(object, self.enterContext(patch.dict(os.environ, caller_environment, clear=True)))
         caller_roots = live_roots()
-        candidates = (Path("/var/tmp"), Path("/tmp"), Path("/dev/shm"), Path.home())
+        candidates = (Path("/var/tmp"), Path("/tmp"), Path.home())
         parents = [parent for parent in map(Path.resolve, candidates)
                    if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
                    and not any(parent.is_relative_to(live) for live in caller_roots)]

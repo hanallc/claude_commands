@@ -28,7 +28,7 @@ from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog import treekey
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
-from scripts.lib import conf, process_group, scratch
+from scripts.lib import build_folders, conf, process_group, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command
@@ -371,13 +371,15 @@ class MacGateSuitesTests(GateSuitesFixture):
         """Hand off a natedev gate, then run gate.main with this mode flag and arguments as the gate process does."""
         argv = [mode_flag, "--repo", str(self.checkout), *arguments]
         run_real = mock.Mock(wraps=gate.run_suites)
-        with placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ):
+        with (placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ),
+              build_folders.use_build_root(self.root / "build")):
             def run_local(repo: Path, *arguments: object, **options: object) -> gate.GateRun:
                 self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
                 grant = cast(gate.LocalGateAssignment, options["local_grant"])
                 self.assertEqual((grant.grant, grant.owner), (reply.grant, reply.assignment.owner))
                 self.assertEqual(grant.sidecar, queue.root / "placement.cgroup")
-                run = cast(gate.GateRun, run_real(repo, *arguments, **options))
+                with mock.patch.dict(os.environ, {"TMPDIR": self.environment["TMPDIR"]}):
+                    run = cast(gate.GateRun, run_real(repo, *arguments, **options))
                 self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
                 return run
 
@@ -390,7 +392,6 @@ class MacGateSuitesTests(GateSuitesFixture):
                       mock.patch.object(gate, "gate_job_from_process",
                                         return_value=gate_job_for_command(["gate.py", *argv])),
                       mock.patch.object(mac_linux, "route") as guest,
-                      mock.patch.object(gate, "_gate_job_parent", return_value=self.fixture_root.parent),
                       mock.patch.object(gate, "gate_reservation") as second_reservation,
                       mock.patch.object(gate, "run_suites", side_effect=run_local) as local,
                       redirect_stderr(io.StringIO()) as errors):

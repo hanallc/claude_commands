@@ -197,7 +197,10 @@ class CopyGateRetryTests(unittest.TestCase):
               mock.patch.object(queue_place, "wait_for_placement", return_value=wire.Assignment(assignment)) as place):
             yield
         prepare.assert_called_once()
-        self.assertEqual(prepare.call_args.args[:3], (list(command), self.root, ("claude-aws",)))
+        targets = placement.GateTargets(("claude-aws",),
+            (("natedev", placement.GATE_CALLER_EXCLUSION), ("mac-linux", placement.GATE_CALLER_EXCLUSION)),
+            caller_supplied=True)
+        self.assertEqual(prepare.call_args.args[:3], (list(command), self.root, targets))
         place.assert_called_once_with(request, "the caller left before first-step admission")
 
     def test_tree_placeholder_in_the_gate_path_can_request_aws(self) -> None:

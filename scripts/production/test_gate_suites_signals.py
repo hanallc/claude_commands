@@ -17,10 +17,9 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf
+from scripts.lib import build_folders, cancellation
 from scripts.lib.process_start import Gone, Started, Unreadable, Zombie
 from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.production import gate, gate_suites_test_support
 from scripts.production.gate_modules import GateRefused
@@ -348,9 +347,6 @@ sys.stdin.read(1)
         parent = self.root / "nested-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = conf.local_host_key_name()
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate.{host}={parent}\n")
         record = self.state / "nested-folders.json"
         module = self.checkout / "scripts" / "hooks" / "test_first.py"
         program = f'''import json
@@ -365,14 +361,20 @@ from scripts.lib import build_folders
 from scripts.production import gate
 from scripts.production.gate_test_support import MergeGateFixture
 
-MergeGateFixture.setUpClass()
+class NestedGateFixture(MergeGateFixture):
+    @classmethod
+    def fixture_configuration(cls, directory):
+        from scripts.lib.build_copies_test_support import private_copy_config
+        return dict(private_copy_config(directory).environment)
+
+NestedGateFixture.setUpClass()
 allocate = build_folders.temporary_build_folder
 
 @contextmanager
-def hold_nested_gate(request):
-    with allocate(request) as folder:
+def hold_nested_gate(request, **options):
+    with allocate(request, **options) as folder:
         Path({str(record)!r}).write_text(json.dumps([
-            str(MergeGateFixture.fixture_root.parent), str(folder)]))
+            str(NestedGateFixture.fixture_root.parent), str(folder)]))
         signal.pause()
         yield folder
 
@@ -392,7 +394,8 @@ gate.run_suites(Path.cwd(), full=True)
         self.assertTrue(outer.is_relative_to(parent), str(outer))
         self.assertTrue(nested.is_relative_to(parent), str(nested))
         self.assertFalse(nested.exists())
-        self.assertEqual(list(parent.iterdir()), [])
+        self.assertEqual(list(parent.iterdir()), [parent / "gate-test-runs"])
+        self.assertEqual(list((parent / "gate-test-runs").iterdir()), [])
 
     def test_cancellation_sends_term_to_all_jobs_before_reaping(self) -> None:
         jobs: list[gate.RunningGateJob] = []
@@ -423,11 +426,17 @@ gate.run_suites(Path.cwd(), full=True)
             self.assertIsNotNone(job.process.returncode)
 
     def test_gate_removes_its_folder_on_normal_exit(self) -> None:
-        parent = self.root / "gate-temporary"
-        parent.mkdir()
-        with mock.patch.dict(os.environ, self.environment, clear=True):
+        temporary = self.root / "gate-temporary"
+        temporary.mkdir()
+        environment = {**self.environment, "TMPDIR": str(temporary)}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            parent = gate.gate_suite_parent(self.checkout, gate.CHECKOUT_TEST_RUNS)
+            self.assertEqual(parent, temporary / "gate-test-runs")
             with gate.private_gate_recovery(self.checkout, parent) as recovery:
-                with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
+                self.assertEqual(recovery.path.parent.parent, parent)
+                self.assertTrue(recovery.path.parent.name.startswith("gate-recovery-"))
+                with gate.gate_temporary(recovery, "g", parent) as folder:
+                    self.assertEqual(folder.parent, parent)
                     self.assertTrue(folder.is_dir())
                     self.assertEqual(recovery.folders, [str(folder)])
                     self.assertEqual(build_folders.build_folder_state(folder), "held")
@@ -504,15 +513,13 @@ gate.run_suites(Path.cwd(), full=True)
         parent = self.root / "gate-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = conf.local_host_key_name()
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate.{host}={parent}\n")
         self.write(self.state / "red-hooks", "red")
 
         result = self.run_gate(own_process=True)
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(list(parent.iterdir()), [], result.stdout + result.stderr)
+        self.assertEqual(list(parent.iterdir()), [parent / "gate-test-runs"], result.stdout + result.stderr)
+        self.assertEqual(list((parent / "gate-test-runs").iterdir()), [], result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
@@ -641,7 +648,9 @@ gate._sweep_nightly_build_folders = lambda: Path({str(sweep_started)!r}).touch()
 
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:
-        self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
+        fixture_parent = self.fixture_root.parents[3]
+        self.assertTrue(fixture_parent.name == "gate-test-runs" or "test-runs" in fixture_parent.parts)
+        self.assertFalse(any((parent / ".git").exists() for parent in (fixture_parent, *fixture_parent.parents)))
         self.supply_jobserver(b"S")
         self.write(self.state / "hold-module", "hold")
         process = subprocess.Popen(

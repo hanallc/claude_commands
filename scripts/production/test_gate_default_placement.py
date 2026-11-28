@@ -26,10 +26,13 @@ from scripts.build_queue.admission_client import OuterReservation
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_targets import mac_linux
+from scripts.build_targets import target_config
+from scripts.build_targets.gate_targets import TARGET_NOT_CONFIGURED, caller_gate_targets
 from scripts.buildlog import treekey
 from scripts.copies import copies
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_folders, conf, scratch
+from scripts.lib.testing_folders import PreparedTestRunsParent
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -217,7 +220,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                         return interrupt()
 
                 with (mock.patch.dict(os.environ, clear=True),
-                      mock.patch.object(first_step, 'gate_targets', return_value=('natedev',)),
+                      mock.patch.object(first_step, 'gate_targets', return_value=placement.GateTargets(('natedev',), ())),
                       mock.patch.object(first_step, 'admitted_run', side_effect=admit),
                       mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                       mock.patch.object(gate, 'current_gate_placement',
@@ -317,7 +320,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
             with (mock.patch.dict(os.environ, {"PYTHONPATH": str(REPOSITORY)}, clear=True),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit):
                 self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--targets", "aws", "--", *command]), 0)
-            admit.assert_called_once_with(command, source, targets=("aws",))
+            admit.assert_called_once_with(command, source, targets=caller_gate_targets(("aws",)))
 
     def test_gate_step_runs_an_affected_named_module_on_natedev(self) -> None:
         with TemporaryDirectory() as folder:
@@ -368,7 +371,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(
                       inherited_admission(assignment))) as admit):
                 self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--targets", "natedev", "--", *command]), 0)
-            admit.assert_called_once_with([*command[:-1], str(source)], source, targets=("natedev",))
+            admit.assert_called_once_with([*command[:-1], str(source)], source,
+                                          targets=caller_gate_targets(("natedev",)))
 
     def test_gate_step_expands_the_checkout_path_once(self) -> None:
         with TemporaryDirectory() as folder:
@@ -393,7 +397,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 result = copies.main(["gate-step", "--repo", str(source), "--targets", "natedev",
                                       "--", *command, "{tree}"])
             self.assertEqual(result, 0)
-            admit.assert_called_once_with(expanded, source, targets=("natedev",))
+            admit.assert_called_once_with(expanded, source, targets=caller_gate_targets(("natedev",)))
             launch.assert_called_once_with(expanded, cwd=source, descriptors=(), environment={
                 "BUILDLOG_PREPARED_COPY": str(source),
                 "BUILDLOG_PLACEMENT_FILE": str(admitted.assignment_file),
@@ -413,10 +417,11 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     environment['BUILDLOG_PREPARED_COPY'] = str(Path.cwd())
 
                 @contextmanager
-                def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[first_step.FirstStepAdmission]:
+                def admit(command: Sequence[str], source: Path, *, targets: placement.GateTargets) -> Generator[first_step.FirstStepAdmission]:
                     self.assertEqual(list(command), ['gate.py', *arguments])
                     self.assertEqual(source, Path.cwd())
-                    self.assertEqual(targets, expected_targets)
+                    self.assertEqual(targets, placement.GateTargets(expected_targets,
+                        (('aws', gate.DIRECT_GATE_TARGETS_ONLY),), caller_supplied=True))
                     calls.append('admit')
                     try:
                         yield inherited_admission(placed('natedev'))
@@ -459,6 +464,11 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(destination.target, "natedev")
                 self.assertEqual(destination.provider, "local")
                 self.assertEqual(request.constraints.command, ("gate.py", "--tests-only"))
+                self.assertEqual(request.route, target_config.ANY_ELIGIBLE_TARGET)
+                caller_supplied = bool(os.environ.get("BUILDLOG_GATE_TARGETS"))
+                reason = placement.GATE_CALLER_EXCLUSION if caller_supplied else TARGET_NOT_CONFIGURED
+                self.assertEqual(request.identity.gate_targets, placement.GateTargets(("natedev",),
+                    (("mac-linux", reason), ("aws", reason)), caller_supplied=caller_supplied))
                 return wire.Assignment(placement.PlacementAssignment(request.episode, "attempt", destination,
                     request.constraints.source_key, request.owner, request.constraints.session, request.since))
 
@@ -491,6 +501,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 close.assert_called_once()
                 suites.assert_called_once()
 
+                os.environ["BUILDLOG_GATE_TARGETS"] = "natedev"
                 state = placement.ClosedAssignment("fixture closed")
                 self.assertEqual(gate.main(["--tests-only"]), 1)
             self.assertEqual(errors.getvalue(), "REFUSED: The gate placement attempt is stale: fixture closed\n")
@@ -838,6 +849,46 @@ class GateDefaultPlacementTests(unittest.TestCase):
             if nested:
                 targets.assert_not_called()
 
+    def test_direct_named_gate_reports_its_targets_while_using_the_parent(self) -> None:
+        with AdmissionFixture() as fixture:
+            module = fixture.root / "scripts/fixture/test_ok.py"
+            module.parent.mkdir(parents=True)
+            module.touch()
+            parent = OuterReservation("parent", os.getppid())
+            marker = f"{parent.reservation}\t{parent.pid}\t{fixture.state_dir}\t{fixture.socket_path}"
+            connection = mock.MagicMock()
+            send = mock.Mock()
+            connect = mock.Mock()
+            close = mock.Mock(return_value=None)
+            connection.configure_mock(**{
+                "__enter__.return_value": connection,
+                "__exit__": close,
+                "makefile.return_value": io.BytesIO(wire.encode_reply(wire.Ok()).encode()),
+                "sendall": send,
+                "connect": connect,
+            })
+            reason = "the gate uses its parent reservation"
+            request = wire.ParentGateTargets(parent.reservation,
+                placement.GateTargets(("natedev",), (("mac-linux", reason), ("aws", reason))))
+
+            def run(_args: gate.GateArguments, _mode: gate.SuiteMode, target: gate.GateTarget) -> int:
+                self.assertEqual(target, "natedev")
+                send.assert_called_once_with(wire.encode_request(request).encode())
+                close.assert_not_called()
+                return 17
+
+            with (mock.patch.dict(os.environ, {admission_client.RESERVED_STEP_ENV: marker}),
+                  mock.patch.object(gate, "outer_reservation", return_value=parent),
+                  mock.patch.object(first_step, "socket", return_value=connection),
+                  mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+                  mock.patch.object(first_step, "admitted_run") as admit,
+                  mock.patch.object(gate, "run_tests_only", side_effect=run)):
+                self.assertEqual(gate.main([
+                    "--tests-only", "--module", "fixture/test_ok.py", "--repo", str(fixture.root)]), 17)
+            admit.assert_not_called()
+            connect.assert_called_once_with(str(fixture.socket_path))
+            close.assert_called_once()
+
     def test_standalone_named_gate_keeps_exit_80_when_cancel_fails(self) -> None:
         with TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -955,12 +1006,14 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(copies, 'standing', return_value=nullcontext(clone)),
                   mock.patch.object(gate, 'gate_state_dir', return_value=repo),
                   mock.patch.object(gate, 'push_nightly_result') as publish,
-                  mock.patch.object(first_step, 'gate_targets', return_value=('mac-linux', 'natedev')),
+                  mock.patch.object(first_step, 'gate_targets',
+                                    return_value=placement.GateTargets(('mac-linux', 'natedev'), ())),
                   mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)) as admit,
                   mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
                   mock.patch.object(gate, 'run_gate_suites', return_value=gate.GateRun((), 0, 0, tests_reused=True)) as run):
                 self.assertEqual(gate.nightly(args, gate.NO_GATE_ASSIGNMENT), 0)
-            admit.assert_called_once_with(command, clone, targets=('mac-linux', 'natedev'))
+            admit.assert_called_once_with(command, clone, targets=placement.GateTargets(
+                ('mac-linux', 'natedev'), (('aws', gate.DIRECT_GATE_TARGETS_ONLY),)))
             self.assertEqual(run.call_args.args[0], clone)
             self.assertEqual(run.call_args.kwargs['target'], gate.MacLinuxAssignment(assignment.assignment))
             publish.assert_called_once()
@@ -1030,6 +1083,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(first_step, 'admitted_run') as place,
                   mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
                   mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
+                  mock.patch.object(gate, 'gate_suite_parent', return_value=PreparedTestRunsParent(repo)),
                   mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
                   mock.patch.object(gate, 'gate_recovery', side_effect=recovery),
                   mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),

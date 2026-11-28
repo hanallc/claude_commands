@@ -50,6 +50,7 @@ from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record, worker_lifecycle
 from scripts.lib import conf, file_lock, unit_runs, resume_message
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
@@ -770,7 +771,7 @@ class MixedRestartTests(ShutdownTestCase):
         from scripts.herdr import worker_panes
         from scripts.herdr.test_worker_panes import PaneWorld
 
-        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        root = Path(fixture.enter_context(short_socket_directory("mixed-")))
         # The fixture files are disposable; on a loaded disk each fsync waits for seconds.
         _ = cast(object, fixture.enter_context(patch.object(os, "fsync")))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
@@ -1920,7 +1921,7 @@ class RestartTests(RestartTestCase):
     def assert_child_report_survives_launcher(self, outcome: str, row: staff.StaffRow) -> None:
         log_path = Path()
         written = b""
-        notification = self.root / f"notify-{outcome}"
+        notification = Path(self.enterContext(short_socket_directory())) / f"notify-{outcome}"
 
         def create_claim(path: Path, content: str) -> bool:
             if outcome == "full disk" and path.exists():
