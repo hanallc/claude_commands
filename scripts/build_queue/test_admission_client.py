@@ -857,6 +857,9 @@ class ClientTests(unittest.TestCase):
                         self.assertEqual(client.main(arguments), 0)
                         lines = output.getvalue().splitlines()
                         if execution_target == "local":
+                            if elapsed_seconds:
+                                self.assertEqual(lines.pop(0), f"memory-seconds {elapsed_seconds}")
+                            self.assertEqual(len(lines), 2, lines)
                             self.assertEqual(lines[0], "done")
                             self.assertTrue(lines[1].startswith("local\tnatedev\t"), lines)
                             self.assertEqual(client.read_assignment(assignment_file).assignment.destination.provider, "local")
