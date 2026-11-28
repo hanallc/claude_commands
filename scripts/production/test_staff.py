@@ -31,7 +31,7 @@ from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import transcripts, unit_runs
+from scripts.lib import atomic_file, transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
@@ -906,6 +906,31 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual([command[0] for command in self.ssh_commands()], ["set-producer-top-item"])
         self.assertEqual(changed.top_item, staff.TopItem(7))
         self.assertEqual(staff.by_id(producer.id), changed)
+
+    def test_priority_request_proof_survives_later_priority_changes(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        command = staff.ApplyPriorityRequest(producer.id, staff.TopItem(7))
+        applied = staff.PriorityRequestKey.read("review:" + "a" * 64)
+        refused = staff.PriorityRequestKey.read("review:" + "b" * 64)
+        with mock.patch.object(atomic_file, "sync_folder", side_effect=OSError("The staff folder did not sync.")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "The staff folder did not sync"):
+                _ = staff.settle_priority_request(applied, command)
+        outcome = staff.settle_priority_request(applied, staff.RefuseUnappliedPriority.REQUEST)
+        self.assertIs(outcome, staff.PriorityRequestOutcome.SAVED)
+        current = staff.by_id(producer.id)
+        assert current is not None
+        self.assertEqual(current.top_item, command.item)
+        outcome = staff.settle_priority_request(refused, staff.RefuseUnappliedPriority.REQUEST)
+        self.assertIs(outcome, staff.PriorityRequestOutcome.NOT_SAVED)
+        _ = staff.set_producer_top_item(producer.id, staff.TopItem(8))
+        saved = staff.local_snapshot()
+        self.assertIs(saved.priority_request_proofs[applied], staff.PriorityRequestOutcome.SAVED)
+        self.assertIs(saved.priority_request_proofs[refused], staff.PriorityRequestOutcome.NOT_SAVED)
+        self.assertIs(staff.settle_priority_request(refused, command), staff.PriorityRequestOutcome.NOT_SAVED)
+        self.assertIs(staff.settle_priority_request(applied, command), staff.PriorityRequestOutcome.SAVED)
+        current = staff.by_id(producer.id)
+        assert current is not None
+        self.assertEqual(current.top_item, staff.TopItem(8))
 
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()

@@ -39,6 +39,24 @@ class ConsoleTextCheckTests(unittest.TestCase):
         self.assertEqual(check.fast_check(text, "reply"),
                          (review.RuleFailure("command-for-user-only", "`git status`"),))
 
+        script = "`~/.claude/scripts/agents/foo.sh`"
+        inline = f"On the Mac, run this command: {script}"
+        for text in (
+                f"Run this command: {script}",
+                "On the Mac, run this command: `~/.claude/scripts/lib/py ~/.claude/scripts/agents/foo.py --x 1`",
+                f"On the Mac, RUN this command: {script}."):
+            with self.subTest(text=text):
+                self.assertEqual(check.fast_check(text, "reply"), ())
+
+        for text, rule, quote in (
+                (f"{inline}\nRun this command: `git status`", "command-for-user-only", "`git status`"),
+                (f"{inline}. Run this command: `git status`", "command-for-user-only", "`git status`"),
+                (f"{inline} and `git status`", "command-for-user-only", "`git status`"),
+                (f"{inline} and see /tmp/result", "omit-file-path", "/tmp/result"),
+                (f"On the Mac, use {script}", "omit-file-path", script.strip("`"))):
+            with self.subTest(text=text):
+                self.assertEqual(check.fast_check(text, "reply"), (review.RuleFailure(rule, quote),))
+
     def test_paths_commits_runs_and_sessions(self) -> None:
         for rule, rejected, accepted in (
                 ("omit-file-path", "/tmp/layout.toml", "the layout settings"),
@@ -75,7 +93,8 @@ class ConsoleTextCheckTests(unittest.TestCase):
             arguments = ["--kind", "proposal", "--file", str(draft)]
             errors = StringIO()
             title = "Show the new layout"
-            with redirect_stderr(errors), patch.object(review, "review_question") as reader:
+            with (redirect_stderr(errors), patch.object(review, "review_question") as reader,
+                  patch.object(review, "state_path", return_value=Path(folder))):
                 _ = draft.write_text(f"## {title}\n\nRead ../notes/proof.")
                 self.assertEqual(check.main(arguments), 1)
                 self.assertIn("omit-file-path: ../notes/proof", errors.getvalue())
@@ -85,7 +104,23 @@ class ConsoleTextCheckTests(unittest.TestCase):
                 _ = draft.write_text(accepted)
                 reader.return_value = review.QuestionAccepted(accepted)
                 self.assertEqual(check.main(arguments), 0)
-                reader.assert_called_once_with(review.QuestionKey("proposal", accepted), accepted, console_kind="proposal")
+                reader.assert_called_once_with(review.QuestionKey("proposal", str(draft.resolve())), accepted,
+                                               console_kind="proposal")
+
+    def test_cli_uses_the_resolved_file_for_the_review_scope(self) -> None:
+        with TemporaryDirectory() as folder:
+            first, alias, second = (Path(folder) / name for name in ("first.md", "alias.md", "second.md"))
+            alias.symlink_to(first)
+
+            with patch.object(review, "review_question", return_value=review.QuestionAccepted("")) as reader:
+                for path, text in ((first, "Retry the download?"),
+                                   (alias, "Resume the download?"),
+                                   (second, "Resume the download?")):
+                    _ = path.write_text(text)
+                    self.assertEqual(check.main(["--kind", "question", "--file", str(path)]), 0)
+            original, revised, independent = (cast(review.QuestionKey, call.args[0]) for call in reader.call_args_list)
+            self.assertEqual(original, revised)
+            self.assertNotEqual(revised, independent)
 
     def test_fast_only_kinds_skip_the_model(self) -> None:
         text = "The image shows the old layout."
@@ -94,6 +129,19 @@ class ConsoleTextCheckTests(unittest.TestCase):
                 with self.subTest(kind=kind):
                     self.assertEqual(check.check(text, kind), review.QuestionAccepted(text))
             reviewer.assert_not_called()
+
+    def test_cli_prints_the_full_quote_mismatch(self) -> None:
+        text = "Retry the download?\n\n1. The download stopped.\n\nRecommended: Yes."
+        reason = ('The reviewer gave a quote that does not match the draft: '
+                  'console-standard-5: "The download stopped." (part 3)')
+        with TemporaryDirectory() as folder:
+            draft = Path(folder) / "question.md"
+            _ = draft.write_text(text)
+            errors = StringIO()
+            with (redirect_stderr(errors),
+                  patch.object(review, "review_question", return_value=review.QuestionReviewFailed(text, (reason,)))):
+                self.assertEqual(check.main(["--kind", "question", "--file", str(draft)]), 1)
+            self.assertEqual(errors.getvalue(), f"Console text: Revise the question draft. {reason}\n")
 
     def test_console_reader_holds_a_rewrite_with_its_quote(self) -> None:
         text = "Step B finished."

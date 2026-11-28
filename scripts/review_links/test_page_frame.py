@@ -1160,22 +1160,16 @@ async function newItemOver(under,description){
  check(under.open,description+' stays open under New item.');
  return captures.at(-1);
 }
+async function capturedDocument(capture){
+ const bytes=Uint8Array.from(atob(capture.document_gzip),char=>char.charCodeAt(0));
+ const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return new DOMParser().parseFromString(await new Response(stream).text(),'text/html');
+}
 async function closeNewItem(under,description){
  newItem().querySelector('[data-cancel]').click();
  await painted();
  check(!newItem().open && under.open && under.contains(document.activeElement),
   'Closing New item leaves '+description+' open with the focus in it.');
-}
-// The screenshot service loads the address and takes the picture at the load event.
-async function opensAgain(place,ready,description){
- const frame=document.createElement('iframe');
- frame.style.cssText='border:0;width:'+innerWidth+'px;height:'+innerHeight+'px';
- const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
- frame.src=place;document.body.append(frame);
- await loaded;
- check(ready(frame.contentDocument),'The screenshot address opens '+description+' by the load event.');
- check(!frame.contentWindow.location.hash.includes('console-window'),'The page removes the window name from its address.');
- frame.remove();
 }
 async function report(){await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});}
 '''
@@ -1303,10 +1297,12 @@ class PageWindowTests(unittest.TestCase):
    'The copy in the window has no plate and no ring around its controls.');
   check(pressNewItem('over the picture')!==null,'The press reaches New item.');
   const capture=await newItemOver(picture,'the picture');
-  check(capture.place===location.pathname+'#console-window='+encodeURIComponent('/fixture/picture.svg'),
-   'The screenshot address names the open picture: '+capture.place);
+  const copy=await capturedDocument(capture);
+  const zoom=copy.querySelector('dialog[data-image-zoom-dialog][open][data-capture-modal]');
+  check(zoom?.querySelector('img').getAttribute('src')==='/fixture/picture.svg',
+   'The snapshot keeps the open picture.');
+  check(!copy.querySelector('#review-new-item,[data-new-item-draft]'),'The snapshot omits New item.');
   await closeNewItem(picture,'the picture');
-  await opensAgain(capture.place,doc=>doc.querySelector('[data-image-zoom-dialog]')?.open===true,'the picture');
  }catch(error){failures.push(String(error));}
  await report();
 })();''')
@@ -1321,7 +1317,8 @@ class PageWindowTests(unittest.TestCase):
   await until(()=>captures.length>0,'the first New item screenshot request');
   const dialog=newItem();
   check(dialog.open && onTop(dialog),'New item opens.');
-  check(captures[0].place===location.pathname,'With no other window open the screenshot address is the page.');
+  const snapshot=await capturedDocument(captures[0]);
+  check(!snapshot.querySelector('dialog[open]'),'The snapshot omits New item.');
   const copy=pressNewItem('over New item');
   check(copy!==null && dialog.contains(copy),'The New item button over New item belongs to its window.');
   await painted();
