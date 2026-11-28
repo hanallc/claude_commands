@@ -20,14 +20,19 @@ from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.mac_test import mac_test
 
 
+GATE_BUCKET_DELETE_BATCH_SIZE = 500
+GATE_BUCKET_DELETE_RETRIES = 3
+
+
 DRY_RUN = '''down would disable AWS routing and aws-target.service.
 down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
 down would remove regional gate stacks and copied images before the home foundation stack.
+down would delete the contents of the home gate bucket.
 down would remove the foundation stack and retained Budget.
 down would delete the data volume and the gate image with its snapshot. The /home build cache is lost.
-down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
+down would remove deployment.json, gate-deployment.json, up.json, setup proofs, and the prepared bundle.
 down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
 
@@ -146,6 +151,7 @@ class TargetRemoval:
         if not identity:
             raise ValueError('missing saved scaler identity; run deploy.py up once to record it')
         name = ledger.text(identity, 'name')
+        resource: dict[str, object] = {}
         if self._stack():
             resource = ledger.mapping(self.api.call('describe-stack-resource', '--stack-name', self.identity.stack_id,
                                                    '--logical-resource-id', 'ScalerUser', service='cloudformation').get('StackResourceDetail'))
@@ -154,7 +160,9 @@ class TargetRemoval:
         try:
             user = ledger.mapping(self.api.call('get-user', '--user-name', name, service='iam').get('User'))
         except AwsUnavailable as error:
-            if 'NoSuchEntity' in str(error) and not self._stack():
+            if 'NoSuchEntity' in str(error) and (
+                    resource.get('ResourceStatus') == 'DELETE_COMPLETE' and self._has_matching_journal()
+                    or not self._stack()):
                 return ''
             raise
         if user.get('Arn') != identity.get('arn') or user.get('UserId') != identity.get('user_id'):
@@ -199,7 +207,7 @@ class TargetRemoval:
         return {} if stacks[0].get('StackStatus') == 'DELETE_COMPLETE' else stacks[0]
 
     def _outputs(self, stack: dict[str, object]) -> dict[str, str]:
-        return {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')
+        return {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in stack_outputs(stack)
                 if row.get('OutputKey') in ('InstanceId', 'DataVolumeId', 'BudgetName', 'ComputeEnabled')}
 
     def verify(self) -> bool:
@@ -239,12 +247,10 @@ class TargetRemoval:
         self.identity = RemovalIdentity(self.identity.stack, self.identity.region, account, stack_id, deployment_id,
                                         str(outputs.get('InstanceId', '')), str(saved.get('data_volume_id', '')),
                                         str(saved.get('budget_name', '')))
-        path = self.directory / 'down.json'
-        if path.exists():
-            journal = remote.read_record(path)
-            for key in ('account_id', 'region', 'stack_id', 'deployment_id'):
-                if journal.get(key) != getattr(self.identity, key):
-                    raise ValueError('the removal journal differs from the current deployment identity')
+        gate_path = self.directory / 'gate-deployment.json'
+        if gate_path.exists() and remote.read_record(gate_path).get('deployment_id') != deployment_id:
+            raise ValueError('The gate record differs from the verified deployment')
+        _ = self._has_matching_journal()
         stack = self._stack()
         if not stack:
             try:
@@ -287,6 +293,16 @@ class TargetRemoval:
                     raise ValueError(f'the live {key} differs from the deployment record')
         return False
 
+    def _has_matching_journal(self) -> bool:
+        path = self.directory / 'down.json'
+        if not path.exists():
+            return False
+        journal = remote.read_record(path)
+        for key in ('account_id', 'region', 'stack_id', 'deployment_id'):
+            if journal.get(key) != getattr(self.identity, key):
+                raise ValueError('the removal journal differs from the current deployment identity')
+        return True
+
     def remember(self) -> None:
         path = self.directory / 'down.json'
         if not path.exists():
@@ -296,9 +312,15 @@ class TargetRemoval:
         stack = self._stack()
         if not stack:
             return False
-        if stack.get('StackStatus') != 'DELETE_IN_PROGRESS':
-            _ = self.api.call('delete-stack', '--stack-name', self.identity.stack_id, service='cloudformation')
-        self._wait(lambda: not self._stack(), 'foundation deletion did not finish')
+
+        def deleted() -> bool:
+            current = self._stack()
+            if current.get('StackStatus') == 'DELETE_FAILED':
+                raise AwsUnavailable(f"The foundation has status DELETE_FAILED. {current.get('StackStatusReason', '')}")
+            return not current
+
+        delete_gate_stack(self.api, stack, self.identity,
+            self._stack, lambda: self._wait(deleted, 'foundation deletion did not finish'))
         print('removed: foundation stack, scaler user, policies, and Budget actions')
         return True
 
@@ -373,6 +395,7 @@ class TargetRemoval:
                 for request in book.pending_compute_requests():
                     book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
         write_text_atomic(self.directory / 'down-complete.json', json.dumps(self.saved, sort_keys=True) + '\n')
+        (self.directory / 'gate-deployment.json').unlink(missing_ok=True)
         (self.directory / 'down.json').unlink(missing_ok=True)
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
@@ -423,6 +446,94 @@ class TargetRemoval:
                     return False
         self._kept_image()
         return True
+
+
+def stack_outputs(stack: dict[str, object]) -> tuple[dict[str, object], ...]:
+    return ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
+
+
+def verified_gate_bucket(stack: dict[str, object], deployment: str) -> tuple[str, ...]:
+    for output in stack_outputs(stack):
+        if output.get('OutputKey') == 'GateBucket':
+            bucket = ledger.text(output, 'OutputValue')
+            if bucket != f'cloud-claude-gate-{deployment}':
+                raise ValueError('The GateBucket differs from the saved deployment')
+            return (bucket,)
+    return ()
+
+
+def empty_gate_bucket(api: AwsCli, bucket: str, *, deployment: str, account_id: str) -> None:
+    target = ('--bucket', bucket, '--expected-bucket-owner', account_id)
+    try:
+        tags = api.call('get-bucket-tagging', *target, service='s3api')
+    except AwsUnavailable as error:
+        if 'NoSuchBucket' in str(error):
+            return
+        raise
+    deployments = [row.get('Value') for row in ledger.rows(tags, 'TagSet') if row.get('Key') == 'GateDeployment']
+    if deployments != [deployment]:
+        raise ValueError('The live gate bucket tag differs from the saved deployment')
+    while True:
+        try:
+            objects = api.call('list-objects-v2', *target, '--no-paginate',
+                               '--max-keys', str(GATE_BUCKET_DELETE_BATCH_SIZE), service='s3api')
+        except AwsUnavailable as error:
+            if 'NoSuchBucket' in str(error):
+                return
+            raise
+        batch = ledger.rows(objects, 'Contents')[:GATE_BUCKET_DELETE_BATCH_SIZE] if 'Contents' in objects else ()
+        if not batch:
+            return
+        keys = [{'Key': ledger.text(row, 'Key')} for row in batch]
+        removed = api.call('delete-objects', *target, '--delete',
+                           json.dumps({'Objects': keys, 'Quiet': True}), service='s3api')
+        if removed.get('Errors'):
+            raise AwsUnavailable(f'The gate bucket {bucket} still contains objects')
+
+
+def gate_bucket_not_empty(reason: str) -> bool:
+    return 'BucketNotEmpty' in reason or 'bucket you tried to delete is not empty' in reason.lower()
+
+
+def gate_bucket_delete_failed(api: AwsCli, stack_id: str) -> bool:
+    events = api.call('describe-stack-events', '--stack-name', stack_id, service='cloudformation')
+    for event in ledger.rows(events, 'StackEvents'):
+        if (event.get('PhysicalResourceId') == stack_id and event.get('ResourceType') == 'AWS::CloudFormation::Stack'
+                and event.get('ResourceStatus') == 'DELETE_IN_PROGRESS'):
+            break
+        if event.get('LogicalResourceId') == 'GateBucket':
+            return (event.get('ResourceStatus') == 'DELETE_FAILED'
+                    and gate_bucket_not_empty(str(event.get('ResourceStatusReason', ''))))
+    return False
+
+
+def delete_gate_stack(api: AwsCli, stack: dict[str, object], identity: RemovalIdentity,
+                      read_stack: Callable[[], dict[str, object]], wait: Callable[[], None]) -> None:
+    start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
+    buckets = verified_gate_bucket(stack, identity.deployment_id) if start_delete else ()
+    for retry in range(GATE_BUCKET_DELETE_RETRIES + 1):
+        if start_delete:
+            for bucket in buckets:
+                empty_gate_bucket(api, bucket, deployment=identity.deployment_id, account_id=identity.account_id)
+        try:
+            if start_delete:
+                _ = api.call('delete-stack', '--stack-name', identity.stack_id, service='cloudformation')
+            wait()
+            return
+        except AwsUnavailable as error:
+            not_empty = gate_bucket_not_empty(str(error))
+            if retry == GATE_BUCKET_DELETE_RETRIES or not (not_empty or 'DELETE_FAILED' in str(error)):
+                raise
+            stack_id = ledger.text(stack, 'StackId')
+            stack = read_stack()
+            if not stack:
+                return
+            if stack.get('StackId') != stack_id:
+                raise ValueError('The gate stack identity changed during deletion') from error
+            buckets = verified_gate_bucket(stack, identity.deployment_id)
+            if not buckets or not (not_empty or gate_bucket_delete_failed(api, stack_id)):
+                raise
+            start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
 
 
 def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = False) -> bool:
