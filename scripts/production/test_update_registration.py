@@ -27,7 +27,6 @@ from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, registration
-from scripts.console_text import check as console_text
 from scripts.console_text.test_support import real_review_question
 
 from scripts.production import footer_counts
@@ -135,12 +134,6 @@ class ProducerQuestionTests(RegistrationFixture):
         return invoke_cli(registration, registration.main, ["ask", *args], self.env, self.checkout,
                           production_state=True)
 
-    def held_review_id(self, result: subprocess.CompletedProcess[str]) -> str:
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        _, hint, rest = result.stdout.rpartition("Use --revise ")
-        self.assertTrue(hint, result.stdout)
-        return rest.split()[0]
-
     def test_ask_revision_preserves_passed_lines_and_rechecks_the_changed_title(self) -> None:
         initial = "Try again?"
         revised = "Retry the download?"
@@ -148,44 +141,59 @@ class ProducerQuestionTests(RegistrationFixture):
         self.use_console_verdicts((initial,), (revised, fact))
 
         first = self.ask_with_review("--ask", initial, "--context", revised, "--item", fact)
-        review_id = self.held_review_id(first)
-        second = self.ask_with_review("--revise", review_id, "--ask", revised, "--item", fact)
-        self.assertEqual(self.held_review_id(second), review_id)
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.assertIn(f"console-standard-4: {initial}", first.stdout)
+        second = self.ask_with_review("--revise-title", initial, "--ask", revised, "--item", fact)
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
         self.assertIn(f"console-standard-4: {revised}", second.stdout)
         self.assertNotIn(f"console-standard-4: {fact}", second.stdout)
 
-    def test_ask_same_title_keeps_separate_draft_verdicts(self) -> None:
+    def test_plain_ask_retry_preserves_passed_lines_with_the_same_title(self) -> None:
         title = "Try again?"
-        shared = "The download stopped."
-        self.use_console_verdicts((title,), (shared,))
+        fact = "The download stopped."
+        initial = "The first file is new."
+        revised = "The first file is incomplete."
+        self.use_console_verdicts((initial,), (revised, title, fact))
 
-        first = self.ask_with_review("--ask", title, "--context", shared, "--item", "The first file is new.")
-        second = self.ask_with_review("--ask", title, "--context", shared, "--item", "The second file is new.")
-        self.assertNotEqual(self.held_review_id(first), self.held_review_id(second))
-        self.assertIn(f"console-standard-4: {shared}", second.stdout)
-        self.assertEqual(len(list((review.state_path() / "question-verdicts").glob("*.json"))), 2)
+        first = self.ask_with_review("--ask", title, "--context", fact, "--item", initial)
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.assertIn(f"console-standard-4: {initial}", first.stdout)
+        second = self.ask_with_review("--ask", title, "--context", fact, "--item", revised)
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        self.assertIn(f"console-standard-4: {revised}", second.stdout)
+        self.assertNotIn(f"console-standard-4: {title}", second.stdout)
+        self.assertNotIn(f"console-standard-4: {fact}", second.stdout)
 
-    def test_ask_migrates_the_verdict_from_the_previous_title(self) -> None:
+    def test_held_ask_names_the_current_title_in_the_retry_hint(self) -> None:
+        title = "Downloads"
+        asked = "Retry the download?"
+        self.use_console_verdicts((asked,))
+
+        result = self.ask_with_review("--text", title, "--ask", asked, "--item", "The download stopped.")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("To change the title on a retry, pass --revise-title 'Downloads'.", result.stdout)
+
+    def test_ask_moves_the_former_title_over_an_existing_record_once(self) -> None:
         initial = "Try again?"
         revised = "Retry the download?"
         fact = "The download stopped."
-        self.use_console_verdicts((initial,), (revised, fact), (fact,))
-        legacy = review.QuestionKey(self.producer.name, initial)
-        outcome = console_text.check(f"{initial}\n\n1. {fact}", "question", key=legacy, title=initial)
-        self.assertIsInstance(outcome, review.QuestionReviewFailed)
+        self.use_console_verdicts((initial,), (fact,), (revised, fact), (revised, fact))
         folder = review.state_path() / "question-verdicts"
-        legacy_path, = folder.glob("*.json")
+        first = self.ask_with_review("--ask", initial, "--item", fact)
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        former_path, = folder.glob("*.json")
+        new_title_args = ("--ask", revised, "--item", fact)
+        split = self.ask_with_review(*new_title_args)
+        self.assertEqual(split.returncode, 2, split.stdout + split.stderr)
+        self.assertIn(f"console-standard-4: {fact}", split.stdout)
+        new_path, = set(folder.glob("*.json")) - {former_path}
 
-        migrated = self.ask_with_review("--revise-title", initial, "--ask", revised, "--item", fact)
-        _ = self.held_review_id(migrated)
-        self.assertIn(f"console-standard-4: {revised}", migrated.stdout)
-        self.assertNotIn(f"console-standard-4: {fact}", migrated.stdout)
-        self.assertFalse(legacy_path.exists())
-        self.assertEqual(len(list(folder.glob("*.json"))), 1)
-
-        new = self.ask_with_review("--ask", initial, "--item", fact)
-        _ = self.held_review_id(new)
-        self.assertIn(f"console-standard-4: {fact}", new.stdout)
+        for _ in range(2):
+            result = self.ask_with_review("--revise-title", initial, *new_title_args)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn(f"console-standard-4: {revised}", result.stdout)
+            self.assertNotIn(f"console-standard-4: {fact}", result.stdout)
+            self.assertEqual(list(folder.glob("*.json")), [new_path])
 
     def test_the_producer_page_count_and_next_share_the_question_store(self) -> None:
         self.file_question()

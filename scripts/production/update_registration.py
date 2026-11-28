@@ -28,7 +28,6 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast, overload
-from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from scripts.production.production_doc import (
@@ -1951,23 +1950,8 @@ class QuestionFromReview:
 
 
 @dataclass(frozen=True)
-class NewQuestionDraft:
-    pass
-
-
-@dataclass(frozen=True)
-class ReviseQuestionDraft:
-    review_id: UUID
-
-
-@dataclass(frozen=True)
-class ReviseTitleKeyedQuestion:
-    previous_title: str
-
-
-@dataclass(frozen=True)
 class QuestionFromStaff:
-    draft: NewQuestionDraft | ReviseQuestionDraft | ReviseTitleKeyedQuestion = NewQuestionDraft()
+    title_change: review.QuestionTitleChange | Literal["keep title"] = "keep title"
 
 
 @dataclass(frozen=True)
@@ -2054,19 +2038,16 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if isinstance(outgoing, KeyedStaffQuestion):
         key = review.QuestionKey(production.name, f"{text} [{outgoing.request_key}]", request_key=outgoing.request_key)
     else:
-        draft = outgoing.draft
-        if isinstance(draft, ReviseQuestionDraft):
-            review_id, previous_title = draft.review_id, review.LegacyQuestionTitle.NONE
-        else:
-            review_id = uuid4()
-            previous_title = draft.previous_title if isinstance(draft, ReviseTitleKeyedQuestion) else text
-        key = review.QuestionKey(production.name, text, console_draft=review.ConsoleQuestionDraft(
-            production.owner.id, asker.id, review_id, previous_title))
+        key = review.QuestionKey(production.name, text, title_change=outgoing.title_change)
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
     accepted = review_open_question(key, QuestionForReview(text, "", question, rank))
     if isinstance(accepted, HeldRegistrationQuestion):
-        retry = (f"\nUse --revise {key.console_draft.review_id} to revise this draft."
-                 if isinstance(key.console_draft, review.ConsoleQuestionDraft) else "")
+        retry = ""
+        if isinstance(outgoing, QuestionFromStaff):
+            quoted_title = shlex.quote(text)
+            if quoted_title == text:
+                quoted_title = f"'{text}'"
+            retry = f"\nTo change the title on a retry, pass --revise-title {quoted_title}."
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}{retry}")
     now = datetime.now(production.zone)
     entry = OutstandingItem(since=now.strftime("%Y-%m-%dT%H:%M"), text=text, question=question,
@@ -2883,9 +2864,7 @@ def main() -> int:
             if action == "reply":
                 _ = subcommand.add_argument("--text", required=True, help="your reply to the user's follow-up")
         elif action == "ask":
-            revision = subcommand.add_mutually_exclusive_group()
-            _ = revision.add_argument("--revise", type=UUID, help="revise the draft with this review ID")
-            _ = revision.add_argument("--revise-title", help="revise an older draft stored under this former title")
+            _ = subcommand.add_argument("--revise-title", default="", help="keep the review record from this former title")
             _ = subcommand.add_argument("--text", default="",
                                         help="the one-line item the count and lists name, at most question_title_max_chars characters (config/production.conf); the default is --ask")
             _ = subcommand.add_argument("--ask", required=True,
@@ -2939,15 +2918,13 @@ def main() -> int:
             asked = cast(str, args.ask)
             parts = QuestionParts(ask=asked, context=cast(str, args.context), items=cast(list[str], args.items),
                                   recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
-            revision_id = cast(UUID | None, args.revise)
-            previous_title = cast(str | None, args.revise_title)
-            draft = NewQuestionDraft()
-            if revision_id is not None:
-                draft = ReviseQuestionDraft(revision_id)
-            elif previous_title:
-                draft = ReviseTitleKeyedQuestion(previous_title)
+            outgoing = _QUESTION_FROM_STAFF
+            if former_title := cast(str, args.revise_title):
+                from scripts.notify import review
+
+                outgoing = QuestionFromStaff(review.QuestionTitleChange(former_title))
             ask(scope, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
-                identities=identities, outgoing=QuestionFromStaff(draft))
+                identities=identities, outgoing=outgoing)
             if isinstance(scope, Production):
                 for line in adopt_moved_state(scope, record=identities.record):
                     report("state-dir", "ok", line)

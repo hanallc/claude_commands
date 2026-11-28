@@ -29,13 +29,13 @@ import time
 import threading
 from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
@@ -250,16 +250,9 @@ ReviewOutcome = Approved | Rewritten | Questions | Unreviewed | Failed | Withhel
 Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 
-class LegacyQuestionTitle(Enum):
-    NONE = "no prior title key"
-
-
 @dataclass(frozen=True)
-class ConsoleQuestionDraft:
-    owner: str
-    asker: str
-    review_id: UUID
-    previous_title: str | LegacyQuestionTitle
+class QuestionTitleChange:
+    former_title: str
 
 
 @dataclass(frozen=True)
@@ -270,8 +263,7 @@ class QuestionKey:
     # The source draft selects an approval within the request's verdict record.
     console_draft_digest: str = field(default="", compare=False, repr=False)
     console_title: str = field(default="", compare=False, repr=False)
-    console_draft: ConsoleQuestionDraft | Literal["use question key"] = field(
-        default="use question key", compare=False, repr=False)
+    title_change: QuestionTitleChange | Literal["keep title"] = field(default="keep title", compare=False, repr=False)
 
     @property
     def digest(self) -> str:
@@ -1182,13 +1174,14 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
     prompt = system_prompt if whole else part_system_prompt
     fingerprint_schema = SCHEMA if whole else LEGACY_PART_REVIEW_SCHEMA
     scope = (key.name, "request", key.request_key) if key.request_key else (key.name, "title", key.text)
-    console_draft = key.console_draft
-    if question and isinstance(console_draft, ConsoleQuestionDraft):
-        scope = ("staff-draft", console_draft.owner, console_draft.asker, console_draft.review_id.hex)
-    elif not question:
+    if not question:
         scope = (*scope, context.console_kind)
     folder = state_path() / "question-verdicts"
     path = folder / f"{question_part_digest(scope)}.json"
+    former_path = path
+    if question and not key.request_key and isinstance(key.title_change, QuestionTitleChange):
+        former_scope = (key.name, "title", key.title_change.former_title)
+        former_path = folder / f"{question_part_digest(former_scope)}.json"
     rules = question_part_digest((prompt, fingerprint_schema, CODE_RULES, PART_RULES, review_date_and_zone))
     line_rules = question_part_digest((system_prompt, part_system_prompt, SCHEMA, LEGACY_PART_REVIEW_SCHEMA,
                                       CODE_RULES, PART_RULES, review_date_and_zone, context.caption_layout,
@@ -1200,17 +1193,14 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
                      for number, part in enumerate(parts, 1)} if question else {})
 
     try:
-        with lock_question_verdicts(path, deadline):
-            if (question and isinstance(console_draft, ConsoleQuestionDraft)
-                    and isinstance(console_draft.previous_title, str) and not path.exists()):
-                old_scope = (key.name, "title", console_draft.previous_title)
-                legacy_path = folder / f"{question_part_digest(old_scope)}.json"
-                if legacy_path.is_file():
-                    with lock_question_verdicts(legacy_path, deadline):
-                        try:
-                            _ = legacy_path.replace(path)
-                        except FileNotFoundError:
-                            pass
+        with ExitStack() as locks:
+            for record_path in sorted({path, former_path}):
+                locks.enter_context(lock_question_verdicts(record_path, deadline))
+            if former_path != path:
+                try:
+                    _ = former_path.replace(path)
+                except FileNotFoundError:
+                    pass
             try:
                 saved = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
             except FileNotFoundError:
