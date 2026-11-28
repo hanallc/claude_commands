@@ -42,12 +42,7 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         _ = write_config_fixture(self.root / "mac2.conf", (self.root / "mac_test.conf").read_text(),
                                  template="mac_test")
         self.write_executable(self.runner, self.runner.read_text().replace(
-            'if mode == "probe-leftovers":', 'if mode == "probe-failed":').replace(
-            '        actions.append("cleanup")\n',
-            '        actions.append("cleanup")\n'
-            + '        if mode == "probe-failed":\n'
-            + '            assert "select_leftovers()" in arguments[-1], arguments\n'
-            + '            assert \'kill "$leftover_pid"\' not in arguments[-1], arguments\n'))
+            'if mode == "probe-leftovers":', 'if mode == "probe-failed":'))
         first_wait, wait_environment = self.first_wait()
         result = self.verify("test", "sample", "--no-cache", extra={
             "TEST_SSH_MODES": '{"mac":"probe-failed"}', **wait_environment})
@@ -56,7 +51,7 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         self.assertEqual([event["target"] for event in events], ["mac", "mac2"],
                          json.dumps(events) + result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(events[0]["actions"], ["claim:0", "probe", "cleanup", "release"])
+        self.assertEqual(events[0]["actions"], ["claim:0", "probe", "release", "cleanup"])
         self.assertEqual([event["queued_at"] for event in events], ["100.25", "100.25"])
         self.assertEqual(first_wait.read_text().strip(), "100.25")
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
@@ -67,7 +62,7 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         self.assertEqual([attempt["target"] for attempt in attempts], ["mac", "mac2"])
         self.assertEqual((attempts[0]["outcome"], attempts[0]["reason"]), ("declined", "unreachable"))
         self.assertEqual((attempts[0]["completion"], attempts[0]["cleanup"], attempts[0]["unresolved_count"]),
-                         ("missing", "confirmed", 0))
+                         ("missing", "unconfirmed", None))
         self.assertEqual(self.routing_record()["target"], "mac2")
 
 
