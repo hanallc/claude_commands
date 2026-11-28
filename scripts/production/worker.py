@@ -2500,9 +2500,10 @@ def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
            ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
     with staff.row_operation(target.parent):
-        claim = target.claim if isinstance(target, worker_panes.DurableDesignRole) else staff.NO_DESIGN_WORKER_CLAIM
-        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase,
-                                            design_claim=claim)
+        if isinstance(target, worker_panes.DurableDesignRole):
+            return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase,
+                                                design_claim=target.claim, design_pane_launch=target.pane_launch)
+        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
@@ -4106,6 +4107,8 @@ def main(arguments: list[str] | None = None) -> int:
             lifecycle = instance.lifecycle
             row = record.by_id(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else None
             if args.command == "end" and row is None:
+                if isinstance(lifecycle, design_roles.HeldWorker) and isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
+                    worker_panes.close_design_launch(instance.pane_launch)
                 return ExitCode.OK
             if not isinstance(instance.parent, str):
                 raise ValueError("the design role has no recorded parent")

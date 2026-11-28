@@ -108,6 +108,7 @@ class PaneWorld(herdr.Herdr):
         self.processes: dict[int, herdr.NativeAgentProcess] = {}
         self.foreground: dict[str, tuple[int, str, list[str]]] = {}
         self.shells: dict[str, int] = {}
+        self.shell_environments: dict[str, dict[str, str]] = {}
         self.exiting_panes: set[str] = set()
         self.used_panes: set[str] = set()
         self.unknown: dict[str, str] = {}
@@ -393,6 +394,8 @@ class PaneWorld(herdr.Herdr):
             self.locations[pane] = {**anchor, "pane_id": pane, "label": destination.label,
                                     "terminal_id": "terminal-" + pane, "focused": False, "agent_status": "idle"}
             _ = self.locations[pane].pop("agent_session", None)
+            if worker_panes.DESIGN_PANE_LAUNCH_ENV in prepared.env:
+                self.shell_environments[pane] = prepared.env.copy()
             self.split_leaf(destination.of_pane, pane, destination.direction, destination.ratio)
         else:
             pane = destination.pane
@@ -496,6 +499,11 @@ class PaneWorld(herdr.Herdr):
             if pane in self.unknown:
                 raise herdr_types.HerdrFailure(self.unknown[pane])
             shell = self.shells.setdefault(pane, 998000 + len(self.shells))
+            shell_environment = self.process_root / str(shell) / "environ"
+            if not shell_environment.exists():
+                shell_environment.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(shell_environment, "\0".join(
+                    f"{key}={value}" for key, value in self.shell_environments.get(pane, {}).items()) + "\0")
             pid, name, argv = self.foreground.get(pane, (shell, "zsh", ["zsh"]))
             return {"process_info": {"shell_pid": shell, "foreground_process_group_id": pid,
                                       "foreground_processes": [{"pid": pid, "name": name, "argv": argv,

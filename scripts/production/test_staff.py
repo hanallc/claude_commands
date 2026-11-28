@@ -2017,6 +2017,9 @@ class StaffTests(StaffCommandTestCase):
         worker = staff.StaffRow.from_json(cast(object, json.loads(result.stdout)))
         self.assertEqual((worker.id, worker.design_claim), (worker_id, claim))
         self.assertEqual(staff.by_id(worker_id), worker)
+        self.assertEqual(staff.authority_snapshot().design_workers, {claim: worker_id})
+        fields = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertEqual(fields["design_workers"], {str(claim): worker_id})
         self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
         with (mock.patch.object(staff, "is_owner", return_value=False),
               mock.patch.object(staff, "_remote_row", return_value=worker) as remote_row):
@@ -2026,6 +2029,27 @@ class StaffTests(StaffCommandTestCase):
         with self.assertRaisesRegex(staff.StaffRefused, "the design role already has a worker"):
             another = staff.native_id(fixture_runtime_id("another-worker"))
             _ = staff.ensure_worker(another, "other-worker", runner.id, design_claim=claim)
+
+    def test_seal_design_start_preserves_an_admission_and_blocks_late_publication(self) -> None:
+        owner = fixture_member("showrunner", name="designs")
+        design_id = "9a01e67d-6c33-4637-8fa8-2e760dfd9445"
+        opened = staff.DesignWorkerClaim(design_id, "designer")
+        stopped = staff.DesignWorkerClaim(design_id, "reviewer")
+        identity = staff.native_id(fixture_runtime_id("design-worker"))
+        worker = staff.ensure_worker(identity, "designer", owner.id, design_claim=opened)
+        staff.seal_design_worker_start(opened)
+        _ = self.cli("seal-design-start", str(stopped))
+        saved = staff.StaffSnapshot.decode(staff.authority_snapshot().encode())
+        self.assertEqual(saved.design_workers, {opened: worker.id})
+        self.assertEqual(saved.sealed_design_starts, frozenset({stopped}))
+        with (mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote", return_value=None) as transport):
+            staff.seal_design_worker_start(stopped)
+        transport.assert_called_once_with(["seal-design-start", str(stopped)])
+        late_id = staff.native_id(fixture_runtime_id("late-design-worker"))
+        with self.assertRaisesRegex(staff.StaffRefused, "the design startup has ended"):
+            _ = staff.ensure_worker(late_id, "reviewer", owner.id, design_claim=stopped)
+        self.assertIsNone(staff.by_id(late_id))
 
     def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
         runner, unit, ordinary = self.tree()

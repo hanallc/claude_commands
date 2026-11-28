@@ -73,6 +73,7 @@ class Arguments(argparse.Namespace):
     target: str = "staff-worker"
     policy: str = ""
     design_role: str = ""
+    parent: str = ""
     to: str = ""
     new_worker: str = ""
     model: str = ""
@@ -144,7 +145,7 @@ def parse_arguments() -> Arguments:
                             default=AssignmentOperation.DISPATCH)
     _ = parser.add_argument("--target", choices=("staff-worker", "consultation-pane", "durable-design-role"), default="staff-worker")
     _ = parser.add_argument("--policy", choices=("astra-reviewer", "astra-designer"), default="")
-    _ = parser.add_argument("--parent", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--parent", help=argparse.SUPPRESS, default="")
     _ = parser.add_argument("--design-role", default="")
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
@@ -979,6 +980,7 @@ def execute_durable(args: Arguments) -> int:
     claim = (staff.DesignWorkerClaim.parse(args.design_role) if args.design_role
              else design_roles.claim_for_worker_name(name_arg))
     expected_worker: staff.StaffId | staff_worker.WorkerIdAtUse = staff_worker.WorkerIdAtUse.BY_NAME
+    pane_launch: worker_panes.DesignPaneLaunch | worker_panes.NoDesignPaneLaunch = worker_panes.NoDesignPaneLaunch.UNRECORDED
     with ExitStack() as locks:
         if isinstance(claim, staff.DesignWorkerClaim):
             if args.policy != f"astra-{claim.role}":
@@ -988,6 +990,7 @@ def execute_durable(args: Arguments) -> int:
             if not isinstance(instance.parent, str):
                 refuse("the design role has no recorded parent")
             parent, name_arg = instance.parent, instance.name
+            pane_launch = instance.pane_launch
             if args.prompt:
                 if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove,
                                                        design_roles.RoleNeedsRecovery)):
@@ -995,12 +998,20 @@ def execute_durable(args: Arguments) -> int:
                 expected_worker = instance.lifecycle.staff_id
         else:
             run = Path(args.session_dir) if args.session_dir else None
-            parent = worker_admission.parent(staff.snapshot(), staff_id=staff.runtime_id(), run=run).id
+            record = staff.snapshot()
+            if args.parent:
+                owner = record.by_id(staff.StaffId(args.parent))
+                if owner is None or owner.kind not in ("unit", "showrunner"):
+                    refuse("the specified parent is not a unit or showrunner")
+                parent = owner.id
+            else:
+                parent = worker_admission.parent(record, staff_id=staff.runtime_id(), run=run).id
         name = staff.WorkerName.parse(name_arg)
         role = cast(staff.WorkerRole, args.policy)
         policy = pane_policy(args.policy, model=args.model, effort=args.effort)
         if not args.prompt:
-            current = launch(worker_panes.DurableDesignRole(parent, name, role, claim), policy, phase=args.phase or None)
+            current = launch(worker_panes.DurableDesignRole(parent, name, role, claim, pane_launch), policy,
+                             phase=args.phase or None)
             if not isinstance(current, worker_panes.OpenWorker):
                 return staff_worker.startup_result(name, current)
             print(json.dumps(current.row.to_json()))

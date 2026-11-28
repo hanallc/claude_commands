@@ -39,13 +39,13 @@ from uuid import UUID, uuid4
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.direct import recorder_state
+from scripts.herdr import herdr_types, worker_panes
 from scripts.lib import conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, worker_admission
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
-DESIGNER_SANDBOX = 'danger-full-access'
 
 
 class AstraCensusProjection(Protocol):
@@ -194,12 +194,20 @@ class RoleParentUnrecorded:
 
 
 @dataclass(frozen=True)
+class RoleIdentityUnresolved:
+    """The legacy record lacks proof of the worker or its parent."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class RoleInstance:
     role: Role
     name: str
     lifecycle: Lifecycle
     assignment_claim: str = ""
-    parent: staff.StaffId | RoleParentUnrecorded = field(default_factory=RoleParentUnrecorded)
+    parent: staff.StaffId | RoleParentUnrecorded | RoleIdentityUnresolved = field(default_factory=RoleParentUnrecorded)
+    pane_launch: worker_panes.DesignPaneLaunch | worker_panes.NoDesignPaneLaunch = worker_panes.NoDesignPaneLaunch.UNRECORDED
 
 
 @dataclass(frozen=True)
@@ -455,8 +463,13 @@ def _decode_design(design_id: str, fields: dict[str, object], *,
             raise RoleRefused('invalid assignment claim')
         lifecycle = _lifecycle(_object(entry.get('lifecycle')))
         name = '' if isinstance(lifecycle, HeldWorker) and lifecycle.staff_id else _text(entry, 'name')
-        parent = staff.StaffId(_text(entry, 'parent')) if 'parent' in entry else RoleParentUnrecorded()
-        instance = RoleInstance(role, name, lifecycle, claim, parent)
+        parent = (RoleIdentityUnresolved(_text(entry, 'identity_problem')) if 'identity_problem' in entry else
+                  staff.StaffId(_text(entry, 'parent')) if 'parent' in entry else RoleParentUnrecorded())
+        launch = _text(entry, 'pane_launch') if 'pane_launch' in entry else ''
+        pane_launch = (worker_panes.NoDesignPaneLaunch.UNRECORDED if not launch else
+                       worker_panes.NoDesignPaneLaunch.NOT_ISSUED if launch == 'not_issued' else
+                       worker_panes.DesignPaneLaunch(UUID(launch)))
+        instance = RoleInstance(role, name, lifecycle, claim, parent, pane_launch)
         instances.append(replace(instance, name=instance_name(instance)))
     if {instance.role for instance in instances} != {'designer', 'reviewer'}:
         raise RoleRefused('design must record both role slots')
@@ -501,6 +514,12 @@ def _design_fields(design: HeldDesign) -> dict[str, object]:
         entry: dict[str, object] = {'role': role.role, 'lifecycle': lifecycle, 'assignment_claim': role.assignment_claim}
         if isinstance(role.parent, str):
             entry['parent'] = role.parent
+        elif isinstance(role.parent, RoleIdentityUnresolved):
+            entry['identity_problem'] = role.parent.reason
+        if isinstance(role.pane_launch, worker_panes.DesignPaneLaunch):
+            entry['pane_launch'] = str(role.pane_launch.token)
+        elif role.pane_launch is worker_panes.NoDesignPaneLaunch.NOT_ISSUED:
+            entry['pane_launch'] = 'not_issued'
         if not isinstance(role.lifecycle, HeldWorker) or not role.lifecycle.staff_id:
             entry['name'] = role.name
         roles.append(entry)
@@ -529,12 +548,12 @@ def _published_workers(design: HeldDesign, *, local_staff: bool = False) -> Held
     if not pending:
         return design
     record = staff.local_snapshot() if local_staff else staff.authority_snapshot()
-    workers = record.find(kind='worker')
     for instance in pending:
         claim = staff.DesignWorkerClaim(design.placement.design_id, instance.role)
-        worker = next((row for row in workers if row.design_claim == claim), None)
-        if worker is not None:
-            design = _set_instance(design, replace(instance, name=worker.name, lifecycle=RoleWorkerPublished(worker.id)))
+        if claim in record.design_workers:
+            reference = record.design_workers[claim]
+            published = replace(instance, lifecycle=RoleWorkerPublished(reference))
+            design = _set_instance(design, replace(published, name=instance_name(published, record)))
     return design
 
 
@@ -686,30 +705,49 @@ def _check_host(design: HeldDesign) -> None:
 
 
 def _migrate_parent(design: HeldDesign, role: Role) -> HeldDesign:
-    """Save the legacy owner and any admitted worker while the design lock is held."""
+    """Save a proved legacy parent or the reason a director must resolve it."""
     instance = _instance(design, role)
-    if (isinstance(instance.parent, str) or isinstance(instance.lifecycle, RoleEnded)
-            or isinstance(instance.lifecycle, RoleNotOpened) and not instance.lifecycle.claim):
-        return design
-    record = staff.snapshot()
-    run = (Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase)
-           else design_directory(design.placement.design_id))
-    owner = unit_runs.run_owner(unit_runs.read_run_fields(run), record)
     lifecycle = instance.lifecycle
-    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
-        if not isinstance(design.binding, DesignUnbound) or not isinstance(lifecycle, HeldWorker):
-            return design
+    if isinstance(lifecycle, RoleEnded) or isinstance(lifecycle, RoleNotOpened) and not lifecycle.claim:
+        return design
+    unknown_legacy_launch = (isinstance(lifecycle, RoleNotOpened) and lifecycle.creation == 'outcome_unknown'
+                             and instance.pane_launch is worker_panes.NoDesignPaneLaunch.UNRECORDED)
+    if isinstance(instance.parent, str) and not unknown_legacy_launch:
+        return design
+    record = staff.authority_snapshot()
+    parent: staff.StaffId | RoleIdentityUnresolved
+    if unknown_legacy_launch:
+        claim = staff.DesignWorkerClaim(design.placement.design_id, role)
+        if claim in record.design_workers:
+            lifecycle = RoleWorkerPublished(record.design_workers[claim])
+    if isinstance(lifecycle, HeldWorker):
         worker = record.by_id(lifecycle.staff_id)
         owner = record.parent_of(worker) if worker is not None else None
-        if owner is None:
-            return design
-    if isinstance(lifecycle, RoleNotOpened) and lifecycle.creation == 'outcome_unknown':
-        worker = worker_admission.find_worker(record, owner.id, instance.name)
-        if worker is not None:
-            lifecycle = RoleWorkerPublished(worker.id)
-    migrated = _set_instance(design, replace(instance, parent=owner.id, lifecycle=lifecycle))
-    _save(migrated)
+        parent = (owner.id if worker is not None and worker.kind == 'worker' and owner is not None
+                  else RoleIdentityUnresolved('the recorded worker has no proved staff parent'))
+    else:
+        run = (Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase)
+               else design_directory(design.placement.design_id))
+        try:
+            run_owner = unit_runs.run_owner(unit_runs.read_run_fields(run), record)
+        except (OSError, ValueError, staff.StaffUnreadable) as error:
+            run_owner = unit_runs.RunOwnerUnrecorded(str(error))
+        if isinstance(run_owner, unit_runs.RunOwnerUnrecorded):
+            parent = RoleIdentityUnresolved(run_owner.reason)
+        elif unknown_legacy_launch:
+            parent = RoleIdentityUnresolved('the legacy launch has no recorded worker ID or pane marker')
+        else:
+            parent = run_owner.id
+    updated = replace(instance, parent=parent, lifecycle=lifecycle)
+    migrated = _set_instance(design, replace(updated, name=instance_name(updated, record)))
+    if migrated != design:
+        _save(migrated)
     return migrated
+
+
+def _require_identity(instance: RoleInstance) -> None:
+    if isinstance(instance.parent, RoleIdentityUnresolved):
+        raise RoleRefused(f'RoleIdentityUnresolved: {instance.parent.reason}. A director must resolve this record.')
 
 
 def recorded_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
@@ -719,10 +757,14 @@ def recorded_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
 
 
 def dispatch_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
-    with _lock(design_directory(claim.design_id)):
+    directory = design_directory(claim.design_id)
+    with _lock(directory):
         design = read_design(claim.design_id)
         _check_host(design)
-        return _instance(_migrate_parent(design, claim.role), claim.role)
+        _require_no_transition(directory)
+        instance = _instance(_migrate_parent(design, claim.role), claim.role)
+        _require_identity(instance)
+        return instance
 
 
 def claim_for_worker_name(name: str) -> staff.DesignWorkerClaim | staff.NoDesignWorkerClaim:
@@ -738,11 +780,25 @@ def claim_for_worker_name(name: str) -> staff.DesignWorkerClaim | staff.NoDesign
 def start_claim(claim: staff.DesignWorkerClaim) -> Generator[RoleInstance]:
     directory = design_directory(claim.design_id)
     with _lock(directory):
-        instance = recorded_role(claim)
+        design = read_design(claim.design_id)
+        _check_host(design)
+        instance = _instance(design, claim.role)
         if (instance.lifecycle != RoleNotOpened('pane-start', 'outcome_unknown')
                 or (directory / 'transition.json').exists()):
             raise RoleRefused('thread creation claim changed')
+        if instance.pane_launch is worker_panes.NoDesignPaneLaunch.NOT_ISSUED:
+            instance = replace(instance, pane_launch=worker_panes.DesignPaneLaunch(uuid4()))
+            _save(_set_instance(design, instance))
+        elif isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
+            instance = replace(instance, pane_launch=worker_panes.RetryDesignPaneLaunch(instance.pane_launch.token))
+        else:
+            raise RoleRefused('the legacy launch has no recorded pane marker')
         yield instance
+
+
+def _require_no_transition(directory: Path) -> None:
+    if (directory / 'transition.json').exists():
+        raise RoleRefused('RoleNeedsRecovery: a lifecycle transition is incomplete')
 
 
 def worker_parent(design: HeldDesign, role: Role, record: staff.StaffSnapshot) -> staff.StaffRow:
@@ -784,6 +840,8 @@ def _validate_binding(binding: Binding, repository: str, role: Role) -> None:
 
 
 def _idle(design: HeldDesign) -> None:
+    for instance in design.roles:
+        _require_identity(instance)
     if any(instance.assignment_claim or isinstance(instance.lifecycle, RoleWorkerPublished)
            or (isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.claim)
            for instance in design.roles):
@@ -827,7 +885,8 @@ def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
 
 
 def access_policy(design: HeldDesign, role: Role) -> ThreadAccessPolicy:
-    return PhaseBoundDesigner(design.placement.generation, DESIGNER_SANDBOX) if role == 'designer' else ReadOnlyReviewer()
+    return (PhaseBoundDesigner(design.placement.generation, worker_panes.DESIGNER_SANDBOX)
+            if role == 'designer' else ReadOnlyReviewer())
 
 
 def _worker_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -953,12 +1012,14 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
                                 checkout=checkout_source)
             _save(design)
         _check_host(design)
+        _require_no_transition(directory)
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
         if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.claim:
             design = _migrate_parent(design, role)
             instance = _instance(design, role)
+        _require_identity(instance)
         if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.creation == 'outcome_unknown':
             if not isinstance(instance.lifecycle, (RoleNotOpened, RoleWorkerPublished)):
                 _project_hold(design, role, staff.snapshot())
@@ -973,7 +1034,8 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
                 raise RoleRefused('staff: caller: not opened: caller is not a unit or showrunner')
             parent = caller.id
         name = instance_name(instance)
-        design = _set_instance(design, replace(instance, parent=parent, lifecycle=RoleNotOpened('pane-start', 'not_started')))
+        design = _set_instance(design, replace(instance, parent=parent, lifecycle=RoleNotOpened('pane-start', 'not_started'),
+                                               pane_launch=worker_panes.NoDesignPaneLaunch.NOT_ISSUED))
         _save(design)
     design = _begin_creation(design, role, 'pane-start')
     run, phase = ((Path(design.binding.run_directory), design.binding.phase) if isinstance(design.binding, DesignBoundToPhase)
@@ -988,16 +1050,22 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
         lifecycle = _instance(current, role).lifecycle
         if not isinstance(lifecycle, RoleWorkerPublished) or (directory / 'transition.json').exists():
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
+        record = staff.authority_snapshot()
+        if record.by_id(lifecycle.staff_id) is None:
+            raise RoleRefused('RoleNeedsRecovery: the recorded worker retired; run end to finish this role')
+        _ = worker_parent(current, role, record)
         design = _set_lifecycle(current, role, RoleOpen(lifecycle.staff_id))
         _save(design)
-    _project_hold(design, role, staff.snapshot())
+        _project_hold(design, role, record)
     return design
 
 
 def _begin_creation(design: HeldDesign, role: Role, claim: str) -> HeldDesign:
     """Record an uncertain outcome before the worker command creates a pane."""
     design_id = design.placement.design_id
-    with _lock(design_directory(design_id)):
+    directory = design_directory(design_id)
+    with _lock(directory):
+        _require_no_transition(directory)
         current = read_design(design_id)
         if current != design or _instance(current, role).lifecycle != RoleNotOpened(claim, 'not_started'):
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
@@ -1012,21 +1080,39 @@ def recover(instance_id: str) -> HeldDesign:
     if role_text not in ('designer', 'reviewer'):
         raise RoleRefused('unknown role')
     role = role_text
-    with _lock(design_directory(design_id)):
+    directory = design_directory(design_id)
+    claim = staff.DesignWorkerClaim(design_id, role)
+    with _lock(directory):
         design = read_design(design_id)
         _check_host(design)
+        _require_no_transition(directory)
         design = _migrate_parent(design, role)
         instance = _instance(design, role)
+        _require_identity(instance)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
         lifecycle = instance.lifecycle
         if isinstance(lifecycle, RoleNotOpened):
             if lifecycle.creation == 'not_started':
                 raise RoleRefused('startup has not started; repeat the original open command')
-            raise RoleRefused('RoleNeedsRecovery: creation outcome unknown; no recorded worker; replacement refused; run end to clear the claim')
-        observed = replace(design, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
-                                               for value in design.roles))
-        _pane_recovery_idle(lifecycle, staff.DesignWorkerClaim(design_id, role))
+            if not isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch) or not isinstance(instance.parent, str):
+                raise RoleRefused('RoleNeedsRecovery: no recorded worker; replacement refused; run end to clear the claim')
+            run = Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase) else directory
+            try:
+                worker_panes.recover_design_launch(instance.parent, staff.WorkerName.parse(instance.name),
+                                                  claim, instance.pane_launch, run)
+            except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError,
+                    subprocess.SubprocessError) as error:
+                raise RoleRefused(f'RoleNeedsRecovery: {error}') from error
+            design = read_design(design_id)
+            instance = _instance(design, role)
+            lifecycle = instance.lifecycle
+            if not isinstance(lifecycle, RoleWorkerPublished):
+                raise RoleRefused('RoleNeedsRecovery: staff has no confirmed design worker')
+        if isinstance(lifecycle, RoleWorkerPublished) and staff.authority_snapshot().by_id(lifecycle.staff_id) is None:
+            raise RoleRefused('RoleNeedsRecovery: the recorded worker retired; run end to finish this role')
+        observed = _set_instance(design, replace(instance, assignment_claim=''))
+        _pane_recovery_idle(lifecycle, claim)
         updated = _set_lifecycle(observed, role, RoleOpen(lifecycle.staff_id))
         _save(updated)
         _project_hold(updated, role, staff.snapshot())
@@ -1047,6 +1133,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
         _check_host(design)
         design = _migrate_parent(design, role)
         instance = _instance(design, role)
+        _require_identity(instance)
         if not isinstance(instance.lifecycle, (RoleOpen, RolePausedForMove)):
             raise RoleRefused(type(instance.lifecycle).__name__ + ': role is unavailable')
         if (directory / 'transition.json').exists():
@@ -1073,18 +1160,22 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
     except BaseException as error:
         with _lock(directory):
             current = read_design(design_id)
-            _save(_set_lifecycle(replace(current, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
-                                                          for value in current.roles)), role,
-                                     RoleNeedsRecovery(instance.lifecycle.staff_id, str(error))))
+            selected = _instance(current, role)
+            if selected.assignment_claim == str(prompt) and selected.lifecycle == instance.lifecycle:
+                updated = _set_instance(current, replace(selected, assignment_claim='',
+                    lifecycle=RoleNeedsRecovery(instance.lifecycle.staff_id, str(error))))
+                _save(updated)
         raise
     with _lock(directory):
         current = read_design(design_id)
-        _save(_set_lifecycle(replace(current, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
-                                                      for value in current.roles)), role, RoleOpen(instance.lifecycle.staff_id)))
-        identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
-        for identifier in identifiers:
-            (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
-    _project_hold(design, role, staff.snapshot())
+        selected = _instance(current, role)
+        if selected.assignment_claim == str(prompt) and selected.lifecycle == instance.lifecycle:
+            updated = _set_instance(current, replace(selected, assignment_claim='', lifecycle=RoleOpen(instance.lifecycle.staff_id)))
+            _save(updated)
+            identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
+            for identifier in identifiers:
+                (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
+            _project_hold(updated, role, staff.snapshot())
     return submitted
 
 
@@ -1139,6 +1230,7 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
             if not pending and not damaged_binding and target_binding != design.binding:
                 for instance in design.roles:
                     design = _migrate_parent(design, instance.role)
+                    _require_identity(_instance(design, instance.role))
                 updated = replace(updated, roles=design.roles)
             fields = _design_fields(updated)
             if pending and pending.get('target', fields) != fields:
@@ -1205,6 +1297,8 @@ def end(instance_id: str) -> HeldDesign:
         raise RoleRefused('unknown role: ' + role_text)
     role = role_text
     directory = design_directory(design_id)
+    claim = staff.DesignWorkerClaim(design_id, role)
+    transition = directory / 'transition.json'
     with _lock(directory):
         design = read_design(design_id)
         _check_host(design)
@@ -1213,36 +1307,47 @@ def end(instance_id: str) -> HeldDesign:
         instance = _instance(design, role)
         lifecycle = instance.lifecycle
         if not isinstance(lifecycle, RoleEnded):
-            pending_start = (isinstance(lifecycle, RoleWorkerPublished) or
-                             isinstance(lifecycle, RoleNotOpened) and lifecycle.creation == 'outcome_unknown')
+            _require_identity(instance)
+            pending_start = isinstance(lifecycle, (RoleNotOpened, RoleWorkerPublished))
             _idle(_set_instance(design, replace(instance, lifecycle=RoleNotOpened())) if pending_start else design)
-            if isinstance(lifecycle, RoleWorkerPublished):
-                _save(design)
-            _atomic(directory / 'transition.json', {'generation': design.placement.generation,
-                                                   'reason': 'explicit end', 'role': role})
-    if isinstance(instance.lifecycle, RoleEnded):
-        _finish_end(design, role)
-        return design
-    if isinstance(instance.lifecycle, HeldWorker):
-        result = _worker_command(['end', '--design-role', str(staff.DesignWorkerClaim(design_id, role))])
-        if result.returncode:
-            raise RoleRefused(result.stderr.strip() or f'held worker end exited {result.returncode}; retry end')
-    with _lock(directory):
-        updated = _set_lifecycle(read_design(design_id), role, RoleEnded(
-            instance.lifecycle.staff_id if not isinstance(instance.lifecycle, RoleNotOpened) else staff.StaffId('')))
-        _save(updated)
-    _finish_end(updated, role)
-    return updated
+            fence = {'generation': design.placement.generation, 'reason': 'explicit end', 'role': role}
+            if transition.exists():
+                if _read(transition) != fence:
+                    raise RoleRefused('another lifecycle transition is incomplete')
+            else:
+                _atomic(transition, fence)
+            if isinstance(lifecycle, RoleNotOpened) and isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
+                staff.seal_design_worker_start(claim)
+                design = read_design(design_id)
+                instance = _instance(design, role)
+                lifecycle = instance.lifecycle
+            if isinstance(lifecycle, HeldWorker):
+                result = _worker_command(['end', '--design-role', str(claim)])
+                if result.returncode:
+                    raise RoleRefused(result.stderr.strip() or f'held worker end exited {result.returncode}; retry end')
+            elif isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
+                try:
+                    worker_panes.close_design_launch(instance.pane_launch)
+                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                    raise RoleRefused(f'RoleNeedsRecovery: {error}') from error
+            reference = lifecycle.staff_id if isinstance(lifecycle, HeldWorker) else staff.StaffId('')
+            design = _set_lifecycle(design, role, RoleEnded(reference))
+            _save(design)
+    _finish_end(design, role)
+    return design
 
 
 def _finish_end(design: HeldDesign, role: Role) -> None:
     """Release the census before clearing this role's end fence."""
-    lifecycle = _instance(design, role).lifecycle
-    if isinstance(lifecycle, HeldWorker) and lifecycle.staff_id:
-        _census_projection().release(lifecycle.staff_id)
     directory = design_directory(design.placement.design_id)
     with _lock(directory):
-        if isinstance(design.binding, DesignUnbound):
+        current = read_design(design.placement.design_id)
+        lifecycle = _instance(current, role).lifecycle
+        if not isinstance(lifecycle, RoleEnded):
+            raise RoleRefused('the ended role changed before cleanup')
+        if lifecycle.staff_id:
+            _census_projection().release(lifecycle.staff_id)
+        if isinstance(current.binding, DesignUnbound):
             if unit_runs.run_is_open(directory):
                 _recorder_command(['finish-run', '--session-dir', str(directory), '--status', 'completed'])
         transition = directory / 'transition.json'
@@ -1262,8 +1367,10 @@ def list_roles() -> dict[str, object]:
                 transition = path.parent / 'transition.json'
                 if transition.exists() and not isinstance(lifecycle, (RoleNotOpened, RoleEnded)):
                     lifecycle = RoleNeedsRecovery(lifecycle.staff_id, 'incomplete ' + str(_read(transition).get('reason')))
+                state = (_tag(lifecycle) if not isinstance(role.parent, RoleIdentityUnresolved)
+                         else {'kind': 'RoleIdentityUnresolved', 'reason': role.parent.reason})
                 entries.append({'design_id': design.placement.design_id, 'instance_id': design.placement.design_id + '/' + role.role,
-                                'role': role.role, 'name': instance_name(role), 'lifecycle': _tag(lifecycle),
+                                'role': role.role, 'name': instance_name(role), 'lifecycle': state,
                                 'binding': _tag(design.binding), 'generation': design.placement.generation,
                                 'document': design.document, 'host': design.placement.host})
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -1276,8 +1383,9 @@ def render_roles(report: dict[str, object]) -> str:
     for entry in cast(list[dict[str, object]], report['roles']):
         lifecycle = _object(entry['lifecycle'])
         thread = ' | staff ' + _text(lifecycle, 'staff_id') if lifecycle.get('staff_id') else ''
+        reason = ' | ' + _text(lifecycle, 'reason') if lifecycle.get('kind') == 'RoleIdentityUnresolved' else ''
         lines.append(f"{entry['instance_id']} | {entry['role']} | {_text(lifecycle, 'kind')} | "
-                     + f"{thread} | {entry['document']}")
+                     + f"{thread} | {entry['document']}{reason}")
     return '\n'.join(lines) if lines else 'no held roles'
 
 
