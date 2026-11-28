@@ -10,12 +10,36 @@ from unittest import mock
 
 from scripts.lib import conf
 from scripts.lint.memory_test_support import (
-    ConfigFixtureRefused, commit_config_fixture, config_environment, shifted_number, write_config_fixture,
+    ConfigFixtureRefused, commit_config_fixture, config_environment, copy_config_file_fixture, copy_config_fixture,
+    shifted_number, write_config_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
+    def test_copy_omits_an_unpinned_word(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "templates"
+            templates.mkdir()
+            source = templates / "template.conf"
+            _ = source.write_text("# one of: on, off\nunpinned=on\n# whole: 1..\nnumber=3\n")
+            fixture = copy_config_fixture(templates, root / "fixtures") / source.name
+            self.assertNotIn("unpinned", fixture.read_text())
+            self.assertEqual(conf.read(fixture).whole("number"), 4)
+            with self.assertRaisesRegex(conf.Unusable, "key is missing"):
+                _ = conf.read(fixture).text("unpinned")
+
+    def test_copy_uses_the_word_pin_in_place_of_the_live_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "mac_test.conf"
+            _ = source.write_text("# one of: on, off\noffload=off\noffload=off # duplicate\n")
+            fixture = copy_config_file_fixture(source, root / "fixture.conf")
+            self.assertIn("# one of: on, off\noffload=on\n", fixture.read_text())
+            self.assertNotIn("offload=off", fixture.read_text())
+            self.assertEqual(conf.read(fixture).text("offload"), "on")
+
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
