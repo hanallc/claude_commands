@@ -13,8 +13,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -464,11 +465,25 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(saved.schedule, the_list.ScheduledRun(
             datetime(2026, 11, 30, 9, tzinfo=ZoneInfo("America/Los_Angeles")), "Check the total."))
 
+    @contextmanager
+    def scheduled_case(self, case: str, config: str, sender_code: str) -> Generator[tuple[Path, Path, Path]]:
+        root = self.root / case
+        list_config = root / self.list_config.relative_to(self.root)
+        list_config.parent.mkdir(parents=True)
+        _ = list_config.write_text(config)
+        sender = root / "send.py"
+        sent = root / "sent.jsonl"
+        attempted = root / "attempted.jsonl"
+        _ = sender.write_text(sender_code)
+        _ = sent.write_text("")
+        _ = attempted.write_text("")
+        with (patch.dict(os.environ, {"HOME": str(root), "SHOWRUNNER_STATE_DIR": str(root / "state")}),
+              patch.object(self, "list_config", list_config),
+              patch.object(session_send, "SEND_SCRIPT", sender)):
+            yield sender, sent, attempted
+
     def test_scheduled_run_cycle(self) -> None:
-        sender = self.root / "send.py"
-        sent = self.root / "sent.jsonl"
-        attempted = self.root / "attempted.jsonl"
-        _ = sender.write_text(r"""from pathlib import Path
+        sender_code = r"""from pathlib import Path
 import json
 import os
 import subprocess
@@ -534,7 +549,7 @@ elif key.endswith(":owner_start") and "Accepted notice" not in args[-1]:
     sys.exit(1)
 else:
     print("SENT: delivered")
-""")
+"""
         cases = (
             ("confirmed", "", 730, 0, RUNNER),
             ("timeout", "", 730, 0, MORTY),
@@ -546,14 +561,11 @@ else:
             ("owner changed", "", 730, 0, RUNNER),
         )
         config = self.list_config.read_text().replace("confirm_wait_minutes=15", "confirm_wait_minutes=2")
-        with (patch.object(session_send, "SEND_SCRIPT", sender),
-              patch.object(remote, "local_machine", return_value="natedev"),
+        with (patch.object(remote, "local_machine", return_value="natedev"),
               patch.object(sys, "platform", "linux")):
             for case, rule, limit, missed_days, caller in cases:
-                with self.subTest(case=case):
-                    _ = self.list_config.write_text(config.replace("series_run_limit=730", f"series_run_limit={limit}"))
-                    for path in (sent, attempted):
-                        _ = path.write_text("")
+                settings = config.replace("series_run_limit=730", f"series_run_limit={limit}")
+                with self.subTest(case=case), self.scheduled_case(case, settings, sender_code) as (_, sent, attempted):
                     scheduled = the_list.ScheduledRun(START, "Compare the account predictions.")
                     schedule = the_list.ScheduledSeries(scheduled, repeat_rule.parse(rule), limit) if rule else scheduled
                     item = self.add(case, changes={"state": the_list.ItemState.SCHEDULED,
@@ -659,10 +671,7 @@ else:
             for case in ("interrupted owner", "slow notice", "accepted notice", "scan resume", "overlapping runs",
                          "same check", "state changed", "all confirmations", "pending instruction",
                          "reopened", "capture allocation fails", "Mac", "orphan sender", "exited sender"):
-                with self.subTest(case=case):
-                    for path in (sent, attempted):
-                        _ = path.write_text("")
-                    _ = self.list_config.write_text(config)
+                with self.subTest(case=case), self.scheduled_case(case, config, sender_code) as (sender, sent, attempted):
                     match case:
                         case "interrupted owner":
                             self.check_scheduled_instruction_interrupt(attempted)
@@ -723,7 +732,7 @@ else:
         with redirect_stderr(io.StringIO()) as errors:
             the_list.fire_scheduled(UPKEEP_INTERVAL)
         self.assertIn("timed out", errors.getvalue())
-        with (self.root / "sender-child.lock").open("r+") as lock:
+        with sent.with_name("sender-child.lock").open("r+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
         self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
