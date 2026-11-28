@@ -786,7 +786,7 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
         receiver = html.escape(owner_name(members, owner), quote=True)
         field = "words-" + entry.key.replace("/", "-")
         route = None if isinstance(owner, the_list.UnassignedOwner) else routing.followup_receiver(owner)
-        ask = (page_frame.send_button("Ask question", page_frame.SendTo(route.name),
+        ask = (page_frame.send_button(review_page.ASK_FOLLOW_UP_LABEL, page_frame.SendTo(route.name),
                                       'name="action" value="question" disabled') if route is not None else '')
         signature = route.signature if route is not None else the_list.ListQuestionRoute.CURRENT
         return (f'<form method="post" data-feedback-form data-question-read data-read-receiver="{receiver}">'
@@ -1985,12 +1985,11 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         return change_page.DeliveryUnconfirmed()
     if isinstance(delivery, ListQuestionDelivery):
         return change_page.deliver_with_outcome(delivery.delivery, delivery.status)
-    outcome: change_page.DeliveryOutcome = change_page.DeliveryUnconfirmed()
-    attempted = False
+    unconfirmed = change_page.DeliveryUnconfirmed()
+    outcome: change_page.DeliveryOutcome = unconfirmed
 
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
-        nonlocal outcome, attempted
-        attempted = True
+        nonlocal outcome
         settings = conf.read("review_links")
         tries = settings.whole("delivery_tries")
         heading = {the_list.ReportVerdict.NOT_FIXED: "Not fixed",
@@ -2005,7 +2004,8 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         failures = change_page.send_with_retries(change_page.SENDER, recipients, message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key,
                                                  confirm=confirm)
-        if repair and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
+        if (repair or feedback.studio_save_notice and feedback.state == "alerted") and any(
+                isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
             return feedback
         if isinstance(delivery, review_actions.StudioNoticeDelivery):
             row = f"{item.id}/Studio/{feedback.request}"
@@ -2036,7 +2036,7 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
-    if not attempted:
+    if outcome is unconfirmed:
         item = the_list.load(delivery.keeper, delivery.identity)
         feedback = the_list.feedback_requests(item).get(delivery.request)
         if feedback is not None:

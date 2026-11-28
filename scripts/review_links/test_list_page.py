@@ -3020,8 +3020,8 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(words.labels[0]?.textContent==='Your words','The words field has a visible label.');
  const submit=form.querySelector('[value="read"]');
  const ask=form.querySelector('[value="question"]');
- check(ask.disabled && !submit.disabled,'Only Ask question needs words.');
- check(ask.textContent==='Ask question' && sendReceiver(ask)==='sdlc','Ask question shows the assignee.');
+ check(ask.disabled && !submit.disabled,'Only Ask a follow-up needs words.');
+ check(ask.textContent==='Ask a follow-up' && sendReceiver(ask)==='sdlc','Ask a follow-up shows the assignee.');
  document.querySelector('[data-list]').dataset.undoSeconds='0';
  const originalFetch=window.fetch.bind(window);
  let posts=0;
@@ -3032,7 +3032,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
   return Promise.resolve(Response.json({words_saved:true,item_state:'Closed',unread:'false',detail_closed:true}));
  };
  words.value='I will use that width.';words.dispatchEvent(new Event('input',{bubbles:true}));
- check(!ask.disabled,'Words enable Ask question.');
+ check(!ask.disabled,'Words enable Ask a follow-up.');
  submit.click();
  await until(()=>form.querySelector('[data-send-status]').textContent.includes('unconfirmed'));
  check(words.value==='I will use that width.','An unconfirmed save keeps the draft.');
@@ -3100,9 +3100,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(row(1).querySelector('[data-new-answer]'),'The parked question shows the new answer.');
 """)
 
-    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_answers_the_team_question_in_its_open_row(self) -> None:
-        item = self.studio_team_question()
+    def file_answered_studio_question(self) -> None:
         exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, "submission/question/answered", "followup:1",
             list_exchange.Direction.ANSWER_TO_NATE, "Which width?", NOW, list_exchange.Nate.USER, OWNER.id,
             list_exchange.ExchangeAnswer("Use 800 pixels.", NOW, list_exchange.AnswerRead.UNREAD))
@@ -3110,6 +3108,33 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         with the_list.lock_exchange_source(exchange.source_key) as source:
             _ = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
                                         owner=OWNER.id, members=members)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_only_answered_questions_show_ask_a_follow_up(self) -> None:
+        _ = self.studio_team_question()
+        self.file_answered_studio_question()
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin, "#show=answers")
+            self.studio_review_check(r"""
+ const answer=row(2);
+ answer.querySelector('.list-toggle').click();
+ await paint();
+ const followUp=recordDetails(answer).querySelector('[data-question-read] [value="question"]');
+ check(followUp.textContent==='Ask a follow-up' && followUp.getAttribute('aria-label')==='Ask a follow-up, sdlc',
+  'The answered row names the follow-up button.');
+ document.querySelector('[data-filter-row="show"] [data-filter-value="questions"]').click();
+ await paint();
+ const question=row(1);
+ question.querySelector('.list-toggle').click();
+ const ask=()=>recordDetails(question).querySelector('[data-studio-question-card] [value="question"]');
+ await until(ask);
+ check(ask().textContent==='Ask question','The unanswered row keeps Ask question.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_answers_the_team_question_in_its_open_row(self) -> None:
+        item = self.studio_team_question()
+        self.file_answered_studio_question()
         with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=change_page.DeliveryConfirmed()),
               self.studio_review_server() as origin):
             self.open_studio_review_fixture(origin, "#show=answers")
@@ -6334,6 +6359,27 @@ window.fetch=(url,options)=>{
         self.assertIn("Keep this result.", cast(str, alert.args[2]))
         saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
         self.assertEqual((saved.state, saved.alerted_to), ("alerted", OWNER.name))
+
+    def test_studio_notice_retry_reports_saved_failure_when_the_sender_is_pending(self) -> None:
+        item = self.add("Check the desktop layout", owner=DWIGHT.id)
+        request = uuid4().hex
+        _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback(
+            request, "Check the desktop layout.", action="read", recipient=DWIGHT.id,
+            origin=the_list.PageNoticeOrigin.STUDIO))
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        delivery = review_actions.StudioNoticeDelivery(MORTY.id, item.id, request, status)
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with (patch.object(change_page, "studio_alert_targets", return_value=(OWNER.id,)),
+              patch.object(change_page, "send_to_staff", side_effect=[RuntimeError("Offline"), None, "pending"]) as send):
+            self.assertIsInstance(list_page.deliver_with_outcome(delivery), change_page.FailedDelivery)
+            first = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
+            self.assertEqual(first.state, "alerted")
+            retry = list_page.deliver_with_outcome(delivery)
+        self.assertIsInstance(retry, change_page.FailedDelivery)
+        assert isinstance(retry, change_page.FailedDelivery)
+        self.assertEqual(retry.last_error, "The owner did not receive the Studio notice.")
+        self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request], first)
+        self.assertEqual(send.call_args_list[0], send.call_args_list[2])
 
     def test_mark_read_on_a_waiting_item_with_an_open_question_sends_no_message(self) -> None:
         root = self.root / "reviews"

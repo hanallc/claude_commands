@@ -7151,6 +7151,31 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(saved.delivery, result.delivery)
         self.assertEqual(saved.answer, result.answer)
 
+    def test_studio_answer_keeps_its_intent_until_delivery_is_confirmed(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Use the wide layout."
+        body = case.body(key, "answer", words) + "&" + urlencode({"revision": shown[1].decode()})
+        delivery = review_page.submit(case.root, body, case.status, snapshot=snapshot).delivery
+        assert isinstance(delivery, change_page.MessageDelivery)
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with (patch.object(change_page, "studio_alert_targets", return_value=()),
+              patch.object(change_page, "send_to_staff", side_effect=["pending", "skipped"]) as send):
+            self.assertIsInstance(change_page.deliver_with_outcome(delivery, case.status),
+                                  change_page.DeliveryUnconfirmed)
+            intent, = case.status.slots(delivery.page, delivery.row).intents()
+            self.assertEqual(intent.attempt, delivery.attempt)
+            self.assertIsInstance(change_page.deliver_with_outcome(delivery, case.status),
+                                  change_page.DeliveryConfirmed)
+        first, retry = send.call_args_list
+        self.assertEqual(first, retry)
+        self.assertEqual(retry.args[0], row.item.owner)
+        self.assertIn(words, cast(str, retry.args[2]))
+        self.assertEqual(case.status.slots(delivery.page, delivery.row).intents(), ())
+
     def test_studio_answer_retries_when_the_team_record_write_fails(self) -> None:
         case, key, row = self.filed_studio_team_question()
         data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)

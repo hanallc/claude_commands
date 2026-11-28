@@ -41,6 +41,7 @@ PAGE_PATH = REVIEW_PATH
 DELIVERY_RESULT_HEADER = 'X-Review-Delivery-Result'
 NEW_ITEM_PATH = '/console/review/new-item'
 ATTACHMENT_PATH = '/console/review/attachment'
+ASK_FOLLOW_UP_LABEL = 'Ask a follow-up'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 CARD_COLUMNS = ('<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%">'
                 '<col style="width:37%"><col style="width:12%"><col style="width:7%"></colgroup>')
@@ -1144,7 +1145,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     if item.type == ReviewType.RESPONSE:
         if not item.actions and not acknowledge:
             return ''
-        labels.update(read='Got it', question='Ask a follow-up')
+        labels.update(read='Got it', question=ASK_FOLLOW_UP_LABEL)
     elif validator:
         labels['question'] = 'Ask a question'
     actions = (('answer', 'question') if inline else ('answer',)) if studio_answer else item.actions
@@ -1177,7 +1178,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     elif closes or returns or later:
         field = 'words-'+item.key
         if item.type == ReviewType.RESPONSE:
-            placeholder = 'Type your words for Ask a follow-up.'
+            placeholder = f'Type your words for {ASK_FOLLOW_UP_LABEL}.'
         elif validator:
             placeholder = 'Ask the validator about this item.'
         else:
