@@ -730,10 +730,12 @@ else:
 
         with (patch.object(time, "monotonic", clock), patch.object(the_list, "monotonic", clock),
               patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(the_list, "TemporaryFile", wraps=tempfile.TemporaryFile) as capture,
               accept_scheduled_sends(record)):
             the_list.fire_scheduled(UPKEEP_INTERVAL)
             saved = the_list.load(MORTY.id, item.id)
             self.assertEqual(sends, [owner])
+            self.assertEqual(capture.call_count, 3)
             self.assertEqual(saved.run_deliveries[0].notices, (
                 the_list.ScheduledNotice(owner, the_list.NoticeState.ACCEPTED),
                 the_list.ScheduledNotice(producer, the_list.NoticeState.READY),
@@ -869,7 +871,7 @@ else:
         changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
         slow = self.add("Accepted notice" if accepted else "Slow notice", changes=changes)
         later = self.add("Later item", changes=changes)
-        with redirect_stderr(io.StringIO()) as errors:
+        with fixed_scheduled_clock(), redirect_stderr(io.StringIO()) as errors:
             the_list.fire_scheduled(UPKEEP_INTERVAL)
         self.assertIn("timed out", errors.getvalue())
         with sent.with_name("sender-child.lock").open("r+") as lock:
@@ -949,7 +951,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
             first_check = the_list.load(MORTY.id, slow.id)
             self.assertIn("Delivery uncertain for owner start", str(first_check.log[-1].what))
             self.assertEqual(the_list.load(MORTY.id, later.id), later)
-            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            with fixed_scheduled_clock():
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
         rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
         self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
         for item in (slow, later):
@@ -1022,7 +1025,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
                                                      "schedule": the_list.ScheduledSeries(first, rule, 730)})
         due = (START, START + timedelta(days=1), START + timedelta(days=2))
         for tick in due[:2]:
-            with patch.object(the_list, "now", return_value=tick):
+            with patch.object(the_list, "now", return_value=tick), fixed_scheduled_clock():
                 the_list.fire_scheduled(UPKEEP_INTERVAL)
         if pending_instruction:
             with (patch.object(the_list, "now", return_value=due[2]),
@@ -1049,7 +1052,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 self.assertEqual(delivered.log[run.log_index].what,
                                  f"Scheduled run due {run.run.start.isoformat()}. Settled by a manual state change.")
             if pending_instruction:
-                the_list.fire_scheduled(UPKEEP_INTERVAL)
+                with fixed_scheduled_clock():
+                    the_list.fire_scheduled(UPKEEP_INTERVAL)
                 resumed = the_list.load(MORTY.id, item.id)
                 self.assertEqual([(run.key, run.confirmation) for run in resumed.run_deliveries],
                                  [(pending[0].key, the_list.AwaitingConfirmation(due[2] + wait))])

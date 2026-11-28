@@ -708,8 +708,8 @@ The next scan gives a deferred item an earlier turn.
 If no deferred item has priority, a scan that reaches its time limit resumes after the last item it inspected.
 Delivery has separate time limits for a notice, an item, and the whole check.
 The first send attempt for each item can use less than the notice time limit.
-Before launch, the List checks if a later notice has the full notice time limit left.
-If the time is too short, the notice returns to ready.
+The List checks the time left for a later notice before preparation and before launch.
+If the time is shorter than the notice time limit, the notice stays ready for the next pass.
 The watchdog keeps the sender group's deadline after upkeep or the sender exits.
 It stays active until the sender group exits or the deadline expires.
 The List reports a group timeout separately from the sender's result.

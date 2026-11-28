@@ -33,7 +33,7 @@ from time import monotonic
 from typing import IO, Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from scripts.agents import remote
+from scripts.agents import remote, worker_lifecycle
 from scripts.console_text import check as console_text
 from scripts.lib import conf, operation_deadline, process_group
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, write_text_atomic
@@ -2736,6 +2736,10 @@ class ScheduledNoticeCapture:
     errors: IO[bytes]
 
 
+def _scheduled_send_budget_is_short(budget: float) -> bool:
+    return budget < _SCHEDULED_SEND_SECONDS
+
+
 def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice,
                            capture: ScheduledNoticeCapture, on_started: Callable[[], None], *,
                            require_full_budget: bool) -> bool:
@@ -2747,10 +2751,13 @@ def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNoti
         command = [sys.executable, "-I", "-c", _WAIT_FOR_SENDER_GROUP,
                    str(Path(__file__).resolve().parents[2]), str(report_fd), *sender]
         environment = {**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}
-        budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
-        if require_full_budget and budget < _SCHEDULED_SEND_SECONDS:
+        inherited_deadline = worker_lifecycle.effective_deadline()
+        launch_time = monotonic()
+        time_left = inherited_deadline - launch_time
+        if time_left <= 0 or (require_full_budget and _scheduled_send_budget_is_short(time_left)):
             return False
-        deadline = monotonic() + budget
+        budget = min(time_left, _SCHEDULED_SEND_SECONDS)
+        deadline = min(inherited_deadline, launch_time + _SCHEDULED_SEND_SECONDS)
         child = subprocess.Popen(["timeout", "--signal=KILL", "--kill-after=1", str(budget), *command],
                                  stdout=output, stderr=errors, start_new_session=True,
                                  pass_fds=(report_fd,), env=environment)
@@ -2915,6 +2922,10 @@ def _fire_scheduled_item(store: record_store.NumberedRecords, identity: str, mom
             for delivery in prepared.run_deliveries:
                 for notice in delivery.notices:
                     if not notice.needs_check():
+                        continue
+                    if (attempted and notice.state is NoticeState.READY
+                            and _scheduled_send_budget_is_short(operation_deadline.remaining())):
+                        deferred = True
                         continue
                     if _deliver_scheduled_notice(store, identity, delivery.key, notice.kind, wait,
                                                  require_full_budget=attempted):
