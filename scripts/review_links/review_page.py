@@ -16,7 +16,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from collections.abc import Callable, Mapping
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
@@ -30,12 +30,15 @@ from scripts.rebuild import need
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, reply_tokens, review_submissions
-from scripts.review_links import question_path, question_record, review_actions, review_events, staff_names
+from scripts.review_links import question_path, question_record, review_actions, review_events, send_hold, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
 from scripts.statusline import rebuild_row
 
 PAGE_PATH = REVIEW_PATH
+SAVE_FAILURE_PATH = '/console/review-save-failure'
+DELIVERY_RETRY_PATH = '/console/review-delivery-retry'
+SAVE_ATTEMPT_HEADER = 'X-Review-Save-Attempt'
 NEW_ITEM_PATH = '/console/review/new-item'
 ATTACHMENT_PATH = '/console/review/attachment'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
@@ -568,6 +571,13 @@ class ReviewActionSave:
     words_saved: bool
 
 
+class ResponseDeliveryReservation(Enum):
+    NOT_TRACKED = "not tracked"
+
+
+type ReserveResponseDelivery = Callable[[Path, str], None] | Literal[ResponseDeliveryReservation.NOT_TRACKED]
+
+
 @dataclass(frozen=True)
 class ReviewSave:
     """The saved record, its published version and any message to deliver."""
@@ -645,7 +655,19 @@ class ReviewSnapshotCache:
             self._generation += 1
             self._wake.set()
 
-    def save(self, body: str, status: change_page.DeliveryStatus) -> ReviewSave:
+    def failure_card_label(self, key: str) -> str:
+        """Use the card title when Review still has it."""
+        with self._condition:
+            current = self._snapshot
+        if isinstance(current, ReviewSnapshot) and key in current.records:
+            item = current.records[key]
+            if item.id and item.id != key:
+                return f'{item.id} · {item.title} ({key})'
+            return f'{key} · {item.title}'
+        return key
+
+    def save(self, body: str, status: change_page.DeliveryStatus, *,
+             reserve_response_delivery: ReserveResponseDelivery = ResponseDeliveryReservation.NOT_TRACKED) -> ReviewSave:
         """Serialize Review writes and publish the saved record before returning."""
         _ = self.get()
         fields = review_fields(body)
@@ -653,7 +675,8 @@ class ReviewSnapshotCache:
         with self._save_lock:
             current = self.get()
             try:
-                action = submit_snapshot(self.root, current, fields, status)
+                action = submit_snapshot(self.root, current, fields, status,
+                                         reserve_response_delivery=reserve_response_delivery)
             except review_items.ReviewRecordChanged:
                 try:
                     if key in current.records:
@@ -1278,6 +1301,8 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +record_table.render_inline_detail()
         +'<div class="review-drafts" hidden><ul id="review-draft-list" aria-label="Unsaved Review words" tabindex="0" hidden></ul>'
         +'<button type="button" data-review-draft-toggle aria-controls="review-draft-list" aria-expanded="false"></button></div>'
+        +page_frame.console_dialog('review-bug-dialog', 'review-bug-title', 'List item',
+                                   '<iframe title="List item"></iframe>', body_class='review-bug-content')
         +'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -1285,7 +1310,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
 def review_fields(body: str) -> dict[str, list[str]]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     required = {'row', 'token', 'outcome', 'feedback'}
-    optional = {'later', 'revision', 'assignee', 'retry_recipients'}
+    optional = {'later', 'revision', 'assignee', 'retry_recipients', 'failure_attempt'}
     if not required <= fields.keys() <= required | optional or any(len(values)!=1 for values in fields.values()):
         raise question_record.AnswerRefused('use the answer form on this page')
     return fields
@@ -1311,7 +1336,8 @@ def repeats_response_followup(item: ReviewItem, outcome: str, words: str, status
 
 
 def submit_response(item: ReviewItem, outcome: str, words: str, status: change_page.DeliveryStatus,
-                    verify_revision: Callable[[], ReviewItem]
+                    verify_revision: Callable[[], ReviewItem],
+                    reserve_delivery: ReserveResponseDelivery = ResponseDeliveryReservation.NOT_TRACKED
                     ) -> ReviewActionSave:
     source = item.source
     if outcome not in item.actions or not isinstance(source, review_items.QuestionSource):
@@ -1324,8 +1350,20 @@ def submit_response(item: ReviewItem, outcome: str, words: str, status: change_p
         return ReviewActionSave(change_page.NoMessageDelivery(), 'got it', words_saved=False)
     words = new_item_dialog.read_words(words, 'Your words')
     if outcome == 'read':
+        def verify_feedback() -> ReviewItem:
+            current = verify_revision()
+            if callable(reserve_delivery):
+                path = source.record.path
+                row = path.stem
+                page = change_page.ReviewPage(path, path.parent, (row,), '')
+                intent = status.slots(page, row).verdict
+                if not isinstance(intent, change_page.DeliveryIntent):
+                    raise OSError('The Response has no saved feedback delivery intent.')
+                reserve_delivery(path, intent.attempt)
+            return current
+
         delivery, answer = review_actions.sent_question_action(item, source.record, scope, 'feedback', words, status,
-                                                               verify_revision=verify_revision)
+                                                               verify_revision=verify_feedback)
         return ReviewActionSave(delivery, answer, words_saved=True)
     delivery, _ = review_actions.sent_question_action(item, source.record, scope, 'question', words, status,
                                                       verify_revision=verify_revision)
@@ -1333,7 +1371,9 @@ def submit_response(item: ReviewItem, outcome: str, words: str, status: change_p
 
 
 def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list[str]],
-                    status: change_page.DeliveryStatus) -> ReviewActionSave:
+                    status: change_page.DeliveryStatus, *,
+                    reserve_response_delivery: ReserveResponseDelivery = ResponseDeliveryReservation.NOT_TRACKED
+                    ) -> ReviewActionSave:
     key, token, outcome, words = (fields[field][0] for field in ('row', 'token', 'outcome', 'feedback'))
     if not secrets.compare_digest(token, change_browser.row_token(snapshot.browser, key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
@@ -1396,7 +1436,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if outcome == 'read' and can_acknowledge_answer(item):
         return acknowledge_answer(root, item, validate)
     if item.type == ReviewType.RESPONSE:
-        return submit_response(item, outcome, words, status, validate)
+        return submit_response(item, outcome, words, status, validate, reserve_response_delivery)
     if waiting_change(item) or (item.state == ReviewState.VALIDATING and outcome != 'question'):
         raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
@@ -1590,6 +1630,10 @@ list-style:none;padding:0;margin:0}
 .review-drafts li{padding:12px 16px;overflow-wrap:anywhere}
 .review-drafts li+li{border-top:1px solid var(--line)}
 .review-drafts p{margin:4px 0 10px}
+.review-drafts p a{color:inherit;white-space:nowrap}
+#review-bug-dialog{width:min(1060px,calc(100vw - 32px))}
+#review-bug-dialog .review-bug-content{display:flex;padding:0}
+#review-bug-dialog iframe{width:100%;height:72dvh;border:0}
 .review-drafts label{display:block;font-weight:600}
 .review-drafts textarea{margin:4px 0 8px;resize:none;font-weight:400}
 .review-actions{margin-top:12px}
@@ -1657,7 +1701,98 @@ column-gap:24px;row-gap:0;border:0;padding:0}
 [data-review-card-notice]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>'''
 
-REVIEW_CARD_SCRIPT = r'''
+REVIEW_SAVE_REPORTS_SCRIPT = r'''
+const reviewSaveFailurePath=''' + json.dumps(SAVE_FAILURE_PATH) + r''';
+const reviewDeliveryRetryPath=''' + json.dumps(DELIVERY_RETRY_PATH) + r''';
+const reviewWordsUnsent='Saved. Your words are still unsent.';
+const reviewReplyDeliveryFailure=result=>typeof result?.send_failure==='string' ? result.send_failure : '';
+const reviewReceiptSavedWords=result=>result.outcome==='saved' && result.words_saved===true && !reviewReplyDeliveryFailure(result);
+function rememberReviewDeliveryRetry(draft,body){
+ const attempt=body.get('failure_attempt');
+ if(draft.deliveryRetry?.get('failure_attempt')===attempt) return;
+ draft.deliveryRetry=new URLSearchParams({row:body.get('row'),token:body.get('token'),failure_attempt:attempt});
+}
+function createReviewSaveReports(drafts,requestSignal,changed){
+ const pending=drafts.pendingSaveReports ??= new Map();
+ let active=false,retry=false;
+ function presentOutcome(key,draft,result){
+  if(reviewReceiptSavedWords(result)){
+   draft.notice?.remove();
+   drafts.delete(key);
+  }else{
+   const message=draft.notice?.querySelector('p');
+   if(message){message.textContent=draft.message;message.hidden=!draft.message;}
+  }
+  changed(key,draft,result);
+ }
+ async function retryDelivery(key,draft){
+  const body=draft.deliveryRetry,edit=draft.edit,attempt=body.get('failure_attempt');
+  pending.delete(attempt);
+  let result;
+  try{
+   const response=await fetch(reviewDeliveryRetryPath,{method:'POST',body,signal:requestSignal()});
+   result=await response.json();
+   if(!response.ok || (result?.outcome!=='pending' && (result?.outcome!=='saved' || typeof result.words_saved!=='boolean')))
+    throw new Error(result?.reason || 'The saved delivery could not retry.');
+  }catch(error){result={send_failure:error.message};}
+  if(drafts.get(key)!==draft || draft.edit!==edit || draft.deliveryRetry!==body) return;
+  const failure=reviewReplyDeliveryFailure(result);
+  if(failure){
+   draft.message=failure;
+   delete draft.filedBug;
+  }
+  presentOutcome(key,draft,result);
+  if(result.outcome==='pending' || failure){
+   const report=new URLSearchParams(body);
+   report.set('feedback',edit.draft.feedback);
+   report.set('reason',failure || 'The sender has not confirmed delivery.');
+   draft.failureAttempt=attempt;
+   pending.set(attempt,{body:report,edit});
+   void flush();
+  }
+ }
+ async function flush(){
+  if(!pending.size) return;
+  if(active){retry=true;return;}
+  active=true;
+  retry=false;
+  try{
+   for(const [attempt,report] of pending){
+    const response=await fetch(reviewSaveFailurePath,{method:'POST',body:report.body,signal:requestSignal()});
+    if(response.status>=500) break;
+    if(!response.ok) continue;
+    const result=await response.json();
+    if(pending.get(attempt)!==report || !['saved','refused','missing','undone'].includes(result?.outcome)) continue;
+    const bug=result.bug;
+    const filedBug=typeof bug?.label==='string' && typeof bug.href==='string' ? bug : null;
+    const needsBug=Boolean(reviewReplyDeliveryFailure(result)) && !filedBug;
+    if(!needsBug) pending.delete(attempt);
+    const key=report.body.get('row'),draft=drafts.get(key);
+    if(draft?.failureAttempt!==attempt || draft.edit!==report.edit) continue;
+    if(!reviewReceiptSavedWords(result)){
+     draft.filedBug=filedBug;
+     if(report.outcomeUnknown && typeof result.reason==='string') draft.message='Not saved: '+result.reason;
+     if(result.outcome==='undone') draft.message='This send was undone.';
+     if(result.outcome==='saved'){
+      const failure=reviewReplyDeliveryFailure(result);
+      draft.message=failure || reviewWordsUnsent;
+      if(!failure) delete draft.retry;
+      if(result.retry_delivery===true) rememberReviewDeliveryRetry(draft,report.body);
+      if(!needsBug) delete draft.failureAttempt;
+     }
+    }
+    presentOutcome(key,draft,result);
+   }
+  }catch{}finally{
+   active=false;
+   if(retry) void flush();
+  }
+ }
+ return {flush,retryDelivery,get active(){return active;},add(attempt,report){pending.set(attempt,report);void flush();}};
+}
+'''
+
+REVIEW_CARD_SCRIPT = REVIEW_SAVE_REPORTS_SCRIPT + r'''
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
 const entrySortValues=entry=>[entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
@@ -1736,6 +1871,7 @@ function installReviewBody(row,body){
 const reviewDrafts=window.frameElement?.linkedReviewDrafts ?? new Map();
 const reviewFormEdits=new WeakMap();
 let presentReviewDraftCopy=update=>update(),reviewDraftsChanged=()=>{};
+let presentReviewSaveOutcome=()=>{};
 // Match Python str.strip() when the server checks for words.
 const blankReviewWords=/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/;
 function reviewActionData(form,outcome,until){
@@ -1799,6 +1935,9 @@ function rememberReviewDraft(form,edited=false){
  if(previous?.draft.feedback!==draft.feedback){
   record.message='';
   delete record.retry;
+  delete record.deliveryRetry;
+  delete record.failureAttempt;
+  delete record.filedBug;
  }
  record.edit=edit;
  reviewDrafts.set(key,record);
@@ -1816,7 +1955,7 @@ function confirmReviewDraft(key,submitted,words,form){
  const stored=reviewDrafts.get(key);
  if(stored && (stored.edit!==submitted || stored.edit.draft.feedback!==words)){
   if(stored.edit.draft.feedback) setReviewDraftMessage(key,stored.edit===submitted
-   ? 'Saved. Your words are still unsent.' : 'Saved. Your newer words are unsent.');
+   ? reviewWordsUnsent : 'Saved. Your newer words are unsent.');
   return;
  }
  clearReviewDraft(key);
@@ -1920,25 +2059,74 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
 function confirmedReviewWords(data,result){
  return result.words_saved===true ? data.get('feedback') : '';
 }
+const reviewSaveAttemptHeader=''' + json.dumps(SAVE_ATTEMPT_HEADER) + r''';
+const reviewSaveUnconfirmed=''' + json.dumps(send_hold.MAY_HAVE_LEFT) + r''';
+const reviewHeldUndone=''' + json.dumps(send_hold.HoldState.UNDONE.value) + r''';
+const reviewHeldMissing=''' + json.dumps(send_hold.HoldState.MISSING.value) + r''';
+const reviewSaveUnknown='Not saved: The save outcome is not known yet.';
+function reviewRequestSignal(){
+ const page=document.querySelector('[data-review]');
+ const seconds=page ? Number(page.dataset.requestTimeoutSeconds) :
+  JSON.parse(document.querySelector('[data-card-settings]').textContent).requestTimeoutSeconds;
+ return AbortSignal.timeout(seconds*1000);
+}
+function reviewSaveOutcomeChanged(key,draft,result){
+ presentReviewSaveOutcome(key,draft,result);
+ const row=document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+ const form=row?.querySelector('[data-review-form]');
+ if(reviewReceiptSavedWords(result) && reviewFormEdits.get(form)===draft.edit){
+  form.elements.feedback.value='';
+  reviewFormEdits.delete(form);
+ }
+ reviewDraftsChanged();
+}
+const reviewSaveReports=window.frameElement?.linkedReviewSaveReports ??
+ createReviewSaveReports(reviewDrafts,reviewRequestSignal,reviewSaveOutcomeChanged);
+const flushReviewSaveReports=reviewSaveReports.flush;
+addEventListener('online',()=>void flushReviewSaveReports());
+async function reviewFetch(url,options){
+ const response=await fetch(url,options);
+ void flushReviewSaveReports();
+ return response;
+}
 async function saveReviewAction(data,{
  hold,receiver,sending,confirmedSave,saved,failed,unconfirmed,deliveryFailed,undone=failed,displayFailed,recover,finished
 }){
- let conflict=false,confirmed=false;
+ const key=data.get('row'),draft=reviewDrafts.get(key),edit=draft?.edit;
+ const attempt=Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join('');
+ let conflict=false,confirmed=false,response,result;
+ const noteFailure=(reason,outcomeUnknown,failedAttempt=attempt,retryDelivery=false)=>{
+  const body=new URLSearchParams({row:key,token:data.get('token'),feedback:data.get('feedback'),
+   reason,failure_attempt:failedAttempt});
+  if(draft && reviewDrafts.get(key)===draft && draft.edit===edit){
+   draft.failureAttempt=failedAttempt;
+   delete draft.filedBug;
+   if(retryDelivery) rememberReviewDeliveryRetry(draft,body);
+   reviewDraftsChanged();
+  }
+  reviewSaveReports.add(failedAttempt,{body,edit,outcomeUnknown});
+ };
  try{
   const saveAction=['later','validate'].includes(data.get('outcome'));
   sending?.();
-  const response=await hold.post(location.pathname,{method:'POST',body:data},saveAction ? null : receiver);
+  response=await hold.post(location.pathname,{method:'POST',body:data,headers:{[reviewSaveAttemptHeader]:attempt}},
+   saveAction ? null : receiver);
+  void flushReviewSaveReports();
   conflict=response.status===409;
-  const result=await response.json().catch(()=>null);
+  result=await response.json().catch(()=>null);
+  if(response.status===404 && result?.hold_state===reviewHeldUndone) throw new SendUndone();
   if(!response.ok) throw new Error(result?.reason || 'HTTP '+response.status);
-  if(result?.send_failure){
+  const sendFailure=reviewReplyDeliveryFailure(result);
+  if(sendFailure){
    hold.restore();
-   deliveryFailed(result.send_failure);
+   deliveryFailed(sendFailure);
+   noteFailure(sendFailure,false,attempt,result.retry_delivery===true);
    return;
   }
   if(typeof result?.answer!=='string' || typeof result.words_saved!=='boolean'){
    hold.restore();
-   unconfirmed('Could not confirm the save. The server response is unreadable.');
+   unconfirmed(reviewSaveUnknown);
+   noteFailure('The server response is unreadable.',true);
    return;
   }
   confirmed=true;
@@ -1948,8 +2136,20 @@ async function saveReviewAction(data,{
   const wasHeld=hold.restore();
   if(error instanceof SendUndone) await undone(error.message);
   else if(confirmed) displayFailed(wasHeld);
-  else if(conflict) await recover(error.message);
-  else failed(error.message);
+  else{
+   const lostReply=!response || !result || (response.status===404 && result.hold_state===reviewHeldMissing) ||
+    (response.status===503 &&
+    (error.message===reviewSaveUnconfirmed || error.message.startsWith('The held send failed: ')));
+   const refusedAttempt=typeof result?.failure_attempt==='string' ? result.failure_attempt : undefined;
+   if(lostReply && !refusedAttempt){
+    unconfirmed(reviewSaveUnknown);
+    noteFailure(error.message,true);
+    return;
+   }
+   if(refusedAttempt) noteFailure(error.message,false,refusedAttempt);
+   if(conflict) await recover(error.message);
+   else failed(error.message);
+  }
  }finally{
   await finished(conflict);
  }
@@ -2031,12 +2231,23 @@ function mountCard(page,replaceCard=false){
 }
 function bindCard(row,zone,settings,requestTimeoutSeconds){
  const form=row.querySelector('[data-review-form]'),key=row.dataset.key;
+ const settled=(settledKey,draft,result)=>{
+  if(settledKey!==key || reviewFormEdits.get(form)!==draft.edit) return;
+  const wordsSaved=reviewReceiptSavedWords(result);
+  if(wordsSaved){
+   form.elements.feedback.value='';
+   reviewFormEdits.delete(form);
+  }
+  report(wordsSaved ? '' : draft.message);
+ };
+ presentReviewSaveOutcome=settled;
  const revealDraft=()=>{
   if(form?.elements.feedback?.type==='textarea') hideReviewDraftNotice(key);
   else showReviewDraftNotice(key,notice);
  };
  if(boxFrame) boxFrame.reviewDraft={
   reveal:revealDraft,
+  settled,
   hide:anchor=>{
    rememberReviewDraft(form);
    showReviewDraftNotice(key,anchor);
@@ -2083,7 +2294,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   };
   return recoverReviewRevision(reason,{form,report,present,reload:async()=>{
    const signal=AbortSignal.timeout(requestTimeoutSeconds*1000);
-   const response=await fetch(location.href,{cache:'no-store',signal});
+   const response=await reviewFetch(location.href,{cache:'no-store',signal});
    if(!response.ok) throw new Error('HTTP '+response.status);
    const template=document.createElement('template');
    template.innerHTML=await response.text();
@@ -2147,6 +2358,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
  return row;
 }
 mountCard(document);
+void flushReviewSaveReports();
 setInterval(updateHandoffAges,5000);
 })();'''
 
@@ -2163,14 +2375,10 @@ function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
 let index=readIndex(JSON.parse(document.querySelector('[data-review-index]').textContent));
-function reviewRequestSignal(){
- const seconds=Number(document.querySelector('[data-review]').dataset.requestTimeoutSeconds);
- return AbortSignal.timeout(seconds*1000);
-}
 function requestReviewCard(key,version,saved=false){
  const query=new URLSearchParams({body:key,version});
  if(saved) query.set('saved','1');
- return fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
+ return reviewFetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
   .then(async response=>({response,text:response.ok ? await response.text() : ''}));
 }
 const firstReviewCard=(()=>{
@@ -2210,6 +2418,17 @@ const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null,newItemRefresh;
 let failedDelivery=null;
+presentReviewSaveOutcome=(key,draft,result)=>{
+ const retained=failedDelivery,row=view.openItem;
+ if(retained?.entry?.key!==key || retained.edit!==draft.edit) return;
+ if(reviewReplyDeliveryFailure(result)){
+  if(retained.session===view.openSession && row?.dataset.key===key)
+   view.preserveRecordRowTop(()=>view.showActionResult(row,retained.submission,key,{kind:'failure',message:draft.message}));
+ }else{
+  failedDelivery=null;
+  if(row?.dataset.key===key && !index.has(key)){view.closeCard(key);view.applyAction();}
+ }
+};
 function missingDeliveryEntry(key){
  const entry=failedDelivery?.entry;
  return entry && entry.key===key && !index.has(key) &&
@@ -2660,6 +2879,10 @@ function bindForm(row){
     pendingSaves.delete(key);
     view.preserveRecordRowTop(()=>showResult({kind:'failure',message}));
    };
+   const retainDeliveryCard=()=>{
+    if(view.currentItemRequest(request))
+     failedDelivery={entry:index.get(key),session,submission,edit:draftAtSubmit};
+   };
    const fail=reason=>showFailure('Not saved: '+reason);
    await saveReviewAction(data,{
    hold,
@@ -2723,9 +2946,12 @@ function bindForm(row){
     else applySaved();
    },
    failed:fail,
-   unconfirmed:showFailure,
+   unconfirmed:message=>{
+    if(draftAtSubmit?.draft.feedback) retainDeliveryCard();
+    showFailure(message);
+   },
    deliveryFailed:message=>{
-    if(view.currentItemRequest(request)) failedDelivery={entry:index.get(key),session};
+    retainDeliveryCard();
     showFailure(message);
    },
    undone:async message=>{
@@ -2834,7 +3060,7 @@ async function refreshReview(current){
  const options={cache:'no-store',signal:reviewRequestSignal()};
  const delivery=view.deliveryRequest(),query=new URLSearchParams({version:'1'});
  if(delivery) query.set('delivery',delivery.delivery);
- const response=await fetch(location.pathname+'?'+query,options);
+ const response=await reviewFetch(location.pathname+'?'+query,options);
  if(!response.ok) throw new Error('HTTP '+response.status);
  const version=await response.json();
  if(!canApply()) return;
@@ -2853,7 +3079,7 @@ async function refreshReview(current){
    content.dispatchEvent(new Event('review-refreshed'));return version.facts;
   },canApply);
  }
- const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version,'for-you':'1'}),options);
+ const fresh=await reviewFetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version,'for-you':'1'}),options);
  if(!fresh.ok) throw new Error('HTTP '+fresh.status);
  const payload=await fresh.json();
  return afterRowAnimations(async()=>{
@@ -2929,7 +3155,28 @@ bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 const draftArea=document.querySelector('.review-drafts');
 const draftList=draftArea.querySelector('ul'),draftToggle=draftArea.querySelector('button');
+const bugDialog=document.getElementById('review-bug-dialog'),bugFrame=bugDialog.querySelector('iframe');
 const draftRows=new Map();
+let bugLink;
+bindConsoleDialog(bugDialog,()=>bugDialog.close());
+bugDialog.addEventListener('close',()=>{
+ bugFrame.removeAttribute('src');
+ bugLink?.focus({preventScroll:true});
+ bugLink=null;
+});
+bugFrame.addEventListener('load',()=>bugFrame.contentDocument?.addEventListener('keydown',event=>{
+ if(event.key==='Escape' && !event.defaultPrevented && !event.isComposing &&
+  !bugFrame.contentDocument.querySelector('dialog[open]')) bugDialog.close();
+}));
+draftList.addEventListener('click',event=>{
+ const link=event.target.closest('a[data-review-bug-link]');
+ if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey ||
+  event.shiftKey || event.altKey) return;
+ event.preventDefault();
+ bugLink=link;
+ bugFrame.src=link.href;
+ bugDialog.showModal();
+});
 let openingDraftKey='';
 function setDraftListOpen(open){
  draftList.hidden=!open;
@@ -2938,6 +3185,10 @@ function setDraftListOpen(open){
 function createDraftRow(key){
  const row=document.createElement('li'),title=document.createElement('strong'),message=document.createElement('p');
  message.className='action-failure';message.setAttribute('role','status');
+ const bug=document.createElement('a'),filed=document.createElement('span');
+ bug.dataset.reviewBugLink='';
+ filed.append(' ',bug,' is filed.');
+ message.textContent='Not saved.';
  const label=document.createElement('label'),words=document.createElement('textarea');
  label.textContent='Your words';
  words.readOnly=true;words.rows=3;
@@ -2947,7 +3198,7 @@ function createDraftRow(key){
  action.addEventListener('click',()=>void sendReviewDraft(key));
  row.dataset.draftListKey=key;
  row.append(title,message,label,action);draftList.append(row);
- return {row,title,message,words,action};
+ return {row,title,message,bug,filed,words,action};
 }
 function renderReviewDrafts(){
  const drafts=[...reviewDrafts].filter(([,record])=>record.edit.draft.feedback);
@@ -2964,12 +3215,18 @@ function renderReviewDrafts(){
   draftRows.set(key,entry);
   const title=record.title ? record.cardId+' · '+record.title : record.cardId;
   if(entry.title.textContent!==title) entry.title.textContent=title;
-  showActionFailure(entry.message,reviewDraftMessage(record));
+  const bug=record.filedBug;
+  if(bug){
+   if(entry.bug.textContent!==bug.label) entry.bug.textContent=bug.label;
+   if(entry.bug.getAttribute('href')!==bug.href) entry.bug.setAttribute('href',bug.href);
+   if(!entry.filed.isConnected) entry.message.append(entry.filed);
+  }else entry.filed.remove();
   const words=record.edit.draft.feedback;
   if(entry.words.value!==words) entry.words.value=words;
-  const action=record.retry?.label || 'Open the card';
+  const action=record.deliveryRetry ? 'Got it' : record.retry?.label || 'Open the card';
   if(entry.action.textContent!==action) entry.action.textContent=action;
-  entry.action.disabled=!index.has(key) || Boolean(openingDraftKey) || pendingSaves.has(key) || recovering.has(key);
+  entry.action.disabled=(!record.deliveryRetry && !index.has(key)) || Boolean(openingDraftKey) ||
+   pendingSaves.has(key) || recovering.has(key);
  }
 }
 function requireReviewDraftChoice(key,record){
@@ -2978,10 +3235,12 @@ function requireReviewDraftChoice(key,record){
 }
 async function sendReviewDraft(key){
  const record=reviewDrafts.get(key),retry=record?.retry;
- if(!record?.edit.draft.feedback || !index.has(key) || openingDraftKey || pendingSaves.has(key) || recovering.has(key)) return;
+ if(!record?.edit.draft.feedback || (!record.deliveryRetry && !index.has(key)) || openingDraftKey ||
+  pendingSaves.has(key) || recovering.has(key)) return;
  openingDraftKey=key;
  renderReviewDrafts();
  try{
+  if(record.deliveryRetry){await reviewSaveReports.retryDelivery(key,record);return;}
   const session=view.openSession;
   await afterRowAnimations(()=>{
    if(view.openItem?.dataset.key!==key){view.openCard(key);view.apply();}
@@ -3046,7 +3305,7 @@ draftToggle.addEventListener('click',()=>{
  if(open) draftList.focus({preventScroll:true});
 });
 document.addEventListener('keydown',event=>{
- if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || draftList.hidden) return;
+ if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || bugDialog.open || draftList.hidden) return;
  event.preventDefault();
  setDraftListOpen(false);
  draftToggle.focus({preventScroll:true});

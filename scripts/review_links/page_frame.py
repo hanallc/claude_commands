@@ -1154,8 +1154,9 @@ async function heldFetch(url,init={},receiver,onHold){
   if(!keepalive) throw error;
   return post(false);
  });
- if(first.headers.get('X-Send-Hold')!=='held'){
-  if(!(first.status>=500)) request.finish();
+ const holdStatus=first.headers.get('X-Send-Hold');
+ if(holdStatus!=='held'){
+  if(first.status<500 || holdStatus==='refused') request.finish();
   return first;
  }
  const {hold,seconds}=await first.json();

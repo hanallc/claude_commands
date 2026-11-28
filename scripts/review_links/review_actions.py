@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -16,13 +17,85 @@ from scripts.for_you.action import REVIEW_PATH
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
-from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, the_list, update_registration
+from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.production.production_doc import Production
-from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
+from scripts.review_links import change_page, decision_store, efficiency_reviews, list_draft, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_path, question_record, reply_tokens
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
 PY = '~/.claude/scripts/lib/py ~/.claude/scripts/'
+
+
+class ReviewSaveBugListState(Enum):
+    AWAITING_PUBLICATION = "awaiting publication"
+    CLOSED = "closed"
+
+
+def _save_bug_list_item(keeper: staff.StaffId, reservation: Path) -> the_list.ListItem | ReviewSaveBugListState:
+    number = the_list.reserved_review_number(reservation)
+    if number is the_list.NextNumber.AVAILABLE:
+        return ReviewSaveBugListState.AWAITING_PUBLICATION
+    path = the_list.folder(keeper) / f"L{number}.md"
+    try:
+        _ = path.stat()
+    except FileNotFoundError:
+        return ReviewSaveBugListState.AWAITING_PUBLICATION
+    item = the_list.load(keeper, f"L{number}")
+    if item.state is the_list.ItemState.CLOSED:
+        return ReviewSaveBugListState.CLOSED
+    return item
+
+
+def _publish_save_bug(keeper: staff.StaffId, bug: investigation.Investigation,
+                      reservation: Path) -> the_list.ListItem | ReviewSaveBugListState:
+    key = review_items.investigation_record_key(bug)
+    evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
+    _ = the_list.add_review_item(keeper, bug.title, owner=keeper, producer=keeper, unit="", words=bug.question,
+                                 evidence=evidence, review_key=key, source="nate via Review", reservation=reservation)
+    return _save_bug_list_item(keeper, reservation)
+
+
+def file_review_save_bug(failure: review_submissions.ReviewSaveFailure, keeper: staff.StaffId,
+                         members: staff.StaffSnapshot) -> the_list.ListItem | ReviewSaveBugListState:
+    """Use an open Bug with an open List item or file a new Bug."""
+    request_id = f"r1-{failure.attempt}-bug-{keeper}"
+    attempt_log = f"Save {failure.attempt}: "
+    title = review_submissions.REVIEW_SAVE_BUG_TITLE
+    cause = failure.cause
+    matching: list[tuple[investigation.Investigation, Path]] = []
+    with investigation.recipient_locks(keeper):
+        for path in investigation.review_record_paths(keeper, strict=True):
+            header = record_store.read_header(path, keys=frozenset(('kind', 'title')), strict=True)
+            if header.get('kind') != ['bug'] or header.get('title') != [title]:
+                continue
+            bug = investigation.read_review_record(path)
+            origin = bug.submission
+            if not isinstance(origin, new_item_dialog.ReviewSubmission) or not bug.question.startswith(f"{title}\n\nPage: "):
+                continue
+            reservation = review_submissions.list_filing_reservation(origin)
+            if origin.request_id == request_id or any(event.words.startswith(attempt_log) for event in bug.log):
+                item = _save_bug_list_item(keeper, reservation)
+                if item is ReviewSaveBugListState.CLOSED:
+                    return item
+                return _publish_save_bug(keeper, bug, reservation)
+            if bug.state is investigation.InvestigationState.OPEN and bug.question.startswith(cause):
+                matching.append((bug, reservation))
+        if matching:
+            with list_draft.list_records(keeper).locked():
+                for bug, reservation in matching:
+                    item = _save_bug_list_item(keeper, reservation)
+                    if isinstance(item, the_list.ListItem):
+                        atomic_file.sync_folder(the_list.folder(keeper))
+                        investigation.record_review_log(keeper, bug.id, failure.repeat_line())
+                        return item
+        # Keep the full draft even when it exceeds the New item length limit.
+        request = review_submissions._AutomaticSaveBugRequest(  # pyright: ignore[reportPrivateUsage]
+            request_id, new_item_dialog.SubmissionKind.BUG, keeper, failure.record_words(), new_item_dialog.NoEvidence(),
+            page="review", page_recipient=new_item_dialog.PageRecipient.SELECTED,
+        )
+        saved = review_submissions.submit(request, members=members)
+        assert isinstance(saved.record, investigation.Investigation)
+        return _publish_save_bug(keeper, saved.record, review_submissions.list_filing_reservation(saved))
 
 
 @dataclass(frozen=True)

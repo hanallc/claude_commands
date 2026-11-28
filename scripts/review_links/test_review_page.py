@@ -43,7 +43,7 @@ from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
-from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
+from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_path, question_record
 from scripts.review_links import list_page, staff_names, test_change_page
@@ -493,6 +493,13 @@ window.fetch=(url,options)=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_response_delivery_failure_keeps_the_card_and_words(self) -> None:
+        self.check_response_delivery_failure(lost=False)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_lost_response_delivery_failure_keeps_the_card_words_and_retry(self) -> None:
+        self.check_response_delivery_failure(lost=True)
+
+    def check_response_delivery_failure(self, *, lost: bool) -> None:
         _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
         owner = self.ready_submission_recipient()
         sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
@@ -501,11 +508,22 @@ window.fetch=(url,options)=>{
 (async()=>{
  const {realFetch,until}=fixtureUndo(),heldFetch=window.fetch,failures=[];
  const content=document.querySelector('[data-review]'),message='Delivery failed: The owner is offline.';
+ const retryFailure='Delivery failed: The relay stopped.';
+ const lost=LOST;
+ let report,reported,retried,retries=0;
  const row=()=>content.querySelector('[data-list-item][data-type="response"]');
  const empty={version:'after-save',index:{n:[],r:[]},facts:pageRefreshFacts()};
  window.fetch=(url,options)=>{
+  if(url===reviewSaveFailurePath) return new Promise(resolve=>{report=resolve;reported=new URLSearchParams(options.body);});
+  if(url==='/console/review-delivery-retry'){
+   retried=new URLSearchParams(options.body);
+   if(++retries===1) return Promise.resolve(Response.json({outcome:'saved',words_saved:true,
+    send_failure:retryFailure,retry_delivery:true}));
+   return Promise.resolve(Response.json({outcome:'saved',words_saved:true}));
+  }
   if(String(url).endsWith('/'+'a'.repeat(24)))
-   return Promise.resolve(Response.json({answer:'feedback sent',words_saved:true,detail_closed:true,send_failure:message}));
+   return lost ? Promise.resolve(Response.json({hold_state:'missing'},{status:404})) :
+    Promise.resolve(Response.json({answer:'feedback sent',words_saved:true,detail_closed:true,send_failure:message}));
   const query=new URL(url,location.href).searchParams;
   if(query.get('version')==='1' || query.has('index')) return Promise.resolve(Response.json(empty));
   return heldFetch(url,options);
@@ -519,14 +537,48 @@ window.fetch=(url,options)=>{
   await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
   toast().getAnimations()[0].finish();
   await until(()=>content.dataset.version===empty.version,'The refreshed index did not arrive.');
+  await until(()=>report,'Review did not check the delivery failure.');
+  report(Response.json({outcome:'saved',words_saved:true,send_failure:message,hold:'a'.repeat(24),
+   retry_delivery:true,bug:{label:'Bug 42',href:'/console/list.html#item=morty%2FL42'}}));
+  await until(()=>!reviewSaveReports.active,'The outcome check did not finish.');
+  const entry=document.querySelector('[data-draft-list-key]');
+  if(!entry?.textContent.includes('Bug 42')) failures.push('Not saved shows the Bug for the failed delivery.');
+  if(lost){
+   if(entry?.querySelector('textarea').value!==words || entry?.querySelector('p').textContent!=='Not saved. Bug 42 is filed.' ||
+    entry?.querySelector('button').textContent!=='Got it')
+    failures.push('The receipt keeps the words, the delivery failure, and Got it in Not saved.');
+  }
   const current=row() && recordDetails(row()).querySelector('[data-review-form]');
   if(!current?.isConnected || !recordIsOpen(row()) || current.elements.feedback.value!==words ||
    current.querySelector('[data-send-status]').textContent!==message)
    failures.push('A failed delivery keeps the Response, the words, and the failure after refresh.');
+  if(lost){
+   document.querySelector('[data-review-draft-toggle]').click();
+   const button=entry.querySelector('button');
+   if(button.disabled) failures.push('Got it remains enabled for the closed Response.');
+   const originalReport=reported;
+   report=null;
+   button.click();
+   await until(()=>retried,'Got it did not retry delivery.');
+   if(retried.get('row')!==originalReport.get('row') || retried.get('token')!==originalReport.get('token') ||
+    retried.get('failure_attempt')!==originalReport.get('failure_attempt') || retried.has('feedback'))
+    failures.push('Got it retries the signed delivery without submitting the feedback again.');
+   await until(()=>report && !button.disabled,'Got it did not report the failed retry.');
+   if(entry.textContent.includes('Bug 42') || entry.querySelector('p').textContent!=='Not saved.')
+    failures.push('Not saved clears the old Bug after the retry fails.');
+   report(Response.json({outcome:'saved',words_saved:true,send_failure:retryFailure,hold:'a'.repeat(24),
+    retry_delivery:true,bug:{label:'Bug 43',href:'/console/list.html#item=morty%2FL43'}}));
+   await until(()=>!reviewSaveReports.active,'The retry report did not finish.');
+   if(!entry.textContent.includes('Bug 43') || entry.textContent.includes('Bug 42') ||
+    entry.querySelector('p').textContent!=='Not saved. Bug 43 is filed.')
+    failures.push('Not saved shows the reason and Bug from the latest failed retry.');
+   button.click();
+   await until(()=>!document.querySelector('[data-draft-list-key]'),'A successful retry did not clear Not saved.');
+  }
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
-        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        markup = browser_markup(self.root).replace('</body>', probe.replace('LOST', json.dumps(lost))+'</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -534,12 +586,7 @@ window.fetch=(url,options)=>{
         ready = self.investigation()
         investigation_key = f'investigation/{ready.owner}/{ready.id}'
         question = self.question()
-        change = 'page-owner/C1'
-        delivery, _ = review_page.submit(self.root, self.body(change, 'question', 'Did the check pass?'), self.status)
-        assert isinstance(delivery, change_page.MessageDelivery)
-        pending = self.status.slots(delivery.page, delivery.row).question
-        assert isinstance(pending, change_page.OpenQuestion)
-        self.assertTrue(change_page.answer_item(change, 'The check passed.', pending.question_id, self.status))
+        change = self.change_with_unread_answer()
         markup = browser_markup(self.root)
         probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
 (async()=>{
@@ -569,7 +616,7 @@ window.fetch=(url,options)=>{
   if(expected==='retained' && copy()?.value!==words)
    failures.push('The acknowledgement leaves the words in the notice.');
   if(expected==='unconfirmed' && (!field.isConnected || field.value!==words ||
-    !form.querySelector('[data-send-status]').textContent.includes('Could not confirm the save.')))
+    !form.querySelector('[data-send-status]').textContent.includes('The save outcome is not known yet.')))
    failures.push('A missing or invalid confirmation keeps the form and its words.');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -741,20 +788,31 @@ window.fetch=(url,options)=>{
         with patch.object(review_items, 'read', return_value=rows):
             return browser_markup(self.root)
 
-    def check_not_saved_list(self, steps: str) -> None:
+    def change_with_unread_answer(self) -> str:
+        key = 'page-owner/C1'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Did the check pass?'), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        pending = self.status.slots(delivery.page, delivery.row).question
+        assert isinstance(pending, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(key, 'The check passed.', pending.question_id, self.status))
+        return key
+
+    def check_not_saved_list(self, steps: str, *, card_key: str = '', listing: bytes | None = None) -> None:
         probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
 (async()=>{
  const {realFetch,until}=fixtureUndo(),failures=[],content=document.querySelector('[data-review]');
  const check=(ok,message)=>{if(!ok) failures.push(message);};
  const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- const requests=[];
+ const requests=[],filings=[];
  window.fetch=(url,options)=>{
+  if(url===reviewSaveFailurePath)
+   return new Promise(respond=>filings.push({respond,body:new URLSearchParams(options.body)}));
   if(options?.method==='POST') return new Promise(resolve=>requests.push(resolve));
   if(new URL(url,location.href).searchParams.get('version')==='1')
    return Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));
   return realFetch(url,options);
  };
- const refuse=(request,status,reason)=>requests[request](Response.json({reason},{status}));
+ const refuse=(request,status,reason,failedAttempt)=>requests[request](Response.json({reason,failure_attempt:failedAttempt},{status}));
  const row=key=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
  const open=async row=>{
   row.querySelector('.list-toggle').click();
@@ -768,17 +826,374 @@ window.fetch=(url,options)=>{
   top.document.body.style.margin='0';
   frameElement.style.cssText='display:block;width:100vw;height:100vh;border:0';
   await paint();
-  const response=content.querySelector('[data-list-item][data-type="response"]');
-  const key=response.dataset.key,form=await open(response);
-  const words='Keep these words with the response.';
+  const cardKey=CARD_KEY;
+  const card=cardKey ? row(cardKey) : content.querySelector('[data-list-item][data-type="response"]');
+  const key=card.dataset.key,form=await open(card);
+  const words='Keep these draft words.';
   form.elements.feedback.value=words;
   form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
   STEPS
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
-        markup = self.long_review_with_response().replace('</body>', probe.replace('STEPS', steps)+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode(), window_size=(1440, 900)), [[]])
+        script = probe.replace('CARD_KEY', json.dumps(card_key)).replace('STEPS', steps)
+        markup = self.long_review_with_response().replace('</body>', script+'</body>')
+        if listing is None:
+            self.assertEqual(firefox_probe_results(markup.encode(), window_size=(1440, 900)), [[]])
+        else:
+            from scripts.review_links.test_page_frame import window_probe_results
+
+            pages = {review_page.PAGE_PATH: markup.encode(), list_page.PAGE_PATH: listing}
+            self.assertEqual(window_probe_results(pages, review_page.PAGE_PATH, 'firefox'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_shows_the_bug_number_on_the_card_line(self) -> None:
+        morty = fixture_member('producer', name='morty')
+        item = the_list.add(morty.id, 'Review save failed', owner=morty.id, source='nate', changes={}, number=42)
+        _ = the_list.add(morty.id, 'Another List item', owner=morty.id, source='nate', changes={})
+        listing = list_page.render(self.root, include_counts=False, status=self.status)
+        href = list_page.PAGE_PATH + list_page.item_link(morty.id, item.number, only_item=True)
+        bug = {'label': 'Bug 42', 'href': href}
+        steps = r"""
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  const failedAttempt='b'.repeat(32);
+  refuse(0,400,'Review refused the save.',failedAttempt);
+  await until(()=>filings.length===1 && entry(key),'The refusal did not reach the list.');
+  draftButton.click();
+  const message=entry(key).querySelector('p'),title=entry(key).querySelector('strong');
+  check(message.textContent==='Not saved.' && !message.querySelector('a'),'A pending filing shows only Not saved.');
+  check(filings[0].body.get('failure_attempt')===failedAttempt,'The report uses the attempt from the refusal.');
+  filings[0].respond(Response.json({outcome:'refused',bug:BUG_LINK}));
+  await until(()=>!reviewSaveReports.active,'The report did not finish.');
+  if(message.textContent!=='Not saved. Bug 42 is filed.')
+   throw new Error('The card line shows '+JSON.stringify({line:message.textContent,bug:reviewDrafts.get(key).filedBug}));
+  const link=message.querySelector('a');
+  check(link.textContent==='Bug 42' && link.getAttribute('href')===BUG_LINK.href,'The line links to the List item.');
+  check(title.nextElementSibling===message && entry(key).textContent.split('Bug 42').length===2,
+   'The title has no separate Bug label.');
+  check(entry(key).querySelector('textarea').value===words,'The entry keeps the submitted words.');
+  const place=location.href;
+  link.focus();
+  link.click();
+  const dialog=document.getElementById('review-bug-dialog'),frame=dialog.querySelector('iframe');
+  const opened=()=>frame.contentDocument?.readyState==='complete' &&
+   frame.contentDocument.querySelector('[data-number="42"] .list-toggle[aria-expanded="true"]');
+  await until(()=>dialog.open && opened(),'The List item did not open in the overlay.');
+  const listing=frame.contentDocument;
+  check(listing.body.innerText.includes('Review save failed') && !listing.body.innerText.includes('Another List item') &&
+   location.href===place,'The overlay shows only the linked List item and keeps the Review address.');
+  opened().dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  await until(()=>!dialog.open && document.activeElement===link,'Escape returns focus to the Bug link.');
+  link.click();
+  await until(()=>dialog.open && opened(),'The List item did not reopen.');
+  dialog.querySelector('[data-close]').click();
+  await until(()=>!dialog.open && document.activeElement===link,'Close returns focus to the Bug link.');
+  check(!list.hidden && entry(key).querySelector('textarea').value===words,'The overlay keeps the list and its draft.');
+ """
+        self.check_not_saved_list(steps.replace('BUG_LINK', json.dumps(bug)), listing=listing)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_shows_only_not_saved_when_bug_filing_fails(self) -> None:
+        self.check_not_saved_list(r"""
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>requests.length===1,'Got it did not submit.');
+  refuse(0,400,'The first save was refused.','b'.repeat(32));
+  await until(()=>filings.length===1,'The first report is missing.');
+  filings[0].respond(Response.json({outcome:'refused',bug:{label:'Bug 42',href:'/console/list.html#item=morty%2FL42'}}));
+  await until(()=>entry(key)?.textContent.includes('Bug 42') && !entry(key).querySelector('button').disabled,
+   'The first Bug number is missing.');
+  draftButton.click();
+  entry(key).querySelector('button').click();
+  await until(()=>requests.length===2,'The retry did not submit.');
+  refuse(1,400,'The retry was refused.','c'.repeat(32));
+  await until(()=>filings.length===2 && reviewDrafts.get(key)?.message.includes('The retry was refused.'),
+   'The card draft did not receive the new refusal.');
+  filings[1].respond(Response.json({outcome:'refused',reason:'The retry was refused.'}));
+  await until(()=>!reviewSaveReports.active,'The report did not finish.');
+  check(entry(key).querySelector('p').textContent==='Not saved.' && !entry(key).querySelector('a') &&
+   entry(key).querySelector('textarea').value===words && draftButton.textContent==='Not saved: 1',
+   'A filing failure leaves only Not saved and keeps the words.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_reports_a_lost_save_after_reconnect(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,attempts=[],reports=[];
+  let reachable=false;
+  window.fetch=async(url,options)=>{
+   if(String(url)===reviewSaveFailurePath){
+    reports.push(new URLSearchParams(options.body));
+    if(!reachable) throw new TypeError('Connection lost.');
+    return Response.json({outcome:'missing',reason:'Connection lost.',bug:{label:'Bug 43',href:'/console/list.html#item=morty%2FL43'}});
+   }
+   if(options?.method==='POST'){
+    attempts.push(new Headers(options.headers).get(reviewSaveAttemptHeader));
+    throw new TypeError('Connection lost.');
+   }
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reports.length>0 && !reviewSaveReports.active &&
+   reviewDrafts.get(key)?.message.includes('The save outcome is not known yet.'),
+   'The save did not fail before reconnect.');
+  const pending=reports.length;
+  reachable=true;
+  await reviewFetch(location.pathname+'?version=1');
+  await until(()=>entry(key).textContent.includes('Bug 43'),'The report did not return a Bug number.');
+  const report=reports.at(-1);
+  check(reports.length===pending+1 && report.get('failure_attempt')===attempts[0] && report.get('row')===key &&
+   report.get('feedback')===words && report.get('reason')==='Connection lost.',
+   'The report keeps the original attempt, card, words, and reason.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_waits_for_the_refusal_and_shows_its_bug(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,reason='The card changed while the save was in progress.';
+  let checks=0,refused=false;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath){
+    checks++;
+    return Promise.resolve(refused ? Response.json({outcome:'refused',reason,bug:{label:'Bug 42',href:'/console/list.html#item=morty%2FL42'}}) :
+     Response.json({outcome:'pending'},{status:202}));
+   }
+   if(options?.method!=='POST') return fixtureFetch(url,options);
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>checks>0 && entry(key) && !reviewSaveReports.active,'The outcome check did not finish.');
+  check(reviewDrafts.get(key).message.includes('The save outcome is not known yet.') &&
+   entry(key).querySelector('p').textContent==='Not saved.','The pending attempt keeps the draft without a Bug number.');
+  refused=true;
+  await reviewFetch(location.pathname+'?version=1');
+  await until(()=>entry(key).textContent.includes('Bug 42'),'Review did not show the existing Bug number.');
+  check(entry(key).querySelector('p').textContent==='Not saved. Bug 42 is filed.' &&
+   reviewDrafts.get(key).message==='Not saved: '+reason &&
+   entry(key).querySelector('textarea').value===words,'The refusal replaces the unknown message and keeps the words.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_removes_a_lost_reply_that_the_server_saved(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath || options?.method!=='POST') return fixtureFetch(url,options);
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>filings.length===1 && entry(key),'The lost save was not reported.');
+  check(reviewDrafts.get(key).message.includes('The save outcome is not known yet.'),
+   'The draft keeps the unknown outcome.');
+  filings[0].respond(Response.json({outcome:'saved',words_saved:true}));
+  await until(()=>!entry(key),'A saved attempt stayed in the list.');
+  check(!reviewDrafts.has(key) && !inline(key),'The draft and its inline copy are removed.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_checks_unknown_replay_until_the_save_finishes(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,hold='a'.repeat(24),reports=[];
+  let attempt,outcome='unknown';
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath){
+    reports.push(new URLSearchParams(options.body));
+    const result=outcome==='saved' ? {outcome,words_saved:true,hold} : {outcome};
+    return Promise.resolve(Response.json(result,{status:outcome==='pending' ? 202 : 200}));
+   }
+   if(options?.method==='POST'){
+    attempt=new Headers(options.headers).get(reviewSaveAttemptHeader);
+    return Promise.resolve(Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}}));
+   }
+   if(url==='/send-hold/'+hold)
+    return Promise.resolve(Response.json({reason:reviewSaveUnconfirmed},{status:503}));
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reports.length && entry(key) && !reviewSaveReports.active,'The first status check did not finish.');
+  check(entry(key)?.querySelector('textarea').value===words,'The unknown outcome keeps the draft.');
+  const unknownChecks=reports.length;
+  outcome='pending';
+  await reviewFetch(location.pathname+'?version=1');
+  if(reports.length<=unknownChecks) throw new Error('The refresh did not check the unknown outcome again.');
+  await until(()=>!reviewSaveReports.active,'The next status check did not finish.');
+  const pendingChecks=reports.length;
+  outcome='saved';
+  await reviewFetch(location.pathname+'?version=1');
+  if(reports.length<=pendingChecks) throw new Error('The refresh did not check the pending outcome again.');
+  await until(()=>!entry(key) && !reviewSaveReports.active,'The confirmed save did not clear the draft.');
+  check(reports.every(report=>report.get('failure_attempt')===attempt && report.get('feedback')===words),
+   'Each status check uses the original attempt and words.');
+  const finalChecks=reports.length;
+  await reviewFetch(location.pathname+'?version=1');
+  check(reports.length===finalChecks,'A confirmed save ends the status checks.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_keeps_words_after_a_lost_mark_read_reply(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath || options?.method!=='POST') return fixtureFetch(url,options);
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>filings.length===1 && entry(key),'The lost reply was not reported.');
+  filings[0].respond(Response.json({outcome:'saved',words_saved:false}));
+  await until(()=>!reviewSaveReports.active,'The outcome check did not finish.');
+  check(entry(key)?.querySelector('textarea').value===words && form.elements.feedback.value===words,
+   'Mark read leaves the draft in the list and the form.');
+  check(entry(key)?.querySelector('p').textContent==='Not saved.' &&
+   reviewDrafts.get(key).message==='Saved. Your words are still unsent.','The confirmed acknowledgement shows the draft without a Bug.');
+ """, card_key=self.change_with_unread_answer())
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_linked_review_card_reports_a_lost_save_after_it_reopens(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        key = 'page-owner/C1'
+        snapshot = review_page.build_snapshot(self.root)
+        card = snapshot.body(key, view=review_page.ReviewBodyView.CARD).decode()
+        card = card.replace('</head>', '<script>parent.installCardTransport(window);</script></head>', 1)
+        markup = '<dialog data-list-review-dialog open></dialog><script>' + UNDO_ACTION_SCRIPT + r"""
+const drafts=new Map(),reports=[],attempts=[];
+let reachable=false;
+function installCardTransport(view){
+ view.fetch=async(url,options)=>{
+  if(url==='/console/review-save-failure'){
+   reports.push(new URLSearchParams(options.body));
+   if(!reachable) throw new TypeError('Connection lost.');
+   return Response.json({outcome:'missing',reason:'Connection lost.',bug:{label:'Bug 43',href:'/console/list.html#item=morty%2FL43'}});
+  }
+  attempts.push(new Headers(options.headers).get('X-Review-Save-Attempt'));
+  throw new TypeError('Connection lost.');
+ };
+}
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[];
+ const dialog=document.querySelector('dialog');
+ const openCard=async()=>{
+  const frame=document.createElement('iframe');
+  frame.linkedReviewDrafts=drafts;
+  frame.src='/console/review.html?body=page-owner%2FC1';
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  dialog.append(frame);
+  await loaded;
+  return frame;
+ };
+ try{
+  const card=await openCard();
+  const form=card.contentDocument.querySelector('[data-review-form]');
+  const words='Keep the words from the closed card.';
+  form.elements.feedback.value=words;
+  form.elements.feedback.dispatchEvent(new card.contentWindow.Event('input',{bubbles:true}));
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  await until(()=>reports.length && !card.hasAttribute('data-saving') &&
+   card.contentDocument.querySelector('[data-review-card-notice]').textContent.includes('The save outcome is not known yet.'),
+   'The linked save failure did not show.');
+  card.reviewDraft.release();
+  card.remove();
+  const count=reports.length;
+  reachable=true;
+  const reopened=await openCard();
+  if(reopened.contentDocument.querySelector('[name="feedback"]').value!==words)
+   failures.push('The reopened card lost the draft.');
+  await until(()=>drafts.get('page-owner/C1')?.filedBug?.label==='Bug 43','The reopened card did not finish the report.');
+  const report=reports.at(-1);
+  if(reports.length!==count+1 || report.get('feedback')!==words || report.get('failure_attempt')!==attempts[0])
+   failures.push('The reopened card did not report the original attempt and words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        self.assertEqual(window_probe_results(
+            {'/list': markup.encode(), review_page.PAGE_PATH: card.encode()}, '/list', 'firefox'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_reports_an_undo_admission_refusal(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,reason='The send is empty or too large.';
+  let attempt;
+  window.fetch=(url,options)=>{
+   if(url===reviewSaveFailurePath || options?.method!=='POST') return fixtureFetch(url,options);
+   const headers=new Headers(options.headers);
+   check(headers.get('X-Undo-Hold')==='1','The save requests Undo.');
+   attempt=headers.get(reviewSaveAttemptHeader);
+   return Promise.resolve(Response.json({reason,failure_attempt:attempt},{status:400}));
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reviewDrafts.get(key)?.message.includes(reason),'The refusal is missing.');
+  await until(()=>filings.length===1,'The Undo admission refusal did not file a report.');
+  const report=filings[0];
+  check(report.body.get('feedback')===words && report.body.get('reason')===reason &&
+   report.body.get('failure_attempt')===attempt,'The report includes the refusal, original words, and attempt.');
+  report.respond(Response.json({outcome:'refused',reason,bug:{label:'Bug 45',href:'/console/list.html#item=morty%2FL45'}}));
+  await until(()=>entry(key).textContent.includes('Bug 45'),'The refusal has no Bug number.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_undo_refusal_retires_the_hold_for_the_same_words(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,ids=[];
+  const reason='The server could not record the hold.';
+  window.fetch=(url,options)=>{
+   if(url!==location.pathname || options?.method!=='POST') return fixtureFetch(url,options);
+   ids.push(new Headers(options.headers).get('X-Undo-Request'));
+   const headers=ids.length===2 ? {'X-Send-Hold':'refused'} : {};
+   return Promise.resolve(Response.json({reason},{status:503,headers}));
+  };
+  const init={method:'POST',body:new URLSearchParams({feedback:words})};
+  for(let index=0;index<3;index++) await heldFetch(location.pathname,init);
+  check(ids.length===3 && ids[0] && ids[0]===ids[1],
+   'An unconfirmed server failure keeps the hold ID.');
+  check(ids[2] && ids[2]!==ids[1],'A confirmed refusal gives the same words a new hold ID.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_reports_an_expired_held_result(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,reports=[],hold='a'.repeat(24);
+  const reason='This send was undone or its result expired.';
+  let attempt;
+  window.fetch=async(url,options)=>{
+   if(url===reviewSaveFailurePath){
+    reports.push(new URLSearchParams(options.body));
+    return Response.json({outcome:'missing',reason,bug:{label:'Bug 44',href:'/console/list.html#item=morty%2FL44'}});
+   }
+   if(options?.method==='POST'){
+    attempt=new Headers(options.headers).get(reviewSaveAttemptHeader);
+    return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+   }
+   if(url==='/send-hold/'+hold) return Response.json({reason,hold_state:'missing'},{status:404});
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>reviewDrafts.get(key)?.message.includes(reason),'The expired result is missing.');
+  draftButton.click();
+  await until(()=>entry(key).innerText.includes('Bug 44'),'The expired result has no Bug number.');
+  check(reports.length===1 && reports[0].get('failure_attempt')===attempt && reports[0].get('reason')===reason &&
+   entry(key).querySelector('textarea').value===words,'The report uses the same attempt and keeps the words.');
+ """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_not_saved_list_keeps_an_undone_hold_without_a_bug(self) -> None:
+        self.check_not_saved_list(r"""
+  const fixtureFetch=window.fetch,hold='a'.repeat(24);
+  let resultRead=false;
+  window.fetch=async(url,options)=>{
+   if(url===reviewSaveFailurePath) return fixtureFetch(url,options);
+   if(options?.method==='POST') return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+   if(url==='/send-hold/'+hold){
+    resultRead=true;
+    return Response.json({reason:'This send was undone.',hold_state:'undone'},{status:404});
+   }
+   return fixtureFetch(url,options);
+  };
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>resultRead && entry(key) && !entry(key).querySelector('button').disabled,'Undo did not finish.');
+  draftButton.click();
+  check(filings.length===0 && entry(key).querySelector('p').textContent==='Not saved.' && entry(key).querySelector('textarea').value===words,
+   'A confirmed Undo keeps the words without a save failure or Bug report.');
+ """)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_not_saved_list_shows_the_new_400_after_the_card_reopens(self) -> None:
@@ -787,7 +1202,7 @@ window.fetch=(url,options)=>{
   await until(()=>requests.length===1,'Got it did not submit.');
   refuse(0,400,'The first save was refused.');
   draftButton.click();
-  await until(()=>entry(key)?.querySelector('p').textContent==='Not saved: The first save was refused.' &&
+  await until(()=>reviewDrafts.get(key)?.message==='Not saved: The first save was refused.' &&
    !entry(key).querySelector('button').disabled,'The list did not show the first refusal.');
   entry(key).querySelector('button').click();
   await until(()=>requests.length===2,'The list did not retry.');
@@ -804,12 +1219,13 @@ window.fetch=(url,options)=>{
   check(recordIsOpen(row(key)) && reopened.elements.feedback.value===words,'The reopened card shows the words.');
   refuse(1,400,'The retry was refused for a different reason.');
   await until(()=>!entry(key).querySelector('button').disabled,'The refusal did not settle.');
-  check(entry(key).querySelector('p').textContent==='Not saved: The retry was refused for a different reason.' &&
+  check(entry(key).querySelector('p').textContent==='Not saved.' &&
+   reviewDrafts.get(key).message==='Not saved: The retry was refused for a different reason.' &&
    entry(key).querySelector('textarea').value===words,'The list shows the new refusal and the same words.');
 """)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_not_saved_list_and_inline_copy_show_the_same_409_during_a_fade(self) -> None:
+    def test_inline_copy_shows_the_409_while_the_not_saved_list_stays_open(self) -> None:
         self.check_not_saved_list(r"""
   form.requestSubmit(form.querySelector('[value="read"]'));
   await until(()=>requests.length===1,'Got it did not submit.');
@@ -817,8 +1233,8 @@ window.fetch=(url,options)=>{
   const otherForm=await open(other);
   await until(()=>inline(key)?.getClientRects().length,'The first draft copy did not appear.');
   draftButton.click();
-  check(entry(key).querySelector('p').textContent===inline(key).querySelector('p').textContent,
-   'The two views start with the same message.');
+  check(entry(key).querySelector('p').textContent==='Not saved.',
+   'The list entry starts without a Bug.');
   otherForm.requestSubmit(otherForm.querySelector('[value="works"]'));
   const clip=content.querySelector('[data-record-motion-key="'+CSS.escape(other.dataset.key)+'"] .record-motion-clip');
   const fade=clip?.getAnimations()[0];
@@ -827,9 +1243,9 @@ window.fetch=(url,options)=>{
   try{
    refuse(0,409,'this item changed while Review was open.');
    const expected='Not saved: this item changed while Review was open.';
-   await until(()=>entry(key).querySelector('p').textContent===expected,'The list did not show the 409.');
-   check(clip.isConnected && fade.playState==='paused' && inline(key).querySelector('p').textContent===expected,
-    'The inline copy shows the same refusal while the other card fades.');
+   await until(()=>inline(key).querySelector('p').textContent===expected,'The inline copy did not show the 409.');
+   check(clip.isConnected && fade.playState==='paused' && entry(key).querySelector('p').textContent==='Not saved.',
+    'The inline copy shows the refusal while the list keeps its summary.');
   }finally{
    fade.finish();
   }
@@ -867,7 +1283,7 @@ window.fetch=(url,options)=>{
   await open(other);
   refuse(0,409,'this item changed while Review was open.');
   draftButton.click();
-  await until(()=>entry(key)?.querySelector('p').textContent==='Not saved: this item changed while Review was open.' &&
+  await until(()=>reviewDrafts.get(key)?.message==='Not saved: this item changed while Review was open.' &&
    !entry(key).querySelector('button').disabled,'The list did not show the 409.');
   await until(()=>row(key),'The response did not return.');
   const reopened=await open(row(key));
@@ -989,7 +1405,7 @@ window.fetch=(url,options)=>{
     'The same explicit recipient can receive the original approval.');
   }else{
    check(posts.length===1 && action.textContent==='Open the card' && !list.hidden &&
-    entry.querySelector('p').textContent==='Not saved: this item changed. Open the card to choose again.' &&
+    reviewDrafts.get(key)?.message==='Not saved: this item changed. Open the card to choose again.' &&
     entry.querySelector('textarea').value===words,'A changed default recipient requires a new choice.');
    if(action.textContent==='Open the card'){
     action.click();
@@ -1163,7 +1579,7 @@ window.fetch=(url,options)=>{
   const entry=list.firstElementChild;
   const draft=entry.querySelector('textarea'),send=entry.querySelector('button');
   check(!list.hidden && document.activeElement===list && entry.querySelector('strong').textContent.includes('Check the question record') &&
-   entry.querySelector('p').textContent==='Not saved: '+refusal && entry.querySelector('label').textContent==='Your words' &&
+   entry.querySelector('p').textContent==='Not saved.' && entry.querySelector('label').textContent==='Your words' &&
    draft.readOnly && draft.value===words && send.textContent===form.querySelector('[value="read"]').textContent &&
    entry.querySelectorAll('button').length===1 && !entry.querySelector('small'),
    'The list shows the card, the refusal, the exact words and one Got it button.');
@@ -1176,7 +1592,7 @@ window.fetch=(url,options)=>{
    posts[1].get('feedback')===words && posts[1].get('token')===posts[0].get('token') &&
    posts[1].get('revision')==='after-1','The retry submits the card action, exact words, token, and current revision.');
   refuse(laterRefusal);
-  await until(()=>entry.querySelector('p').textContent.includes(laterRefusal) && !send.disabled &&
+  await until(()=>reviewDrafts.get(responseKey)?.message.includes(laterRefusal) && !send.disabled &&
    content.dataset.version===version,'The list did not show the new refusal.');
   check(list.firstElementChild===entry && draft.value===words && toggle.textContent==='Not saved: 2',
    'A refused retry keeps the entry and its words.');
@@ -2516,7 +2932,7 @@ window.fetch=(url,options)=>{
   if(VALIDATING){
    ask(reopened);edit(reopened.elements.feedback,'Keep the words after Ask.');
    finishPost(new Response('Unreadable result'));await settled(reopened);
-   check(reopened.querySelector('[data-send-status]').textContent.includes('Could not confirm the save.') &&
+   check(reopened.querySelector('[data-send-status]').textContent.includes('The save outcome is not known yet.') &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
     'An unreadable response reports an unconfirmed save and keeps the draft.');
    ask(reopened);finishPost(Response.json({reason:'The save failed.'},{status:400}));await settled(reopened);

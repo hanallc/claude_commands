@@ -52,6 +52,7 @@ BROWSER_DRAFT_ID = re.compile(r"r6-[0-9a-f]{32}")
 LEGACY_DRAFT_BINDING = re.compile(r"(r2-[0-9a-f]{32})-.+")
 BROWSER_DRAFT_BINDING = re.compile(r"(r6-[0-9a-f]{32})-.+")
 PAGE_SCREENSHOT = ImageReference("000000000000", "image.png")
+REVIEW_SAVE_BUG_TITLE = "Review save failed"
 
 
 def is_draft_id(value: object) -> bool:
@@ -61,6 +62,65 @@ def is_draft_id(value: object) -> bool:
 def submission_title(words: str) -> str:
     """The title of a New item: its first line with words, at most 120 characters."""
     return next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+
+
+@dataclass(frozen=True)
+class ReviewSaveFailure:
+    page: str
+    card: str
+    reason: str
+    words: str
+    attempt: str
+
+    @property
+    def cause(self) -> str:
+        reason = json.dumps(self.reason, ensure_ascii=False)
+        return f"{REVIEW_SAVE_BUG_TITLE}\n\nPage: {self.page}\nRefusal: {reason}\n"
+
+    def record_words(self) -> str:
+        return f"{self.cause}Card: {self.card}\n\nYour words\n\n{self.words}"
+
+    def repeat_line(self) -> str:
+        card, words = (json.dumps(value, ensure_ascii=False) for value in (self.card, self.words))
+        return f"Save {self.attempt}: Card {card}. Your words {words}."
+
+
+@dataclass(frozen=True)
+class _AutomaticSaveBugRequest(NewItemRequest):
+    """Keep the exact words of a failed Review save in a Bug."""
+
+
+def file_review_save_bug(failure: ReviewSaveFailure, owner: staff.StaffId,
+                         members: staff.StaffSnapshot) -> investigation.Investigation:
+    """File or recover the native Bug under the owner lock."""
+    request_id = f"r1-{failure.attempt}-bug-{owner}"
+    cause = failure.cause
+    attempt_log = f"Save {failure.attempt}: "
+    matching: list[investigation.Investigation] = []
+    with investigation.recipient_locks(owner):
+        for path in investigation.review_record_paths(owner, strict=True):
+            header = record_store.read_header(path, keys=frozenset(('kind', 'title')), strict=True)
+            if header.get('kind') != ['bug'] or header.get('title') != [REVIEW_SAVE_BUG_TITLE]:
+                continue
+            record = investigation.read_review_record(path)
+            if (not isinstance(record.submission, ReviewSubmission)
+                    or not record.question.startswith(f"{REVIEW_SAVE_BUG_TITLE}\n\nPage: ")):
+                continue
+            if record.submission.request_id == request_id or any(
+                    event.words.startswith(attempt_log) for event in record.log):
+                return record
+            if record.state == investigation.InvestigationState.OPEN and record.question.startswith(cause):
+                matching.append(record)
+        if matching:
+            record = matching[0]
+            investigation.record_review_log(owner, record.id, failure.repeat_line())
+            return record
+        request = _AutomaticSaveBugRequest(request_id, SubmissionKind.BUG, owner, failure.record_words(),
+                                           NoEvidence(), page="review",
+                                           page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        record = submit(request, members=members).record
+        assert isinstance(record, investigation.Investigation)
+        return record
 
 
 @dataclass(frozen=True)
@@ -1310,7 +1370,7 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
                            unit=unit, source=source)
 
 
-def list_filing_reservation(saved: SavedSubmission) -> Path:
+def list_filing_reservation(saved: SavedSubmission | ReviewSubmission) -> Path:
     """Return the number reservation for the saved request."""
     return _request_folder(saved.request_id) / "list-number"
 
@@ -2363,7 +2423,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         raise SubmissionError("Invalid draft request ID.")
     address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
                else _request_address(kind, request.recipient_id, request_id))
-    words = read_words(request.words, "Your words", kind=request.kind)
+    words = (request.words if isinstance(request, _AutomaticSaveBugRequest)
+             else read_words(request.words, "Your words", kind=request.kind))
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
     if list_draft:

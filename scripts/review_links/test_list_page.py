@@ -1701,7 +1701,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   await until(()=>completed && !frame.hasAttribute('data-saving'),'The follow-up did not finish.');
   const message=doc.querySelector('[data-review-card-notice]').textContent;
   if(!dialog.open || frame.hidden || !field.isConnected || field.value!==draft ||
-   (readable ? message!=='Saved. Your newer words are unsent.' : !message.includes('Could not confirm')))
+   (readable ? message!=='Saved. Your newer words are unsent.' : !message.includes('The save outcome is not known yet.')))
    failures.push('The send result returns the dialog with the newer, unsent words.');
   if(posts.length!==1 || posts[0]!==sent) failures.push('Only the original words were sent.');
   if(!readable){
@@ -1720,6 +1720,58 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 })();
 </script>'''
         page = page.replace(b"</body>", probe.replace(b"READABLE", json.dumps(readable).encode()) + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_checks_a_lost_review_reply_after_the_card_closes(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = b'<script>' + UNDO_ACTION_SCRIPT.encode() + br'''
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[],reports=[];
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ let reachable=false,attempt;
+ window.fetch=(url,options)=>{
+  if(url!=='/console/review-save-failure') return realFetch(url,options);
+  reports.push(new URLSearchParams(options.body));
+  return reachable ? Promise.resolve(Response.json({outcome:'saved',words_saved:true})) :
+   Promise.reject(new TypeError('Connection lost.'));
+ };
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,form=frame.contentDocument.querySelector('[data-review-form]');
+  const words='Keep the words until the outcome is known.';
+  view.fetch=(_url,options)=>{
+   const sent=new view.Headers(options?.headers).get('X-Review-Save-Attempt');
+   if(sent) attempt=sent;
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>!frame.hasAttribute('data-saving') && dialog.open,'The unresolved card did not return.');
+  dialog.querySelector('[data-close]').click();
+  const copy=()=>document.querySelector('[data-unsaved-review-key]');
+  if(dialog.querySelector('iframe') || copy()?.querySelector('textarea').value!==words)
+   throw new Error('Close did not keep the words in the List.');
+  reachable=true;
+  document.dispatchEvent(new Event('visibilitychange'));
+  await until(()=>!copy(),'The List did not clear the saved draft after reconnecting.');
+  const report=reports.at(-1);
+  if(!report) failures.push('The List did not send an outcome check.');
+  else{
+   if(report.get('failure_attempt')!==attempt) failures.push('The List changed the attempt ID.');
+   if(report.get('feedback')!==words) failures.push('The List changed the words.');
+  }
+  if(dialog.querySelector('iframe')) failures.push('The List opened a card to check the outcome.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
         self.assertEqual(window_probe_results(
             {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
 

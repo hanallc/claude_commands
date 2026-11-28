@@ -27,11 +27,11 @@ import time
 import threading
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from enum import Enum
+from enum import Enum, StrEnum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, cast, override
+from typing import BinaryIO, Literal, NotRequired, TypedDict, cast, override
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
@@ -170,6 +170,7 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
 PAGE_CAPTURE_TTL_SECONDS = 600
 PAGE_CAPTURE_PREVIEW_SECONDS = 20
 PAGE_CAPTURE_FOLDER = ".review-link-page-captures"
+REVIEW_SAVE_ATTEMPTS_FOLDER = ".review-link-save-attempts"
 MAX_PAGE_CAPTURES = 8
 PAGE_ATTACHMENT_RETRY_SECONDS = 5
 
@@ -744,6 +745,489 @@ class ModuleStampUnavailable(Enum):
     UNREADABLE = "unreadable"
 
 
+class ReviewSaveAttemptState(StrEnum):
+    MISSING = "missing"
+    PENDING = "pending"
+    UNDONE = "undone"
+    UNKNOWN = "unknown"
+
+
+class ReviewHoldAbsent(Enum):
+    DIRECT_SAVE = "direct save"
+
+
+class ReviewDeliveryFailureAbsent(Enum):
+    NO_REPORTED_FAILURE = "no reported failure"
+
+
+@dataclass(frozen=True)
+class ReviewDeliveryFailure:
+    message: str
+    failure_attempt: str
+
+
+@dataclass(frozen=True)
+class ReviewDeliveryInProgress:
+    failure_attempt: str
+    last_failure: ReviewDeliveryFailure | ReviewDeliveryFailureAbsent = ReviewDeliveryFailureAbsent.NO_REPORTED_FAILURE
+
+    def failure_after_interruption(self) -> ReviewDeliveryFailure:
+        if isinstance(self.last_failure, ReviewDeliveryFailure):
+            return self.last_failure
+        attempt = hashlib.sha256(f'{self.failure_attempt}:unconfirmed'.encode()).hexdigest()[:32]
+        return ReviewDeliveryFailure("The sender has not confirmed delivery.", attempt)
+
+
+class ReviewDeliveryIdAbsent(Enum):
+    NO_MESSAGE = "no message"
+
+
+class ReviewDeliveryRetryAbsent(Enum):
+    NO_SAVED_RESPONSE = "no saved response"
+
+
+@dataclass(frozen=True)
+class ResponseFeedbackDeliveryTarget:
+    card_key: str
+    source: Path
+    words: str
+
+    def receipt_fields(self) -> dict[str, str]:
+        return {'card': self.card_key, 'source': str(self.source), 'words': self.words}
+
+    def native_outcome(self, status: change_page.DeliveryStatus, attempt: str
+                       ) -> change_page.DeliveryOutcome | Literal[ReviewSaveAttemptState.PENDING]:
+        row = self.source.stem
+        target = change_page.ReviewPage(self.source, self.source.parent, (row,), '')
+        with status.locked():
+            page = status.metadata_page(target)
+            if not isinstance(page, change_page.UserQuestionPage) or page.saved.get('kind') != 'feedback':
+                return ReviewSaveAttemptState.PENDING
+            if status.owns_live_claim(page, row, attempt):
+                return ReviewSaveAttemptState.PENDING
+            closeout = status.closeout_fields(page, row)
+            dispatch = closeout.get('review_dispatch')
+            if dispatch is not None and dispatch['attempt'] == attempt and dispatch['state'] == 'finished':
+                failed = closeout.get('failed_delivery')
+                if failed is None:
+                    return change_page.DeliveryConfirmed()
+                if failed['attempt'] == attempt:
+                    return change_page.FailedDelivery(attempt, self.source, row, failed['last_error'])
+            intent = status.slots(page, row).verdict
+            if (not status.startup_recovery_pending.is_set() and isinstance(intent, change_page.DeliveryIntent)
+                    and intent.attempt == attempt and (page.saved['saved'] or status.has_review_save_receipt(page, row, intent))):
+                return change_page.DeliveryUnconfirmed()
+            return ReviewSaveAttemptState.PENDING
+
+    def claim(self, status: change_page.DeliveryStatus, attempt: str
+              ) -> change_page.MessageDelivery | change_page.DeliveryConfirmed | Literal[ReviewSaveAttemptState.PENDING]:
+        """Claim the original delivery ID without changing the closed Response."""
+        row = self.source.stem
+        target = change_page.ReviewPage(self.source, self.source.parent, (row,), '')
+        with status.locked():
+            page = status.metadata_page(target)
+            if (not isinstance(page, change_page.UserQuestionPage) or page.saved.get('kind') != 'feedback'
+                    or not page.saved['saved']):
+                raise ValueError('The saved Response delivery is unavailable.')
+            slots = status.slots(page, row)
+            closeout = status.closeout_fields(page, row)
+            dispatch = closeout.get('review_dispatch')
+            failed = closeout.get('failed_delivery')
+            if attempt in status.request_attempts:
+                return ReviewSaveAttemptState.PENDING
+            if isinstance(slots.verdict, change_page.DeliveryIntent) and slots.verdict.attempt != attempt:
+                raise ValueError('The saved Response delivery changed.')
+            if dispatch is not None and dispatch['attempt'] == attempt and dispatch['state'] == 'finished':
+                if failed is None:
+                    return change_page.DeliveryConfirmed()
+                if failed['attempt'] != attempt:
+                    raise ValueError('The saved Response delivery changed.')
+            elif not isinstance(slots.verdict, change_page.DeliveryIntent):
+                raise ValueError('The saved Response delivery is unavailable.')
+            owner = staff.StaffId(page.saved['owner'])
+            intent = change_page.DeliveryIntent(attempt, 'verdict', recipients=(owner,))
+            status.write_slots(page, row, slots.updated('verdict', intent))
+            started: change_page.StoredDeliveryCloseout = {**closeout, 'review_dispatch': {
+                'attempt': attempt, 'state': 'started', 'keyed': True}}
+            status.save_dispatch_start(page, row, closeout, started)
+            status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
+            return change_page.MessageDelivery(page, row, (owner,), page.saved['message'], attempt, (owner,))
+
+
+@dataclass(frozen=True)
+class SavedReviewAttempt:
+    words_saved: bool
+    hold_id: str | ReviewHoldAbsent = ReviewHoldAbsent.DIRECT_SAVE
+    delivery_id: str | ReviewDeliveryIdAbsent = ReviewDeliveryIdAbsent.NO_MESSAGE
+    response_delivery: ResponseFeedbackDeliveryTarget | ReviewDeliveryRetryAbsent = ReviewDeliveryRetryAbsent.NO_SAVED_RESPONSE
+    delivery_outcome: ReviewDeliveryFailure | ReviewDeliveryFailureAbsent | ReviewDeliveryInProgress = (
+        ReviewDeliveryFailureAbsent.NO_REPORTED_FAILURE)
+
+    def last_failure(self) -> ReviewDeliveryFailure | ReviewDeliveryFailureAbsent:
+        if isinstance(self.delivery_outcome, ReviewDeliveryInProgress):
+            return self.delivery_outcome.last_failure
+        return self.delivery_outcome
+
+    def with_delivery_result(self, outcome: change_page.DeliveryOutcome, failure_attempt: str) -> SavedReviewAttempt:
+        reason = held_delivery_result(outcome).get('send_failure')
+        delivery = (ReviewDeliveryFailure(reason, failure_attempt) if isinstance(reason, str)
+                    else ReviewDeliveryFailureAbsent.NO_REPORTED_FAILURE)
+        return replace(self, delivery_outcome=delivery)
+
+    def reply_fields(self) -> dict[str, object]:
+        fields: dict[str, object] = {'words_saved': self.words_saved}
+        if isinstance(self.hold_id, str):
+            fields['hold'] = self.hold_id
+        if isinstance(self.delivery_outcome, ReviewDeliveryFailure):
+            fields['send_failure'] = self.delivery_outcome.message
+            if isinstance(self.response_delivery, ResponseFeedbackDeliveryTarget):
+                fields['retry_delivery'] = True
+        return fields
+
+
+@dataclass(frozen=True)
+class RefusedReviewSave:
+    status: int
+    reason: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class ReservedResponseSave:
+    hold_id: str | ReviewHoldAbsent
+    delivery_id: str
+    response_delivery: ResponseFeedbackDeliveryTarget
+    failure_attempt: str
+
+    def confirmed_save(self) -> SavedReviewAttempt:
+        return SavedReviewAttempt(True, self.hold_id, self.delivery_id, self.response_delivery,
+                                  ReviewDeliveryInProgress(self.failure_attempt))
+
+
+class HoldOriginAttemptAbsent(Enum):
+    LEGACY_HOLD = "legacy hold"
+
+
+@dataclass(frozen=True)
+class HeldReviewSave:
+    hold_id: str
+    origin_attempt: str | HoldOriginAttemptAbsent
+    replay_started: bool = False
+    replay_unconfirmed: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewAttemptHoldReference:
+    hold_id: str
+
+
+class ReviewHoldReceiptFailed(OSError):
+    """The receipt could not reserve a hold before admission."""
+
+
+class ReviewSaveAdmission(Enum):
+    ACCEPTED = "accepted"
+    UNRECORDED = "unrecorded"
+
+
+type ReviewSaveOutcome = ReviewSaveAttemptState | SavedReviewAttempt | RefusedReviewSave
+type ReviewSaveReceipt = ReviewSaveOutcome | HeldReviewSave | ReservedResponseSave
+type ReviewAttemptEntry = ReviewSaveReceipt | ReviewAttemptHoldReference | Literal[ReviewSaveAdmission.UNRECORDED]
+
+
+class ReviewSaveAttempts:
+    """Keep Review outcomes after the HTTP reply and any Undo result expire."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder: Path = folder
+        self._lock: threading.Lock = threading.Lock()
+        self._active: dict[str, object] = {}
+        self._unwritten: dict[str, ReviewSaveReceipt] = {}
+
+    def _read(self, attempt: str) -> ReviewAttemptEntry:
+        if attempt in self._unwritten:
+            return self._unwritten[attempt]
+        try:
+            fields = cast(object, json.loads(self._path(attempt).read_text(encoding='utf-8')))
+        except FileNotFoundError:
+            return ReviewSaveAdmission.UNRECORDED
+        match fields:
+            case {"outcome": "response_reserved", "delivery_id": str(delivery_id),
+                  "response_delivery": {"card": str(card), "source": str(source), "words": str(words)},
+                  "failure_attempt": str(failure_attempt)}:
+                hold_id = cast(dict[str, object], fields).get('hold')
+                return ReservedResponseSave(hold_id if isinstance(hold_id, str) else ReviewHoldAbsent.DIRECT_SAVE,
+                                            delivery_id, ResponseFeedbackDeliveryTarget(card, Path(source), words), failure_attempt)
+            case {"outcome": "saved", "words_saved": bool(words_saved)}:
+                saved = cast(dict[str, object], fields)
+                hold_id = saved.get('hold')
+                delivery_id = saved.get('delivery_id')
+                target: ResponseFeedbackDeliveryTarget | ReviewDeliveryRetryAbsent = ReviewDeliveryRetryAbsent.NO_SAVED_RESPONSE
+                match saved.get('response_delivery'):
+                    case {'card': str(card), 'source': str(source), 'words': str(words)}:
+                        target = ResponseFeedbackDeliveryTarget(card, Path(source), words)
+                    case _:
+                        pass
+                failure: ReviewDeliveryFailure | ReviewDeliveryFailureAbsent = ReviewDeliveryFailureAbsent.NO_REPORTED_FAILURE
+                match saved.get('delivery_failure'):
+                    case {'reason': str(reason), 'attempt': str(failed_attempt)}:
+                        failure = ReviewDeliveryFailure(reason, failed_attempt)
+                    case _:
+                        pass
+                running = saved.get('delivery_running')
+                delivery_outcome = ReviewDeliveryInProgress(running, failure) if isinstance(running, str) else failure
+                return SavedReviewAttempt(words_saved, hold_id if isinstance(hold_id, str) else ReviewHoldAbsent.DIRECT_SAVE,
+                                          delivery_id if isinstance(delivery_id, str) else ReviewDeliveryIdAbsent.NO_MESSAGE,
+                                          target, delivery_outcome)
+            case {"refused": int(status), "reason": str(reason), "attempt": str(refused_attempt)}:
+                return RefusedReviewSave(status, reason, refused_attempt)
+            case {"hold": str(hold_id), "replay_started": bool(started)} if send_hold.valid_hold_id(hold_id):
+                held = cast(dict[str, object], fields)
+                origin = held.get('origin_attempt')
+                return HeldReviewSave(hold_id, origin if isinstance(origin, str) else HoldOriginAttemptAbsent.LEGACY_HOLD,
+                                      started, held.get('replay_unconfirmed') is True)
+            case {"hold_reference": str(hold_id)} if send_hold.valid_hold_id(hold_id):
+                return ReviewAttemptHoldReference(hold_id)
+            case str(state):
+                return ReviewSaveAttemptState(state)
+            case _:
+                raise ValueError('Invalid Review save receipt.')
+
+    def _path(self, attempt: str) -> Path:
+        return self.folder / attempt[:2] / f'{attempt}.json'
+
+    def _record(self, attempt: str) -> tuple[str, ReviewSaveReceipt | Literal[ReviewSaveAdmission.UNRECORDED]]:
+        entry = self._read(attempt)
+        if not isinstance(entry, ReviewAttemptHoldReference):
+            return attempt, entry
+        record = self._read(entry.hold_id)
+        if isinstance(record, ReviewAttemptHoldReference):
+            raise ValueError('A Review hold cannot refer to another hold.')
+        return entry.hold_id, record
+
+    def _write(self, attempt: str, receipt: ReviewSaveReceipt | ReviewAttemptHoldReference) -> None:
+        fields: dict[str, object] | str
+        match receipt:
+            case ReviewAttemptHoldReference(hold_id):
+                fields = {'hold_reference': hold_id}
+            case HeldReviewSave(hold_id, origin_attempt, replay_started, replay_unconfirmed):
+                fields = {'hold': hold_id, 'replay_started': replay_started}
+                if isinstance(origin_attempt, str):
+                    fields['origin_attempt'] = origin_attempt
+                if replay_unconfirmed:
+                    fields['replay_unconfirmed'] = True
+            case ReservedResponseSave():
+                fields = {'outcome': 'response_reserved', 'delivery_id': receipt.delivery_id,
+                          'response_delivery': receipt.response_delivery.receipt_fields(),
+                          'failure_attempt': receipt.failure_attempt}
+                if isinstance(receipt.hold_id, str):
+                    fields['hold'] = receipt.hold_id
+            case SavedReviewAttempt():
+                fields = {'outcome': 'saved', 'words_saved': receipt.words_saved}
+                if isinstance(receipt.hold_id, str):
+                    fields['hold'] = receipt.hold_id
+                if isinstance(receipt.delivery_id, str):
+                    fields['delivery_id'] = receipt.delivery_id
+                if isinstance(target := receipt.response_delivery, ResponseFeedbackDeliveryTarget):
+                    fields['response_delivery'] = target.receipt_fields()
+                if isinstance(receipt.delivery_outcome, ReviewDeliveryInProgress):
+                    fields['delivery_running'] = receipt.delivery_outcome.failure_attempt
+                if isinstance(failure := receipt.last_failure(), ReviewDeliveryFailure):
+                    fields['delivery_failure'] = {'reason': failure.message, 'attempt': failure.failure_attempt}
+            case RefusedReviewSave(status, reason, refused_attempt):
+                fields = {'refused': status, 'reason': reason, 'attempt': refused_attempt}
+            case ReviewSaveAttemptState():
+                fields = receipt.value
+        self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_file.write_text_atomic(self._path(attempt), json.dumps(fields), new_file_mode=0o600)
+        _ = self._unwritten.pop(attempt, None)
+
+    def _remember(self, attempt: str, receipt: ReviewSaveReceipt) -> None:
+        try:
+            self._write(attempt, receipt)
+        except OSError as error:
+            self._unwritten[attempt] = receipt
+            print(f"review-links Review save receipt: {error}", file=sys.stderr)
+
+    def _persist_pending(self, attempt: str, receipt: HeldReviewSave | ReviewAttemptHoldReference |
+                         Literal[ReviewSaveAttemptState.PENDING]) -> None:
+        self._write(attempt, receipt)
+        # The atomic write syncs the shard. Sync the entries for its parent folders.
+        atomic_file.sync_folder(self.folder)
+        atomic_file.sync_folder(self.folder.parent)
+
+    @contextmanager
+    def processing(self, attempt: str, *, from_hold: bool = False, admitting_hold: bool = False
+                   ) -> Generator[ReviewSaveOutcome | Literal[ReviewSaveAdmission.ACCEPTED]]:
+        if not attempt:
+            yield ReviewSaveAdmission.ACCEPTED
+            return
+        admitted: ReviewSaveOutcome | Literal[ReviewSaveAdmission.ACCEPTED]
+        lease = object()
+        with self._lock:
+            record, receipt = self._record(attempt)
+            if admitting_hold and isinstance(receipt, HeldReviewSave):
+                admitted = ReviewSaveAdmission.ACCEPTED
+            elif record in self._active or isinstance(receipt, ReservedResponseSave) or (isinstance(receipt, HeldReviewSave)
+                                             and (not from_hold or receipt.replay_started)) or (
+                    isinstance(receipt, SavedReviewAttempt) and isinstance(receipt.delivery_outcome, ReviewDeliveryInProgress)):
+                admitted = ReviewSaveAttemptState.PENDING
+            elif receipt is ReviewSaveAdmission.UNRECORDED or isinstance(receipt, HeldReviewSave):
+                self._active[record] = lease
+                admitted = ReviewSaveAdmission.ACCEPTED
+            else:
+                admitted = receipt
+        try:
+            yield admitted
+        finally:
+            if admitted is ReviewSaveAdmission.ACCEPTED:
+                with self._lock:
+                    if self._active.get(record) is lease:
+                        del self._active[record]
+
+    def start_save(self, attempt: str) -> str | ReviewHoldAbsent:
+        """Persist the pending attempt before the Review action can write."""
+        if attempt:
+            with self._lock:
+                record, receipt = self._record(attempt)
+                if isinstance(receipt, HeldReviewSave):
+                    self._persist_pending(record, replace(receipt, replay_started=True))
+                    return receipt.hold_id
+                self._persist_pending(attempt, ReviewSaveAttemptState.PENDING)
+        return ReviewHoldAbsent.DIRECT_SAVE
+
+    def finish(self, attempt: str, outcome: ReviewSaveOutcome) -> None:
+        if attempt:
+            with self._lock:
+                record, receipt = self._record(attempt)
+                if (receipt in (ReviewSaveAdmission.UNRECORDED, ReviewSaveAttemptState.PENDING)
+                        or isinstance(receipt, (HeldReviewSave, ReservedResponseSave))):
+                    self._remember(record, outcome)
+
+    def reserve_response(self, attempt: str, reservation: ReservedResponseSave) -> None:
+        with self._lock:
+            record, _ = self._record(attempt)
+            self._write(record, reservation)
+
+    def prepare_delivery(self, attempt: str, receipt: SavedReviewAttempt) -> None:
+        if attempt:
+            with self._lock:
+                record, _ = self._record(attempt)
+                self._write(record, receipt)
+
+    def record_delivery(self, attempt: str, receipt: SavedReviewAttempt) -> None:
+        if attempt:
+            with self._lock:
+                record, _ = self._record(attempt)
+                self._remember(record, receipt)
+
+    @contextmanager
+    def retrying(self, attempt: str) -> Generator[ReviewSaveOutcome]:
+        with self._lock:
+            record, receipt = self._record(attempt)
+            current: ReviewSaveOutcome = ReviewSaveAttemptState.MISSING
+            if record in self._active:
+                current = ReviewSaveAttemptState.PENDING
+            elif isinstance(receipt, ReservedResponseSave):
+                current = ReviewSaveAttemptState.PENDING
+            elif isinstance(receipt, SavedReviewAttempt):
+                current = receipt
+                self._active[record] = current
+        try:
+            yield current
+        finally:
+            if isinstance(current, SavedReviewAttempt):
+                with self._lock:
+                    del self._active[record]
+
+    def hold(self, attempt: str, request_id: str, submit: Callable[[str], send_hold.HeldFields]
+             ) -> send_hold.HeldFields | ReviewSaveOutcome:
+        if not attempt:
+            return submit(request_id)
+        with self._lock:
+            record, receipt = self._record(attempt)
+            hold_id = record if record != attempt else request_id or send_hold.new_hold_id()
+            try:
+                if record == attempt and receipt is ReviewSaveAdmission.UNRECORDED:
+                    _, receipt = self._record(hold_id)
+                    if receipt is ReviewSaveAdmission.UNRECORDED:
+                        receipt = HeldReviewSave(hold_id, attempt)
+                        self._persist_pending(hold_id, receipt)
+                    self._persist_pending(attempt, ReviewAttemptHoldReference(hold_id))
+            except OSError as error:
+                raise ReviewHoldReceiptFailed(str(error)) from error
+            if isinstance(receipt, (ReviewSaveAttemptState, SavedReviewAttempt, RefusedReviewSave)):
+                return receipt
+            if isinstance(receipt, ReservedResponseSave):
+                return ReviewSaveAttemptState.PENDING
+            if isinstance(receipt, HeldReviewSave) and (receipt.replay_started or receipt.replay_unconfirmed):
+                return {'hold': hold_id, 'seconds': 0}
+            try:
+                held = submit(hold_id)
+            except OSError as error:
+                raise ReviewHoldReceiptFailed(str(error)) from error
+            _ = self._active.pop(attempt, None)
+            return held
+
+    def record_hold_replay(self, hold_id: str, outcome: send_hold.HoldReplayOutcome) -> send_hold.HeldResponse:
+        """Resolve a held receipt if the Review handler did not record the save."""
+        response = send_hold.replay_response(hold_id, outcome)
+        try:
+            with self._lock:
+                receipt = self._read(hold_id)
+                if isinstance(receipt, HeldReviewSave):
+                    if (isinstance(outcome, send_hold.HoldReplayRefused) and not receipt.replay_started
+                            and isinstance(receipt.origin_attempt, str)):
+                        refused = RefusedReviewSave(response.status, "The server could not release the hold.",
+                                                    receipt.origin_attempt)
+                        self._remember(hold_id, refused)
+                        return replace(response, body=b'{"review_save_record": true}')
+                    if not receipt.replay_unconfirmed:
+                        self._remember(hold_id, replace(receipt, replay_unconfirmed=True))
+        except (OSError, ValueError) as error:
+            print(f"review-links Review hold outcome {hold_id}: {error}", file=sys.stderr)
+        return response
+
+    def outcome(self, attempt: str, status: change_page.DeliveryStatus) -> ReviewSaveOutcome:
+        with self._lock:
+            record, receipt = self._record(attempt)
+            if isinstance(receipt, SavedReviewAttempt) and not isinstance(receipt.delivery_outcome, ReviewDeliveryInProgress):
+                return receipt
+            if isinstance(receipt, (ReviewSaveAttemptState, RefusedReviewSave)):
+                return receipt
+            if record in self._active:
+                return ReviewSaveAttemptState.PENDING
+            if isinstance(receipt, HeldReviewSave):
+                return ReviewSaveAttemptState.UNKNOWN if receipt.replay_unconfirmed else ReviewSaveAttemptState.PENDING
+            if receipt is ReviewSaveAdmission.UNRECORDED:
+                self._remember(record, ReviewSaveAttemptState.MISSING)
+                return ReviewSaveAttemptState.MISSING
+        target, delivery_id = receipt.response_delivery, receipt.delivery_id
+        if not isinstance(target, ResponseFeedbackDeliveryTarget) or not isinstance(delivery_id, str):
+            return ReviewSaveAttemptState.PENDING
+        outcome = target.native_outcome(status, delivery_id)
+        if outcome is ReviewSaveAttemptState.PENDING:
+            return outcome
+        saved = receipt.confirmed_save() if isinstance(receipt, ReservedResponseSave) else receipt
+        running = saved.delivery_outcome
+        if not isinstance(running, ReviewDeliveryInProgress):
+            return saved
+        unconfirmed = isinstance(outcome, change_page.DeliveryUnconfirmed)
+        resolved = saved if unconfirmed else saved.with_delivery_result(outcome, running.failure_attempt)
+        with self._lock:
+            if record in self._active or self._read(record) != receipt:
+                return ReviewSaveAttemptState.PENDING
+            if resolved != receipt:
+                self._remember(record, resolved)
+        return replace(saved, delivery_outcome=running.failure_after_interruption()) if unconfirmed else resolved
+
+    def undo(self, hold_id: str) -> None:
+        with self._lock:
+            if isinstance(self._read(hold_id), HeldReviewSave):
+                self._remember(hold_id, ReviewSaveAttemptState.UNDONE)
+
+
+
 def loaded_module_stamps() -> dict[Path, tuple[int, int] | ModuleStampUnavailable]:
     checkout = Path(__file__).resolve().parents[2]
     stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = {}
@@ -808,7 +1292,8 @@ def sweep_snapshots(root: Path, now: float) -> int:
     for entry in entries:
         try:
             # The console folder holds the browser token; the images folder holds registered images until a delete.
-            if entry.name in (change_page.CONSOLE_FOLDER, image_store.IMAGES_FOLDER, image_store.CHANGE_FOLDER) or entry.is_symlink() or not entry.is_dir():
+            if (entry.name in (change_page.CONSOLE_FOLDER, image_store.IMAGES_FOLDER, image_store.CHANGE_FOLDER,
+                               REVIEW_SAVE_ATTEMPTS_FOLDER) or entry.is_symlink() or not entry.is_dir()):
                 continue
             children = list(entry.iterdir())
             # New snapshots contain regular files. Check symlinks before their
@@ -930,6 +1415,16 @@ def held_delivery_result(outcome: change_page.DeliveryOutcome, no_message: bool 
     if isinstance(outcome, change_page.DeliveryUnconfirmed):
         return {"send_failure": "The sender has not confirmed delivery."}
     return {}
+
+
+class FiledReviewSaveBug(TypedDict):
+    label: str
+    href: str
+
+
+class ReviewSaveFailureFields(TypedDict):
+    reason: str
+    bug: NotRequired[FiledReviewSaveBug]
 
 
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
@@ -1311,16 +1806,27 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if self.headers.get(send_hold.HOLD_HEADER) == "1" and self.held_send_path(route.path):
             request_ids = self.headers.get_all(send_hold.REQUEST_HEADER, [])
             if request_ids and (len(request_ids) != 1 or not send_hold.valid_hold_id(request_ids[0])):
-                self.json_response(400, {"reason": "The send has no valid request ID."})
+                self.hold_admission_refusal(route.path, 400, "The send has no valid request ID.")
                 return
             request_id = request_ids[0] if request_ids else ""
             seconds = conf.read("review_links").whole("undo_seconds")
             server = cast(ReviewLinksServer, self.server)
             if seconds or (request_id and server.send_holds.has_hold(request_id)):
-                self.hold_post(route, seconds, request_id)
+                attempt = self.review_save_attempt() if route.path == review_page.PAGE_PATH else ''
+                with server.review_attempts.processing(attempt, admitting_hold=True) as admission:
+                    if admission is ReviewSaveAdmission.ACCEPTED:
+                        self.hold_post(route, seconds, request_id, attempt)
+                    else:
+                        self.review_attempt_reply(admission, hold_admission=True)
                 return
         if route.path == review_page.NEW_ITEM_PATH:
             self._write_post(self.new_item_post)
+            return
+        if route.path == review_page.SAVE_FAILURE_PATH:
+            self._write_post(lambda: self.review_failure_post(route.query))
+            return
+        if route.path == review_page.DELIVERY_RETRY_PATH:
+            self._write_post(lambda: self.review_delivery_retry_post(route.query))
             return
         if route.path == review_page.ATTACHMENT_PATH:
             self.html_response(405, change_page.document("<p>Use GET to open this attachment.</p>", "Review attachment"))
@@ -2141,33 +2647,300 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         return BytesIO(content)
 
+    def signed_review_save(self, fields: dict[str, list[str]]) -> bool:
+        server = cast(ReviewLinksServer, self.server)
+        key, token = (fields[field][0] for field in ('row', 'token'))
+        browser = change_page.ReviewBrowser(*change_browser.browser_manifest(
+            change_page.console_folder(server.review_cache.root)))
+        return token.isascii() and secrets.compare_digest(token, change_browser.row_token(browser, key))
+
+    def review_failure_fields(self, reason: str, key: str, words: str, attempt: str) -> ReviewSaveFailureFields:
+        """Add the filed Bug's List link to an authenticated failure."""
+        server = cast(ReviewLinksServer, self.server)
+        result: ReviewSaveFailureFields = {"reason": reason}
+        try:
+            card = server.review_cache.failure_card_label(key)
+            failure = review_submissions.ReviewSaveFailure(review_page.PAGE_PATH, card, reason, words, attempt)
+            with server.list_store_access(), server.staff_read_scope():
+                members = staff.snapshot()
+                keeper = the_list.producer_id(members, "morty")
+                with staff.supplied_snapshot(members):
+                    item = review_actions.file_review_save_bug(failure, keeper, members)
+            if isinstance(item, the_list.ListItem):
+                result['bug'] = FiledReviewSaveBug(
+                    label=new_item.filing_number_label(item.number, label="Bug"),
+                    href=list_page.PAGE_PATH + list_page.item_link(keeper, item.number, only_item=True),
+                )
+                server.review_cache.invalidate()
+        except Exception as error:
+            print(f"review-links Review save Bug: {error}", file=sys.stderr)
+        return result
+
+    def review_attempt_fields(self, query: str, extra: frozenset[str]) -> dict[str, list[str]]:
+        lengths = self.headers.get_all('Content-Length', [])
+        if (query or self.headers.get_content_type() != 'application/x-www-form-urlencoded'
+                or self.headers.get('Transfer-Encoding') or len(lengths) != 1
+                or not re.fullmatch(r'[0-9]{1,10}', lengths[0]) or not int(lengths[0])):
+            raise ValueError('Invalid Review attempt form.')
+        size = int(lengths[0])
+        body = self.rfile.read(size)
+        if len(body) != size:
+            raise ValueError('Incomplete Review attempt form.')
+        fields = parse_qs(body.decode('utf-8'), keep_blank_values=True, strict_parsing=True)
+        if (fields.keys() != {'row', 'token', 'failure_attempt'} | extra
+                or any(len(values) != 1 for values in fields.values())
+                or not re.fullmatch(r'[0-9a-f]{32}', fields['failure_attempt'][0])):
+            raise ValueError('Invalid Review attempt form.')
+        return fields
+
+    def review_failure_post(self, query: str) -> None:
+        """Receive a failed save or a delivery failure from Review."""
+        if not self.same_origin(required=True):
+            self.json_response(403, {"reason": "Report the save from Review."})
+            return
+        try:
+            fields = self.review_attempt_fields(query, frozenset(('feedback', 'reason')))
+            if not fields['reason'][0].strip():
+                raise ValueError('Invalid Review save report.')
+        except ValueError:
+            self.json_response(400, {"reason": "Use the Review save report."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        attempt = fields['failure_attempt'][0]
+        key, words = (fields[field][0] for field in ('row', 'feedback'))
+        try:
+            if not self.signed_review_save(fields):
+                self.json_response(403, {"reason": "Report the save from Review."})
+                return
+            outcome = server.review_attempts.outcome(attempt, server.delivery_status)
+        except (OSError, ValueError) as error:
+            print(f"review-links Review save outcome: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The save outcome is unavailable."})
+            return
+        match outcome:
+            case SavedReviewAttempt():
+                result = {"outcome": "saved", **outcome.reply_fields()}
+                if isinstance(target := outcome.response_delivery, ResponseFeedbackDeliveryTarget):
+                    if target.card_key != key:
+                        self.json_response(404, {"reason": "The saved Response delivery is unavailable."})
+                        return
+                    words = target.words
+                if isinstance(failure := outcome.delivery_outcome, ReviewDeliveryFailure):
+                    report = self.review_failure_fields(failure.message, key, words, failure.failure_attempt)
+                    if 'bug' in report:
+                        result['bug'] = report['bug']
+                self.json_response(200, result)
+            case RefusedReviewSave(reason=reason, attempt=refused_attempt):
+                self.json_response(200, {"outcome": "refused", **self.review_failure_fields(
+                    reason, key, words, refused_attempt)})
+            case ReviewSaveAttemptState.MISSING:
+                self.json_response(200, {"outcome": outcome, **self.review_failure_fields(
+                    fields['reason'][0], key, words, attempt)})
+            case ReviewSaveAttemptState.PENDING:
+                self.json_response(202, {"outcome": outcome})
+            case ReviewSaveAttemptState():
+                self.json_response(200, {"outcome": outcome})
+
+    def retry_review_delivery(self, server: ReviewLinksServer, attempt: str, receipt: SavedReviewAttempt,
+                              target: ResponseFeedbackDeliveryTarget, delivery_id: str) -> ReviewSaveOutcome:
+        if receipt.delivery_outcome is ReviewDeliveryFailureAbsent.NO_REPORTED_FAILURE:
+            return receipt
+        running = ReviewDeliveryInProgress(secrets.token_hex(16), receipt.last_failure())
+        try:
+            server.review_attempts.prepare_delivery(attempt, replace(receipt, delivery_outcome=running))
+            claimed = target.claim(server.delivery_status, delivery_id)
+        except (OSError, ValueError) as error:
+            print(f"review-links Review delivery retry: {error}", file=sys.stderr)
+            reason = str(error) if isinstance(error, ValueError) else "The saved delivery could not retry."
+            failed = replace(receipt, delivery_outcome=ReviewDeliveryFailure(reason, running.failure_attempt))
+            server.review_attempts.record_delivery(attempt, failed)
+            return failed
+        if claimed is ReviewSaveAttemptState.PENDING:
+            server.review_attempts.record_delivery(attempt, receipt)
+            return ReviewSaveAttemptState.PENDING
+        result = (self.deliver_review(server, claimed, report_outcome=True)
+                  if isinstance(claimed, change_page.MessageDelivery) else claimed)
+        return self.record_review_delivery(server, attempt, receipt, result, running.failure_attempt)
+
+    def review_delivery_retry_post(self, query: str) -> None:
+        if not self.same_origin(required=True):
+            self.json_response(403, {"reason": "Retry the delivery from Review."})
+            return
+        try:
+            fields = self.review_attempt_fields(query, frozenset())
+            if not self.signed_review_save(fields):
+                self.json_response(403, {"reason": "Retry the delivery from Review."})
+                return
+        except (OSError, ValueError):
+            self.json_response(400, {"reason": "Use the Review delivery retry."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        attempt, key = (fields[field][0] for field in ('failure_attempt', 'row'))
+        try:
+            if server.review_attempts.outcome(attempt, server.delivery_status) is ReviewSaveAttemptState.PENDING:
+                self.json_response(202, {"outcome": "pending"})
+                return
+            with server.review_attempts.retrying(attempt) as receipt:
+                if receipt is ReviewSaveAttemptState.PENDING:
+                    self.json_response(202, {"outcome": "pending"})
+                    return
+                if (not isinstance(receipt, SavedReviewAttempt)
+                        or not isinstance(target := receipt.response_delivery, ResponseFeedbackDeliveryTarget)
+                        or not isinstance(delivery_id := receipt.delivery_id, str) or target.card_key != key):
+                    self.json_response(404, {"reason": "The saved Response delivery is unavailable."})
+                    return
+                retried = self.retry_review_delivery(server, attempt, receipt, target, delivery_id)
+                if not isinstance(retried, SavedReviewAttempt):
+                    self.review_attempt_reply(retried)
+                    return
+                result = {"outcome": "saved", **retried.reply_fields()}
+        except ValueError as error:
+            self.json_response(409, {"reason": str(error)})
+            return
+        except OSError as error:
+            print(f"review-links Review delivery retry: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The saved delivery could not retry."})
+            return
+        try:
+            self.json_response(200, result)
+        finally:
+            if isinstance(failure := retried.delivery_outcome, ReviewDeliveryFailure):
+                _ = self.review_failure_fields(failure.message, key, target.words, failure.failure_attempt)
+
+    def review_save_attempt(self) -> str:
+        attempt = self.headers.get(review_page.SAVE_ATTEMPT_HEADER, '')
+        return attempt if re.fullmatch(r'[0-9a-f]{32}', attempt) else ''
+
+    def review_attempt_reply(self, outcome: ReviewSaveOutcome, *, hold_admission: bool = False) -> None:
+        if isinstance(outcome, SavedReviewAttempt):
+            self.json_response(200, {"outcome": "saved", **outcome.reply_fields()})
+        elif isinstance(outcome, RefusedReviewSave):
+            marker = send_hold.HoldHeader.REFUSED if hold_admission else None
+            self.json_response(outcome.status, {"reason": outcome.reason, "failure_attempt": outcome.attempt},
+                               hold=marker)
+        elif outcome is ReviewSaveAttemptState.UNDONE:
+            self.json_response(404, {"reason": "This send was undone.", "hold_state": send_hold.HoldState.UNDONE.value})
+        elif outcome is ReviewSaveAttemptState.MISSING:
+            self.json_response(404, {"reason": "The server has no record of this save.",
+                                     "hold_state": send_hold.HoldState.MISSING.value})
+        else:
+            self.json_response(202 if outcome is ReviewSaveAttemptState.PENDING else 200, {"outcome": outcome})
+
+    def review_refusal(self, status: int, reason: str, error: Exception, fields: dict[str, list[str]],
+                       attempt: str, hold_id: str | ReviewHoldAbsent = ReviewHoldAbsent.DIRECT_SAVE, *,
+                       hold_admission: bool = False) -> None:
+        server = cast(ReviewLinksServer, self.server)
+        attempt = attempt or secrets.token_hex(16)
+        refused = RefusedReviewSave(status, reason, attempt)
+        try:
+            server.review_attempts.finish(attempt, refused)
+        except (OSError, ValueError) as receipt_error:
+            print(f"review-links Review save refusal receipt: {receipt_error}", file=sys.stderr)
+        try:
+            if isinstance(hold_id, str):
+                self.json_response(status, {'review_save_record': True})
+            else:
+                self.review_attempt_reply(refused, hold_admission=hold_admission)
+        finally:
+            print(f"review-links browser answer: {error}", file=sys.stderr)
+            self.file_review_failure(reason, fields, attempt)
+
+    def file_review_failure(self, reason: str, fields: dict[str, list[str]], attempt: str) -> None:
+        try:
+            if self.signed_review_save(fields):
+                _ = self.review_failure_fields(reason, fields['row'][0], fields['feedback'][0],
+                                               attempt or secrets.token_hex(16))
+        except (OSError, ValueError) as error:
+            print(f"review-links Review save report: {error}", file=sys.stderr)
+
     def review_post(self) -> None:
-        """Save the review answer before its shared message delivery."""
+        server = cast(ReviewLinksServer, self.server)
+        replay = self.headers.get(send_hold.REPLAY_HEADER) == '1'
+        attempt = self.review_save_attempt()
+        with server.review_attempts.processing(attempt) as admission:
+            if admission is not ReviewSaveAdmission.ACCEPTED:
+                self.review_attempt_reply(admission)
+                return
+            self.read_review_save(attempt, replay=replay)
+
+    def read_review_save(self, attempt: str, *, replay: bool) -> None:
         server = cast(ReviewLinksServer, self.server)
         try:
-            body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
-            key = review_page.review_fields(body)['row'][0]
-            saved = server.review_cache.save(body, server.delivery_status)
+            size = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(size).decode("utf-8")
+            fields = review_page.review_fields(body)
+        except ValueError as error:
+            self.browser_failure(400, str(error), error)
+            return
+        if replay and not attempt and re.fullmatch(r'[0-9a-f]{32}', held_attempt := fields.get('failure_attempt', [''])[0]):
+            with server.review_attempts.processing(held_attempt, from_hold=True) as admission:
+                if admission is ReviewSaveAdmission.ACCEPTED:
+                    self.save_review(body, fields, held_attempt)
+                else:
+                    self.review_attempt_reply(admission)
+            return
+        self.save_review(body, fields, attempt)
+
+    def save_review(self, body: str, fields: dict[str, list[str]], attempt: str) -> None:
+        """Save the review answer before its shared message delivery."""
+        server = cast(ReviewLinksServer, self.server)
+        key = fields['row'][0]
+        try:
+            hold_id = server.review_attempts.start_save(attempt)
+        except OSError as error:
+            self.review_refusal(503, "The server could not record the save attempt.", error, fields, attempt)
+            return
+        words = fields['feedback'][0]
+
+        def reserve_response_delivery(source: Path, delivery_id: str) -> None:
+            target = ResponseFeedbackDeliveryTarget(key, source, words)
+            server.review_attempts.reserve_response(attempt, ReservedResponseSave(hold_id, delivery_id, target, attempt))
+
+        try:
+            if attempt and fields['outcome'][0] == 'read' and words.strip():
+                saved = server.review_cache.save(body, server.delivery_status,
+                                                reserve_response_delivery=reserve_response_delivery)
+            else:
+                saved = server.review_cache.save(body, server.delivery_status)
         except review_items.ReviewRecordChanged as error:
-            self.browser_failure(409, str(error), error)
+            self.review_refusal(409, str(error), error, fields, attempt, hold_id)
             return
         except change_review.VerdictDurabilityUnconfirmed as error:
             server.review_cache.invalidate()
             try:
-                self.browser_failure(503, "The verdict was written. Durability is unconfirmed. Refresh Review.", error)
+                self.review_refusal(503, "The verdict was written. Durability is unconfirmed. Refresh Review.",
+                                    error, fields, attempt, hold_id)
             finally:
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
                 server.review_cache.invalidate()
             return
         except ValueError as error:
-            self.browser_failure(400, str(error), error)
+            self.review_refusal(400, str(error), error, fields, attempt, hold_id)
             return
-        except (OSError, RuntimeError, change_page.Refusal) as error:
-            self.browser_failure(503, "The answer could not be saved.", error)
+        except (OSError, RuntimeError, change_page.Refusal, change_review.ChangeReviewError) as error:
+            self.review_refusal(503, "The answer could not be saved.", error, fields, attempt, hold_id)
             return
         pending = isinstance(saved.delivery, change_page.MessageDelivery)
-        result: dict[str, object] = {'answer':saved.answer, 'words_saved':saved.words_saved,
-                                     'version':saved.version, 'delivery_pending':pending}
+        response_send = (pending and saved.submitted_type == review_items.ReviewType.RESPONSE
+                         and self.headers.get(send_hold.HOLD_HEADER) == "1")
+        report_delivery = self.headers.get(send_hold.REPLAY_HEADER) == "1" or response_send
+        receipt = SavedReviewAttempt(saved.words_saved, hold_id)
+        failure_attempt = attempt or secrets.token_hex(16)
+        if isinstance(delivery := saved.delivery, change_page.MessageDelivery):
+            receipt = replace(receipt, delivery_id=delivery.attempt)
+            if (saved.submitted_type is review_items.ReviewType.RESPONSE
+                    and isinstance(delivery.page, change_page.UserQuestionPage)
+                    and delivery.page.saved.get('kind') == 'feedback'):
+                receipt = replace(receipt, response_delivery=ResponseFeedbackDeliveryTarget(
+                    key, delivery.page.review_list, fields['feedback'][0]))
+            try:
+                server.review_attempts.prepare_delivery(attempt, replace(
+                    receipt, delivery_outcome=ReviewDeliveryInProgress(failure_attempt)))
+            except OSError as error:
+                print(f"review-links Review delivery preparation: {error}", file=sys.stderr)
+        else:
+            server.review_attempts.finish(attempt, receipt)
+        result: dict[str, object] = {'answer':saved.answer, 'version':saved.version, 'delivery_pending':pending}
         if isinstance(saved.detail, review_page.ConfirmedReviewDetail):
             result.update(detail_html=saved.detail.body, detail_revision=saved.detail.revision)
         elif isinstance(saved.detail, review_page.ClosedReviewDetail):
@@ -2178,26 +2951,48 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             later = saved.item.times.later
             result.update(state=saved.item.state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
-        response_send = (pending and saved.submitted_type == review_items.ReviewType.RESPONSE
-                         and self.headers.get(send_hold.HOLD_HEADER) == "1")
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1" or response_send:
+        if report_delivery:
             delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
-            outcome = self.deliver_review(server, delivery, report_outcome=True)
-            result.update(held_delivery_result(outcome, not pending))
+            if pending:
+                outcome = self.deliver_review(server, delivery, report_outcome=True)
+                receipt = self.record_review_delivery(server, attempt, receipt, outcome, failure_attempt)
+        if report_delivery:
             result['delivery_pending'] = False
             if pending:
                 self.publish_review_delivery(server, key)
-            self.json_response(200, result)
+            else:
+                result['no_message'] = True
+            if isinstance(hold_id, str) and self.headers.get(send_hold.REPLAY_HEADER) == "1":
+                result = {'review_save_record': True, **result}
+            else:
+                result.update(receipt.reply_fields())
+            try:
+                self.json_response(200, result)
+            finally:
+                if isinstance(failure := receipt.delivery_outcome, ReviewDeliveryFailure):
+                    self.file_review_failure(failure.message, fields, failure.failure_attempt)
             return
+        result.update(receipt.reply_fields())
         with server.item_delivery(pending) as check:
             if check:
                 result['delivery'] = check
             try:
                 self.json_response(200, result)
             finally:
-                _ = self.deliver_review(server, change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status))
+                delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
+                outcome = self.deliver_review(server, delivery, report_outcome=bool(attempt))
                 if pending:
+                    if attempt:
+                        finished = self.record_review_delivery(server, attempt, receipt, outcome, failure_attempt)
+                        if isinstance(failure := finished.delivery_outcome, ReviewDeliveryFailure):
+                            self.file_review_failure(failure.message, fields, failure.failure_attempt)
                     self.publish_review_delivery(server, key)
+
+    def record_review_delivery(self, server: ReviewLinksServer, attempt: str, receipt: SavedReviewAttempt,
+                               outcome: change_page.DeliveryOutcome, failure_attempt: str) -> SavedReviewAttempt:
+        finished = receipt.with_delivery_result(outcome, failure_attempt)
+        server.review_attempts.record_delivery(attempt, finished)
+        return finished
 
     def publish_review_delivery(self, server: ReviewLinksServer, key: str) -> None:
         try:
@@ -2685,33 +3480,64 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"reason": "The undo failed. The send can still leave."})
             return
         status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
+        if outcome is send_hold.UndoResult.UNDONE:
+            server.review_attempts.undo(hold_id)
         self.json_response(status, {"outcome": outcome.value})
 
-    def hold_post(self, route: SplitResult, seconds: int, request_id: str) -> None:
+    def hold_admission_refusal(self, path: str, status: int, reason: str) -> None:
+        """Let Review report the original form when Undo refuses it."""
+        fields = {"reason": reason}
+        if path == review_page.PAGE_PATH and (attempt := self.review_save_attempt()):
+            server = cast(ReviewLinksServer, self.server)
+            server.review_attempts.finish(attempt, RefusedReviewSave(status, reason, attempt))
+            fields['failure_attempt'] = attempt
+        self.json_response(status, fields)
+
+    def hold_post(self, route: SplitResult, seconds: int, request_id: str, review_attempt: str) -> None:
         """Hold a marked send for Undo."""
         server = cast(ReviewLinksServer, self.server)
         if not self.same_origin(required=True) or route.query:
-            self.json_response(403, {"reason": "Send from the console page."})
+            self.hold_admission_refusal(route.path, 403, "Send from the console page.")
             return
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != 1 or self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
-            self.json_response(400, {"reason": "The send has no valid size."})
+            self.hold_admission_refusal(route.path, 400, "The send has no valid size.")
             return
         size = int(lengths[0])
         if not 0 < size <= HELD_SEND_LIMIT:
-            self.json_response(400, {"reason": "The send is empty or too large."})
+            self.hold_admission_refusal(route.path, 400, "The send is empty or too large.")
             return
         body = self.rfile.read(size)
         if len(body) != size:
-            self.json_response(400, {"reason": "The send is incomplete."})
+            self.hold_admission_refusal(route.path, 400, "The send is incomplete.")
             return
+        if review_attempt and self.headers.get_content_type() == 'application/x-www-form-urlencoded':
+            # Keep the attempt in the replay body. The browser uses the same hold for the same form.
+            body += b'&failure_attempt=' + review_attempt.encode('ascii')
         try:
             # A restart waits until the browser has the hold id, so it can read the result from the next server.
             with server.send_holds.answering():
-                held = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds, request_id=request_id)
-                self.json_response(202, held, hold=send_hold.HoldHeader.HELD)
-        except send_hold.HoldsStopped:
-            self.json_response(503, {"reason": "The console is restarting. Send again."})
+                held = server.review_attempts.hold(review_attempt, request_id, lambda hold_id: server.send_holds.hold(
+                    route.path, dict(self.headers.items()), body, seconds, request_id=hold_id))
+                if isinstance(held, (ReviewSaveAttemptState, SavedReviewAttempt, RefusedReviewSave)):
+                    self.review_attempt_reply(held, hold_admission=True)
+                else:
+                    self.json_response(202, held, hold=send_hold.HoldHeader.HELD)
+        except (send_hold.HoldsStopped, ReviewHoldReceiptFailed) as error:
+            if isinstance(error, send_hold.HoldsStopped):
+                reason = "The console is restarting. Send again."
+            else:
+                reason = "The server could not record the hold."
+            if route.path == review_page.PAGE_PATH:
+                try:
+                    fields = review_page.review_fields(body.decode('utf-8'))
+                except ValueError:
+                    pass
+                else:
+                    self._write_post(lambda: self.review_refusal(503, reason, error, fields, review_attempt,
+                                                                  hold_admission=True))
+                    return
+            self.hold_admission_refusal(route.path, 503, reason)
 
     def hold_result(self, hold_id: str) -> None:
         """Answer with the response of a released send, or say that it is still held."""
@@ -2724,10 +3550,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if result is send_hold.HoldState.PENDING:
             self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
         elif result is send_hold.HoldState.UNDONE:
-            self.json_response(404, {"reason": "This send was undone."})
+            self.json_response(404, {"reason": "This send was undone.", "hold_state": result.value})
         elif result is send_hold.HoldState.MISSING:
-            self.json_response(404, {"reason": "This send was undone or its result expired."})
+            self.json_response(404, {"reason": "This send was undone or its result expired.", "hold_state": result.value})
         else:
+            if result.body.startswith(b'{"review_save_record": true'):
+                fields = cast(dict[str, object], json.loads(result.body))
+                if fields.pop('review_save_record', False) is True:
+                    try:
+                        receipt = server.review_attempts.outcome(hold_id, server.delivery_status)
+                    except (OSError, ValueError) as error:
+                        print(f"review-links Review hold result {hold_id}: {error}", file=sys.stderr)
+                        self.json_response(503, {"reason": send_hold.MAY_HAVE_LEFT})
+                        return
+                    if isinstance(receipt, SavedReviewAttempt):
+                        self.json_response(result.status, {**fields, **receipt.reply_fields()})
+                    elif isinstance(receipt, RefusedReviewSave):
+                        self.review_attempt_reply(receipt)
+                    else:
+                        self.json_response(503, {"reason": send_hold.MAY_HAVE_LEFT})
+                    return
             self.send_response(result.status)
             self.send_header("Content-Type", result.content_type)
             self.send_header("Content-Length", str(len(result.body)))
@@ -2826,8 +3668,10 @@ class ReviewLinksServer(ThreadingHTTPServer):
         if mode is ServerMode.LIVE:
             _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
+        self.review_attempts: ReviewSaveAttempts = ReviewSaveAttempts(self.store_folder / REVIEW_SAVE_ATTEMPTS_FOLDER)
         self.send_holds: send_hold.Holds = send_hold.Holds(
-            self.store_folder / send_hold.HOLD_FOLDER, send_hold.replay_to(self.bound_address, self.server_port))
+            self.store_folder / send_hold.HOLD_FOLDER, send_hold.replay_to(self.bound_address, self.server_port),
+            record_replay=self.review_attempts.record_hold_replay)
         self.send_holds.recover()
         if mode is ServerMode.LIST_FIXTURE:
             return

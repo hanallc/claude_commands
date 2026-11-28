@@ -2856,6 +2856,55 @@ Review keeps the draft when the server saves the record and reports a delivery f
 Response sends report delivery failures when Undo is off.
 When Review hides or removes a card, the notice shows its unsaved words.
 The notice uses the current draft. A confirmed retry clears the refusal for that draft.
+The **Not saved** button opens the list of unsent words. Each entry keeps the card's retry action.
+When Review cannot save an action, it files a Bug for morty with the page, card, refusal, and submitted words.
+If delivery fails, Review sends the reply and then files a Bug for morty.
+The save report supplies a link to the Bug's List item after the first failure or a failed retry.
+The entry shows “Not saved. Bug 556 is filed.” when the report supplies a Bug.
+Without a Bug, the entry shows “Not saved.”
+The Bug number opens the List item in an overlay above Review.
+Closing the overlay returns focus to the Bug link and keeps the draft.
+The List item links to the native Bug and has its own number.
+Failures on the same page with the same cause reuse a Bug when the native Bug and its List item are open.
+Each repeat adds one line to the Bug log.
+Closing or removing the List item makes the next failure file a new Bug with a new List number.
+A repeat report for the same save attempt omits the link when its List item is closed.
+The card and its inline draft can show the refusal before Bug filing.
+The list entry stays visible if filing fails.
+A lost reply or an expired held result shows that the save outcome is unknown.
+The server keeps one record for each save. Review and the List use it to check the save outcome.
+The server refuses the action if it cannot persist the pending attempt before the save.
+Before it admits a hold, the server records the hold ID in the pending attempt.
+Browser attempts for the same hold refer to the same record.
+If a Review hold fails before replay sends any bytes, the server records a refusal.
+The save report uses that refusal to file a Bug.
+If the hold folder rejects the release write, the server records the result in the adjacent refusal folder.
+Recovery uses this result to block replay even if the pending file remains.
+If transmission fails after it starts, Review reports an unknown outcome until the save has a confirmed result.
+On restart, the replay guard changes an unresolved held attempt to unknown.
+The guard prevents another replay.
+A status check retries each pending or unknown report.
+A report ends when the server confirms the save, refusal, missing record, or Undo.
+A confirmed hold refusal retires the hold ID. The next send uses a new ID, even when the words match.
+The server records whether it saved the words and records the delivery ID before it sends the message.
+For Response feedback, it records the delivery ID and retry target before it saves the feedback.
+The server continues delivery if the attempt record write fails after the native save.
+The server updates the record with the delivery result. The Undo result uses that record to report the outcome.
+An attempt in progress stays pending. A refused attempt uses the Bug for its refusal.
+An interrupted write stays pending if the server cannot confirm the save.
+If the delivery result write fails for Response feedback, recovery checks the native delivery status.
+A confirmed delivery updates the attempt record, clears the entry, and files no Bug.
+A failed delivery can still retry with its original delivery ID.
+If the server has no record of the attempt, Review reports the connection error.
+The server does not accept a late request for an attempt it reported missing. A retry sends a new attempt.
+A saved attempt clears its Not saved entry when the outcome confirms that the server saved the words and reports no delivery failure.
+A recovered delivery failure keeps the draft and its retry action.
+**Got it** retries the saved feedback delivery, even after the closed Response leaves the index.
+The retry uses the original delivery ID. It clears the draft after delivery succeeds.
+Newer edits stay in the draft.
+The List keeps pending attempts when a linked card closes. A List refresh can check them with the card closed.
+Review reports refusals from the Undo checks with the submitted words.
+Confirmed Undo keeps the draft and files no Bug.
 The New item dialog and the linked Review card reopen with the draft.
 You can open a new draft or another linked card while a send waits.
 The List keeps a separate recovery slot for each unresolved draft in the browser tab.

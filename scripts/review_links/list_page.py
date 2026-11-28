@@ -487,8 +487,12 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
     return ''.join(markup for _, markup in sorted(reversed(rows), key=lambda row: row[0], reverse=True))
 
 
-def item_link(keeper: staff.StaffId, number: int) -> str:
-    return '#' + urlencode({"item": f"{keeper}/L{number}"})
+def item_link(keeper: staff.StaffId, number: int, *, only_item: bool = False) -> str:
+    key = f"{keeper}/L{number}"
+    fields = {"item": key}
+    if only_item:
+        fields["key"] = key
+    return '#' + urlencode(fields)
 
 
 @dataclass(frozen=True)
@@ -2202,6 +2206,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 # Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + review_legacy.SHOW_ALIAS_SCRIPT
+          + review_page.REVIEW_SAVE_REPORTS_SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
 ''' + question_path.queue_script() + '''
 const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
@@ -3364,6 +3369,7 @@ async function refresh(_supersede=false,current=()=>true){
  const requestStarted=performance.now();
  const response=await fetch(location.pathname+query,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
+ void linkedReviewSaveReports.flush();
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
@@ -3427,6 +3433,10 @@ const listHost=window.frameElement?.matches('iframe[data-console-page="list"],if
  ? window.frameElement : null;
 let activeReview,refreshingReview=false;
 const savedReviews=new Set(),returnedReviews=[],linkedReviewDrafts=new Map();
+const linkedReviewSaveReports=createReviewSaveReports(linkedReviewDrafts,listRequestSignal,(key,draft,result)=>{
+ for(const frame of reviewDialog.querySelectorAll('iframe')) frame.reviewDraft?.settled(key,draft,result);
+});
+addEventListener('online',()=>void linkedReviewSaveReports.flush());
 const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
@@ -3535,6 +3545,7 @@ document.addEventListener('click',event=>{
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.linkedReviewDrafts=linkedReviewDrafts;
+ frame.linkedReviewSaveReports=linkedReviewSaveReports;
  frame.src=href;
  const card={frame,link:reviewLinkPlace(link)};
  activeReview=card;
