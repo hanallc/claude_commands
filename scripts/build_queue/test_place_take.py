@@ -9,10 +9,11 @@ import unittest
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
 from scripts.build_queue import admission_wire as status_wire, placement, execution_identity
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, NotVerifyCall, StepJob, VerifyCall
-from scripts.build_hold.owning_session import OwningSession
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.build_targets.target_config import PinnedTarget
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.test_placement import (PlacementFixture, adopt_assignment, assignment_for,
-    consume_permission, placement_request, publish_candidate)
+    consume_permission, local_candidate, placement_request, publish_candidate)
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.lint import memory_admit as gate
 
@@ -242,6 +243,64 @@ class FailedFirstStepTests(unittest.TestCase):
             request = unit_request(fixture, third)
             wait_in_line(fixture, request)
             self.assertEqual(run_since(fixture, third), request.since)
+
+    def test_a_second_red_affected_gate_rejoins_the_line_after_a_reload(self) -> None:
+        with PlacementFixture() as fixture:
+            place_rules(fixture)
+
+            def request_gate() -> wire.PlacementRequest:
+                request = placement_request(fixture, session=NoOwningSession())
+                sizing = records.HistoryPeakSizing(8 * GIB, records.FirstProgramPeak(8 * GIB), fixture.clock.now())
+                profile = records.ProgramProfile(JOB, "claude_commands", str(fixture.root), sizing)
+                return replace(request, profile=profile,
+                    identity=replace(request.identity, unit=UNIT, step=JOB, job=StepJob(JOB)),
+                    constraints=replace(request.constraints, candidates=(local_candidate(fixture),), command_kind="final"),
+                    route=PinnedTarget("natedev"), prerequisite=placement.TokenNotRequired())
+
+            def start_gate(request: wire.PlacementRequest) -> wire.LocalPlacementGranted:
+                fixture.allow_next_start()
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.LocalPlacementGranted), reply
+                return reply
+
+            def fail_gate(request: wire.PlacementRequest, grant: wire.LocalPlacementGranted) -> None:
+                assert isinstance(request.run, wire.RunIdentity)
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "release-" + request.episode, grant.grant.reservation, 1)), [wire.Ok()])
+                line = unit_place(fixture, request.run)
+                self.assertEqual((line.reservations, line.first_status, line.failed_step), (1, 1, ""))
+                self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                    "cancel-" + request.episode, request.episode, request.owner, "the gate caller ended")), [wire.Ok()])
+                fixture.end_run(request.run)
+                _ = fixture.run_pass()
+
+            original = request_gate()
+            fail_gate(original, start_gate(original))
+            kept, = held(fixture)
+            self.assertEqual((kept.since, kept.replaces, kept.failed_step), (original.since, 1, JOB))
+
+            fixture.clock.advance(10 * 60)
+            retry = request_gate()
+            grant = start_gate(retry)
+            assert isinstance(retry.run, wire.RunIdentity)
+            self.assertEqual(run_since(fixture, retry.run), original.since)
+            fixture.clock.advance(10 * 60)
+            fixture.restart()
+            line = unit_place(fixture, retry.run)
+            self.assertEqual((line.replaces, line.took_place), (1, "failed"))
+
+            fixture.clock.advance(54 * 60)
+            fail_gate(retry, grant)
+            self.assertFalse(held(fixture))
+
+            fixture.clock.advance(130)
+            fixture.hold_starts()
+            resubmitted = request_gate()
+            reply, = fixture.server.handle_request(resubmitted)
+            self.assertIsInstance(reply, wire.PlacementWait)
+            assert isinstance(resubmitted.run, wire.RunIdentity)
+            self.assertEqual(run_since(fixture, resubmitted.run), resubmitted.since)
+            self.assertEqual(unit_place(fixture, resubmitted.run).took_place, "")
 
     def test_a_fail_at_a_lint_step_after_a_passed_step_keeps_the_place(self) -> None:
         with AdmissionFixture() as fixture:
