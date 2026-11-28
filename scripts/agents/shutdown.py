@@ -1406,11 +1406,7 @@ def retired_remote_read(machine: str, arguments: list[str]) -> str:
     route = remote.machine_alias(machine)
     if not isinstance(route, remote.MachineAlias) or route.alias != other_machine():
         raise ValueError(f"no route to {machine}")
-    remaining = worker_lifecycle.effective_deadline() - time.monotonic()
-    if remaining <= 0:
-        raise staff.StaffRefused("retired unit removal request deadline expired")
-    seconds = min(remaining, remote.STANDARD_TIME_LIMIT["seconds"])
-    status, output = run_remote(arguments, limit=remote.TimeLimit(kind="time limit", seconds=seconds))
+    status, output = run_remote(arguments)
     if status:
         raise ValueError(output or f"cannot read from {machine}")
     return output
@@ -2160,7 +2156,7 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
     origin = staff.RetiredUnitOrigin(local_machine(), unit.production.checkout,
                                     tips.commits.get("origin", staff.OriginBranchAbsent()))
     try:
-        staff.remove_retired_unit(row, origin)
+        removal = staff.remove_retired_unit(row, origin)
     except staff.RetiredUnitRemovalUnconfirmed as error:
         print(f"{unit.name}: {error}. Run agents retire {row.id} again.")
         return 1
@@ -2168,7 +2164,8 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
         _ = unit_remote_command("retired-forget-journal", row, record)
     elif saved is not None:
         _ = forget_retirement_journal(row.id, row.name)
-    print(f"{unit.name}: retired record removed")
+    message = "retired record removed" if removal is staff.RetiredUnitRemoval.REMOVED else "staff record is absent"
+    print(f"{unit.name}: {message}")
     return 0
 
 
@@ -2214,7 +2211,7 @@ def retire_named_unit(name: str) -> int:
                         print(output)
                     elif status:
                         print(f"anomaly: {identity}: cannot check the retirement journal on {other_machine()}")
-                print(f"{identity}: retired record removed")
+                print(f"{identity}: staff record is absent")
                 return 0
             unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record)
             return retirement_retire(unit, settings=settings, record=record)

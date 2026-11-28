@@ -9,14 +9,13 @@ except FileNotFoundError:
 
 import fcntl
 import json
-import math
 import os
 import re
 import shlex
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -198,7 +197,10 @@ class StaffAbsent(StaffUnreadable):
 
 
 class RetiredUnitRemovalUnconfirmed(StaffUnreadable):
-    """The caller timed out before it received the result of the removal."""
+    """The caller did not receive a confirmed removal result."""
+
+    def __init__(self) -> None:
+        super().__init__("retired record removal result is not confirmed")
 
 
 class StaffRefused(Exception):
@@ -1620,8 +1622,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
     timeout = _wait_seconds("remote_seconds")
-    if arguments[0] == "remove-retired-unit":
-        arguments = [*arguments, "--request-budget-seconds", str(timeout)]
+    removes_retired_unit = arguments[0] == "remove-retired-unit"
     command = ["ssh", "-o", "BatchMode=yes", machine,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
@@ -1629,15 +1630,17 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
         done = subprocess.run(command, stdin=subprocess.DEVNULL if input_text is None else None,
                               input=input_text, capture_output=True,
                               text=True, timeout=timeout, check=False)
+    except UnicodeError as error:
+        if removes_retired_unit:
+            raise RetiredUnitRemovalUnconfirmed() from error
+        raise
     except (OSError, subprocess.TimeoutExpired) as error:
-        if arguments[0] == "remove-retired-unit" and isinstance(error, subprocess.TimeoutExpired):
-            raise RetiredUnitRemovalUnconfirmed("retired record removal result is not confirmed") from error
+        if removes_retired_unit:
+            raise RetiredUnitRemovalUnconfirmed() from error
         if time.monotonic() >= worker_lifecycle.effective_deadline():
             raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
         raise StaffUnreadable(f"{machine} not reached") from error
     reason = done.stderr.strip()
-    if done.returncode != 0 and (done.returncode == 255 or not reason):
-        raise StaffUnreadable(f"{machine} not reached")
     if done.returncode == 1 and reason.startswith("staff member not found: "):
         raise StaffNotFound(StaffId(reason.removeprefix("staff member not found: ")))
     if done.returncode == 2:
@@ -1647,11 +1650,20 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
             raise StaffAbsent(reason.removeprefix("StaffAbsent: "))
         if reason.startswith("StaffUnreadable: "):
             raise StaffUnreadable(reason.removeprefix("StaffUnreadable: "))
+        if reason.startswith("OperationDeadlineExpired: "):
+            raise StaffUnreadable(reason)
     if done.returncode != 0:
-        raise StaffUnreadable(reason)
+        if removes_retired_unit:
+            raise RetiredUnitRemovalUnconfirmed()
+        raise StaffUnreadable(f"{machine} not reached" if done.returncode == 255 or not reason else reason)
     if done.stderr:
         print(done.stderr, end="", file=sys.stderr)
-    return _decode(done.stdout)
+    try:
+        return _decode(done.stdout)
+    except StaffUnreadable as error:
+        if removes_retired_unit:
+            raise RetiredUnitRemovalUnconfirmed() from error
+        raise
 
 
 def _remote_row(arguments: list[str]) -> StaffRow:
@@ -2666,25 +2678,33 @@ class RetiredUnitOrigin:
     tip: str | OriginBranchAbsent
 
 
-def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> None:
-    """Remove a retired unit and its stopped workers in one staff write."""
-    from scripts.agents import worker_lifecycle
+class RetiredUnitRemoval(Enum):
+    REMOVED = "removed"
+    ALREADY_ABSENT = "absent"
 
+
+def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> RetiredUnitRemoval:
+    """Confirm absence or remove the unit and its stopped workers in one staff write."""
     location = expected.worktree
     if (expected.kind != "unit" or not isinstance(location, RemovedWorktree)
             or not isinstance(location.branch, ParkedBranch)):
         raise StaffRefused(f"{expected.name}: removal requires a retired unit with a recorded branch")
     branch = location.branch
     if not is_owner():
-        _ = _remote(["remove-retired-unit"], input_text=json.dumps({
+        reply = _remote(["remove-retired-unit"], input_text=json.dumps({
             "row": expected.to_json(), "machine": origin.machine, "checkout": str(origin.checkout),
             "tip": origin.tip if isinstance(origin.tip, str) else None,
         }))
-        return
+        try:
+            return RetiredUnitRemoval(reply)
+        except ValueError as error:
+            raise RetiredUnitRemovalUnconfirmed() from error
 
     with slot_operation(expected.id, expected.name), ExitStack() as locks:
         record = authority_snapshot()
-        unit = _required(list(record.rows), expected.id)
+        unit = record.by_id(expected.id)
+        if unit is None:
+            return RetiredUnitRemoval.ALREADY_ABSENT
         if unit.to_json() != expected.to_json():
             raise StaffRefused(f"{expected.name}: the unit changed before removal")
         workers = record.find(kind="worker", parent=unit.id)
@@ -2702,17 +2722,13 @@ def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> None:
             pending.difference_update(members)
 
         def recheck() -> None:
-            deadline = worker_lifecycle.effective_deadline()
-            if time.monotonic() >= deadline:
-                raise StaffRefused("retired unit removal request deadline expired")
             check = cast(Callable[[ParkedBranch, RetiredUnitOrigin, RemovedWorktree], None],
                 import_module("scripts.agents.shutdown").require_retired_record_unchanged)
             check(branch, origin, location)
-            if time.monotonic() >= deadline:
-                raise StaffRefused("retired unit removal request deadline expired")
 
         _record_transaction(edit, before_replace=recheck)
     _forget_restart(list(members))
+    return RetiredUnitRemoval.REMOVED
 
 
 def _forget_restart(staff_ids: list[StaffId]) -> None:
@@ -2960,7 +2976,6 @@ class _Arguments:
     new_id: str = ""
     value: str = ""
     only_unknown: bool = False
-    request_budget_seconds: float = 0.0
     verb: str = ""
     kind: Kind | None = None
     unit_type: UnitType | None = None
@@ -3097,7 +3112,6 @@ def _parser() -> argparse.ArgumentParser:
     _ = retire_parser.add_argument("--worker-row", action="store_true", help=argparse.SUPPRESS)
     retired_unit_parser = verbs.add_parser("remove-retired-unit", help=argparse.SUPPRESS)
     _ = retired_unit_parser.add_argument("--json", action="store_true")
-    _ = retired_unit_parser.add_argument("--request-budget-seconds", type=float, required=True)
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
@@ -3148,7 +3162,7 @@ def _expected_document(arguments: _Arguments) -> LiveDoc | WrappedDoc | DocUnfil
             return NO_EXPECTED_DOCUMENT
 
 
-def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | RetiredUnitRemoval | tuple[StaffId, ...] | None:
     if arguments.verb == "set-worker-role":
         return set_worker_role(StaffId(arguments.target), KnownWorkerRole(cast(WorkerRole, arguments.value)))
     if arguments.verb in ("set-run", "clear-run"):
@@ -3331,22 +3345,15 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
-    with ExitStack() as resources:
-        if arguments.verb == "remove-retired-unit":
-            from scripts.agents import worker_lifecycle
-            from scripts.lib import conf
-
-            started = time.monotonic()
-            budget = arguments.request_budget_seconds
-            margin = conf.read("send").number("caller_margin_seconds")
-            if not math.isfinite(budget) or budget <= margin:
-                raise StaffRefused("retired unit removal request deadline expired")
-            _ = resources.enter_context(worker_lifecycle.operation_deadline(deadline=started + budget - margin))
-        seed_text = sys.stdin.read() if arguments.verb in ("apply-seed", "remove-retired-unit") else ""
-        if is_owner() and not arguments.row_write and arguments.verb not in (
-                "set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer"):
-            _ = resources.enter_context(operation())
+    seed_text = sys.stdin.read() if arguments.verb in ("apply-seed", "remove-retired-unit") else ""
+    use_operation = is_owner() and not arguments.row_write and arguments.verb not in (
+        "set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer")
+    with operation() if use_operation else nullcontext():
         result = _mutate(arguments, seed_text)
+    if isinstance(result, RetiredUnitRemoval):
+        if arguments.json:
+            print(json.dumps(result.value))
+        return 0
     if isinstance(result, tuple):
         print(json.dumps(result))
         return 0

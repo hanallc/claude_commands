@@ -1037,9 +1037,12 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             ("peer checkout returns during liveness check", "still exists on mac"),
             ("peer checkout request changes the origin tip", "origin branch alpha-branch changed before record removal"),
             ("origin changes during liveness check", "origin branch alpha-branch changed before record removal"),
-            ("origin read passes the request deadline", "retired unit removal request deadline expired"),
-            ("origin read passes the request deadline with clock skew", "retired unit removal request deadline expired"),
             ("caller times out after record removal", ""),
+            ("caller loses SSH after record removal", ""),
+            ("caller receives invalid JSON after record removal", ""),
+            ("caller receives an invalid result after record removal", ""),
+            ("retry reaches the authority after record removal", ""),
+            ("record removal uses a ten second staff timeout", ""),
         )
         for scenario, refusal in cases:
             with self.subTest(scenario=scenario):
@@ -1054,7 +1057,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     checkout_returns = "checkout returns" in scenario
                     missing_peer_record = scenario == "peer checkout record is missing"
                     origin_changes_during_checkout = scenario == "peer checkout request changes the origin tip"
-                    origin_read_expires = scenario.startswith("origin read passes the request deadline")
+                    unconfirmed_removal = scenario.startswith("caller ")
+                    already_removed = scenario == "retry reaches the authority after record removal"
+                    short_staff_timeout = scenario == "record removal uses a ten second staff timeout"
                     if scenario.startswith("peer"):
                         location = case.unit_worktree()
                         assert isinstance(location, staff.RemovedWorktree)
@@ -1169,22 +1174,17 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         if scenario.startswith("peer") and (checkout_returns or origin_changes_during_checkout):
                             _ = checks.enter_context(mock.patch.object(roster, "peer_snapshot",
                                 return_value=roster.Roster([], [])))
-                        if origin_read_expires:
-                            expected = record.by_id(case.unit_staff_id)
-                            assert expected is not None
-                            clock_offset = -3.0 if scenario.endswith("with clock skew") else 0.0
-                            code, output = case.remove_record_with_expired_origin_read(expected, tip, clock_offset)
-                        elif scenario == "caller times out after record removal":
-                            code, output = case.retry_after_unconfirmed_record_removal(tip)
+                        if unconfirmed_removal or already_removed or short_staff_timeout:
+                            code, output = case.retire_through_authority(tip, scenario)
                         else:
                             code, output = case.retire()
-                    authority_refusal = (scenario.endswith("during liveness check") or origin_read_expires
-                                         or origin_changes_during_checkout)
+                    authority_refusal = scenario.endswith("during liveness check") or origin_changes_during_checkout
                     expected_code = 2 if authority_refusal else int(bool(refusal))
                     case.assertEqual(code, expected_code, output)
                     if missing_peer_record:
                         guess_clone.assert_not_called()
-                    case.assertIn(refusal or "retired record removed", output)
+                    confirmed = "staff record is absent" if unconfirmed_removal or already_removed else "retired record removed"
+                    case.assertIn(refusal or confirmed, output)
                     if refusal.startswith("unmerged"):
                         case.assertNotIn("cannot read", output)
                     case.assertEqual(staff.by_id(case.unit_staff_id), record.by_id(case.unit_staff_id) if refusal else None)
@@ -1199,72 +1199,64 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 finally:
                     case.doCleanups()
 
-    def remove_record_with_expired_origin_read(self, row: staff.StaffRow, tip: str,
-                                               authority_clock_offset: float) -> tuple[int, str]:
-        elapsed = 0.0
-        clock_offset = 0.0
-        wall_time = time.time()
-        monotonic = time.monotonic()
-        request_timeout = 20.0
-        margin = conf.read("send").number("caller_margin_seconds")
-        limits: list[remote.RemoteCallLimit] = []
+        with self.subTest(scenario="unused staff id reports absence"):
+            unused = fixture_runtime_id("TEST-unused-retired-unit")
+            before = staff.snapshot().rows
+            with (mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                code = shutdown.main(["retire", unused])
+            self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                             (0, f"{unused}: staff record is absent\n", ""))
+            self.assertEqual(staff.snapshot().rows, before)
 
-        def read_origin(args: list[str], *, limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
-            nonlocal elapsed
-            self.assertEqual(args, ["_retired-origin-tip", str(self.checkout), "alpha-branch"])
-            limits.append(limit)
-            elapsed = request_timeout + 1
-            return 0, json.dumps(tip)
-
-        def request(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
-            nonlocal elapsed, clock_offset
-            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
-            self.assertEqual(timeout, request_timeout)
-            elapsed = 1.0
-            clock_offset = authority_clock_offset
-            with (mock.patch.object(staff, "is_owner", return_value=True),
-                  mock.patch.object(sys, "stdin", io.StringIO(input)),
-                  redirect_stdout(io.StringIO()) as result, redirect_stderr(io.StringIO()) as error):
-                status = staff.main(shlex.split(argv[-1])[2:])
-            clock_offset = 0.0
-            return subprocess.CompletedProcess(argv, status, result.getvalue(), error.getvalue())
-
-        state = Path(os.environ["STAFF_FILE"])
-        before = state.read_bytes()
-        origin = staff.RetiredUnitOrigin("mac", self.checkout, tip)
-        with (mock.patch.object(time, "time", side_effect=lambda: wall_time + elapsed + clock_offset),
-              mock.patch.object(time, "monotonic", side_effect=lambda: monotonic + elapsed),
-              mock.patch.object(staff, "is_owner", return_value=False),
-              mock.patch.object(staff, "require_stopped"),
-              mock.patch.object(shutdown, "run_remote", side_effect=read_origin),
-              mock.patch.object(subprocess, "run", side_effect=request),
-              redirect_stderr(io.StringIO()) as errors):
-            code = staff.cli_result(lambda: staff.remove_retired_unit(row, origin) or 0)
-        self.assertEqual(state.read_bytes(), before)
-        self.assertEqual(limits, [remote.TimeLimit(kind="time limit", seconds=request_timeout - margin)])
-        return code, errors.getvalue()
-
-    def retry_after_unconfirmed_record_removal(self, tip: str) -> tuple[int, str]:
+    def retire_through_authority(self, tip: str, scenario: str) -> tuple[int, str]:
         remove = staff.remove_retired_unit
+        short_timeout = scenario == "record removal uses a ten second staff timeout"
 
-        def lose_reply(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+        def authority_reply(argv: list[str], request: str) -> subprocess.CompletedProcess[str]:
             with (mock.patch.object(staff, "is_owner", return_value=True),
                   mock.patch.object(staff, "remove_retired_unit", new=remove),
-                  mock.patch.object(sys, "stdin", io.StringIO(input)),
+                  mock.patch.object(sys, "stdin", io.StringIO(request)),
                   mock.patch.object(staff, "require_stopped"),
                   mock.patch.object(shutdown, "retired_origin_tip_at", return_value=tip),
-                  redirect_stdout(io.StringIO())):
-                self.assertEqual(staff.main(shlex.split(argv[-1])[2:]), 0)
-            raise subprocess.TimeoutExpired(argv, timeout)
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                code = staff.main(shlex.split(argv[-1])[2:])
+            return subprocess.CompletedProcess(argv, code, output.getvalue(), errors.getvalue())
 
-        def remove_through_authority(row: staff.StaffRow, origin: staff.RetiredUnitOrigin) -> None:
+        def request(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+            self.assertEqual(timeout, 10.0 if short_timeout else 20.0)
+            reply = authority_reply(argv, input)
+            self.assertEqual(reply.returncode, 0, reply.stderr)
+            match scenario:
+                case "caller times out after record removal":
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                case "caller loses SSH after record removal":
+                    return subprocess.CompletedProcess(argv, 255, "", "Connection closed")
+                case "caller receives invalid JSON after record removal":
+                    return subprocess.CompletedProcess(argv, 0, "Incomplete reply", "")
+                case "caller receives an invalid result after record removal":
+                    return subprocess.CompletedProcess(argv, 0, "{}", "")
+                case "retry reaches the authority after record removal":
+                    return authority_reply(argv, input)
+                case _:
+                    return reply
+
+        def remove_through_authority(row: staff.StaffRow, origin: staff.RetiredUnitOrigin) -> staff.RetiredUnitRemoval:
             with (mock.patch.object(staff, "is_owner", return_value=False),
-                  mock.patch.object(subprocess, "run", side_effect=lose_reply)):
-                remove(row, origin)
+                  mock.patch.object(subprocess, "run", side_effect=request)):
+                return remove(row, origin)
 
-        with mock.patch.object(staff, "remove_retired_unit", side_effect=remove_through_authority):
+        environment: dict[str, str] = {}
+        if short_timeout:
+            config = self.root / "short-staff.conf"
+            write_text_atomic(config, SHUTDOWN_FIXTURE_SETTINGS["staff"].replace("remote_seconds=20", "remote_seconds=10"))
+            environment["STAFF_CONFIG"] = str(config)
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(staff, "remove_retired_unit", side_effect=remove_through_authority)):
             code, output = self.retire()
+        if not scenario.startswith("caller "):
+            return code, output
         self.assertEqual(code, 1, output)
         self.assertIn(f"retired record removal result is not confirmed. Run agents retire {self.unit_staff_id} again.", output)
         self.assertIsNone(staff.by_id(self.unit_staff_id))
