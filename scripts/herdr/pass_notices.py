@@ -49,6 +49,11 @@ class Notice:
         """Only the latest-turn check of the turn end sends this notice."""
         return self.source_event_id.startswith(TURN_EVENT)
 
+    @property
+    def busy_dispatch_attempt(self) -> bool:
+        """The event identifies one busy dispatch attempt."""
+        return self.source_event_id.startswith("busy:")
+
 
 @dataclass(frozen=True)
 class LegacyNoticeStamp:
@@ -226,7 +231,8 @@ def stage_status(run: Path, route: Route, notice: Notice, *, legacy: LegacyNotic
                 return key
             if entry.legacy_stamp == legacy.incoming and (not entry.source_event_id or not notice.source_event_id):
                 return key
-        if statuses and statuses[-1][1].transition == notice.transition:
+        if (statuses and not notice.busy_dispatch_attempt and not statuses[-1][1].busy_dispatch_attempt
+                and statuses[-1][1].transition == notice.transition):
             key = statuses[-1][0]
             if notice.source_event_id:
                 _append(path, {"route": asdict(route), "status_replays": {notice.source_event_id: key}})
