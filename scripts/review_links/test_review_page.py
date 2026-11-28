@@ -495,7 +495,8 @@ window.fetch=(url,options)=>{
         request = replace(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
                           words='Which layout should I use?')
         saved = review_submissions.submit(request)
-        self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
         source = browser_markup(self.root)
         for action, state in (('read', 'Done'), ('question', 'Waiting')):
             with self.subTest(action=action):
@@ -503,16 +504,18 @@ window.fetch=(url,options)=>{
  const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+
   (name==='owner' && value ? CSS.escape(staffChipValue(value)) : value || 'all')+'"]');
  const selected=name=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value][aria-pressed="true"]');
- const responses=chip('type','response');responses.click();
- check(responses.previousElementSibling===chip('type','question') &&
-  responses.nextElementSibling===chip('type','change') && responses.textContent.trim()==='Responses 1',
-  'Responses has a count between Questions and Changes.');
- check(!chip('show','Validating') && chip('show','Done')?.querySelector('b').textContent==='0' &&
-  selected('show')===chip('show','open'),
-  'Responses starts in Open with a Done count.');
+ const responses=chip('type','response');
+ check(responses.hidden && chip('type','question').hidden,
+  'Review hides the legacy types until a link selects one.');
  const row=rows().find(item=>item.dataset.type==='response');
  history.replaceState(null,'','#'+new URLSearchParams({type:'response',show:'Validating',item:row.dataset.key}));
  dispatchEvent(new HashChangeEvent('hashchange'));
+ check(selected('type')===responses && !responses.hidden && chip('type','question').hidden &&
+  responses.textContent.trim()==='Responses 1',
+  'The legacy link shows the selected Responses chip with a count of one.');
+ check(!chip('show','Validating') && chip('show','Done')?.querySelector('b').textContent==='0' &&
+  selected('show')===chip('show','open'),
+  'Responses starts in Open with a Done count.');
  check(selected('show')===chip('show','open') && !chip('show','Waiting') &&
   recordIsOpen(row),
   'The saved Response link opens the card under Open.');
@@ -4971,7 +4974,7 @@ window.fetch=async(url,options)=>{
   check(rows().length===2,'For you in All shows both actions.');
   clickAndCheck(chip('type','for-you'));
   check(review.dataset.show==='all','The selected For you chip keeps All.');
-  place('question','Validating');
+  place('response','Validating');
   clickAndCheck(chip('type','response'));
   check(review.dataset.show==='open' && rows().length===1 && rows()[0].dataset.type==='response',
    'Responses opens the single response from Validating.');
@@ -5005,12 +5008,12 @@ window.fetch=async(url,options)=>{
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
         _ = self.decisions()
         _ = self.question()
-        _ = self.investigation()
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            _ = self.investigation()
         _ = investigation.file(self.fixture.unit.id, 'Check the build', 'Which step stopped?',
                                waiting_why='The owner checks the build.', kind=investigation.InvestigationKind.BUG)
         owner = self.ready_submission_recipient()
-        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
-        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        _ = self.file_response(owner.id)
         examples = {item.type: item for item in review_items.read(self.root)}
         owners = {fixture_member('showrunner', name=name).id: name
                   for name in ('natedev', 'second-owner', 'third-owner')}
@@ -5102,7 +5105,15 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
   for(const [show,types] of Object.entries(expected)){
    if(selected('show')!==show) changeShow(show);
    for(const type of Object.keys(types)){
-    chip('type',type).click();
+    const button=chip('type',type);
+    if(button.hidden){
+     const address=new URLSearchParams({type,show});
+     history.replaceState({recordTable:{opened:[]}},'','#'+address);
+     dispatchEvent(new HashChangeEvent('hashchange'));
+    }else{
+     button.click();
+    }
+    check(selected('type')===(type || 'all'), 'Review selects the requested type.');
     checkCounts(show,type);
    }
   }
@@ -6316,7 +6327,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
     def file_response(self, owner: staff.StaffId) -> str:
         request = self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner)
         saved = review_submissions.submit(request)
-        self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
         return f'question/{owner}/{saved.path.name}'
 
     def test_sent_question_feedback_recovers_when_the_saved_mark_write_fails(self) -> None:
@@ -6420,7 +6432,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         question = self.file_sent_question(producer.id)
         open_record = investigation.file(producer.id, "Why did the gate stop?", "Read the gate log.",
                                          waiting_why="The producer checks the gate.")
-        record = investigation.answer(producer.id, open_record.id, "The repair is ready.")
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            record = investigation.answer(producer.id, open_record.id, "The repair is ready.")
         cases = ((question, 'feedback'), (f'investigation/{record.owner}/{record.id}', 'feedback'),
                  (self.file_response(producer.id), 'question'))
         for key, action in cases:

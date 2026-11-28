@@ -7218,6 +7218,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(change_page, "send_to_staff", return_value=None) as delivered:
             change_page.recover_question_answers(restarted)
             change_page.recover_question_answers(restarted)
+        self.assertEqual(delivered.call_count, 2)
         self.assertEqual(len({cast(str, entry.kwargs["key"]) for entry in delivered.call_args_list}), 2)
         for entry, text in zip(pending.call_args_list, words, strict=True):
             self.assertEqual(entry.args[0], row.item.owner)
