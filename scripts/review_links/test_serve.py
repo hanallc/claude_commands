@@ -6510,6 +6510,23 @@ addEventListener('DOMContentLoaded', async () => {
         self.assertEqual(version_notice.read(root), cleared)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
+    def test_browser_version_notice_scrollbars_use_the_dark_theme(self) -> None:
+        _ = self.check_version_notice_browser(version_card_probe(br"""
+  const studio=document.querySelector('iframe[data-console-page="studio"]');
+  await until(()=>studio?.contentDocument.querySelector('[data-list]'),'Studio did not load.');
+  const studioRoot=studio.contentDocument.documentElement;
+  const studioStyle=studio.contentWindow.getComputedStyle(studioRoot);
+  const dialog=page.querySelector('[data-version-list-dialog][open]');
+  const dialogStyle=page.defaultView.getComputedStyle(dialog);
+  const colors='rgb(154, 152, 143) rgb(18, 18, 17)';
+  check(studioStyle.scrollbarGutter==='stable','Studio keeps its scrollbar gutter.');
+  check(dialogStyle.overflowY==='auto' && dialog.scrollHeight>dialog.clientHeight,'The overlay can scroll.');
+  check(studioStyle.scrollbarColor===colors && dialogStyle.scrollbarColor===colors,
+        'Studio and the overlay use dark scrollbar colors. Found '+
+        studioStyle.scrollbarColor+' and '+dialogStyle.scrollbarColor+'.');
+"""))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
     def test_browser_version_notice_reads_again_after_focus_during_a_read(self) -> None:
         setup = br"""<script>
  const staleNotice=Promise.withResolvers();

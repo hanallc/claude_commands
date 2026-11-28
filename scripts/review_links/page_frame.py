@@ -726,7 +726,7 @@ inset 0 0 0 100vmax light-dark(rgb(0 0 0 / 32%),rgb(0 0 0 / 64%))}
 # The heading row with its title also sets the column, so the action area script measures the final width.
 # A page that measures its layout uses the desktop gutter.
 STYLE = (BUTTON_STATES
-         + ':root{scrollbar-gutter:stable}'
+         + ':root{scrollbar-gutter:stable;scrollbar-color:var(--ink-3,CanvasText) var(--bg,Canvas)}'
          + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
