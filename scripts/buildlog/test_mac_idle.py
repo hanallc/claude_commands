@@ -76,7 +76,8 @@ class MacIdleTests(NotificationGuardedTestCase):
         }))
         _ = write_config_fixture(self.root / "mac_test.conf",
                                  "offload=on\nalert_seconds=180\nstale_seconds=300\n")
-        _ = write_config_fixture(self.root / "build_targets.conf")
+        # Pin the Mac notices on: the repository value is a live setting that nate turns off.
+        _ = write_config_fixture(self.root / "build_targets.conf", "notices.mac=on\n")
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
         self.paths.admission.mkdir(parents=True)
