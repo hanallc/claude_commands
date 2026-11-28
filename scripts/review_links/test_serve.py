@@ -7218,11 +7218,60 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(change_page, "send_to_staff", return_value=None) as delivered:
             change_page.recover_question_answers(restarted)
             change_page.recover_question_answers(restarted)
-        self.assertCountEqual(delivered.call_args_list, pending.call_args_list)
         self.assertEqual(len({cast(str, entry.kwargs["key"]) for entry in delivered.call_args_list}), 2)
         for entry, text in zip(pending.call_args_list, words, strict=True):
             self.assertEqual(entry.args[0], row.item.owner)
             self.assertIn(text, cast(str, entry.args[2]))
+        first_ask, first_answer = pending.call_args_list
+        retried_ask, = (entry for entry in delivered.call_args_list if entry.kwargs == first_ask.kwargs)
+        self.assertEqual(retried_ask.args[:2], first_ask.args[:2])
+        self.assertIn(words[0], cast(str, retried_ask.args[2]))
+        self.assertIn("This question no longer accepts a reply.", cast(str, retried_ask.args[2]))
+        self.assertNotIn("answer-question", cast(str, retried_ask.args[2]))
+        self.assertIn(first_answer, delivered.call_args_list)
+
+    def test_studio_ask_recovery_uses_the_current_reply_command_after_a_second_ask(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        first_words = "Does the wide layout fit on a laptop?"
+        current_words = "Does the compact layout fit on a phone?"
+
+        def ask(words: str) -> change_page.MessageDelivery:
+            cache = self.server.review_cache
+            snapshot = cache.get()
+            data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+            shown = re.search(rb'name="revision" value="([^"]+)"', data)
+            assert shown is not None
+            body = case.body(key, "question", words) + "&" + urlencode({"revision": shown[1].decode()})
+            delivery = cache.save(body, case.status).delivery
+            assert isinstance(delivery, change_page.MessageDelivery)
+            return delivery
+
+        first = ask(first_words)
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as pending,
+              patch.object(change_page, "studio_alert_targets", return_value=())):
+            self.assertIsInstance(change_page.deliver_with_outcome(first, case.status), change_page.DeliveryUnconfirmed)
+        current = ask(current_words)
+        with patch.object(change_page, "send_to_staff", return_value=None) as sent:
+            self.assertIsInstance(change_page.deliver_with_outcome(current, case.status), change_page.DeliveryConfirmed)
+            current_message = cast(str, sent.call_args.args[2])
+            sent.reset_mock()
+            restarted = change_page.DeliveryStatus(case.status.root)
+            change_page.recover_question_answers(restarted)
+            change_page.recover_question_answers(restarted)
+        sent.assert_called_once()
+        self.assertEqual(sent.call_args.args[:2], (row.item.owner, change_page.SENDER))
+        self.assertEqual(sent.call_args.kwargs, pending.call_args.kwargs)
+        retry_message = cast(str, sent.call_args.args[2])
+        self.assertIn(first_words, retry_message)
+        self.assertIn("A newer question superseded this question.", retry_message)
+        self.assertIn(current_words, retry_message)
+        self.assertNotIn(first.message.splitlines()[-1], retry_message)
+        command = retry_message.splitlines()[-1]
+        self.assertEqual(command, current_message.splitlines()[-1])
+        arguments = shlex.split(command)
+        self.assertTrue(change_page.answer_item(arguments[arguments.index("--item") + 1], "Yes, it fits.",
+                                               arguments[arguments.index("--question") + 1], restarted))
 
     def test_studio_undo_replay_confirms_the_save_while_delivery_is_blocked(self) -> None:
         case, key, row = self.filed_studio_team_question()

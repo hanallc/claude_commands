@@ -2588,6 +2588,49 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[:2], (fallback.id, change_page.SENDER))
         self.assertIn(delivery.message, cast(str, send.call_args.args[2]))
 
+    def test_studio_alert_reaches_the_fallback_when_the_first_send_is_unconfirmed(self) -> None:
+        primary = fixture_member("showrunner", name="primary-team")
+        fallback = showrunners.owner_for("page-owner")
+        owner = fixture_member("unit", name="offline-unit", parent=primary.id)
+        _ = write_config_fixture(conf.path("review_links"), f"unrouted_alert_recipient={fallback.name}\n")
+        status = change_page.DeliveryStatus(self.root)
+        failures = [change_page.DeliveryFailure(owner.id, "Offline")]
+        for index, result in enumerate(("pending", change_page.UnconfirmedSend("Unconfirmed"))):
+            with self.subTest(result=result):
+                delivery = change_page.MessageDelivery(self.page, f"C1/Studio/{index}", (owner.id,),
+                                                       "Use the tool clock.", f"studio-attempt-{index}")
+                with patch.object(change_page, "send_to_staff", side_effect=[result, None]) as send:
+                    reached = status.alert_studio_failure(delivery, failures, 3)
+                self.assertEqual(reached, (fallback.id,))
+                first, second = send.call_args_list
+                self.assertEqual(first.args[0], primary.id)
+                self.assertEqual(second.args[0], fallback.id)
+                self.assertEqual(first.args[1:], second.args[1:])
+                self.assertEqual(first.kwargs, second.kwargs)
+                self.assertIn(delivery.message, cast(str, second.args[2]))
+                self.assertEqual(status.closeout_fields(self.page, delivery.row).get("pending_alerts"), [])
+
+    def test_studio_alert_without_a_route_records_the_case_in_the_service_journal(self) -> None:
+        owner = fixture_member("producer", name="offline-producer")
+        _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=missing-showrunner\n")
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.MessageDelivery(self.page, "C1/Studio/attempt", (owner.id,),
+                                               "Use the tool clock.", "studio-attempt")
+        with (patch.object(change_page, "send_to_staff") as send, redirect_stderr(StringIO()) as journal):
+            self.assertEqual(status.alert_studio_failure(delivery, [change_page.DeliveryFailure(owner.id, "Offline")], 3), ())
+            restarted = change_page.DeliveryStatus(self.root)
+            restarted.send_pending_alerts(restarted.closeout_path(self.page, delivery.row))
+        send.assert_not_called()
+        entry, = journal.getvalue().splitlines()
+        header, _, message = entry.partition(": ")
+        alert, = restarted.closeout_fields(self.page, delivery.row).get("pending_alerts", [])
+        assert "failed_recipient" in alert
+        self.assertEqual(header, f"review-links Studio delivery alert with no team route {alert['key']}")
+        self.assertIn("Row: C1", cast(str, json.loads(message)))
+        self.assertIn("Last error: Offline", cast(str, json.loads(message)))
+        self.assertIn(delivery.message, cast(str, json.loads(message)))
+        self.assertTrue(restarted.has_deferred_alerts())
+
     def test_studio_terminal_alert_failure_keeps_the_team_record_until_confirmation(self) -> None:
         team = showrunners.owner_for("page-owner")
         producer = fixture_member("producer", name="offline-producer")

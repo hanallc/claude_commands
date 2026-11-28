@@ -24,7 +24,7 @@ from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, ClassVar, Literal, cast, final, override
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, ThreadingMock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree
@@ -3271,7 +3271,9 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_later_reuses_short_preset_after_lost_responses(self) -> None:
         item = self.studio_team_question()
+        delivered = ThreadingMock(wraps=list_page.deliver_with_outcome)
         with (patch.object(change_page, "send_to_staff", return_value=None) as send,
+              patch.object(list_page, "deliver_with_outcome", new=delivered),
               self.studio_review_server() as origin):
             self.open_studio_review_fixture(origin, "#show=questions")
             self.studio_review_check(r"""
@@ -3302,6 +3304,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(requests.length===3 && requests[2]===requests[0],'Later sends the original deadline and request ID.');
  check(!recordIsOpen(item),'The confirmed reply closes the row.');
 """)
+            delivered.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
         send.assert_called_once()
         notice, = the_list.feedback_requests(the_list.load(MORTY.id, item.id)).values()
         self.assertEqual((notice.state, notice.form_words), ("sent", "Wait for the desktop check."))
@@ -3309,7 +3312,9 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_later_uses_a_new_request_after_an_expired_deadline_refusal(self) -> None:
         item = self.studio_team_question()
+        delivered = ThreadingMock(wraps=list_page.deliver_with_outcome)
         with (patch.object(change_page, "send_to_staff", return_value=None) as send,
+              patch.object(list_page, "deliver_with_outcome", new=delivered),
               self.studio_review_server() as origin):
             self.open_studio_review_fixture(origin, "#show=questions")
             self.studio_review_check(r"""
@@ -3340,6 +3345,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(Date.parse(requests[1].get('later'))>present,'The second request has a future deadline.');
  check(!recordIsOpen(item),'The second request saves the item.');
 """.replace("FIXTURE_NOW", json.dumps(NOW.isoformat())))
+            delivered.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
         send.assert_called_once()
         notice, = the_list.feedback_requests(the_list.load(MORTY.id, item.id)).values()
         self.assertEqual((notice.state, notice.form_words), ("sent", "Wait for the desktop check."))

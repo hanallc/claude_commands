@@ -221,6 +221,7 @@ class PendingStudioAlert(TypedDict):
     message: str
     key: str
     item_owner: NotRequired[staff.StaffId]
+    journaled: NotRequired[Literal[True]]
 
 
 class StoredReviewDispatch(TypedDict):
@@ -1561,6 +1562,9 @@ class DeliveryStatus:
                         recipients = studio_alert_targets(alert)
                     except (OSError, ValueError) as error:
                         print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
+                        recipients = ()
+                    if not recipients:
+                        self.journal_unrouted_studio_alert(path, alert)
                         retry = True
                         continue
                     studio = True
@@ -1573,13 +1577,16 @@ class DeliveryStatus:
                         outcome = send_to_staff(recipient, SENDER, alert["message"], key=alert.get("key", ""))
                     except SEND_ERRORS as error:
                         print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
-                        if studio and isinstance(error, FinalSendFailure):
+                        if studio:
                             continue
-                        if not studio and isinstance(error, FinalSendFailure):
+                        if isinstance(error, FinalSendFailure):
                             reached.append(recipient)
                         break
-                    if outcome != "pending":
-                        reached.append(recipient)
+                    if outcome == "pending":
+                        if studio:
+                            continue
+                        break
+                    reached.append(recipient)
                     break
                 if not reached:
                     retry = True
@@ -1602,6 +1609,19 @@ class DeliveryStatus:
                 self.sending_alerts.remove(path)
                 if retry:
                     self.deferred_alerts.add(path)
+
+    def journal_unrouted_studio_alert(self, path: Path, alert: PendingStudioAlert) -> None:
+        """Record an unrouted case in the Review service journal."""
+        if alert.get("journaled"):
+            return
+        with self.locked():
+            fields = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
+            alerts = fields.get("pending_alerts", [])
+            if alert in alerts:
+                print(f"review-links Studio delivery alert with no team route {alert['key']}: "
+                      + json.dumps(alert["message"], ensure_ascii=False), file=sys.stderr, flush=True)
+                alerts[alerts.index(alert)] = {**alert, "journaled": True}
+                self.write_closeout(path, fields)
 
     def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
                                 recipients: tuple[staff.StaffId, ...]) -> None:
@@ -2812,7 +2832,7 @@ def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = 
     return "review:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
-def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
+def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str | Callable[[], str], tries: int,
                       pause: float, *, key: str,
                       skipped: set[staff.StaffId] | None = None,
                       errors: tuple[type[Exception], ...] = SEND_ERRORS,
@@ -2826,7 +2846,7 @@ def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], messag
         failures = []
         for target in remaining:
             try:
-                result = send_to_staff(target, sender, message, key=key)
+                result = send_to_staff(target, sender, message() if callable(message) else message, key=key)
                 if result == "pending" and confirm:
                     failures.append(UnconfirmedDelivery(target, "The sender has not confirmed delivery."))
                 if result == "skipped" and skipped is not None:
@@ -3145,6 +3165,27 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
     _ = deliver_with_outcome(delivery, status)
 
 
+def studio_question_text(delivery: MessageDelivery, status: DeliveryStatus) -> str:
+    """Use the current reply ID while the caller holds the delivery lock."""
+    page, message = delivery.page, delivery.message
+    if not isinstance(page, UserQuestionPage) or page.saved.get("kind") != "question":
+        return message
+    question_id = page.saved.get("question_id", "")
+    question = status.slots(page, page.review_list.stem).question
+    if isinstance(question, OpenQuestion) and question.question_id == question_id:
+        return message
+    words, separator, command = message.rpartition("\nAnswer with this command:\n")
+    if not separator:
+        return message
+    old_option = f" --question {shlex.quote(question_id)} "
+    if isinstance(question, OpenQuestion) and old_option in command:
+        current_option = f" --question {shlex.quote(question.question_id)} "
+        command = command.replace(old_option, current_option, 1)
+        return (words + "\n\nA newer question superseded this question.\n"
+                + question.text + "\nAnswer the current question with this command:\n" + command)
+    return words + "\n\nThis question no longer accepts a reply."
+
+
 def defer_studio_review(status: DeliveryStatus, delivery: MessageDelivery, intent: DeliveryIntent,
                         failures: list[DeliveryFailure], tries: int) -> DeliveryUnconfirmed:
     page, row = delivery.page, delivery.row
@@ -3154,7 +3195,8 @@ def defer_studio_review(status: DeliveryStatus, delivery: MessageDelivery, inten
             if intent not in status.slots(page, row).intents():
                 retry = False
                 return DeliveryUnconfirmed()
-            status.record_studio_failure_locked(delivery, failures, tries)
+            alert_delivery = replace(delivery, message=studio_question_text(delivery, status))
+            status.record_studio_failure_locked(alert_delivery, failures, tries)
     except (OSError, ValueError) as error:
         print(f"review-links delivery alert {row}: {error}", file=sys.stderr)
     finally:
@@ -3219,7 +3261,14 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
             failures = [DeliveryFailure(MissingRecipient(), reason)]
     else:
         key = review_delivery_key(page.review_list, delivery.row, delivery.attempt)
-        failures = (send_with_retries(SENDER, delivery.recipients, outbound.text, tries, pause,
+
+        def current_question_text() -> str:
+            with status.locked():
+                return studio_question_text(delivery, status)
+
+        studio_ask = studio and isinstance(page, UserQuestionPage) and page.saved.get("kind") == "question"
+        message = current_question_text if studio_ask else outbound.text
+        failures = (send_with_retries(SENDER, delivery.recipients, message, tries, pause,
                                        key=key, confirm=confirm) if delivery.recipients
                     else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
         failures = [replace(failure, error=outbound.redact(failure.error)) for failure in failures]
