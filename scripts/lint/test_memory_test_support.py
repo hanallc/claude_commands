@@ -40,6 +40,24 @@ class ConfigFixtureTests(unittest.TestCase):
             self.assertNotIn("offload=off", fixture.read_text())
             self.assertEqual(conf.read(fixture).text("offload"), "on")
 
+    def test_copy_applies_fixture_settings_to_nested_config_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "templates"
+            nested = templates / "subdir" / "child"
+            nested.mkdir(parents=True)
+            _ = (nested / "mac_test.conf").write_text(
+                "# one of: on, off\noffload=off\nunpinned=live\n# whole: 1..\ncount=3\n")
+            _ = (nested / "note.txt").write_text("unpinned=live\n")
+
+            fixture = copy_config_fixture(templates, root / "fixtures") / nested.relative_to(templates)
+            settings = conf.read(fixture / "mac_test.conf")
+            self.assertEqual(settings.text("offload"), "on")
+            self.assertEqual(settings.whole("count"), 4)
+            with self.assertRaisesRegex(conf.Unusable, "key is missing"):
+                _ = settings.text("unpinned")
+            self.assertEqual((fixture / "note.txt").read_text(), "unpinned=live\n")
+
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

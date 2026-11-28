@@ -459,16 +459,13 @@ def copy_config_file_fixture(source: Path, destination: Path) -> Path:
 
 def copy_config_fixture(source: Path, destination: Path) -> Path:
     """Copy the committed configuration folder into a private fixture."""
-    templates = tuple(source.glob("*.conf"))
-    names = {template.name for template in templates}
+    def copy_file(original: str, target: str) -> str:
+        path = Path(original)
+        if path.name.endswith(".conf"):
+            return str(copy_config_file_fixture(path, Path(target)))
+        return shutil.copy2(original, target)
 
-    def ignore_templates(folder: str, entries: list[str]) -> set[str]:
-        return names.intersection(entries) if Path(folder) == source else set()
-
-    _ = shutil.copytree(source, destination, ignore=ignore_templates)
-    for template in templates:
-        _ = copy_config_file_fixture(template, destination / template.name)
-    return destination
+    return shutil.copytree(source, destination, copy_function=copy_file)
 
 
 def write_config_fault(path: Path, source: str) -> int:
