@@ -654,6 +654,11 @@ Older files stay in the folder for manual removal.
 The selector keeps cached facts for the current tree and its base tree.
 The current and base graphs share one cache read and one cache update.
 The selector extracts missing base facts only when it builds the base graph for a removed Python file.
+The selector reads the missing source text in the parent and sends batches to a process pool for extraction.
+The pool has up to `affected.extract.processes` workers, with a default of eight.
+The selector runs serially with one worker, fewer than twice the configured worker count in misses, or an OS error during pool startup.
+Spawn keeps the parent’s cache lock and database state out of the workers.
+The parent uses the results in path order and builds the graph and publishes the cache.
 Dirty sources never enter the cache or cause cache writes.
 A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
 The nightly-red marker requires the full suite for integrate and test all jobs. Targeted tests keep their selection and reuse rules.
@@ -670,11 +675,11 @@ Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its
 
 Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files, selected in S s`.
 The same line gives cache hits, cache misses, part times, and the cache lock result.
-A hit uses cached facts. A miss counts before the source read.
-The extraction count records each source file that starts extraction.
+A hit uses cached facts. A miss requires a source read.
+The extraction count includes serial attempts after a successful read and results returned by the pool.
 The counts include current and base graph lookups when selection builds both graphs.
 The times show cache read, extraction, graph build, and other work in seconds to one decimal place.
-Extraction time includes source reads for both graphs.
+Extraction time includes source reads and the elapsed time for pool startup, extraction, and shutdown in both graphs.
 The lock result shows when selection publishes facts or reads the old snapshot with the lock busy.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.

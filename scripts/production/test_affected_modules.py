@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -944,7 +945,7 @@ def shadow(root):
 
         def interleave(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
                        cached: dict[str, affected.SourceFacts], *, worktree: bool,
-                       run: affected.SelectionRun | None = None) -> affected.SourceGraph:
+                       run: affected.SelectionRun | None = None, processes: int = 1) -> affected.SourceGraph:
             with (mock.patch.object(affected, "graph_for_files", graph_for_files),
                   mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
                   mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write,
@@ -959,7 +960,7 @@ def shadow(root):
             self.assertEqual(len(attempts), 1)
             write.assert_not_called()
             self.assertEqual(self.cache_file().read_bytes(), before)
-            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
+            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run, processes=processes)
 
         with mock.patch.object(affected, "graph_for_files", side_effect=interleave) as graph:
             writer = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
@@ -993,6 +994,91 @@ def shadow(root):
             self.assertGreaterEqual(run.cache_read_s, 0)
             self.assertGreaterEqual(run.graph_s, 0)
             self.assertGreaterEqual(run.other_s, 0)
+
+    def set_extraction_processes(self, processes: int) -> None:
+        config = ".git/test-config/gate.conf"
+        with (self.repo / config).open("a", encoding="utf-8") as stream:
+            _ = stream.write(f"# whole: 1..\naffected.extract.processes={processes}\n")
+
+    def add_extraction_sources(self, value: str) -> None:
+        for index in range(24):
+            self.write(f"scripts/component/source_{index}.py", f"VALUE = {value!r}, {index}\n")
+
+    def test_pooled_extraction_preserves_selection_and_cached_facts(self) -> None:
+        self.add_extraction_sources("base")
+        self.write("scripts/component/removed.py", "REMOVED = True\n")
+        self.write("scripts/component/dirty.py", "VALUE = 'committed'\n")
+        self.add_test("checks/test_reader.py", "from scripts.component import source_1, removed\n")
+        self.certify()
+        self.add_extraction_sources("current")
+        self.write("scripts/component/duplicate.py", "VALUE = 'current', 1\n")
+        self.write("scripts/component/invalid.py", "invalid (\n")
+        (self.repo / "scripts/component/removed.py").unlink()
+        _ = self.commit()
+        self.write("scripts/component/dirty.py", "VALUE = 'dirty'\n")
+        dirty = affected.dirty_paths(self.repo)
+        serial_state = self.cache_dir() / "serial"
+        pool_state = self.cache_dir() / "pool"
+        config = self.repo / ".git/test-config/gate.conf"
+        original = config.read_text()
+        self.set_extraction_processes(1)
+        with mock.patch.object(affected, "ProcessPoolExecutor") as serial_pool:
+            serial = affected.select_affected(self.repo, self.base, self.modules, dirty, state_dir=serial_state)
+        serial_pool.assert_not_called()
+        _ = config.write_text(original)
+        self.set_extraction_processes(8)
+        with mock.patch.object(affected, "ProcessPoolExecutor", wraps=ProcessPoolExecutor) as pool:
+            pooled = affected.select_affected(self.repo, self.base, self.modules, dirty, state_dir=pool_state)
+        self.assertEqual(pool.call_count, 2)
+        assert isinstance(serial, affected.AffectedSelection) and isinstance(pooled, affected.AffectedSelection)
+        self.assertEqual(serial.modules, (self.repo / "scripts/checks/test_reader.py",))
+        self.assertEqual(pooled, serial)
+        serial_facts = affected.read_fact_cache(serial_state / affected.FACT_CACHE_NAME)
+        pool_facts = affected.read_fact_cache(pool_state / affected.FACT_CACHE_NAME)
+        self.assertTrue(serial_facts)
+        self.assertEqual(pool_facts, serial_facts)
+        assert isinstance(serial.run, affected.SelectionRun) and isinstance(pooled.run, affected.SelectionRun)
+        self.assertEqual(pooled.run.cache_hits, serial.run.cache_hits)
+        self.assertEqual(pooled.run.cache_misses, serial.run.cache_misses)
+        self.assertEqual(pooled.run.extracted_files, serial.run.extracted_files)
+
+    def test_pooled_extraction_skips_a_small_number_of_misses(self) -> None:
+        self.add_extraction_sources("base")
+        self.certify()
+        _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        self.add_test("checks/test_new.py", "NEW = True\n")
+        _ = self.commit()
+        self.set_extraction_processes(8)
+        with mock.patch.object(affected, "ProcessPoolExecutor") as pool:
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        pool.assert_not_called()
+        assert isinstance(result, affected.AffectedSelection) and isinstance(result.run, affected.SelectionRun)
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_new.py",))
+        self.assertEqual((result.run.cache_misses, result.run.extracted_files), (1, 1))
+
+    def test_pooled_extraction_retries_serially_after_a_start_error(self) -> None:
+        self.add_extraction_sources("base")
+        self.certify()
+        self.add_test("checks/test_new.py", "NEW = True\n")
+        _ = self.commit()
+        self.set_extraction_processes(8)
+        with mock.patch.object(ProcessPoolExecutor, "map", side_effect=OSError("cannot start worker")) as start:
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        start.assert_called_once()
+        assert isinstance(result, affected.AffectedSelection) and isinstance(result.run, affected.SelectionRun)
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_new.py",))
+        self.assertEqual((result.run.cache_misses, result.run.extracted_files), (26, 26))
+        self.assertIs(result.run.lock, affected.FactCacheLock.PUBLISHED)
+
+    def test_pooled_extraction_worker_error_returns_a_graph_error(self) -> None:
+        self.add_extraction_sources("base")
+        self.certify()
+        self.set_extraction_processes(8)
+        with mock.patch.object(affected, "extract_facts", pow):
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        assert isinstance(result, affected.FullSuite)
+        self.assertIn("graph error: fact extraction worker: unsupported operand type", result.reason)
+        self.assertFalse(self.cache_file().exists())
 
     def test_invalid_source_reads_count_misses_before_extraction(self) -> None:
         invalid = self.repo / "scripts/broken.py"
@@ -1446,8 +1532,8 @@ def shadow(root):
 
         def without_base_imports(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
                                  cached: dict[str, affected.SourceFacts], *, worktree: bool,
-                                 run: affected.SelectionRun | None = None) -> affected.SourceGraph:
-            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
+                                 run: affected.SelectionRun | None = None, processes: int = 1) -> affected.SourceGraph:
+            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run, processes=processes)
             return graph if worktree else replace(graph, imports={})
 
         with mock.patch.object(affected, "graph_for_files", side_effect=without_base_imports):

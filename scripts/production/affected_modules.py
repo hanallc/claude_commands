@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,6 +17,7 @@ from hashlib import sha256
 from importlib.metadata import packages_distributions
 from io import BytesIO
 from itertools import chain
+from multiprocessing import get_context
 from pathlib import Path, PurePosixPath
 import json
 import os
@@ -1072,8 +1074,57 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
     return graph
 
 
+def pool_fact_paths(sources: list[str], blobs: dict[str, str], dirty: set[str],
+                    cached: dict[str, SourceFacts]) -> list[str]:
+    """Keep the first path for each uncached blob and every dirty path."""
+    seen: set[str] = set()
+    missing: list[str] = []
+    for path in sources:
+        blob = blobs.get(path) if path not in dirty else None
+        if blob is not None:
+            if blob in cached or blob in seen:
+                continue
+            seen.add(blob)
+        missing.append(path)
+    return missing
+
+
+def extract_pool_facts(paths: list[str], read_source: Callable[[str], str], processes: int,
+                       run: SelectionRun | None, *, worktree: bool) -> dict[str, SourceFacts]:
+    started = monotonic()
+    try:
+        try:
+            texts = [read_source(path) for path in paths]
+        except (OSError, UnicodeError):
+            # Let the serial loop report the read failure in path order.
+            return {}
+        with ExitStack() as stack:
+            try:
+                # Spawn keeps the parent's file locks out of the workers.
+                pool = ProcessPoolExecutor(max_workers=processes, mp_context=get_context("spawn"))
+                _ = stack.callback(pool.shutdown, cancel_futures=True)
+                results = pool.map(extract_facts, texts, paths, chunksize=max(1, len(paths) // (processes * 2)))
+            except OSError:
+                return {}
+            if run is not None and worktree:
+                run.cache_misses += len(paths)
+            extracted: dict[str, SourceFacts] = {}
+            try:
+                for path, facts in zip(paths, results, strict=True):
+                    extracted[path] = facts
+                    if run is not None:
+                        run.extracted_files += 1
+            except Exception as error:
+                raise GraphError(f"fact extraction worker: {error}") from error
+            return extracted
+    finally:
+        if run is not None:
+            run.extraction_s += monotonic() - started
+
+
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                    cached: dict[str, SourceFacts], *, worktree: bool, run: SelectionRun | None = None
+                    cached: dict[str, SourceFacts], *, worktree: bool, run: SelectionRun | None = None,
+                    processes: int = 1,
                     ) -> SourceGraph:
     bare_modules: dict[str, set[str]] = defaultdict(set)
     for path in paths:
@@ -1092,6 +1143,16 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
             finally:
                 if run is not None:
                     run.extraction_s += monotonic() - started
+
+    def read_source(path: str) -> str:
+        return (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
+
+    extracted: dict[str, SourceFacts] = {}
+    minimum_pool_misses = processes * 2
+    if processes > 1 and len(sources) >= minimum_pool_misses:
+        missing_paths = pool_fact_paths(sources, blobs, dirty, cached)
+        if len(missing_paths) >= minimum_pool_misses:
+            extracted = extract_pool_facts(missing_paths, read_source, processes, run, worktree=worktree)
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
     tokens: dict[str, frozenset[str]] = {}
@@ -1101,17 +1162,19 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
         blob = blobs.get(path) if path not in dirty else None
         facts = cached.get(blob) if blob is not None else None
         if facts is None:
-            if worktree and run is not None:
-                run.cache_misses += 1
-            started = monotonic()
-            try:
-                text = (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
-                if run is not None:
-                    run.extracted_files += 1
-                facts = extract_facts(text, path)
-            finally:
-                if run is not None:
-                    run.extraction_s += monotonic() - started
+            facts = extracted.get(path)
+            if facts is None:
+                if worktree and run is not None:
+                    run.cache_misses += 1
+                started = monotonic()
+                try:
+                    text = read_source(path)
+                    if run is not None:
+                        run.extracted_files += 1
+                    facts = extract_facts(text, path)
+                finally:
+                    if run is not None:
+                        run.extraction_s += monotonic() - started
             if blob is not None:
                 cached[blob] = facts
         elif run is not None:
@@ -1393,9 +1456,10 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
+        processes = settings.value("affected.extract.processes", conf.positive_whole, default=8)
         with fact_cache(state_dir, run) as cached:
             with run.graph_build():
-                graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True, run=run)
+                graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True, run=run, processes=processes)
             config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
             configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
             recorded = latest_module_reads() if changed else {}
@@ -1417,7 +1481,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             old_graph: dict[str, set[str]] = {}
             if removed:
                 with run.graph_build():
-                    old_graph = graph_for_files(repo, base_paths, base_blobs, set(), cached.facts, worktree=False, run=run).imports
+                    old_graph = graph_for_files(repo, base_paths, base_blobs, set(), cached.facts,
+                                                worktree=False, run=run, processes=processes).imports
             cached.retain(source_blobs(paths | dirty, blobs) | source_blobs(base_paths, base_blobs))
         folder_stems: dict[str, set[str]] = defaultdict(set)
         for source in python:
