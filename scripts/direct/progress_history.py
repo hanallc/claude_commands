@@ -1327,6 +1327,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     record = staff.initial_snapshot()
     state = _read_state(session_dir, record=record)
     if unit_runs.terminal_run(state):
+        if getattr(args, "require_open_run", False) is True:
+            raise SystemExit(f"{session_dir}: the run has ended")
         if isinstance(_run_pointer(session_dir, record), staff.StaffRow):
             raise SystemExit(f"{session_dir}: complete the pending run end before reopening it")
         owner = unit_runs.run_owner(state, record)
@@ -2464,6 +2466,19 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
             _ = _stage_stopped_pass(state, passed, worker, owner.id, run_id="", reason="The worker was canceled.")
             ended += _close_slot_pass(session_dir, state, slot, "canceled", pass_recorder.now_epoch())
         return ended
+
+
+@dataclass(frozen=True)
+class CanceledPassesInRun:
+    run: Path
+    count: int
+
+
+def cancel_worker_passes_in_runs(runs: Iterable[Path], worker_id: staff.StaffId) -> Generator[CanceledPassesInRun]:
+    """End open passes and yield each run with a cancellation. The caller holds the worker lock."""
+    for run in runs:
+        if count := cancel_worker_passes(run, worker_id):
+            yield CanceledPassesInRun(run, count)
 
 
 def _resolve_worker_agent(task: str) -> pass_recorder.AgentIdentity:
@@ -7557,6 +7572,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--session-dir", required=True)
     _ = start_phase.add_argument("--phase-id", "--phase", required=True)
     _ = start_phase.add_argument("--phase-title", required=True)
+    _ = start_phase.add_argument("--require-open-run", action="store_true")
     _ = start_phase.add_argument("--work-order-file", default="")
     _ = start_phase.add_argument("--started-at", default="")
     start_phase.set_defaults(handler=_start_phase)

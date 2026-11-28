@@ -240,6 +240,12 @@ class PageStatusTests(unittest.TestCase):
  const hold=(id,receiver='The producer of the final review card')=>
   heldFetch('/hold-'+id,{method:'POST'},receiver).catch(error=>error);
  const undoButtons=()=>[...stack().querySelectorAll('button')];
+ const toasts=()=>stack()?.querySelectorAll('button').length || 0;
+ const insetMatchesStack=()=>Math.abs(inset()-(host.defaultView.innerHeight-stack().getBoundingClientRect().top))<1;
+ const settle=async (test,condition)=>{
+  for(let frame=0;frame<60 && !test();frame++) await painted();
+  if(!test()) throw new Error('Undo stack did not settle: '+condition);
+ };
  const clearButtons=()=>{
   const top=stack().getBoundingClientRect().top;
   return [...controls.querySelectorAll('button')].every(button=>{
@@ -276,7 +282,7 @@ class PageStatusTests(unittest.TestCase):
   scrollTo({top:bottom(),behavior:'instant'});
   const baseline=bottom(),start=controls.getBoundingClientRect().bottom;
   const first=hold('a');
-  await painted();
+  await settle(()=>toasts()===1 && insetMatchesStack(),'one toast and its measured inset');
   const one=stack().getBoundingClientRect();
   check(one.width<=280 && Math.abs(one.right-374)<1 && Math.abs(one.bottom-820)<1,
    'The stack wraps at 280 px and stays at the bottom right.');
@@ -284,7 +290,7 @@ class PageStatusTests(unittest.TestCase):
   check(Math.abs(inset()-one.height-24)<1 && Math.abs(bottom()-baseline-inset())<1,
    'The scroll range and scroll padding use the measured stack height and bottom gap.');
   const second=hold('b','Another producer');
-  await painted();
+  await settle(()=>toasts()===2 && insetMatchesStack(),'two toasts and their measured inset');
   const both=stack().getBoundingClientRect();
   check(both.height>one.height && Math.abs(inset()-both.height-24)<1,
    'The scroll padding grows when a second toast appears.');
@@ -292,10 +298,12 @@ class PageStatusTests(unittest.TestCase):
   await painted();
   check(clearButtons(),'All last card buttons can scroll fully above the stack.');
   undoButtons().at(-1).click();
-  await second;await painted();
+  await second;
+  await settle(()=>toasts()===1 && insetMatchesStack(),'one toast and the reduced inset after Undo');
   check(Math.abs(inset()-one.height-24)<1,'The scroll padding shrinks when one toast leaves.');
   undoButtons()[0].click();
-  await first;await painted();
+  await first;
+  await settle(()=>!stack() && !root.hasAttribute('data-send-undo-space'),'no stack or inset after Undo');
   check(!stack() && !root.hasAttribute('data-send-undo-space') &&
    getComputedStyle(root).scrollPaddingBottom==='auto' && bottom()===baseline,
    'The scroll space and scroll padding disappear when the stack empties.');
@@ -305,7 +313,7 @@ class PageStatusTests(unittest.TestCase):
     def test_phone_undo_stack_caps_below_the_frozen_header(self) -> None:
         self.check_phone_undo_stack(r'''
   const sends=Array.from({length:20},(_,index)=>hold(index.toString(16)));
-  await painted();
+  await settle(()=>toasts()===20 && insetMatchesStack(),'twenty toasts and their measured inset');
   const box=stack(),initial=box.getBoundingClientRect();
   check(box.scrollHeight>box.clientHeight && initial.top>=96,
    'The capped stack scrolls below the 56 px console header and a full button.');
@@ -332,7 +340,8 @@ class PageStatusTests(unittest.TestCase):
   check(last.bottom<=box.getBoundingClientRect().bottom && last.top>=top,
    'The last Undo button scrolls fully into view.');
   buttons.forEach(button=>button.click());
-  await Promise.all(sends);await painted();
+  await Promise.all(sends);
+  await settle(()=>!stack(),'no capped stack after Undo');
   check(!stack(),'Undo removes the capped stack.');
 ''')
 
@@ -340,7 +349,7 @@ class PageStatusTests(unittest.TestCase):
     def test_short_undo_stack_fits_one_full_toast(self) -> None:
         self.check_phone_undo_stack(r'''
   const first=hold('a'),second=hold('b');
-  await painted();
+  await settle(()=>toasts()===2 && insetMatchesStack(),'two toasts and their inset in the short viewport');
   const box=stack();
   box.scrollTop=box.scrollHeight;
   const area=box.getBoundingClientRect(),last=box.lastElementChild.getBoundingClientRect();
@@ -394,7 +403,8 @@ class PageStatusTests(unittest.TestCase):
   const box=footer.closest('.review-box');
   const baseline=footer.getBoundingClientRect().bottom;
   const first=hold('a'),second=hold('b');
-  await painted();
+  await settle(()=>toasts()===2 && footer.getBoundingClientRect().bottom<baseline,
+   'two toasts and a raised footer in the linked card');
   check(footer.getBoundingClientRect().bottom<baseline && clearsStack(),
    'Later fits above the stack in a full-height linked card.');
   const bottomWithStack=footer.getBoundingClientRect().bottom;
@@ -404,17 +414,22 @@ class PageStatusTests(unittest.TestCase):
   later.click();await painted();
   check(!doc.querySelector('[data-later-menu]').hidden,'Later opens its menu.');
   undoButtons().forEach(button=>button.click());
-  await Promise.all([first,second]);await painted();
+  await Promise.all([first,second]);
+  await settle(()=>!stack() && !doc.documentElement.hasAttribute('data-send-undo-space'),
+   'no stack or linked card inset after Undo');
   check(!stack() && !doc.documentElement.hasAttribute('data-send-undo-space') &&
    footer.getBoundingClientRect().bottom===baseline,'Undo restores the full-height card.');
   later.click();
   const sends=Array.from({length:20},(_,index)=>hold(index.toString(16)));
-  await painted();
+  await settle(()=>toasts()===20 && box.hasAttribute('data-whole-scroll'),
+   'twenty toasts and whole-card scrolling');
   box.scrollTop=box.scrollHeight;
   check(box.hasAttribute('data-whole-scroll') && box.scrollTop>0 && clearsStack(),
    'With a capped stack, the full card scrolls until Later clears the stack.');
   undoButtons().forEach(button=>button.click());
-  await Promise.all(sends);await painted();
+  await Promise.all(sends);
+  await settle(()=>!stack() && !box.hasAttribute('data-whole-scroll'),
+   'no stack and body-only scrolling after Undo');
   check(!box.hasAttribute('data-whole-scroll') && footer.getBoundingClientRect().bottom===baseline,
    'The body scrolls again after the stack leaves.');
 ''', linked_card=card)

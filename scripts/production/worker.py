@@ -1778,7 +1778,10 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(selection, ExitCode):
             return selection
         matched = selection.action
-        if (unit_runs.terminal_run(unit_runs.read_run_fields(session_dir))
+        fields = worker_panes.dispatch_run_fields(parent, session_dir, record=record)
+        if isinstance(fields, worker_panes.AdmissionRefused):
+            return startup_result(name, fields)
+        if (unit_runs.terminal_run(fields)
                 and not (isinstance(matched, progress_history.MatchedDispatch)
                          and progress_history.dispatch_completed(session_dir, selection.slot, matched.instance_id))):
             print(f"{session_dir}: the run has ended dispatch admission", file=sys.stderr)
@@ -1850,7 +1853,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 return DispatchSubmission.SUBMITTED
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
-            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy, phase=phase)
+            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy,
+                                                        dispatch_run=worker_panes.DispatchRun(session_dir), phase=phase)
             arm_launch_cleanup(cleanup, before, current_start)
         else:
             if not started.row.reports_to(parent) or not hold.owns(started.row):
@@ -2493,7 +2497,8 @@ def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
            ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
     with staff.row_operation(target.parent):
-        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase)
+        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock,
+                                            dispatch_run=target.dispatch_run, phase=phase)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
@@ -2535,13 +2540,20 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if not enrolled and not name and role in ("impl", "fix", "review", "test"):
             needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
         if needs_team:
+            fields = worker_panes.dispatch_run_fields(parent, session_dir, record=record)
+            if isinstance(fields, worker_panes.AdmissionRefused):
+                return startup_result(WorkerName.parse(role), fields)
+            if unit_runs.terminal_run(fields):
+                print(f"{session_dir}: the run has ended dispatch admission", file=sys.stderr)
+                return ExitCode.REFUSED
             names = {row.name for row in rows}
             for default_role in ("impl", "fix", "review", "test"):
                 if default_role in names or default_role == role:
                     continue
                 before = rows_before_launch()
                 with redirect_stderr(io.StringIO()) as diagnostics:
-                    result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
+                    result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role,
+                                                          dispatch_run=worker_panes.DispatchRun(session_dir))
                 if isinstance(result, worker_panes.OpenWorker):
                     arm_launch_cleanup(cleanup, before, result)
                     print(diagnostics.getvalue(), end="", file=sys.stderr)

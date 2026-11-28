@@ -19,7 +19,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Collection, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Hashable, Mapping, Sequence
 
 import argparse
 import contextlib
@@ -154,8 +154,12 @@ class RunRecord(StopFields):
     ended_pass_result_released: NotRequired[Literal[True]]
     worker_result_receipt: NotRequired[object]
     blocked_notice_accepted: NotRequired[Literal[True]]
+    pane_submit_failure_counted: NotRequired[Literal[True]]
     push_retries: NotRequired[int]
+    push_alert_delivery: NotRequired[str]
     push_alert_attempted: NotRequired[Literal[True]]
+    push_alert_missing_director_reported: NotRequired[Literal[True]]
+    push_alert_reported_causes: NotRequired[list[str]]
     # Set when the run ended without its supervisor: "supervisor gone".
     completion_pending: NotRequired[bool]
     ended: NotRequired[str]
@@ -252,12 +256,12 @@ def _write_record_locked(path: Path, record: RunRecord) -> RunRecord:
         fields.update(current)
     if delivery := current.get("delivery"):
         fields["delivery"] = delivery
-    stop_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop")
+    saved_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop", "push_alert_delivery")
     if _has_saved_cgroup(current):
-        stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id",
-                        "pending_hold_stop_requests")
+        saved_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id",
+                         "pending_hold_stop_requests")
     saved = cast(Mapping[str, object], current)
-    for key in stop_fields:
+    for key in saved_fields:
         if key in saved:
             fields[key] = saved[key]
         else:
@@ -303,11 +307,15 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
             return (bool(run_id) and not isinstance(raw["started_at"], bool)
                     and not isinstance(raw["pid"], bool)
                     and all(isinstance(arg, str) for arg in cast(list[object], raw["command"]))
+                    and ("push_alert_reported_causes" not in raw or (
+                        isinstance(causes := raw["push_alert_reported_causes"], list)
+                        and all(isinstance(cause, str) for cause in cast(list[object], causes))))
                     and all(key not in raw or type(raw[key]) is int
                             for key in ("command_pid", "command_group", "exit_code", "push_retries"))
                     and all(key not in raw or isinstance(raw[key], str)
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
-                                        "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id"))
+                                        "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id",
+                                        "push_alert_delivery"))
                     and ("hold_stop_requests" not in raw or _is_hold_stop_requests(raw["hold_stop_requests"]))
                     and ("pending_hold_stop_requests" not in raw or (
                         raw.get("stop_pass_requested") is True and "command_slice" in raw
@@ -317,7 +325,8 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
-                                        "blocked_notice_accepted", "push_alert_attempted",
+                                        "blocked_notice_accepted", "push_alert_attempted", "pane_submit_failure_counted",
+                                        "push_alert_missing_director_reported",
                                         "slice_cleanup_pending", "slice_leftovers",
                                         "completion_after_slice_cleanup", "ended_pass_result_released"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
@@ -877,6 +886,15 @@ ENDED_PASS_RESULT_QUEUED = "queued: the director has a notice for the ended pass
 INTERRUPTED_PASS_DELIVERY = "interrupted pass result: "
 
 
+def _confirmed_orphan_was_superseded(record: Mapping[str, object]) -> bool:
+    return type(record.get("exit_code")) is int and record.get("delivery") == SUPERSEDED_ORPHAN_DELIVERY
+
+
+class CompletionPaneWait(StrEnum):
+    ALLOW = "allow the completion event to wait for input readiness"
+    READY_NOW = "submit only when the pane can accept input now"
+
+
 @dataclass
 class OrphanReapResult:
     """Keep reaped run IDs and the completion events that must follow the admission lock."""
@@ -889,7 +907,7 @@ class OrphanReapResult:
         path.with_suffix(".completion.lock").touch(exist_ok=True)
         self.pending_completions.append((path, record))
 
-    def complete(self) -> None:
+    def complete(self, *, pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW) -> None:
         for path, _ in self.pending_completions:
             # Pruning can remove the claim file after collection. Do not create it here.
             try:
@@ -904,9 +922,15 @@ class OrphanReapResult:
                         continue
                     current = _read_record(path)
                     if _needs_completion(current):
-                        _ = _replay_completion(path, current)
-                if _needs_push_retry(_read_record(path)):
+                        _ = _replay_completion(path, current, pane_wait=pane_wait)
+                current = _read_record(path)
+                if pane_wait == CompletionPaneWait.READY_NOW:
+                    if _needs_push_retry(current):
+                        _stage_push_alert(path)
+                elif current.get("push_alert_delivery") or _needs_push_retry(current):
                     _alert_failed_push(path, check_receipt=True)
+                _resume_orphan_result(path, replay_completion=pane_wait == CompletionPaneWait.READY_NOW
+                                      and _needs_completion(current))
             except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
                 print(" ".join(str(error).splitlines()), file=sys.stderr)
 
@@ -914,7 +938,11 @@ class OrphanReapResult:
 def reap_orphan(path: Path) -> None:
     """Recover one run while keeping other records available for comparison."""
     record = worker_lifecycle.read_json_object(path)
-    if record.get("status") != "running" or _supervisor_alive(path, record):
+    if not _is_run_record(record):
+        return
+    if record["status"] == "finished" and not (_needs_completion(record) or _result_retry_pending(record)):
+        return
+    if _supervisor_alive(path, record):
         return
     with (path.parent / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
@@ -958,7 +986,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
     for path, raw in records:
         if (only is not None and path != only) or (worker and raw.get("worker") != worker):
             continue
-        if raw["status"] == "finished" and (_needs_completion(raw) or _needs_push_retry(raw)):
+        if raw["status"] == "finished" and (_needs_completion(raw) or _result_retry_pending(raw)):
             if not _supervisor_alive(path, raw):
                 result.queue_completion(path, raw)
             continue
@@ -982,10 +1010,11 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
                 if record.get("pending_hold_stop_requests") or not _orphaned(path, record, now):
                     continue
                 record = _recover_staged_pane_stop(path, record)
-                newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
-                            and other.get("staff_id") == record["staff_id"]
-                            and _number(other.get("started_at"), 0.0) > record["started_at"]
-                            for _, other in records)
+                newer = "exit_code" not in record and any(
+                    other.get("worker") == record["worker"] and other.get("command") == record["command"]
+                    and other.get("staff_id") == record["staff_id"]
+                    and _number(other.get("started_at"), 0.0) > record["started_at"]
+                    for _, other in records)
                 if not record.get("delivery"):
                     if _cancels_pass(record):
                         if newer:
@@ -1029,20 +1058,28 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
         return _settle_completion_diagnostics(path, current)
 
 
-def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
+def _replay_completion(path: Path, record: RunRecord, *,
+                       pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW) -> CompletionReplay:
     """Keep an unresolved completion available for the next event."""
     delivery = record.get("delivery", "")
     try:
-        if _result_push_failed(delivery):
+        if _confirmed_orphan_was_superseded(record):
+            _ = _save_delivery(path, ORPHAN_RESULT_PENDING, if_current=delivery)
+            record = _read_record(path)
+            delivery = record.get("delivery", "")
+        if _result_push_failed(delivery) and not _pane_submission_not_started(delivery):
             if _result_pass_changed(record):
                 return CompletionReplay.HANDLED
             if not _unconfirmed_pass_result(record):
                 return CompletionReplay.RETRY
         if _cancels_pass(record) and delivery in ("", ORPHAN_RESULT_PENDING):
+            if pane_wait == CompletionPaneWait.READY_NOW:
+                return CompletionReplay.RETRY
             delivery = _complete_stopped_run(path, record)
             if delivery is CompletionReplay.RETRY or _worker_result_pending(delivery):
                 return CompletionReplay.RETRY
-            if _stop_fallback_delivered(record, delivery) and _complete_worker_dispatch(record) == CompletionReplay.RETRY:
+            if (_stop_fallback_delivered(record, delivery)
+                    and _complete_worker_dispatch(record, pane_wait) == CompletionReplay.RETRY):
                 return CompletionReplay.RETRY
             if delivery.startswith("finished: the pane pass "):
                 pending_close = cast(Callable[[staff.StaffId, Path], bool],
@@ -1050,30 +1087,35 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
                 if pending_close(staff.StaffId(record["staff_id"]), Path(record["session_dir"])):
                     return CompletionReplay.CLOSE_PENDING
         elif _retired_worker_result(record):
-            if _result_push_failed(deliver(record, command_result(record))):
+            if pane_wait == CompletionPaneWait.READY_NOW or _result_push_failed(deliver(record, command_result(record))):
                 return CompletionReplay.RETRY
         else:
             if delivery == ORPHAN_RESULT_PENDING:
-                delivery = deliver(record, command_result(record))
-                if _worker_result_pending(delivery) and delivery != PARKED_WORKER_RESULT:
+                if pane_wait == CompletionPaneWait.READY_NOW:
+                    submitted = _deliver(record, command_result(record), pane_wait=pane_wait)
+                    delivery = submitted.delivery if isinstance(submitted, ConfirmedPaneResult) else submitted
+                else:
+                    delivery = deliver(record, command_result(record))
+                if _worker_result_pending(delivery) and delivery not in (PARKED_WORKER_RESULT, WORKER_READINESS_PENDING):
                     return CompletionReplay.RETRY
             if (not record.get("ended_pass_result_released")
                     and delivery not in (OTHER_PASS_DELIVERY, ENDED_PASS_RESULT_QUEUED)
-                    and _complete_worker_dispatch(record) == CompletionReplay.RETRY):
+                    and _complete_worker_dispatch(record, pane_wait) == CompletionReplay.RETRY):
                 return CompletionReplay.RETRY
             if delivery == PARKED_WORKER_RESULT and _worker_result_pending(_read_record(path).get("delivery", "")):
                 return CompletionReplay.RETRY
+        current = _read_record(path)
+        if _needs_pane_input_retry(current) or (
+                current.get("completion_pending") is True
+                and current.get("delivery", "").startswith(UNCONFIRMED_WORKER_RESULT)):
+            return CompletionReplay.RETRY
+        if pane_wait == CompletionPaneWait.READY_NOW and current.get("pane_dispatch_id") != "":
+            return CompletionReplay.RETRY
+        return _settle_completion_diagnostics(path, current)
     except (Exception, SystemExit) as error:
         detail = " ".join(str(error).splitlines())
-        with contextlib.suppress(SystemExit, worker_lifecycle.WorkerStateUnreadable):
-            _ = _save_delivery(path, FAILED_RESULT_PUSH + detail, if_current=ORPHAN_RESULT_PENDING)
         print(f"anomaly: {record['run_id']}: completion event failed: {detail}", file=sys.stderr)
         return CompletionReplay.RETRY
-    if delivery.startswith(UNCONFIRMED_WORKER_RESULT):
-        current = _read_record(path)
-        if current.get("completion_pending") is True and current.get("delivery", "").startswith(UNCONFIRMED_WORKER_RESULT):
-            return CompletionReplay.RETRY
-    return _settle_completion_diagnostics(path, record)
 
 
 def _settle_completion_diagnostics(path: Path, record: RunRecord) -> CompletionReplay:
@@ -1129,7 +1171,7 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str | Literal[Comple
         return _save_delivery(path, f"finished: the pane pass {result.outcome}")
     if isinstance(result, worker_panes.Kept):
         print(f"detached_runs: {record['run_id']}: kept the pane pass: {result.blocker}", file=sys.stderr)
-    if record.get("orphan_result_superseded"):
+    if record.get("orphan_result_superseded") and "exit_code" not in record:
         return _save_delivery(path, SUPERSEDED_ORPHAN_DELIVERY)
     return deliver(record, command_result(record))
 
@@ -1188,7 +1230,7 @@ def acknowledge_worker_completion(run: Path, row: staff.StaffRow, passed: dict[s
                 completion = CompletionReplay.RETRY
             if coverage != ResultDoneCoverage.COVERED:
                 continue
-            if not _result_push_failed(delivery):
+            if not _result_push_failed(delivery) or _pane_submission_not_started(delivery):
                 path = runs / f"{record['run_id']}.json"
                 if _save_delivery(path, COVERED_BY_DONE, if_current=delivery) != COVERED_BY_DONE:
                     continue
@@ -1212,7 +1254,7 @@ def _result_pass_changed(record: RunRecord) -> bool:
     return result_is_from_another_pass(record, passed.get("instance_id"))
 
 
-def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
+def _complete_worker_dispatch(record: RunRecord, pane_wait: CompletionPaneWait) -> CompletionReplay:
     """Recheck the pass after the finished record becomes visible."""
     if not record["staff_id"] or _result_pass_changed(record):
         return CompletionReplay.HANDLED
@@ -1220,6 +1262,9 @@ def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
     if isinstance(member, staff.StaffRow) and member.kind == "worker":
         module = import_module("scripts.herdr.turn_end")
         link = record.get("pane_dispatch_id", "")
+        if pane_wait == CompletionPaneWait.READY_NOW:
+            return cast(Callable[[staff.StaffId, str, CompletionPaneWait], CompletionReplay],
+                        module.run_finished)(member.id, link if isinstance(link, str) else "", pane_wait)
         if isinstance(link, str) and link:
             return cast(Callable[[staff.StaffId, str], CompletionReplay], module.run_finished)(member.id, link)
         return cast(Callable[[staff.StaffId], CompletionReplay], module.run_finished)(member.id)
@@ -1227,7 +1272,8 @@ def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
 
 
 # Keep the record lock at its path until the record is gone.
-_RUN_FILES = ("{}.log", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-staged",
+_RUN_FILES = ("{}.log", "{}.completion.lock", ".{}.delivery.lock", ".{}.transport.lock", ".{}.alert.lock", ".{}.retry.lock",
+              ".{}.blocked-notice.lock", "{}.stop-staged",
               "{}" + CONFIRMED_STOP_SUFFIX, "{}" + PENDING_STOP_SUFFIX,
               "{}" + process_stop.RUN_SLICE_RECORD_SUFFIX, "{}.json", "{}.record.lock", "{}.scope-stop.lock")
 
@@ -1241,10 +1287,20 @@ def prune_finished(runs: Path) -> list[str]:
         return _prune_finished_locked(runs)
 
 
+def _keeps_finished_result(record: Mapping[str, object], *, owner_gone: bool) -> bool:
+    if record.get("push_alert_delivery"):
+        return True
+    if owner_gone and record.get("push_alert_attempted") is True:
+        return False
+    return (bool(record.get("completion_pending")) or _worker_result_pending(str(record.get("delivery", "")))
+            or _confirmed_orphan_was_superseded(record))
+
+
 def _prune_finished_locked(runs: Path) -> list[str]:
     """Delete settled finished runs while the caller holds the admission lock.
 
     Keep a worker result until the saved stage and reply prove completion.
+    An accepted alert settles the result for a retired worker.
     Keep another owner's result until that owner starts again.
     Keep stop notice evidence until the caller acknowledges the notice ID.
     """
@@ -1267,15 +1323,16 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     removed: list[str] = []
     for path, raw in records:
         run_id = raw.get("run_id")
-        if (raw.get("status") != "finished" or raw.get("completion_pending")
-                or _worker_result_pending(str(raw.get("delivery", "")))
-                or not isinstance(run_id, str) or path.name != f"{run_id}.json"):
+        if raw.get("status") != "finished" or not isinstance(run_id, str) or path.name != f"{run_id}.json":
             continue
         started = _number(raw.get("started_at"), 0.0)
         staff_id = str(raw.get("staff_id", ""))
         if staff_id and membership is None:
             continue
         member = membership.by_id(staff.StaffId(staff_id)) if staff_id and membership is not None else None
+        owner_gone = bool(staff_id) and member is None
+        if _keeps_finished_result(raw, owner_gone=owner_gone):
+            continue
         if member is not None and member.kind == "worker":
             if member.id not in passes:
                 passes[member.id] = worker_panes.worker_pass(member, runs.parent, record=membership)
@@ -1295,8 +1352,8 @@ def _prune_finished_locked(runs: Path) -> list[str]:
         with record_lock(path):
             current = worker_lifecycle.read_json_object(path)
             if (current.get("run_id") != run_id or current.get("status") != "finished"
-                    or current.get("stop_notice_id") or current.get("completion_pending")
-                    or _worker_result_pending(str(current.get("delivery", "")))):
+                    or current.get("staff_id", "") != staff_id or current.get("stop_notice_id")
+                    or _keeps_finished_result(current, owner_gone=owner_gone)):
                 continue
             if _has_saved_cgroup(current) and not _command_has_ended(current, _integer(current.get("pid"))):
                 continue
@@ -1490,7 +1547,15 @@ class WorkerRunReceipt:
 DEFERRED_WORKER_RESULT = "deferred: "
 ORPHAN_RESULT_PENDING = DEFERRED_WORKER_RESULT + "the supervisor ended before delivery"
 PARKED_WORKER_RESULT = DEFERRED_WORKER_RESULT + "the worker is parked"
+BUSY_WORKER_RESULT = DEFERRED_WORKER_RESULT + "worker is working"
+WORKER_INPUT_NOT_READY = "worker is not ready for input"
+WORKER_READINESS_PENDING = DEFERRED_WORKER_RESULT + WORKER_INPUT_NOT_READY
+WORKER_INPUT_LOCK_HELD = DEFERRED_WORKER_RESULT + "the worker lock is held"
+WORKER_CLOSED_RESULT = DEFERRED_WORKER_RESULT + "worker pane is closed"
+WORKER_BLOCKED_RESULT = DEFERRED_WORKER_RESULT + "worker is blocked"
+RESULT_RELAY_PENDING = DEFERRED_WORKER_RESULT + "the result needs a relay"
 FAILED_WORKER_SUBMISSION = "submission failed: "
+LEGACY_WORKER_READINESS_FAILURE = FAILED_WORKER_SUBMISSION + WORKER_INPUT_NOT_READY
 UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
 WORKER_INPUT_CHECKPOINT = UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input"
 FAILED_RESULT_PUSH = "result push failed: "
@@ -1502,13 +1567,61 @@ def _worker_result_pending(delivery: str) -> bool:
                                 FAILED_RESULT_PUSH))
 
 
+def _result_delivery_accepted(delivery: str) -> bool:
+    return delivery.startswith(("sent: ", "queued: ", "skipped: ", "kept: ", "already delivered: "))
+
+
 def _result_push_failed(delivery: str) -> bool:
-    return delivery.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION, UNCONFIRMED_WORKER_RESULT))
+    return delivery != LEGACY_WORKER_READINESS_FAILURE and delivery.startswith((
+        FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION, UNCONFIRMED_WORKER_RESULT))
 
 
 def _needs_push_retry(record: RunRecord) -> bool:
-    return (record["status"] == "finished" and not record.get("push_alert_attempted")
-            and _result_push_failed(record.get("delivery", "")))
+    return (record["status"] == "finished" and _has_unreported_push_failure(record)
+            and not _pane_submission_not_started(record.get("delivery", "")))
+
+
+def _has_unreported_push_failure(record: RunRecord) -> bool:
+    return not record.get("push_alert_attempted") and _result_push_failed(record.get("delivery", ""))
+
+
+def _pane_submission_not_started(delivery: str) -> bool:
+    return delivery.startswith(FAILED_WORKER_SUBMISSION)
+
+
+def _awaits_pane_receipt(record: RunRecord) -> bool:
+    delivery = record.get("delivery", "")
+    return (record["status"] == "finished" and delivery.startswith(UNCONFIRMED_WORKER_RESULT)
+            and not delivery.startswith(UNCONFIRMED_RESULT_PUSH))
+
+
+def _failed_pane_attempt(record: RunRecord) -> bool:
+    delivery = record.get("delivery", "")
+    return (record["status"] == "finished" and _pane_submission_not_started(delivery)
+            and delivery != LEGACY_WORKER_READINESS_FAILURE)
+
+
+def _needs_pane_input_retry(record: RunRecord) -> bool:
+    delivery = record.get("delivery", "")
+    return record["status"] == "finished" and (
+        _pane_submission_not_started(delivery) or delivery.startswith(DEFERRED_WORKER_RESULT))
+
+
+def _needs_stopped_result_completion(record: RunRecord) -> bool:
+    delivery = record.get("delivery", "")
+    return record["status"] == "finished" and _cancels_pass(record) and (
+        delivery == ORPHAN_RESULT_PENDING or (not delivery and record.get("completion_pending") is True))
+
+
+def _result_send_not_started(record: RunRecord, detail: str) -> str:
+    if (record["run_id"].endswith(f"@{record['staff_id']}") or record.get("pane_dispatch_id")
+            or record.get("self_stop")):
+        return WORKER_READINESS_PENDING
+    with contextlib.suppress(staff.StaffUnreadable):
+        member = _run_owner(record, staff.local_snapshot())
+        if isinstance(member, staff.StaffRow) and member.kind == "worker":
+            return WORKER_READINESS_PENDING
+    return FAILED_RESULT_PUSH + detail
 
 
 def _unconfirmed_pass_result(record: RunRecord) -> bool:
@@ -1518,7 +1631,10 @@ def _unconfirmed_pass_result(record: RunRecord) -> bool:
 
 
 def _needs_completion(record: RunRecord) -> bool:
-    return ((not _result_push_failed(record.get("delivery", "")) or _unconfirmed_pass_result(record))
+    if _confirmed_orphan_was_superseded(record):
+        return True
+    return ((not _result_push_failed(record.get("delivery", "")) or _needs_pane_input_retry(record)
+             or _unconfirmed_pass_result(record))
             and bool(record.get("completion_pending") or _retired_worker_result(record)))
 
 
@@ -1833,7 +1949,9 @@ def stage_ended_pass_results(run: Path, row: staff.StaffRow, director: staff.Sta
         if saved["run_id"] not in ids:
             continue
         path = directory / f"{saved['run_id']}.json"
-        with _delivery_lock(path):
+        with _delivery_lock(path), _result_transport_claim(path) as claimed:
+            if not claimed:
+                continue
             record = _read_record(path)
             if (record["staff_id"] != row.id or record["status"] != "finished"
                     or Path(record["session_dir"]).resolve() != run.resolve()
@@ -2280,10 +2398,10 @@ def command_start(args: argparse.Namespace) -> int:
                 )
             record["pid"] = supervisor.pid
             _ = _write_record(record_path, record)
+        print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
+              + "its result arrives as your next message", flush=True)
     finally:
-        reaped.complete()
-    print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
-          + "its result arrives as your next message", flush=True)
+        reaped.complete(pane_wait=CompletionPaneWait.READY_NOW)
     try:
         _ = prune_finished(runs)
     except (OSError, ValueError, recorder_state.OldRecorderState) as error:
@@ -2435,12 +2553,12 @@ def _unconfirmed_result_received(record: RunRecord, membership: staff.StaffSnaps
         if isinstance(member, RunOwnerUnavailable):
             return False
     marker = f"Detached run: {record['run_id']}"
-    with contextlib.suppress(OSError, ValueError):
+    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
         if _result_received(member, membership, marker):
             return True
     if member.kind == "worker" and delivery.startswith(UNCONFIRMED_RESULT_PUSH):
         holder = membership.parent_of(member)
-        with contextlib.suppress(OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
             return holder is not None and _result_received(holder, membership, marker)
     return False
 
@@ -2462,7 +2580,8 @@ def _keep_send_error(path: Path) -> Generator[None]:
 
 class WorkerResultInput(Enum):
     TYPE = "submit the result to an idle worker"
-    TURN_ENDED = "wait for the pane to become idle after the turn ends"
+    WAIT_FOR_READINESS = "allow a wait for input readiness on an idle pane"
+    TURN_ENDED = "allow a wait for a busy pane after a Stop"
 
 
 class WorkerResultTarget(Enum):
@@ -2490,10 +2609,23 @@ class AcquireWorkerInputLock(Enum):
 
 class HeldWorkerInputLock(Protocol):
     def owns(self, row: staff.StaffRow) -> bool: ...
+    def defer_until_unlock(self, key: Hashable, action: Callable[[], None]) -> None: ...
 
 
 def _delivery_lock_path(runs: Path, run_id: str) -> Path:
     return runs / f".{run_id}.delivery.lock"
+
+
+@contextlib.contextmanager
+def _result_transport_claim(path: Path) -> Generator[bool]:
+    """Claim transport without blocking the worker or the delivery lock."""
+    with path.with_name(f".{path.stem}.transport.lock").open("a") as claim:
+        try:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 @contextlib.contextmanager
@@ -2508,6 +2640,9 @@ def guard_worker_park(run: Path, run_ids: tuple[str, ...]) -> Generator[bool]:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                yield False
+                return
+            if not locks.enter_context(_result_transport_claim(run / DETACHED_RUNS_DIR / f"{run_id}.json")):
                 yield False
                 return
         yield True
@@ -2544,12 +2679,34 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
     return delivery.delivery if isinstance(delivery, ConfirmedPaneResult) else delivery
 
 
-def _deliver(record: RunRecord, result: CommandResult, *,
-             worker_input: WorkerResultInput = WorkerResultInput.TYPE,
-             resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
-             input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
+def _deliver(record: RunRecord, result: CommandResult, *, pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
              ) -> str | ConfirmedPaneResult:
-    """Deliver the command result to its current worker or director."""
+    delivery = _prepare_result_delivery(record, result, pane_wait=pane_wait)
+    if isinstance(delivery, PreparedResultRelay):
+        if pane_wait == CompletionPaneWait.READY_NOW:
+            return _save_delivery(delivery.path, RESULT_RELAY_PENDING, if_current=record.get("delivery", ""))
+        return delivery.complete()
+    return delivery
+
+
+@dataclass(frozen=True)
+class PreparedResultRelay:
+    path: Path
+    transport: Callable[[], str]
+
+    def complete(self) -> str:
+        with _result_transport_claim(self.path) as claimed:
+            if not claimed:
+                return DEFERRED_WORKER_RESULT + "a result submission is active"
+            return self.transport()
+
+
+def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
+                             resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
+                             input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
+                             pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
+                             ) -> str | ConfirmedPaneResult | PreparedResultRelay:
+    """Submit pane input under the worker lock and prepare relays for later."""
     runs = _runs_dir(record["session_dir"])
     path = runs / f"{record['run_id']}.json"
     self_stop = record.get("self_stop") is True
@@ -2557,11 +2714,12 @@ def _deliver(record: RunRecord, result: CommandResult, *,
     done_file = "" if record.get("slice_leftovers") or record.get("scope_error") else record["done_message_file"]
     if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS) and not record.get("stop_reason"):
         return _save_delivery(path, _success_only_delivery(result))
+    from scripts.herdr import worker_panes
     from scripts.message import send
 
     marker = f"Detached run: {record['run_id']}"
 
-    def save_push(sent: send.Result, *, interrupted: bool = False) -> str:
+    def save_push(sent: send.Result, *, expected: str, interrupted: bool = False) -> str:
         detail = f"{sent.outcome}: {sent.detail}"
         if isinstance(sent, (send.UncertainRelayDelivery, send.WorkerMessageUnconfirmed)):
             detail = UNCONFIRMED_RESULT_PUSH + detail
@@ -2571,34 +2729,44 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             detail = UNCONFIRMED_RESULT_PUSH + detail
         elif interrupted:
             detail = INTERRUPTED_PASS_DELIVERY + detail
-        return _save_delivery(path, detail)
+        return _save_delivery(path, detail, if_current=expected)
 
-    def save_deferral(detail: str) -> str:
-        return _save_delivery(path, saved if saved.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION)) else detail)
-
-    with _delivery_lock(path), contextlib.ExitStack() as locks:
-        with record_lock(path):
+    with contextlib.ExitStack() as after_unlock, _result_transport_claim(path) as claimed, contextlib.ExitStack() as lock:
+        if not claimed:
+            return DEFERRED_WORKER_RESULT + "a result submission is active"
+        with _delivery_lock(path), record_lock(path):
             current_record = _read_record(path)
             saved = current_record.get("delivery", "")
             if "worker_result_receipt" in current_record and saved and not _worker_result_pending(saved):
                 return f"already delivered: {record['run_id']}"
         unconfirmed = saved.startswith(UNCONFIRMED_WORKER_RESULT)
+        failed_pane_attempt = _failed_pane_attempt(current_record)
         try:
             membership = staff.snapshot()
         except staff.StaffUnreadable as error:
             if unconfirmed or (saved and not _worker_result_pending(saved)):
                 return saved
-            return _save_delivery(path, FAILED_RESULT_PUSH + str(error))
+            if _needs_pane_input_retry(current_record):
+                return saved
+            return _save_delivery(path, _result_send_not_started(record, str(error)))
         member = _run_owner(record, membership)
         if (unconfirmed and (isinstance(member, RunOwnerUnavailable) or member.kind != "worker")
                 and _unconfirmed_result_received(record, membership, saved)):
             return _save_delivery(path, f"already delivered: {record['run_id']}")
         if isinstance(member, RunOwnerUnavailable) and (
                 not self_stop or membership.by_id(staff.StaffId(record["staff_id"])) is not None):
-            if _result_push_failed(saved):
+            if saved and not _worker_result_pending(saved):
+                return saved
+            failed_push = _result_push_failed(saved) and not _pane_submission_not_started(saved)
+            if not self_stop and isinstance(result, CompletedCommand):
+                failure = saved if failed_push else FAILED_RESULT_PUSH + member.reason
+                return _save_delivery(path, failure, if_current=saved, stage_push_alert=True)
+            if failed_push:
                 return saved
             print(f"anomaly: {member.reason}", file=sys.stderr)
-            return _save_delivery(path, "finished: worker retired")
+            delivery = ("finished: worker retired" if self_stop
+                        else "nothing delivered: the supervisor ended before it reported an exit status")
+            return _save_delivery(path, delivery, if_current=saved)
         checkpoint = UNCONFIRMED_RESULT_PUSH + "the send did not record an outcome"
         if _result_push_failed(saved):
             checkpoint += f" after {saved}"
@@ -2611,23 +2779,35 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 except (worker_admission.RunOwnerUnavailable, staff.StaffUnreadable) as error:
                     if isinstance(error, staff.StaffUnreadable) or record.get("ended") == "supervisor gone":
                         return _save_delivery(path, FAILED_RESULT_PUSH + f"director unavailable: {error}")
-                    return save_deferral(DEFERRED_WORKER_RESULT + f"director unavailable: {error}")
+                    return _save_delivery(path, DEFERRED_WORKER_RESULT + f"director unavailable: {error}")
             options = send.parse(["--to", str(member.id), "--from", "detached-runs",
                                   "--timeout", str(send_budget.seconds()), "--text",
                                   _worker_result_message(record, result)])
-            _ = _save_delivery(path, checkpoint)
-            with _keep_send_error(path), staff.supplied_snapshot(membership):
-                sent = send.send(options)
-            return save_push(sent)
+            def relay_to_director() -> str:
+                with _delivery_lock(path):
+                    current = _save_delivery(path, checkpoint, if_current=saved)
+                    if current != checkpoint:
+                        return current
+                with _keep_send_error(path), staff.supplied_snapshot(membership):
+                    sent = send.send(options)
+                return save_push(sent, expected=checkpoint)
+
+            return PreparedResultRelay(path, relay_to_director)
         if saved and not _worker_result_pending(saved):
             return saved
         worker = member
-        pane_checkpoint = checkpoint if saved.startswith(FAILED_RESULT_PUSH) else WORKER_INPUT_CHECKPOINT
+
+        if isinstance(input_lock, AcquireWorkerInputLock):
+            try:
+                _ = lock.enter_context(worker_panes.worker_id_lock(worker.id))
+            except BlockingIOError:
+                _ = _save_delivery(path, WORKER_INPUT_LOCK_HELD, if_current="")
+                return WORKER_INPUT_LOCK_HELD
+        elif not input_lock.owns(worker):
+            return WORKER_INPUT_LOCK_HELD
 
         def read_pass(selected: staff.StaffRow, selected_membership: staff.StaffSnapshot
                       ) -> tuple[ResultPassOwnership, dict[str, object]]:
-            from scripts.herdr import worker_panes
-
             if record.get("pane_dispatch_id") == "":
                 return ResultPassOwnership.OUTSIDE_PASS, {}
             try:
@@ -2656,10 +2836,12 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             read_coverage = cast(Callable[[staff.StaffRow, dict[str, object], RunRecord],
                 ResultDoneCoverage | ResultTranscriptUnknown],
                 import_module("scripts.production.worker").result_done_coverage)
-            coverage = read_coverage(selected, passed, record)
-            if not isinstance(coverage, str):
-                raise _WorkerPassDeliveryBlocked(
-                    DEFERRED_WORKER_RESULT + f"worker transcript is unavailable: {coverage.reason}")
+            try:
+                coverage = read_coverage(selected, passed, record)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise _WorkerPassDeliveryBlocked(WORKER_READINESS_PENDING) from error
+            if isinstance(coverage, ResultTranscriptUnknown):
+                raise _WorkerPassDeliveryBlocked(WORKER_READINESS_PENDING)
             if coverage == ResultDoneCoverage.COVERED:
                 raise _WorkerPassDeliveryBlocked(COVERED_BY_DONE)
             if isinstance(stage, UnknownResultStage):
@@ -2677,16 +2859,13 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             return target, SendResultAlone.SEND
 
         park_acceptance = ParkedAssignmentAcceptance.UNRECORDED
+        pane_checkpoint_saved = False
+        expected_delivery = saved
+
+        def save_outcome(status: str) -> str:
+            return _save_delivery(path, status, if_current=expected_delivery)
 
         def validate_transport(*, pane_input: bool = False) -> dict[str, object]:
-            from scripts.herdr import worker_panes
-
-            if isinstance(input_lock, AcquireWorkerInputLock):
-                try:
-                    _ = locks.enter_context(worker_panes.worker_id_lock(worker.id))
-                except BlockingIOError as error:
-                    raise _WorkerPassDeliveryBlocked(
-                        DEFERRED_WORKER_RESULT + "the worker lock is held") from error
             try:
                 current_membership = staff.local_snapshot()
             except staff.StaffUnreadable as error:
@@ -2695,8 +2874,6 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             if (current is None or current.kind != "worker" or current.current_session != worker.current_session
                     or current.parent != worker.parent or current.name != worker.name):
                 raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the worker session changed")
-            if not isinstance(input_lock, AcquireWorkerInputLock) and not input_lock.owns(current):
-                raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the worker lock changed")
             holder = membership.parent_of(worker)
             current_holder = current_membership.parent_of(current)
             if holder is None or current_holder is None or current_holder.current_session != holder.current_session:
@@ -2717,7 +2894,7 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             return current_pass
 
         def before_input() -> None:
-            nonlocal park_acceptance
+            nonlocal park_acceptance, pane_checkpoint_saved, expected_delivery
             from scripts.direct import progress_history
 
             current_pass = validate_transport(pane_input=True)
@@ -2727,15 +2904,14 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                     and isinstance(parked_launch, progress_history.ParkedWorkerLaunch)
                     and parked_launch.thread == worker.current_session):
                 park_acceptance = ParkedAssignmentAcceptance.VERIFIED
-            _ = _save_delivery(path, pane_checkpoint)
+            current = save_outcome(WORKER_INPUT_CHECKPOINT)
+            if current != WORKER_INPUT_CHECKPOINT:
+                raise _WorkerPassDeliveryBlocked(current)
+            expected_delivery = current
+            pane_checkpoint_saved = True
 
-        def before_holder() -> None:
-            _ = validate_transport()
-            _ = _save_delivery(path, checkpoint)
-
-        request = send.WorkerResultSubmission(wait_for_idle=worker_input == WorkerResultInput.TURN_ENDED,
-            worker_only=self_stop, before_input=before_input, before_holder=before_holder)
-        reason = ""
+        request = send.WorkerResultSubmission(worker_only=self_stop or pane_wait == CompletionPaneWait.READY_NOW,
+                                              before_input=before_input)
         try:
             ownership, passed = read_pass(worker, membership)
             require_owned_pass(ownership)
@@ -2743,25 +2919,30 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                           else ResultWithoutPass.OUTSIDE)
             if unconfirmed:
                 if _unconfirmed_result_received(record, membership, saved):
-                    return _save_delivery(path, f"already delivered: {record['run_id']}")
+                    return save_outcome(f"already delivered: {record['run_id']}")
             else:
                 try:
                     if _result_received(worker, membership, marker):
-                        return _save_delivery(path, f"already delivered: {record['run_id']}")
-                except (OSError, ValueError) as error:
-                    reason = f"worker transcript is unavailable: {error}"
+                        return save_outcome(f"already delivered: {record['run_id']}")
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    if failed_pane_attempt:
+                        return WORKER_READINESS_PENDING
+                    return save_outcome(WORKER_READINESS_PENDING)
             target, reply_instruction = check_pass(worker, ownership, passed, assignment)
             if unconfirmed:
                 return saved
-            if target is WorkerResultTarget.DIRECTOR:
-                reason = target.value
+            reason = target.value if target is WorkerResultTarget.DIRECTOR else ""
             if target is WorkerResultTarget.PARKED and not isinstance(resume_parked, ParkedWorkerDelivery):
-                if not resume_parked():
-                    return save_deferral(DEFERRED_WORKER_RESULT + "the parked worker could not resume")
+                restored = resume_parked()
+                latest = _read_record(path).get("delivery", "")
+                if latest != expected_delivery:
+                    return latest
+                if not restored:
+                    return save_outcome(DEFERRED_WORKER_RESULT + "the parked worker could not resume")
                 membership = staff.local_snapshot()
                 resumed = membership.by_id(worker.id)
                 if resumed is None:
-                    return save_deferral(DEFERRED_WORKER_RESULT + "the resumed worker is unavailable")
+                    return save_outcome(DEFERRED_WORKER_RESULT + "the resumed worker is unavailable")
                 worker = resumed
                 request = replace(request, worker_only=True)
             text = _worker_result_message(record, result)
@@ -2770,75 +2951,116 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 separator = "" if text.endswith("\n") else "\n"
                 pane_text = (f"{text}{separator}End your final reply with this line alone: "
                              f"DONE {reply_instruction.completion_id}")
-            timeout = send_budget.seconds()
-            with _keep_send_error(path):
-                delivery = send.deliver_worker_text(worker, membership, text,
-                    sender="detached-runs", timeout=timeout, reason=reason, receipt=request, review_text=pane_text)
-                if isinstance(delivery, send.BlockedWorkerResult):
-                    if not _cancels_pass(record):
-                        _ = validate_transport()
-                        return _defer_blocked_worker_result(path, delivery)
-                    before_holder()
-                    delivery = delivery.send_to_holder(delivery.detail, text)
         except _WorkerPassDeliveryBlocked as blocked:
             status = str(blocked)
             if unconfirmed:
                 # DONE can settle the pass. Keep the uncertain delivery for the alert.
                 return COVERED_BY_DONE if status == COVERED_BY_DONE else saved
-            if status in (OTHER_PASS_DELIVERY, COVERED_BY_DONE):
-                return _save_delivery(path, status)
-            return save_deferral(status)
+            if failed_pane_attempt and status.startswith(DEFERRED_WORKER_RESULT):
+                return status
+            return save_outcome(status)
+
+        def relay_to_holder(relay: send.WorkerResultHolderRelay) -> str:
+            try:
+                with worker_panes.worker_id_lock(worker.id):
+                    try:
+                        _ = validate_transport()
+                    except _WorkerPassDeliveryBlocked as blocked:
+                        return save_outcome(str(blocked))
+                    current = save_outcome(checkpoint)
+            except BlockingIOError:
+                _ = _save_delivery(path, WORKER_INPUT_LOCK_HELD, if_current="")
+                return WORKER_INPUT_LOCK_HELD
+            if current != checkpoint:
+                return current
+            with _keep_send_error(path):
+                delivery = relay.send_to_holder(relay.detail, text)
+            return save_push(delivery, expected=checkpoint, interrupted=target is WorkerResultTarget.DIRECTOR)
+
+        try:
+            if failed_pane_attempt:
+                follow_up = _check_pane_attempt(path, current_record, membership)
+                if _read_record(path).get("push_alert_delivery"):
+                    if not isinstance(input_lock, AcquireWorkerInputLock):
+                        _resume_result_after_unlock(input_lock, path)
+                    elif pane_wait == CompletionPaneWait.ALLOW:
+                        _ = after_unlock.callback(_send_staged_push_alert, path, check_receipt=True)
+                if follow_up is PaneAttemptFollowUp.RECEIPT_FOUND:
+                    return f"already delivered: {record['run_id']}"
+                if follow_up is PaneAttemptFollowUp.BUSY:
+                    return BUSY_WORKER_RESULT
+                if follow_up is PaneAttemptFollowUp.CHECK_AGAIN:
+                    return WORKER_READINESS_PENDING
+            with _keep_send_error(path):
+                delivery = send.deliver_worker_text(worker, membership, text, sender="detached-runs",
+                    timeout=send_budget.seconds(), reason=reason, receipt=request, review_text=pane_text)
+                if isinstance(delivery, send.WorkerResultHolderRelay):
+                    if pane_checkpoint_saved:
+                        return save_outcome(UNCONFIRMED_WORKER_RESULT + delivery.detail)
+                    if isinstance(delivery, send.BlockedWorkerResult) and not _cancels_pass(record):
+                        _ = validate_transport()
+                        deferred = save_outcome(DEFERRED_WORKER_RESULT + delivery.detail)
+                        notice = delivery
+                        if isinstance(input_lock, AcquireWorkerInputLock):
+                            _ = after_unlock.callback(_send_blocked_worker_notice, path, notice)
+                        else:
+                            _resume_result_after_unlock(input_lock, path)
+                        return deferred
+                    relay = delivery
+                    return PreparedResultRelay(path, lambda: relay_to_holder(relay))
+        except _WorkerPassDeliveryBlocked as blocked:
+            status = str(blocked)
+            if failed_pane_attempt and not pane_checkpoint_saved and status.startswith(DEFERRED_WORKER_RESULT):
+                return status
+            return save_outcome(status)
+        if isinstance(delivery, send.WorkerResultNotReady):
+            return save_outcome(WORKER_READINESS_PENDING)
         if isinstance(delivery, send.WorkerResultNotSubmitted):
-            return save_deferral(FAILED_WORKER_SUBMISSION + delivery.detail)
-        if isinstance(delivery, send.WorkerResultUnconfirmed):
-            prefix = UNCONFIRMED_RESULT_PUSH if saved.startswith(FAILED_RESULT_PUSH) else UNCONFIRMED_WORKER_RESULT
-            return _save_delivery(path, prefix + delivery.detail)
-        if delivery.outcome == "retry":
-            return save_deferral(DEFERRED_WORKER_RESULT + delivery.detail)
+            return save_outcome(FAILED_WORKER_SUBMISSION + delivery.detail)
         if isinstance(delivery, send.WorkerResultSubmitted):
             if isinstance(assignment, UnknownResultStage):
-                return _save_delivery(path, UNCONFIRMED_WORKER_RESULT + assignment.value)
+                return save_outcome(UNCONFIRMED_WORKER_RESULT + assignment.value)
             receipt = WorkerResultReceipt(record["run_id"], Path(record["session_dir"]).resolve(),
-                                          delivery.worker, delivery.session, delivery.pane, delivery.terminal, assignment, delivery.cursor,
-                                          delivery.input_digest, park_acceptance)
+                                          delivery.worker, delivery.session, delivery.pane, delivery.terminal,
+                                          assignment, delivery.cursor, delivery.input_digest, park_acceptance)
             submission = ConfirmedPaneResult(ownership, receipt, delivery.detail)
-            _ = _save_delivery(path, submission.delivery, worker_result_receipt=receipt)
-            return submission
-        return save_push(delivery, interrupted=target is WorkerResultTarget.DIRECTOR)
+            current = _save_delivery(path, submission.delivery, if_current=expected_delivery,
+                                     worker_result_receipt=receipt)
+            return submission if current == submission.delivery else current
+        if pane_checkpoint_saved or isinstance(delivery, send.WorkerResultUnconfirmed):
+            return save_outcome(UNCONFIRMED_WORKER_RESULT + delivery.detail)
+        if delivery.outcome == "retry":
+            return save_outcome(DEFERRED_WORKER_RESULT + delivery.detail)
+        return save_push(delivery, expected=expected_delivery, interrupted=target is WorkerResultTarget.DIRECTOR)
 
 
-def _defer_blocked_worker_result(path: Path, delivery: send.BlockedWorkerResult) -> str:
-    """Keep the result pending and send a separate notice to the holder."""
+def _send_blocked_worker_notice(path: Path, delivery: send.BlockedWorkerResult) -> None:
+    """Send one pending notice without holding the worker or delivery lock."""
     from scripts.message import send
 
-    deferred = DEFERRED_WORKER_RESULT + delivery.detail
-    with record_lock(path):
+    with path.with_name(f".{path.stem}.blocked-notice.lock").open("a") as claim:
+        try:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
         record = _read_record(path)
-        saved = record.get("delivery", "")
-        if not _result_push_failed(saved):
-            saved = deferred
-            record["delivery"] = saved
-        record["completion_pending"] = True
-        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-    if record.get("blocked_notice_accepted"):
-        return saved
-    label = send.one_line(record["label"], limit=80)
-    sent = delivery.send_to_holder(f"needs input. The result for {label} waits.", str(path))
-    if sent.outcome in ("sent", "queued", "skipped", "kept"):
-        with record_lock(path):
-            record = _read_record(path)
-            record["blocked_notice_accepted"] = True
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-    else:
-        print(f"detached_runs: {record['run_id']}: blocked worker notice {sent.outcome}: {sent.detail}", file=sys.stderr)
-    return saved
-
+        if record.get("blocked_notice_accepted") or record.get("delivery") != DEFERRED_WORKER_RESULT + delivery.detail:
+            return
+        label = send.one_line(record["label"], limit=80)
+        sent = delivery.send_to_holder(f"needs input. The result for {label} waits.", str(path))
+        if sent.outcome in ("sent", "queued", "skipped", "kept"):
+            with record_lock(path):
+                record = _read_record(path)
+                record["blocked_notice_accepted"] = True
+                _ = _write_record_locked(path, record)
+        else:
+            print(f"detached_runs: {record['run_id']}: blocked worker notice {sent.outcome}: {sent.detail}", file=sys.stderr)
 
 class KeepWorkerResultReceipt(Enum):
     EXISTING = "retain the saved receipt"
 
 
-def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None,
+def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None, stage_push_alert: bool = False,
                    worker_result_receipt: WorkerResultReceipt | KeepWorkerResultReceipt = KeepWorkerResultReceipt.EXISTING,
                    ) -> str:
     with record_lock(path):
@@ -2846,7 +3068,15 @@ def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None,
         current = record.get("delivery", "")
         if if_current is not None and if_current != current:
             return current
+        if delivery == WORKER_INPUT_CHECKPOINT:
+            _ = record.pop("pane_submit_failure_counted", None)
+        if _result_delivery_accepted(delivery):
+            _ = record.pop("push_alert_delivery", None)
         record["delivery"] = delivery
+        if stage_push_alert and _has_unreported_push_failure(record) and not record.get("push_alert_delivery"):
+            record["push_alert_delivery"] = delivery
+        if _needs_pane_input_retry(record) or _awaits_pane_receipt(record):
+            record["completion_pending"] = True
         if isinstance(worker_result_receipt, WorkerResultReceipt):
             record["worker_result_receipt"] = worker_result_receipt.to_json()
         if (delivery not in (COVERED_BY_DONE, OTHER_PASS_DELIVERY)
@@ -2860,6 +3090,7 @@ class WorkerResultReplay(Enum):
     NONE = "no result needs submission"
     RETRY = "result delivery is unresolved"
     DUPLICATE = "the transcript prevented duplicate input"
+    WAIT_FOR_INPUT = "wait for the pane to accept input before retrying"
 
 
 @dataclass(frozen=True)
@@ -2879,10 +3110,13 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
                                   worker_input: WorkerResultInput,
                                   resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
                                   input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
+                                  pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
                                   ) -> WorkerResultReplay | ConfirmedPaneResult:
     """Submit one waiting result. The next turn can receive the next result."""
     from scripts.herdr import worker_panes
 
+    if not isinstance(input_lock, AcquireWorkerInputLock) and not input_lock.owns(worker):
+        return WorkerResultReplay.RETRY
     passed = worker_panes.worker_pass(worker, run)
     runs = run / DETACHED_RUNS_DIR
     for record in _registered_runs(runs, worker.id):
@@ -2891,54 +3125,143 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
                 or not _worker_result_pending(record.get("delivery", ""))):
             continue
         ownership = result_pass_ownership(record, worker, run, passed)
-        if _unconfirmed_pass_result(record) or (
-                ownership is ResultPassOwnership.OTHER_PASS and _result_push_failed(record.get("delivery", ""))):
-            continue
+        saved = record.get("delivery", "")
         path = runs / f"{record['run_id']}.json"
+        if _unconfirmed_pass_result(record) or (ownership is ResultPassOwnership.OTHER_PASS
+                and _result_push_failed(saved) and not _pane_submission_not_started(saved)):
+            if pane_wait == CompletionPaneWait.ALLOW and not isinstance(input_lock, AcquireWorkerInputLock):
+                _resume_result_after_unlock(input_lock, path)
+            continue
         try:
-            delivery = _deliver(record, command_result(record), worker_input=worker_input,
-                                resume_parked=resume_parked, input_lock=input_lock)
-        except (Exception, SystemExit, KeyboardInterrupt) as error:
-            detail = " ".join(str(error).splitlines()) or type(error).__name__
-            _alert_late_delivery_failure(path, detail)
+            delivery = _prepare_result_delivery(record, command_result(record), resume_parked=resume_parked,
+                                                input_lock=input_lock, pane_wait=pane_wait)
+            if isinstance(delivery, PreparedResultRelay):
+                if not isinstance(input_lock, AcquireWorkerInputLock):
+                    _ = _save_delivery(path, RESULT_RELAY_PENDING, if_current=saved)
+                    _resume_result_after_unlock(input_lock, path)
+                    return WorkerResultReplay.RETRY
+                delivery = delivery.complete()
+        except (Exception, SystemExit, KeyboardInterrupt):
+            _handle_late_delivery_failure(input_lock, path)
             raise
         if ownership is ResultPassOwnership.OTHER_PASS:
             continue
         if isinstance(delivery, ConfirmedPaneResult):
             return delivery
-        if _result_push_failed(delivery):
-            _alert_late_delivery_failure(path)
-        if _worker_result_pending(delivery):
-            return WorkerResultReplay.RETRY
-        if delivery.startswith("already delivered: ") and not isinstance(resume_parked, ParkedWorkerDelivery):
-            return WorkerResultReplay.DUPLICATE
+        replay = _worker_delivery_replay(delivery, worker_input, resume_parked)
+        if _result_push_failed(delivery) and not _pane_submission_not_started(delivery):
+            _handle_late_delivery_failure(input_lock, path)
+        elif (replay is WorkerResultReplay.RETRY and pane_wait == CompletionPaneWait.ALLOW
+              and not isinstance(input_lock, AcquireWorkerInputLock)):
+            _resume_result_after_unlock(input_lock, path)
+        if replay is not WorkerResultReplay.NONE:
+            return replay
     return WorkerResultReplay.NONE
 
 
-def _alert_late_delivery_failure(path: Path, error: str = "") -> None:
-    """Record a late delivery error and alert after the supervisor exits."""
-    with _delivery_lock(path):
-        record = _read_record(path)
-        if record["status"] != "finished" or detached_run_process.supervises(record["pid"], path):
-            return
-        saved = record.get("delivery", "")
-        if error and saved.startswith(DEFERRED_WORKER_RESULT):
-            record["delivery"] = _save_delivery(path, FAILED_WORKER_SUBMISSION + error, if_current=saved)
-        _alert_failed_push_locked(path, record, check_receipt=True)
+def _worker_delivery_replay(delivery: str, worker_input: WorkerResultInput,
+                            resume_parked: Callable[[], bool] | ParkedWorkerDelivery,
+                            ) -> WorkerResultReplay:
+    if (delivery == BUSY_WORKER_RESULT and worker_input is WorkerResultInput.TURN_ENDED
+            or delivery == WORKER_READINESS_PENDING and worker_input is not WorkerResultInput.TYPE):
+        return WorkerResultReplay.WAIT_FOR_INPUT
+    if _worker_result_pending(delivery):
+        return WorkerResultReplay.RETRY
+    if delivery.startswith("already delivered: ") and not isinstance(resume_parked, ParkedWorkerDelivery):
+        return WorkerResultReplay.DUPLICATE
+    return WorkerResultReplay.NONE
+
+
+def _handle_late_delivery_failure(input_lock: HeldWorkerInputLock | AcquireWorkerInputLock, path: Path) -> None:
+    """Keep the failed delivery with a retry owner."""
+    record = _read_record(path)
+    if not _result_retry_pending(record) or _supervisor_alive(path, record):
+        return
+    if _needs_push_retry(record):
+        _stage_push_alert(path)
+    if isinstance(input_lock, AcquireWorkerInputLock):
+        _send_staged_push_alert(path, check_receipt=True)
+        _resume_orphan_result(path)
+    else:
+        _resume_result_after_unlock(input_lock, path)
 
 
 def _alert_failed_push(path: Path, *, check_receipt: bool = False) -> None:
-    with _delivery_lock(path):
-        _alert_failed_push_locked(path, _read_record(path), check_receipt=check_receipt)
+    _stage_push_alert(path)
+    _send_staged_push_alert(path, check_receipt=check_receipt)
 
 
-def _alert_failed_push_locked(path: Path, record: RunRecord, *, check_receipt: bool) -> None:
-    """Send the alert and record its outcome under the delivery lock."""
+def _resume_result_after_unlock(input_lock: HeldWorkerInputLock, path: Path) -> None:
+    input_lock.defer_until_unlock((path, "resume result"), lambda: _resume_orphan_result(path))
+
+
+def _needs_external_result_delivery(record: RunRecord) -> bool:
+    delivery = record.get("delivery")
+    return (delivery == RESULT_RELAY_PENDING
+            or delivery == WORKER_BLOCKED_RESULT and not record.get("blocked_notice_accepted"))
+
+
+def _result_retry_pending(record: RunRecord) -> bool:
+    if (record.get("push_alert_delivery") or _needs_push_retry(record) or _awaits_pane_receipt(record)
+            or _needs_stopped_result_completion(record)):
+        return True
+    return _needs_pane_input_retry(record) and not (_failed_pane_attempt(record) and record.get("push_alert_attempted"))
+
+
+def resume_pending_worker_results(run: Path, identity: staff.StaffId) -> None:
+    """Start a retry for each pending result after the worker lock is released."""
+    runs = run / DETACHED_RUNS_DIR
+    for record in _registered_runs(runs, identity):
+        if record["staff_id"] == identity and _result_retry_pending(record):
+            _resume_orphan_result(runs / f"{record['run_id']}.json")
+
+
+def _resume_orphan_result(path: Path, *, replay_completion: bool = False) -> None:
+    """Start a detached retry if the supervisor has ended."""
+    record = _read_record_if_present(path)
+    if (record is None or record["status"] != "finished" or not (replay_completion or _result_retry_pending(record))
+            or _supervisor_alive(path, record)):
+        return
+    script = Path(__file__).resolve()
+    command = [str(script.parents[1] / "lib/py"), str(script), "deliver-deferred", str(path)]
+    if replay_completion:
+        command.append("--complete")
+    try:
+        with Path(record["log"]).open("ab") as log:
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+    except OSError as error:
+        print(f"detached_runs: {path.stem}: could not start result delivery: {error}", file=sys.stderr)
+
+
+def _stage_push_alert(path: Path, *, expected: str | None = None) -> None:
+    with _delivery_lock(path), record_lock(path):
+        current = _read_record(path)
+        if (current["status"] == "finished" and (expected is None or current.get("delivery") == expected)
+                and _has_unreported_push_failure(current) and not current.get("push_alert_delivery")):
+            current["push_alert_delivery"] = current.get("delivery", "")
+            write_text_atomic(path, json.dumps(current, indent=2, sort_keys=True))
+
+
+def _send_staged_push_alert(path: Path, *, check_receipt: bool = False) -> None:
+    with _result_transport_claim(path) as claimed:
+        if not claimed:
+            return
+        record = _read_record_if_present(path)
+        if record is not None and record.get("push_alert_delivery"):
+            delivery = record.get("delivery", "")
+            if _result_delivery_accepted(delivery):
+                _ = _save_delivery(path, delivery, if_current=delivery)
+            else:
+                _send_failed_push_alert(path, record, check_receipt=check_receipt)
+
+
+def _send_failed_push_alert(path: Path, record: RunRecord, *, check_receipt: bool) -> None:
+    """Send the staged alert without the worker or delivery lock."""
+    from scripts.herdr import worker_panes
     from scripts.message import send
 
-    if not _needs_push_retry(record):
-        return
-    delivery = record.get("delivery", "")
+    delivery = record.get("push_alert_delivery", "")
     state = ("Result delivery is unconfirmed. The result may have arrived."
              if delivery.startswith(UNCONFIRMED_WORKER_RESULT) else "Result delivery failed.")
     text = (f"Detached run {record['run_id']}. {state}\n"
@@ -2946,62 +3269,215 @@ def _alert_failed_push_locked(path: Path, record: RunRecord, *, check_receipt: b
             f"Worker: {record['worker']}\n"
             f"Result: {_exit_words(command_result(record))}\n"
             f"Delivery: {delivery}")
+    checked_receipt = False
     try:
         membership = staff.snapshot()
-        if (check_receipt and delivery.startswith(UNCONFIRMED_WORKER_RESULT)
-                and _unconfirmed_result_received(record, membership, delivery)):
-            _ = _save_delivery(path, f"already delivered: {record['run_id']}")
-            return
-        state_path = Path(record["director_dir"] or record["session_dir"]) / unit_runs.STATE_FILE
-        lookup_error = ""
-        try:
-            fields = worker_lifecycle.read_json_object(state_path)
-        except worker_lifecycle.WorkerStateUnreadable as error:
-            fields = {}
-            lookup_error = str(error)
-        owner = unit_runs.run_owner(fields, membership)
-        director = owner if isinstance(owner, staff.StaffRow) else membership.owner_of(record["staff_id"])
-        if director is None or director.kind not in ("unit", "showrunner"):
-            raise worker_admission.RunOwnerUnavailable(lookup_error or f"{state_path}: no director staff row")
-        with staff.supplied_snapshot(membership):
-            alert = send.send(send.parse(["--to", str(director.id), "--from", "detached-runs",
-                                          "--timeout", str(send_budget.seconds()), "--text", text]))
-        if alert.outcome not in ("sent", "queued", "skipped"):
-            raise RuntimeError(f"{alert.outcome}: {alert.detail}")
+        current_delivery = record.get("delivery", "")
+        if check_receipt and current_delivery.startswith(UNCONFIRMED_WORKER_RESULT):
+            member = _run_owner(record, membership)
+            with contextlib.ExitStack() as lock:
+                if isinstance(member, staff.StaffRow) and member.kind == "worker":
+                    try:
+                        _ = lock.enter_context(worker_panes.worker_id_lock(member.id))
+                    except BlockingIOError:
+                        return
+                checked_receipt = _unconfirmed_result_received(record, membership, current_delivery)
+                if checked_receipt:
+                    _ = _save_delivery(path, f"already delivered: {record['run_id']}", if_current=current_delivery)
+        if not checked_receipt:
+            state_path = Path(record["director_dir"] or record["session_dir"]) / unit_runs.STATE_FILE
+            lookup_error = ""
+            try:
+                fields = worker_lifecycle.read_json_object(state_path)
+            except worker_lifecycle.WorkerStateUnreadable as error:
+                fields = {}
+                lookup_error = str(error)
+            try:
+                owner = unit_runs.run_owner(fields, membership)
+            except staff.StaffUnreadable as error:
+                raise worker_admission.RunOwnerUnavailable(str(error)) from error
+            director = owner if isinstance(owner, staff.StaffRow) else membership.owner_of(record["staff_id"])
+            if director is None or director.kind not in ("unit", "showrunner"):
+                raise worker_admission.RunOwnerUnavailable(lookup_error or f"{state_path}: no director staff row")
+            with staff.supplied_snapshot(membership):
+                alert = send.send(send.parse(["--to", str(director.id), "--from", "detached-runs",
+                                              "--key", f"detached-result-alert:{record['run_id']}", "--once-per-key",
+                                              "--timeout", str(send_budget.seconds()), "--text", text]))
+            if alert.outcome not in ("sent", "queued", "kept", "skipped"):
+                raise RuntimeError(f"{alert.outcome}: {alert.detail}")
     except (Exception, SystemExit) as error:
-        detail = " ".join(str(error).splitlines())
-        print(f"anomaly: {record['run_id']}: could not alert the director: {detail}", file=sys.stderr, flush=True)
+        _report_push_alert_failure(path, error)
+        return
     with record_lock(path):
         record = _read_record(path)
-        record["push_alert_attempted"] = True
+        _ = record.pop("push_alert_delivery", None)
+        if not checked_receipt:
+            record["push_alert_attempted"] = True
         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
-def _retry_failed_push(path: Path) -> None:
-    """Retry a pending result after the supervisor releases the completion lock."""
+def _report_push_alert_failure(path: Path, error: Exception | SystemExit) -> None:
+    detail = " ".join(str(error).splitlines())
+    if isinstance(error, worker_admission.RunOwnerUnavailable):
+        cause = "director missing"
+    elif isinstance(error, staff.StaffUnreadable):
+        cause = "staff snapshot unreadable"
+    else:
+        cause = f"{type(error).__name__}: {detail}"
+    with record_lock(path):
+        record = _read_record(path)
+        if cause == "director missing" and record.get("push_alert_missing_director_reported"):
+            return
+        reported = record.get("push_alert_reported_causes", [])
+        if cause in reported:
+            return
+        record["push_alert_reported_causes"] = [*reported, cause]
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+    print(f"anomaly: {record['run_id']}: could not alert the director: {detail}", file=sys.stderr, flush=True)
+
+
+class PaneAttemptFollowUp(Enum):
+    CHECK_AGAIN = "check the saved attempt again"
+    BUSY = "wait for the worker to become idle"
+    RECEIPT_FOUND = "the transcript contains the result receipt"
+    RETRY_INPUT = "the previous attempt did not send input"
+    WORKER_GONE = "the worker can no longer accept the result"
+
+
+def _check_pane_attempt(path: Path, record: RunRecord, membership: staff.StaffSnapshot) -> PaneAttemptFollowUp:
+    """Spend the budget only after an idle worker has no receipt."""
+    from scripts.herdr import herdr, worker_panes
+
+    may_have_sent_input = _awaits_pane_receipt(record)
+    next_attempt = PaneAttemptFollowUp.CHECK_AGAIN if may_have_sent_input else PaneAttemptFollowUp.RETRY_INPUT
+    member = _run_owner(record, membership)
+    receipt_readable = True
+    if isinstance(member, staff.StaffRow):
+        try:
+            if _result_received(member, membership, f"Detached run: {record['run_id']}"):
+                confirmed = f"already delivered: {record['run_id']}"
+                if _save_delivery(path, confirmed, if_current=record.get("delivery", "")) == confirmed:
+                    return PaneAttemptFollowUp.RECEIPT_FOUND
+                return PaneAttemptFollowUp.CHECK_AGAIN
+        except (OSError, ValueError, subprocess.SubprocessError):
+            receipt_readable = False
+    if isinstance(member, RunOwnerUnavailable) or member.kind != "worker" or _result_pass_changed(record):
+        state = worker_panes.WorkerNotObserved.CURRENT
+        worker_gone = True
+    else:
+        holder = membership.parent_of(member)
+        if holder is None:
+            return PaneAttemptFollowUp.CHECK_AGAIN
+        selection = worker_panes.SelectedWorkerRows(frozenset({member.id}))
+        states = worker_panes.observe_parents([holder], membership, selection=selection)[holder.id]
+        state = next(iter(states), worker_panes.WorkerNotObserved.CURRENT)
+        worker_gone = isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))
+
+    if worker_gone:
+        if may_have_sent_input:
+            _stage_push_alert(path, expected=record.get("delivery", ""))
+            return PaneAttemptFollowUp.WORKER_GONE
+        return next_attempt
+    if not receipt_readable or not isinstance(state, worker_panes.OpenWorker):
+        return PaneAttemptFollowUp.CHECK_AGAIN
+    if state.status == herdr.AgentStatus.WORKING:
+        return PaneAttemptFollowUp.BUSY
+    if state.status == herdr.AgentStatus.BLOCKED:
+        return next_attempt
+    if not state.status.idle:
+        return PaneAttemptFollowUp.CHECK_AGAIN
+    limit = conf.read("detached_runs").whole("result_push_retries")
+    with _delivery_lock(path), record_lock(path):
+        current = _read_record(path)
+        if current.get("delivery") != record.get("delivery"):
+            return PaneAttemptFollowUp.CHECK_AGAIN
+        if current.get("push_alert_attempted") or current.get("pane_submit_failure_counted"):
+            return next_attempt
+        if current.get("push_retries", 0) < limit:
+            current["push_retries"] = current.get("push_retries", 0) + 1
+            if not may_have_sent_input:
+                current["pane_submit_failure_counted"] = True
+            write_text_atomic(path, json.dumps(current, indent=2, sort_keys=True))
+            return next_attempt
+    _stage_push_alert(path, expected=record.get("delivery", ""))
+    return next_attempt
+
+
+class SupervisedResultPruned(Enum):
+    REMOVED = "the run record was pruned"
+
+
+def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
+    """Retry this run's delivery after releasing the completion lock."""
+    from scripts.herdr import worker_panes
+
     settings = conf.read("detached_runs")
     limit = settings.whole("result_push_retries")
     delay = settings.number("result_push_retry_seconds")
     while True:
-        with record_lock(path):
-            record = _read_record(path)
-            if not _needs_push_retry(record):
-                return
-            retries = record.get("push_retries", 0)
-            if retries >= limit:
-                break
-            record["push_retries"] = retries + 1
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-        time.sleep(delay)
-        record = _read_record(path)
-        if not _needs_push_retry(record):
-            return
         try:
-            _ = deliver(record, command_result(record))
+            record = _read_record_if_present(path)
+            if record is None:
+                return SupervisedResultPruned.REMOVED
+            retries = record.get("push_retries", 0)
+            staged_alert = bool(record.get("push_alert_delivery"))
+            relay_retry = not (_needs_pane_input_retry(record) or _awaits_pane_receipt(record)
+                               or _needs_stopped_result_completion(record))
+            if relay_retry and not staged_alert and not _needs_push_retry(record):
+                return record
+            if relay_retry and (staged_alert or retries >= limit):
+                _alert_failed_push(path, check_receipt=staged_alert)
+                current = _read_record_if_present(path)
+                if current is None:
+                    return SupervisedResultPruned.REMOVED
+                if current.get("push_alert_delivery"):
+                    time.sleep(delay)
+                    continue
+                if _needs_pane_input_retry(current) or _awaits_pane_receipt(current):
+                    continue
+                return current
+        except (OSError, ValueError, SystemExit) as error:
+            detail = " ".join(str(error).splitlines())
+            print(f"detached_runs: {path.stem}: result retry record is unavailable: {detail}", file=sys.stderr)
+            time.sleep(delay)
+            continue
+        time.sleep(delay)
+        try:
+            current = _read_record_if_present(path)
+            if current is None:
+                return SupervisedResultPruned.REMOVED
+            if _awaits_pane_receipt(current):
+                with _result_transport_claim(path) as claimed:
+                    if not claimed:
+                        continue
+                    try:
+                        with worker_panes.worker_id_lock(staff.StaffId(current["staff_id"])):
+                            follow_up = _check_pane_attempt(path, current, staff.snapshot())
+                    except BlockingIOError:
+                        continue
+                _send_staged_push_alert(path, check_receipt=True)
+                if follow_up is PaneAttemptFollowUp.WORKER_GONE:
+                    current = _read_record(path)
+                    if not current.get("push_alert_delivery"):
+                        return current
+            elif (_needs_stopped_result_completion(current) or _needs_pane_input_retry(current)
+                  or (relay_retry and _needs_push_retry(current))):
+                if _needs_stopped_result_completion(current):
+                    _ = _finish_record(path, current)
+                else:
+                    delivery = deliver(current, command_result(current))
+                    if delivery == PARKED_WORKER_RESULT:
+                        _ = _finish_record(path, current)
+                    if relay_retry and _result_push_failed(delivery) and not _pane_submission_not_started(delivery):
+                        with record_lock(path):
+                            updated = _read_record(path)
+                            if updated.get("delivery") == delivery and _needs_push_retry(updated):
+                                updated["push_retries"] = updated.get("push_retries", 0) + 1
+                                write_text_atomic(path, json.dumps(updated, indent=2, sort_keys=True))
+                _send_staged_push_alert(path, check_receipt=True)
         except (Exception, SystemExit) as error:
             detail = " ".join(str(error).splitlines())
-            print(f"detached_runs: {record['run_id']}: result retry failed: {detail}", file=sys.stderr)
-    _alert_failed_push(path)
+            print(f"detached_runs: {path.stem}: result retry failed: {detail}", file=sys.stderr)
 
 
 def command_deliver(args: argparse.Namespace) -> int:
@@ -3032,7 +3508,50 @@ def command_deliver(args: argparse.Namespace) -> int:
         return 1
     if _cancels_pass(record):
         return int(_finish_record(record_path, record) == CompletionReplay.RETRY)
+    current = _read_record_if_present(record_path)
+    return int(current is not None and not current.get("delivery"))
+
+
+def command_deliver_deferred(args: argparse.Namespace) -> int:
+    """Continue delivery after the supervisor has ended."""
+    path = Path(str(getattr(args, "record", "")))
+    record = _read_record_if_present(path)
+    if record is None or record["status"] != "finished" or _supervisor_alive(path, record):
+        return 0
+    with path.with_name(f".{path.stem}.retry.lock").open("a") as claim:
+        try:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        _continue_orphan_result(path, replay_completion=bool(getattr(args, "complete", False)))
     return 0
+
+
+def _continue_orphan_result(path: Path, *, replay_completion: bool) -> None:
+    try:
+        record = _read_record_if_present(path)
+        if record is None:
+            return
+        if replay_completion and _needs_completion(record):
+            _ = _finish_record(path, record)
+            record = _read_record_if_present(path)
+            if record is None:
+                return
+        if _needs_external_result_delivery(record):
+            _ = deliver(record, command_result(record))
+        _send_staged_push_alert(path, check_receipt=True)
+        current = _read_record_if_present(path)
+        # The director owns the result after accepting the alert for a failed prompt.
+        if current is None or (_failed_pane_attempt(current) and current.get("push_alert_attempted")):
+            return
+    except (Exception, SystemExit) as error:
+        detail = " ".join(str(error).splitlines())
+        print(f"detached_runs: {path.stem}: deferred result delivery failed: {detail}", file=sys.stderr)
+    saved = _retry_result_delivery(path)
+    if replay_completion and saved is not SupervisedResultPruned.REMOVED:
+        delivery = saved.get("delivery", "")
+        if delivery and not _worker_result_pending(delivery) and _needs_completion(saved):
+            _ = _finish_record(path, saved)
 
 
 def deliver_in_fresh_process(record_path: Path) -> int:
@@ -3045,16 +3564,19 @@ def deliver_in_fresh_process(record_path: Path) -> int:
             stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", check=False,
         )
     except OSError as error:
-        if cast(object, error.filename) == launcher and not _cancels_pass(_read_record(record_path)):
-            _ = _save_delivery(record_path, FAILED_RESULT_PUSH + str(error), if_current="")
+        if cast(object, error.filename) == launcher:
+            record = _read_record(record_path)
+            if not _cancels_pass(record):
+                _ = _save_delivery(record_path, _result_send_not_started(record, str(error)), if_current="")
         print(f"detached_runs: delivery process did not start: {error}", file=sys.stderr)
         return 1
     if completed.stderr:
         _ = sys.stderr.write(completed.stderr)
-        if completed.returncode and not _cancels_pass(_read_record(record_path)):
+        if completed.returncode:
+            record = _read_record(record_path)
             detail = completed.stderr.strip().splitlines()
-            if detail:
-                _ = _save_delivery(record_path, FAILED_RESULT_PUSH + detail[-1], if_current="")
+            if detail and not _cancels_pass(record):
+                _ = _save_delivery(record_path, _result_send_not_started(record, detail[-1]), if_current="")
     return completed.returncode
 
 
@@ -3256,12 +3778,15 @@ def command_supervise(args: argparse.Namespace) -> int:
         # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
         # unless the result is already held.
         record = _checkpoint_command_exit(record_path, exit_code)
+        retry_delay = conf.read("detached_runs").number("result_push_retry_seconds")
         if run_slice := record.get("command_slice"):
-            try:
-                _finish_command_slice(record_path, run_slice)
-            except (OSError, ValueError) as error:
-                print(f"detached_runs: {record['run_id']}: slice cleanup failed: {error}", file=sys.stderr)
-                return 1
+            while True:
+                try:
+                    _finish_command_slice(record_path, run_slice)
+                    break
+                except (OSError, ValueError) as error:
+                    print(f"detached_runs: {record['run_id']}: slice cleanup failed: {error}", file=sys.stderr)
+                    time.sleep(retry_delay)
         elif record.get("stop_pass_requested") and not _stopped_group_has_ended(record):
             grace, kill_grace = _scope_stop_graces()
             deadline = time.monotonic() + grace + kill_grace
@@ -3273,26 +3798,43 @@ def command_supervise(args: argparse.Namespace) -> int:
                     break
                 time.sleep(min(0.25, remaining))
         record = _save_finish_time(record_path)
-        delivery_exit = deliver_in_fresh_process(record_path)
-        record = _read_record(record_path)
-        cancelled = _cancels_pass(record)
-        if cancelled:
-            if delivery_exit == 0 and record["status"] == "finished":
-                return 0
-            if record["status"] == "running" and not _stopped_group_has_ended(record):
-                return 1
-        elif delivery_exit != 0:
-            # The delivery process saves a checkpoint before it starts a send.
-            _ = _save_delivery(
-                record_path, FAILED_RESULT_PUSH + f"delivery process exited {delivery_exit}", if_current="")
-        completion = _finish_record(record_path, record)
-        saved = worker_lifecycle.read_json_object(record_path)
-        if _is_run_record(saved) and _needs_push_retry(saved):
-            _retry_failed_push(record_path)
-            saved = worker_lifecycle.read_json_object(record_path)
-            if _is_run_record(saved) and _needs_completion(saved):
-                completion = _finish_record(record_path, saved)
-        if _result_push_failed(str(saved.get("delivery", ""))):
+        try:
+            delivery_exit = deliver_in_fresh_process(record_path)
+        except (OSError, ValueError) as error:
+            print(f"detached_runs: {record_path.stem}: result delivery is unavailable: {error}", file=sys.stderr)
+            delivery_exit = 1
+        while True:
+            try:
+                current = _read_record_if_present(record_path)
+                if current is None:
+                    return int(bool(record.get("scope_error")))
+                record = current
+                cancelled = _cancels_pass(record)
+                if cancelled:
+                    if (delivery_exit == 0 and record["status"] == "finished"
+                            and record.get("delivery") and not record.get("push_alert_delivery")
+                            and not _worker_result_pending(record.get("delivery", ""))):
+                        return 0
+                    if record["status"] == "running" and not _stopped_group_has_ended(record):
+                        time.sleep(retry_delay)
+                        continue
+                elif not record.get("delivery"):
+                    # The delivery process saves a checkpoint before it starts a send.
+                    detail = (f"delivery process exited {delivery_exit}" if delivery_exit
+                              else "the delivery process saved no outcome")
+                    _ = _save_delivery(record_path, _result_send_not_started(record, detail), if_current="")
+                completion = _finish_record(record_path, record)
+                break
+            except (OSError, ValueError, SystemExit) as error:
+                print(f"detached_runs: {record_path.stem}: result completion read failed: {error}", file=sys.stderr)
+                time.sleep(retry_delay)
+        saved = _retry_result_delivery(record_path)
+        if saved is SupervisedResultPruned.REMOVED:
+            return int(bool(record.get("scope_error")))
+        if (saved.get("delivery") != record.get("delivery") and not _worker_result_pending(saved.get("delivery", ""))
+                and _needs_completion(saved)):
+            completion = _finish_record(record_path, saved)
+        if _result_push_failed(saved.get("delivery", "")):
             return 1
         if record.get("scope_error"):
             return 1
@@ -3449,6 +3991,10 @@ def main(argv: list[str] | None = None) -> int:
     delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
     _ = delivery.add_argument("record")
     delivery.set_defaults(handler=command_deliver)
+    deferred = verbs.add_parser("deliver-deferred", help="continue delivery after the supervisor ends")
+    _ = deferred.add_argument("record")
+    _ = deferred.add_argument("--complete", action="store_true")
+    deferred.set_defaults(handler=command_deliver_deferred)
     stop = verbs.add_parser("stop", help="stop a running command; its supervisor delivers the stopped result")
     _ = stop.add_argument("--reason", required=True, help="the Stop reason line of the result")
     _ = stop.add_argument("record")

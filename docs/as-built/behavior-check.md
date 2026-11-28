@@ -19,13 +19,32 @@ The PR script checks the range from the merge base to the PR head.
 It reads the head and base again before merge and supplies the checked head to GitHub.
 
 A clear record names the saved reviewer reply.
-The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
-The gate checks each changed test for no user decision or a verified request from Nate.
-The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
+The reviewer filters transcript files before parsing them.
+The prompt gives the checker's absolute code root and paths to the transcript reader and question record code.
+The reviewer starts isolated Python from the checker's code root before it imports the checker modules.
+It passes the imports to Python with `-c` so the shell needs no temporary file.
+The reviewer runs each command in one tool call without `write_stdin`.
+For a `requested` finding, the reviewer quotes one source message.
+If several messages contain relevant words, the reviewer quotes the newest message that sets the behavior.
+The gate checks the finding for each changed test.
+Source verification applies only to `requested` findings.
+The check accepts typed Claude turns, sent List Tell feedback, and saved List or Question answers from Nate.
+The check accepts a List question from Nate when its List page receipt matches a saved send receipt in state `sent`.
+The check counts only a signed Images Approved answer with a matching, completed server delivery to all recipients.
+For a List entry, the server record must match the List item, keeper, delivery key, and words.
+Only the approval line, `Image <id>: your image is approved.`, counts as Nate's words. Images feedback is not a source.
+The Images store keeps standalone answers in `.review-link-image-decisions/*.json` under the configured review links directory.
+The check reads an Approved `answer` as Nate's words when the archived decision matches the server delivery.
+The reviewer uses `image_text` for context.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
-The check reports the date from the source. If the source cannot prove the author or quote, the finding needs a question.
+The check reports the date from the source. A `requested` finding needs a question if the source cannot prove the author or quote.
 Status fails if it cannot read or parse the saved proof for a clear record.
 For a Yes record, the gate reads the answer in the original question.
+
+The reviewer gives a verdict for each `specified` finding.
+Use `against` only when the change removes or changes behavior Nate explicitly asked for.
+A refinement of a term Nate did not define, such as "history", does not warrant `against`.
+The verdicts `against` and `unclear` need a question. The verdicts `follows` and `different` clear the finding.
 
 The showrunner state root stores the records in `behavior_checks/`.
 Each key has one state. The states are clear, waiting, invalid answer, Yes, and No.
@@ -35,7 +54,7 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 1. If the range has no changed test, the command exits 0.
 2. If the range has changed tests, the command starts an independent read-only review. Run the same command after the reviewer replies.
 3. The command saves a clear record when no test needs a question. It lists each verified request with its test, quote, date, and source.
-4. A departure from Nate's newest words, uncertainty, or a request with an unverified quote needs a question. The command prints the evidence for those tests.
+4. The command prints the evidence for findings that need a question. It includes requests with unverified quotes.
 5. Send the finding to the unit named in `Ask UNIT (phase PHASE)`.
 6. Ask the author to write the question and run the same command with `--question FILE`.
 7. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
@@ -58,6 +77,9 @@ The command files one question per key with `blocks` urgency.
 Once the command files the question, later runs track the answer without the file.
 
 A retry starts a new review if the prior reviewer process ended before it saved a valid reply.
+The reviewer can report a blocked part as `[{"blocker":"what stopped the review"}]`.
+The blocker row may include a `source` field.
+The command prints the part number and blocker text. A retry starts a new review for that part.
 The collector reads the first word of the answer. It ignores letter case and punctuation at the end of that word.
 If the Console review holds the question, the command prints the review's questions and failed rules.
 Revise the JSON file and run the command again with `--question FILE`.
