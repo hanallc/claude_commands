@@ -4581,6 +4581,7 @@ with (patch.object(conf, 'read', read_config),
         sidecar = path.with_name('progress')
         local = replace(fixture.local, grant=replace(fixture.local.grant, max_path=str(self.root / 'gate.max')))
         _ = write_config_fixture(self.registry.with_name('build_admission.conf'))
+        _ = write_config_fixture(self.registry.with_name('gate.conf'))
         admission_wire.write_assignment(path, wire.Assignment(guest))
         fixture.report_failure.return_value = wire.DispatchStatus(guest, placement.CurrentAssignment(),
             placement.PermissionConsumed(1.0), retry=placement.RetryAt(1.0))

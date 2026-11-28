@@ -863,3 +863,27 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Showrunner ruling (16:02 PST): ship X with the live reads as they are. `user_zone()` and notify `review_timeout_seconds` have no code default; a runtime with no config copy raises `conf.Unusable`.
 
 **Files:** `scripts/build_queue/test_kill_action.py`, `test_memory_feed.py`; `scripts/lib/test_main_sync.py`, `test_waiting_rows.py`; `scripts/rebuild/test_reason.py`; `scripts/review_links/test_change_page.py`, `test_new_item.py`; `scripts/worktree_delete/test_perform_deletion_rerun.py`
+
+### Phase 27 — Test fixtures for the Phase 13 and 14 config reads  · status: todo
+
+**Depends on:** Phase 13, Phase 14
+
+#### Work Order
+
+**Goal:** The queued affected run of tip d62d695234 is green again. It was red in 9 test modules.
+
+**Spec:**
+1. Each test fixture that builds its own config folder writes each key the code now reads: `record_store.history_cache_entries` (production.conf), `rerun.max_failed_modules` (gate.conf), and the other keys the red log names. Use `write_config_fixture`.
+2. A code read of the wrong file or path is fixed where it lives.
+3. No code default, no config change, no new refusal and no weakened assertion. A test that pins behavior the branch changed on purpose goes to the showrunner.
+4. A failure that main 9cd539b198 also has is reported, not fixed.
+
+**Files:** `scripts/aws_target/test_aws_trial.py`, `scripts/build_targets/test_mac_linux.py`, `scripts/buildlog/test_mac_idle.py`, `test_machine_watch.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_waiting_why.py`, `scripts/review_links/test_list_page.py`, `test_review_submissions.py`, `scripts/statusline/test_statusline.py`
+
+**Workers:** 2 writers, split by test module.
+- `impl`: aws_target, build_targets, buildlog, notify.
+- `test` opens as impl: production, review_links, statusline.
+
+**Constraints from prior phases:** Phase 20: each config move adds its keys to each `CONF_DIR` fixture that reads them. Phase 21: no code default and no new refusal.
+
+**Acceptance gate:** each failed test passes by test id with no `'<missing>'` warning; then the queued `gate.py --affected` run of the new tip is green.

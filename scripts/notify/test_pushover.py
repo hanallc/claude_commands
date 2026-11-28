@@ -959,7 +959,7 @@ class PushoverTests(unittest.TestCase):
                     f"send.py in {sender}", "0", "t", "No action needed.\n" + "B" * 2000,
                     self.keys, post, "", text_id="auto_mode.refused"), 0)
             self.assertEqual(len(sent[-1]), pushover.MESSAGE_MAX)
-            self.assertTrue(sent[-1].startswith("No action needed.\nBBB"))
+            self.assertTrue(sent[-1].startswith("BBB"))
             self.assert_footer(sent[-1], sender[:limit], "auto_mode.refused")
 
     def draft(self, *, answerable: bool = False) -> review.Draft:

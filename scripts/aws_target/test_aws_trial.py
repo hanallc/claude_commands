@@ -63,7 +63,7 @@ class GuestTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
         install_aws_fixture_settings(root)
         write_guest_config(root)
-        _ = (root / 'gate.conf').write_text('# range: 1..\ngate_time_limit_factor=1.5\n')
+        _ = write_config_fixture(root / 'gate.conf', 'gate_time_limit_factor=1.5\n')
         _ = (root / 'buildlog.conf').write_text(
             '# range: 0..\nindex_unused_days=2\n'
             + '# range: 0..\nindex_touch_minutes=60\n'
@@ -305,9 +305,9 @@ class GuestTests(unittest.TestCase):
                     exec(compile(code, '<guest>', 'exec'), {})
                 finally:
                     os.chdir(previous)
-            discover.assert_called_once_with(repo)
             payload = ledger.mapping(cast(object, json.loads(uploads[links['result']])))
             self.assertEqual(payload['verdict'], 'fail', payload.get('error'))
+            discover.assert_called_once_with(repo)
             self.assertNotIn('governor_gib', payload)
             self.assertEqual(ledger.mapping(payload['tools'])['python_sqlite'], sqlite3.sqlite_version)
             self.assertEqual(payload['module_time_limit_s'], module_limit_s)

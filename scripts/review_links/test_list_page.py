@@ -512,7 +512,7 @@ class ListPageTests(unittest.TestCase):
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
-        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = write_config_fixture(config / "production.conf", "# whole: 20..\nquestion_title_max_chars=100\n")
         _ = (config / "statusline.conf").write_text(
             "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
             + "role.producer=#90fe42\nrole.worker=#ff0404\n")
@@ -1287,8 +1287,7 @@ if(example.filterOn){
             (root / folder).mkdir(parents=True)
             for size in studio_page.SIZES:
                 _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
-        with (self.root / "config/review_links.conf").open("a") as settings:
-            _ = settings.write(f"studio_avatar_root={root}\n")
+        _ = write_config_fixture(self.root / "config/review_links.conf", f"studio_avatar_root={root}\n")
         return root
 
     def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
@@ -2917,6 +2916,7 @@ document.body.append(result);
         config = self.root / "config"
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)
+        _ = write_config_fixture(config / "statusline.conf", f"rebuild.cache={self.root / 'rebuild-cache'}\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
         environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
