@@ -657,7 +657,8 @@ The selector extracts missing base facts only when it builds the base graph for 
 The parent reads the missing source text and sorts it by length, longest first.
 The parent assigns each path to the slice with the lowest total text length.
 `affected.extract.processes` sets the worker count. `config/gate.conf` sets this value to eight.
-Each worker sends one list of facts or exceptions with their path indexes through its own pipe.
+The parent starts all workers before it sends any source text.
+Each worker receives its slice and sends one list of indexed results through its own pipe.
 The selector runs serially with one configured process, too few misses, or an OS error during pool startup.
 The pool needs at least twice the configured process count in misses.
 If a worker exits before it sends its complete list, the parent extracts that slice from the saved source text.

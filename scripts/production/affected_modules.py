@@ -1117,25 +1117,33 @@ def extraction_slices(sources: list[tuple[str, str]], processes: int) -> list[li
     return slices
 
 
-def extract_slice(sender: Connection, sources: list[IndexedSource]) -> None:
+def extract_slice_results(sources: list[IndexedSource]) -> list[tuple[int, ExtractionResult]]:
+    results: list[tuple[int, ExtractionResult]] = []
+    for index, path, source in sources:
+        try:
+            result = extract_facts(source, path)
+        except Exception as error:
+            results.append((index, error))
+        else:
+            results.append((index, result))
+    return results
+
+
+def extract_slice(connection: Connection) -> None:
     # The parent blocks cancellation while it registers new workers.
     _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
-    with sender:
-        results: list[tuple[int, ExtractionResult]] = []
-        for index, path, source in sources:
-            try:
-                result = extract_facts(source, path)
-            except Exception as error:
-                results.append((index, error))
-            else:
-                results.append((index, result))
-        sender.send(results)
+    with connection:
+        try:
+            sources = cast(list[IndexedSource], connection.recv())
+        except (EOFError, OSError):
+            return
+        connection.send(extract_slice_results(sources))
 
 
 def extract_slices(sources: list[tuple[str, str]], processes: int) -> dict[str, ExtractionResult]:
     context = get_context("spawn")
     workers: list[BaseProcess] = []
-    pending: dict[Connection, int] = {}
+    pending: dict[Connection, list[IndexedSource]] = {}
     results: dict[int, ExtractionResult] = {}
     joined = False
     with ExitStack() as pipes:
@@ -1143,26 +1151,33 @@ def extract_slices(sources: list[tuple[str, str]], processes: int) -> dict[str, 
             try:
                 for batch in extraction_slices(sources, processes):
                     with cancellation.defer_cleanup_signals():
-                        receiver, sender = cast(tuple[Connection, Connection], context.Pipe(duplex=False))
-                        with sender:
-                            _ = pipes.enter_context(receiver)
-                            worker = context.Process(target=extract_slice, args=(sender, batch))
+                        parent, child = cast(tuple[Connection, Connection], context.Pipe())
+                        with child:
+                            _ = pipes.enter_context(parent)
+                            worker = context.Process(target=extract_slice, args=(child,))
                             worker.start()
                             workers.append(worker)
-                        pending[receiver] = len(batch)
+                        pending[parent] = batch
             except OSError:
                 return {}
 
+            for connection, batch in list(pending.items()):
+                try:
+                    connection.send(batch)
+                except OSError:
+                    connection.close()
+                    del pending[connection]
+
             while pending:
-                for receiver in cast(list[Connection], wait(pending)):
-                    expected = pending.pop(receiver)
-                    with receiver:
+                for connection in cast(list[Connection], wait(pending)):
+                    batch = pending.pop(connection)
+                    with connection:
                         try:
-                            extracted = cast(list[tuple[int, ExtractionResult]], receiver.recv())
+                            extracted = cast(list[tuple[int, ExtractionResult]], connection.recv())
                         except (EOFError, OSError):
                             # Each pipe has one writer. A short result affects only this slice.
                             continue
-                    if len(extracted) == expected:
+                    if len(extracted) == len(batch):
                         results.update(extracted)
             for worker in workers:
                 worker.join()

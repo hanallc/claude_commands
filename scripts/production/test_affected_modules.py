@@ -30,25 +30,27 @@ from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
 
-def block_extraction_worker(sender: Connection, _sources: list[affected.IndexedSource]) -> None:
-    with sender:
-        sender.send(os.getpid())
+def block_extraction_worker(connection: Connection) -> None:
+    with connection:
+        _ = cast(object, connection.recv())
+        connection.send(os.getpid())
         signal.pause()
 
 
-def kill_extraction_worker_for_new_test(sender: Connection, sources: list[affected.IndexedSource], *,
-                                        partial_result: bool) -> None:
-    if any(path == "scripts/checks/test_new.py" for _, path, _ in sources):
-        if partial_result:
-            # Write a frame header and one byte before the worker dies.
-            _ = os.write(sender.fileno(), b"\x00\x00\x00\x08\x00")
-        os.kill(os.getpid(), signal.SIGKILL)
-    affected.extract_slice(sender, sources)
+def kill_extraction_worker_for_new_test(connection: Connection, *, partial_result: bool) -> None:
+    with connection:
+        sources = cast(list[affected.IndexedSource], connection.recv())
+        if any(path == "scripts/checks/test_new.py" for _, path, _ in sources):
+            if partial_result:
+                # Write a frame header and one byte before the worker dies.
+                _ = os.write(connection.fileno(), b"\x00\x00\x00\x08\x00")
+            os.kill(os.getpid(), signal.SIGKILL)
+        connection.send(affected.extract_slice_results(sources))
 
 
-def fail_extraction_worker(sender: Connection, sources: list[affected.IndexedSource]) -> None:
+def fail_extraction_worker(connection: Connection) -> None:
     with mock.patch.object(affected, "extract_facts", side_effect=ValueError("unsupported operand type")):
-        affected.extract_slice(sender, sources)
+        affected.extract_slice(connection)
 
 
 class AffectedModulesTests(unittest.TestCase):
@@ -1045,7 +1047,23 @@ def shadow(root):
         self.assertEqual([sum(len(text) for _, _, text in batch) for batch in slices], [150, 150, 150])
 
         expected = [(path, affected.extract_facts(text, path)) for path, text in sources]
-        self.assertEqual(list(affected.extract_slices(sources, processes=3).items()), expected)
+        events: list[str] = []
+        start = SpawnProcess.start
+        send = Connection.send
+
+        def record_start(worker: SpawnProcess) -> None:
+            start(worker)
+            events.append("start")
+
+        def record_send(connection: Connection, batch: list[affected.IndexedSource]) -> None:
+            send(connection, batch)
+            events.append("send")
+
+        with (mock.patch.object(SpawnProcess, "start", autospec=True, side_effect=record_start),
+              mock.patch.object(Connection, "send", autospec=True, side_effect=record_send)):
+            results = affected.extract_slices(sources, processes=3)
+        self.assertEqual(events, ["start"] * 3 + ["send"] * 3)
+        self.assertEqual(list(results.items()), expected)
 
     def test_pooled_extraction_preserves_selection_and_cached_facts(self) -> None:
         self.add_extraction_sources("base")
@@ -1196,6 +1214,25 @@ def shadow(root):
             self.assertEqual(pooled.run.cache_misses, serial.run.cache_misses)
             self.assertEqual(pooled.run.extracted_files, serial.run.extracted_files)
             self.assertEqual(retry.call_args_list, expected_retries)
+
+    def test_pooled_extraction_retries_only_the_slice_with_a_send_error(self) -> None:
+        sources = {f"scripts/source_{index}.py": f"import module_{index}\n#".ljust(length, "x")
+                   for index, length in enumerate((100, 90, 60, 50))}
+        expected = [affected.extract_facts(text, path) for path, text in sources.items()]
+        send = Connection.send
+
+        def fail_send(connection: Connection, batch: list[affected.IndexedSource]) -> None:
+            if any(index == 0 for index, _, _ in batch):
+                raise BrokenPipeError("worker closed the pipe")
+            send(connection, batch)
+
+        with (mock.patch.object(Connection, "send", autospec=True, side_effect=fail_send),
+              mock.patch.object(affected, "extract_facts", wraps=affected.extract_facts) as retry):
+            read_facts = affected.pooled_fact_reader(list(sources), sources.__getitem__, 2, None)
+            results = [read_facts(path) for path in sources]
+        self.assertEqual(results, expected)
+        retry_paths = ("scripts/source_0.py", "scripts/source_3.py")
+        self.assertEqual(retry.call_args_list, [mock.call(sources[path], path) for path in retry_paths])
 
     def test_pooled_source_read_error_matches_serial_without_rereading(self) -> None:
         self.add_extraction_sources("base")
