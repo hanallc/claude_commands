@@ -36,7 +36,6 @@ import uuid
 from typing import Literal, Protocol, TextIO, cast, final
 
 from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
-from scripts.astra import design_roles
 from scripts.herdr import herdr_types, pane_launch, pass_notices
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
@@ -2497,16 +2496,9 @@ def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
            phase: str | None = None,
            ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
-    dispatch_run: worker_panes.DispatchRun | worker_panes.HolderRun | worker_panes.UnboundRoleLaunchRun
-    if isinstance(target, worker_panes.StaffWorker):
-        dispatch_run = target.dispatch_run
-    elif directory := os.environ.get(design_roles.DURABLE_ROLE_LAUNCH_RUN_ENV):
-        dispatch_run = worker_panes.UnboundRoleLaunchRun(Path(directory))
-    else:
-        dispatch_run = worker_panes.HolderRun.CURRENT
     with staff.row_operation(target.parent):
         return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock,
-                                            dispatch_run=dispatch_run, phase=phase)
+                                            dispatch_run=target.dispatch_run, phase=phase)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
