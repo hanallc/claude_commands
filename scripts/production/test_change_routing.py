@@ -45,9 +45,11 @@ class StaffRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, {
-            **fixture_git_environment(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+            **fixture_git_environment(self.root), **config_environment(self.root / "fixture-config"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
+            "NEXT_STATE_DIR": str(self.root / "next"),
         }, clear=True))
         self.alert = cast(mock.Mock, self.enterContext(mock.patch.object(unrouted_alert, "notify")))
         self.top = fixture_member("showrunner", name="top")
@@ -62,10 +64,7 @@ class StaffRoutingTests(unittest.TestCase):
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
         _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
-        config = self.root / "config"
-        _ = write_config_fixture(config / "review_links.conf", "unrouted_alert_recipient=top\n")
-        _ = write_config_fixture(config / "change_review.conf")
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=top\n")
         return doc
 
     def test_a_stored_unit_id_routes_without_history_and_ignores_production_and_merge(self) -> None:
@@ -658,6 +657,12 @@ class StaffRoutingTests(unittest.TestCase):
 
 
 class MergeWriterRoutingTests(ProducerFixture):
+    @override
+    def setUp(self) -> None:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, fixture_git_environment(directory), clear=True))
+        super().setUp()
+
     def test_a_gate_written_producer_routes_to_the_unit_and_receives_return_feedback(self) -> None:
         from scripts.production import gate
         from scripts.review_links import change_page
