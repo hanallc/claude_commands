@@ -465,6 +465,7 @@ _repository_fixtures: dict[tuple[str, Path, ConfigurationStamp], dict[str, Setti
 _repository_fixtures_lock = Lock()
 
 
+# Implicit fallbacks use fixture rules in tests. Explicit reads use the stored file.
 def _read_repository(stem: str, source: Path) -> tuple[dict[str, Setting], ConfigurationStamp | UnstampedConfiguration]:
     if not conf_reads.shift_reads_enabled():
         return _read_settings(source.read_text(encoding="utf-8"), source), UnstampedConfiguration.UNSTAMPED
@@ -644,7 +645,7 @@ def known_host_names() -> frozenset[str]:
     try:
         machines = _parse(source.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
+        machines, _ = _read_repository("machines", _repository_path("machines"))
     aliases = machines.get("aliases")
     hosts = {local_host_key_name()}
     if aliases is not None:

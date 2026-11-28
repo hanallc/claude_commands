@@ -391,6 +391,19 @@ conf_reads.record('disabled')
         self.assertEqual(settings.text("notes_directory"), "/raw")
         self.assertEqual(settings.text("word"), "raw")
 
+    def test_known_host_names_applies_fixture_rules_to_repository_fallback(self) -> None:
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(""))
+        repository = self.root / "repository-config/machines.conf"
+        _ = repository.write_text("aliases=mac\nmac.hosts=Remote.example\n", encoding="utf-8")
+
+        with (mock.patch.object(conf, "_repository_path", return_value=repository),
+              mock.patch("socket.gethostname", return_value="Local.example")):
+            self.assertEqual(conf.known_host_names(), frozenset({"local", "mac", "remote"}))
+            _ = conf_reads.set_shift_read_log(str(self.root / "shift-reads"))
+            self.assertEqual(conf.known_host_names(), frozenset({"local"}))
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(repository.parent)}):
+                self.assertEqual(conf.known_host_names(), frozenset({"local", "mac", "remote"}))
+
     def test_repository_fallback_applies_the_fixture_rules_with_the_test_marker(self) -> None:
         log = self.root / "shift-reads"
         previous = conf_reads.set_shift_read_log(str(log))
