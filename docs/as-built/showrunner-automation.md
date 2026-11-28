@@ -704,17 +704,22 @@ Herdr upkeep checks the List on natedev after it restores the shared server.
 The job uses its existing lock and interval.
 It reads the next check time from each item header.
 It loads the item when a run, notice, or confirmation deadline is due.
-If the scan reaches its time limit, the next check starts after the last item it inspected.
+The next scan gives a deferred item an earlier turn.
+If no deferred item has priority, a scan that reaches its time limit resumes after the last item it inspected.
 Delivery has separate time limits for a notice, an item, and the whole check.
+The first send attempt for each item can use less than the notice time limit.
+The List checks the time left for a later notice before preparation and before launch.
+If the time is shorter than the notice time limit, the notice stays ready for the next pass.
 The watchdog keeps the sender group's deadline after upkeep or the sender exits.
 It stays active until the sender group exits or the deadline expires.
 The List reports a group timeout separately from the sender's result.
 
 On the first check at or after the start, the List saves the run and sets the item to Working.
-The owner receives the instruction. The producer receives a copy.
+The owner receives the instruction. The producer receives a copy in the same pass or a later pass.
 The List opens the capture files before it saves the notice as sending.
 If a file cannot open, the notice stays ready for the next check.
 The List calls the sender after it saves the notice as sending.
+If the deadline prevents the sender from starting, the List restores the notice to ready.
 If the List cannot confirm acceptance, it records one uncertainty entry.
 The List calls `send.py` at most once per notice.
 The List starts runs due within two upkeep intervals in order of their saved start times.
