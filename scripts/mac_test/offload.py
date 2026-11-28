@@ -1809,9 +1809,8 @@ _MAC_DISK_PROBE = (
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
-    from scripts.copies import copies
-
-    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
+    del repository, target, slot
+    return _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -3011,7 +3010,7 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: Mirror
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
-                         repository: MirrorScope, target: str = "mac", slot: int = 1
+                         repository: MirrorScope, target: str = "mac", slot: int = 1, *, observe: bool = False,
                          ) -> StartSettled | StartUnsettled:
     """Keep the claim until the remote fence prevents a delayed start."""
     identity = controller.claim_identity
@@ -3022,7 +3021,7 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
     command = (start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key) + " || exit 1\n"
-               + leftover_check_script(repository, target, slot))
+               + leftover_check_script(repository, target, slot, observe=observe))
     observed = read_leftovers(connection, host, command, target)
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
@@ -3183,6 +3182,12 @@ def claimed_run(
         probe = probe_mac(controller, config, repository, request.target, request.slot)
         if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
             write_backoff(time.time() + config.unreachable_backoff_s, request.target)
+            settlement = settle_pending_start(controller, config, config.host, repository, request.target,
+                                              request.slot, observe=True)
+            if isinstance(settlement, StartSettled):
+                observe_cleanup(evidence, settlement.leftovers)
+            else:
+                release_allowed = False
             return declined("unreachable", started)
         disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
         if isinstance(disk, SweepFailed):

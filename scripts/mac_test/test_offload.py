@@ -1208,7 +1208,16 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_declined(result, "repo")
         self.assertEqual(self.events(), [])
 
+    def install_probe_cleanup_selectors(self) -> None:
+        selectors = self.stub_directory / "selectors"
+        selectors.mkdir()
+        self.write_executable(selectors / "pgrep", "raise SystemExit(1)\n")
+        self.write_executable(selectors / "lsof", "raise SystemExit(0)\n")
+        self.write_executable(selectors / "sleep", "raise SystemExit('The probe settlement must only observe')\n")
+        self.fixture["selector_shell"] = "sh"
+
     def test_unreachable_status_sets_backoff_without_a_second_probe(self) -> None:
+        self.install_probe_cleanup_selectors()
         self.fixture["probe_status"] = 255
         self.sync_fixture()
         self.assert_declined(self.command(), "unreachable")
@@ -1236,6 +1245,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(self.events_for("ssh")), 2)
 
     def test_probe_timeout_declines_as_unreachable(self) -> None:
+        self.install_probe_cleanup_selectors()
         self.config["probe_timeout_s"] = "0.1"
         self.fixture["hold_probe"] = True
         self.sync_config()
@@ -1267,6 +1277,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
     def test_probe_without_final_status_declines_as_unreachable(self) -> None:
+        self.install_probe_cleanup_selectors()
         self.fixture["probe_lines"] = self.fixture["probe_lines"][:-1]
         self.sync_fixture()
         result = self.command(separate_stderr=True)
@@ -1282,6 +1293,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
     def test_failed_probe_prints_collapsed_ssh_error_before_unreachable_decline(self) -> None:
+        self.install_probe_cleanup_selectors()
         self.fixture["probe_status"] = 255
         self.fixture["probe_error"] = "ssh:\tconnection refused\n  host mac is unavailable  "
         self.sync_fixture()
@@ -1290,6 +1302,25 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(result.stderr, "mac_test: could not reach the Mac: host mac is unavailable\n")
         self.assertEqual(self.events_for("rsync"), [])
         self.assertTrue((self.state_directory / "unreachable_until").exists())
+
+    def test_failed_probe_without_a_leftover_count_keeps_the_claim(self) -> None:
+        self.install_probe_cleanup_selectors()
+        self.write_executable(self.stub_directory / "selectors/lsof", "raise SystemExit(2)\n")
+        self.fixture["probe_status"] = 255
+        self.sync_fixture()
+        result = self.command(call_id="probe-without-cleanup-proof", runner_options=("--target", "mac"),
+                              assigned_adapter=True)
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assert_wire("declined", "unreachable")
+        self.assertTrue(self.claim_file.exists())
+        self.assertEqual(self.events_for("rsync"), [])
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        attempt, = (row for row in rows if row.get("kind") == "ssh_attempt"
+                    and row.get("call_id") == "probe-without-cleanup-proof")
+        self.assertEqual(attempt["cleanup"], "unconfirmed")
+        self.assertIsNone(attempt["unresolved_count"])
 
     def test_other_build_processes_do_not_decline_mac_tests(self) -> None:
         self.fixture["probe_lines"] = [
@@ -2026,11 +2057,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(probe[: len(ssh_arguments)], ssh_arguments)
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
-            ".local/state/mac-test/test-mirror/hana",
             'df -g "$HOME"',
             "hostname -s",
         ):
             self.assertIn(fragment, probe_script)
+        self.assertNotIn(".local/state/mac-test/test-mirror/hana", probe_script)
         self.assertNotIn("loadavg", probe_script)
         self.assertNotIn("pgrep", probe_script)
         self.assertNotIn("procs", probe_script)
