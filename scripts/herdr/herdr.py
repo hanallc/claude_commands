@@ -250,23 +250,6 @@ class TrackedPromptSubmission:
         self.check()
 
 
-class AnswerTransportCompleted(Enum):
-    SENT = "the transport finished sending the answer"
-
-
-@dataclass(frozen=True)
-class AnswerDidNotSubmit:
-    reason: str
-
-
-@dataclass(frozen=True)
-class AnswerDeliveryUnknown:
-    reason: str
-
-
-AnswerTransport = AnswerTransportCompleted | AnswerDidNotSubmit | AnswerDeliveryUnknown
-
-
 class _WrongNativeTarget(HerdrFailure):
     def __init__(self, reason: str, sessions: frozenset[str]) -> None:
         super().__init__(reason, "wrong_target")
@@ -3595,19 +3578,6 @@ class Herdr:
         if any(characters):
             script_prompts.mark_keys(pane)
         self._send_keys(pane, *keys)
-
-    def answer_prompt(self, pane: str, text: str, *, target: str) -> AnswerTransport:
-        """Send an answer through the normal composer."""
-        submission = TrackedPromptSubmission(lambda: None)
-        try:
-            self.prompt(pane, text, target=target, on_submission=submission)
-        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            refused = isinstance(error, AgentBlocked) or (
-                isinstance(error, HerdrFailure) and error.code in ("agent_not_found", "agent_not_ready"))
-            if refused or not submission.may_have_submitted:
-                return AnswerDidNotSubmit(str(error))
-            return AnswerDeliveryUnknown(str(error))
-        return AnswerTransportCompleted.SENT
 
     def answer_question(self, pane: str, text: str, *, target: str) -> None:
         """Answer a Codex question through the selected session's input box."""

@@ -255,22 +255,17 @@ class DispatchAgent:
         self.after_complete(pane)
 
     def question_record(self, pane: str, call: str) -> None:
-        arguments = {"questions": [{"id": "question", "header": "Format", "question": "Which format?"}]}
-        payload = {"type": "function_call", "call_id": call, "name": "request_user_input",
-                   "arguments": json.dumps(arguments)}
-        self.append_transcript(pane, json.dumps({"type": "response_item", "payload": payload}) + "\n")
+        self.append_codex_record(pane, {"type": "response_item", "payload": {
+            "type": "function_call", "call_id": call, "name": "request_user_input",
+            "arguments": json.dumps({"questions": [{"id": "format", "header": "Format", "question": "Which format?"}]}),
+        }})
 
-    def question_output(self, pane: str, call: str) -> None:
-        payload = {"type": "function_call_output", "call_id": call,
-                   "output": json.dumps({"answers": {"question": {"answers": ["user_note: Use JSON."]}}})}
-        self.append_transcript(pane, json.dumps({"type": "response_item", "payload": payload}) + "\n")
-
-    def append_transcript(self, pane: str, line: str) -> None:
+    def append_codex_record(self, pane: str, record: dict[str, object]) -> None:
         row = self.row(pane)
         backend = staff.backend(row)
         assert isinstance(backend, staff.CodexBackend)
         with worker_admission.transcript_source(row, backend).open("a", encoding="utf-8") as stream:
-            _ = stream.write(line)
+            _ = stream.write(json.dumps(record) + "\n")
 
     def pane_commands(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
@@ -4253,7 +4248,6 @@ class WorkerCommandTests(unittest.TestCase):
         for index, reported in enumerate((True, False), start=1):
             with self.subTest(reported=reported):
                 if index == 2:
-                    self.agent.question_output(opened.pane, "question-1")
                     self.agent.append(opened.pane, "assistant", "Which output format must I use?")
                 self.agent.question_record(opened.pane, f"question-{index}")
                 self.agent.questions[opened.pane] = "Which output format must I use?"
@@ -4375,7 +4369,7 @@ class WorkerCommandTests(unittest.TestCase):
                     with patch.object(self.fixture.world, "_prompt", side_effect=herdr.HerdrCommandNotStarted("not started")):
                         code, output, error = self.command("answer", row.name, "--text", text)
                     self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-                    self.assertIn("did not submit", error)
+                    self.assertIn("answer did not submit: not started", error)
                     self.assertEqual(self.command("answer", row.name, "--text", text), (0, "done\n", ""))
                     for state, code in (("working", worker.ExitCode.BUSY), ("unknown", worker.ExitCode.UNCERTAIN),
                                         ("idle", worker.ExitCode.BUSY)):
@@ -4736,35 +4730,41 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.world.locations[opened.pane]["agent_status"] = status
         return opened
 
-    def test_answer_uses_an_open_question_box_when_status_is_idle(self) -> None:
-        opened = self.answerable_worker()
-        self.agent.question_record(opened.pane, "format")
-        with patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt:
-            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
-        prompt.assert_not_called()
-        self.assertEqual(self.agent.answers, [(opened.pane, "Use JSON.")])
-        (pending,) = self.run_dir.glob(".*.pending-answer.json")
-        self.assertEqual(worker_lifecycle.read_json_object(pending)["question_call"], "format")
+    def assert_blocked_answer_uses_prompt(self, pane: str) -> None:
+        world = self.fixture.world
+        before = len(world.commands)
+        code, output, error = self.command("answer", "impl", "--text", "Use JSON.")
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("answer did not submit", error)
+        self.assertIn("is blocked and requires interactive input", error)
+        commands = world.commands[before:]
+        self.assertEqual([command[:3] for command in commands if command[:2] == ("agent", "prompt")],
+                         [("agent", "prompt", pane)])
+        self.assertFalse(any(command[:2] in (("pane", "send-keys"), ("pane", "send-text")) for command in commands))
+        self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+        self.assertEqual(self.agent.answers, [])
 
-    def test_answer_prompts_a_blocked_codex_worker_without_an_open_call(self) -> None:
+    def test_answer_retries_a_blocked_codex_plain_text_question_when_idle(self) -> None:
         opened = self.answerable_worker(status="blocked")
-        self.agent.question_record(opened.pane, "closed")
-        self.agent.question_output(opened.pane, "closed")
-        answer = ("answer", "impl", "--text", "Use JSON.")
-        with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as box:
-            code, output, error = self.command(*answer)
-            self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-            self.assertIn("answer did not submit", error)
-            self.assertIn("is blocked and requires interactive input", error)
-            self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
-            self.assertEqual(self.agent.answers, [])
-            self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
-            self.assertEqual(self.command(*answer), (0, "done\n", ""))
-        box.assert_not_called()
+        self.assert_blocked_answer_uses_prompt(opened.pane)
+        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+        self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
         (pane, text), = self.agent.answers
         self.assertEqual(pane, opened.pane)
         self.assertIn("Use JSON.", text)
         self.assertIn("DONE ", text)
+
+    def test_answer_uses_a_prompt_after_turn_aborted(self) -> None:
+        opened = self.answerable_worker(status="blocked")
+        self.agent.question_record(opened.pane, "format")
+        self.agent.append_codex_record(opened.pane, {"type": "event_msg", "payload": {"type": "turn_aborted"}})
+        self.assert_blocked_answer_uses_prompt(opened.pane)
+
+    def test_answer_uses_a_prompt_after_task_complete(self) -> None:
+        opened = self.answerable_worker(status="blocked")
+        self.agent.question_record(opened.pane, "format")
+        self.agent.append_codex_record(opened.pane, {"type": "event_msg", "payload": {"type": "task_complete"}})
+        self.assert_blocked_answer_uses_prompt(opened.pane)
 
     def test_answer_allows_retry_after_target_refusal_before_input(self) -> None:
         opened = self.answerable_worker()
@@ -4772,14 +4772,29 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.answer_inputs[opened.pane] = "Unsent answer"
         code, output, error = self.command(*answer)
         self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-        self.assertIn("did not submit", error)
+        self.assertIn("answer did not submit", error)
+        self.assertIn("would overwrite unsaved input", error)
         self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
         self.assertEqual(self.agent.answers, [])
         del self.agent.answer_inputs[opened.pane]
         self.assertEqual(self.command(*answer), (0, "done\n", ""))
-        (pane, text), = self.agent.answers
-        self.assertEqual(pane, opened.pane)
-        self.assertIn("Use JSON.", text)
+        self.assertEqual([pane for pane, _ in self.agent.answers], [opened.pane])
+
+    def test_answer_retries_a_prompt_that_herdr_refused_before_input(self) -> None:
+        opened = self.answerable_worker()
+        answer = ("answer", "impl", "--text", "Use JSON.")
+        for refusal in ("agent_not_found", "agent_not_ready"):
+            with self.subTest(refusal=refusal):
+                failure = herdr_types.HerdrFailure(f"herdr agent prompt: {refusal}", refusal)
+                with patch.object(self.fixture.world, "_prompt", side_effect=failure) as transport:
+                    code, output, error = self.command(*answer)
+                transport.assert_called_once()
+                self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+                self.assertIn(f"answer did not submit: herdr agent prompt: {refusal}", error)
+                self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+                self.assertEqual(self.agent.answers, [])
+        self.assertEqual(self.command(*answer), (0, "done\n", ""))
+        self.assertEqual([pane for pane, _ in self.agent.answers], [opened.pane])
 
     def test_answer_refuses_a_second_answer_when_delivery_is_unknown(self) -> None:
         _ = self.answerable_worker()
@@ -4788,58 +4803,38 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.object(self.fixture.world, "_prompt", side_effect=timeout) as transport:
             code, output, error = self.command(*answer)
             self.assertEqual((code, output), (worker.ExitCode.UNCERTAIN, ""))
-            self.assertIn("delivery unknown", error)
+            self.assertIn("answer delivery unknown", error)
+            (pending,) = self.run_dir.glob(".*.pending-answer.json")
+            saved = pending.read_bytes()
             code, output, error = self.command(*answer)
             self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
             self.assertIn("an answer is pending for this input request", error)
+            self.assertEqual(pending.read_bytes(), saved)
         transport.assert_called_once()
         self.assertEqual(self.agent.answers, [])
 
-    def test_answer_retries_a_prompt_that_herdr_refused_before_input(self) -> None:
+    def test_answer_uses_a_normal_prompt_for_an_idle_open_call(self) -> None:
         opened = self.answerable_worker()
-        answer = ("answer", "impl", "--text", "Use JSON.")
-        for refusal in ("agent_not_found", "agent_not_ready"):
-            with self.subTest(refusal=refusal):
-                error = herdr_types.HerdrFailure(f"herdr agent prompt: {refusal}", refusal)
-                with patch.object(self.fixture.world, "_prompt", side_effect=error) as transport:
-                    code, output, detail = self.command(*answer)
-                transport.assert_called_once()
-                self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-                self.assertIn(f"did not submit: herdr agent prompt: {refusal}", detail)
-                self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
-                self.assertEqual(self.agent.answers, [])
-        self.assertEqual(self.command(*answer), (0, "done\n", ""))
-        self.assertEqual([pane for pane, _ in self.agent.answers], [opened.pane])
-
-    def test_answer_uses_a_prompt_after_the_transcript_ends_turns_with_open_calls(self) -> None:
-        opened = self.answerable_worker()
-        for event in ("turn_aborted", "task_complete"):
-            self.agent.question_record(opened.pane, event)
-            self.agent.append_transcript(opened.pane, json.dumps({"type": "event_msg", "payload": {"type": event}}) + "\n")
+        self.agent.question_record(opened.pane, "format")
         with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as box:
             self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
         box.assert_not_called()
         (pane, text), = self.agent.answers
         self.assertEqual(pane, opened.pane)
-        self.assertIn("Use JSON.", text)
         self.assertIn("DONE ", text)
+        (pending,) = self.run_dir.glob(".*.pending-answer.json")
+        self.assertEqual(worker_lifecycle.read_json_object(pending)["question_call"], "")
 
     def test_answer_sends_no_input_with_a_torn_transcript_tail(self) -> None:
-        opened = self.answerable_worker()
+        opened = self.answerable_worker(status="blocked")
         self.agent.question_record(opened.pane, "format")
-        self.agent.append_transcript(opened.pane, '{"type": "response_item", "payload":')
-        self.assert_answer_has_no_proved_input_path()
-
-    def test_answer_sends_no_input_with_two_open_calls(self) -> None:
-        opened = self.answerable_worker()
-        self.agent.question_record(opened.pane, "format")
-        self.agent.question_record(opened.pane, "indent")
-        self.assert_answer_has_no_proved_input_path()
-
-    def assert_answer_has_no_proved_input_path(self) -> None:
+        backend = staff.backend(opened.row)
+        assert isinstance(backend, staff.CodexBackend)
+        with worker_admission.transcript_source(opened.row, backend).open("a", encoding="utf-8") as stream:
+            _ = stream.write('{"type": "response_item", "payload":')
         world = self.fixture.world
         with (patch.object(world, "answer_question", wraps=world.answer_question) as box,
-              patch.object(world, "answer_prompt", wraps=world.answer_prompt) as prompt):
+              patch.object(world, "prompt", wraps=world.prompt) as prompt):
             code, output, _ = self.command("answer", "impl", "--text", "Use JSON.")
         self.assertEqual((code, output), (worker.ExitCode.UNCERTAIN, ""))
         box.assert_not_called()
@@ -4897,10 +4892,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.questions[opened.pane] = "Which format?"
         self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
         with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer:
-            code, output, error = self.command("answer", "impl", "--text", "Use JSON.")
-            self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-            self.assertIn("answer did not submit", error)
-            self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+            self.assert_blocked_answer_uses_prompt(opened.pane)
             self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
             self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
         answer.assert_not_called()

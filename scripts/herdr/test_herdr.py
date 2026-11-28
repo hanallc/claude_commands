@@ -4460,17 +4460,6 @@ class HerdrTests(unittest.TestCase):
                     client.answer_question(pane, text, target=session)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text)])
 
-    def test_answer_prompt_distinguishes_unstarted_transport_from_uncertain_delivery(self) -> None:
-        client = self.herdr
-        pane, session = "w1:p1", "fixture-answer"
-        with self.prompt_target(client, pane, session):
-            with patch.object(client, "_prompt", side_effect=herdr.HerdrCommandNotStarted("the command could not start")):
-                result = client.answer_prompt(pane, "Use JSON.", target=session)
-            self.assertEqual(result, herdr.AnswerDidNotSubmit("the command could not start"))
-            with patch.object(client, "_prompt", side_effect=herdr_types.HerdrFailure("the command timed out")):
-                result = client.answer_prompt(pane, "Use JSON.", target=session)
-            self.assertEqual(result, herdr.AnswerDeliveryUnknown("the command timed out"))
-
     def test_failed_source_record_prevents_prompt_submission(self) -> None:
         from scripts.lib import script_prompts
 

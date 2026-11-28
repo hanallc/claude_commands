@@ -2639,32 +2639,9 @@ class PendingAnswer:
     question_call: str
 
 
-class AnswerTranscriptUnavailable(Enum):
+class AnswerBlocked(Enum):
+    PENDING = "an answer is pending for this input request"
     UNAVAILABLE = "the transcript cannot verify the pending answer"
-
-
-class PreviousAnswer(Enum):
-    NONE = "no answer is pending"
-    UNCONFIRMED = "the transcript does not show the pending answer"
-    ACCEPTED = "the transcript shows the pending answer"
-    NEXT_REQUEST = "the transcript shows a new request after the pending answer"
-
-
-@dataclass(frozen=True)
-class OpenQuestionCall:
-    call: str
-
-
-class AnswerPrompt(Enum):
-    NORMAL = "send the answer as a normal prompt"
-
-
-@dataclass(frozen=True)
-class AnswerRequest:
-    record_number: int
-    request_digest: str
-    input_path: OpenQuestionCall | AnswerPrompt
-    previous: PreviousAnswer
 
 
 def _answer_digest(text: str) -> str:
@@ -2672,62 +2649,60 @@ def _answer_digest(text: str) -> str:
 
 
 def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend,
-                    status: herdr.AgentStatus) -> AnswerRequest | AnswerTranscriptUnavailable:
+                    status: herdr.AgentStatus, text: str) -> PendingAnswer | AnswerBlocked:
     saved = worker_lifecycle.read_json_object(path)
     session = str(row.current_session)
     boundary = saved.get("record_number", 0)
     if not isinstance(boundary, int) or isinstance(boundary, bool):
-        return AnswerTranscriptUnavailable.UNAVAILABLE
+        return AnswerBlocked.UNAVAILABLE
     if saved and (saved.get("session") != session or boundary < 1):
-        return AnswerTranscriptUnavailable.UNAVAILABLE
+        return AnswerBlocked.UNAVAILABLE
 
     source = worker_admission.transcript_source(row, backend)
     number = 0
     last: dict[str, object] = {}
-    open_questions: set[str] = set()
-    saved_call = saved.get("question_call")
-    previous = PreviousAnswer.UNCONFIRMED if saved else PreviousAnswer.NONE
+    question_call = ""
+    accepted = False
+    next_request = False
     records = worker_admission.transcript_records(
         source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
     for number, fields in enumerate(records, start=1):
         if isinstance(fields, worker_admission.TornTranscriptRecord):
             if number >= boundary:
-                return AnswerTranscriptUnavailable.UNAVAILABLE
+                return AnswerBlocked.UNAVAILABLE
             continue
         last = fields
         if number == boundary and _answer_digest(json.dumps(fields, sort_keys=True)) != saved.get("request_digest"):
-            return AnswerTranscriptUnavailable.UNAVAILABLE
+            return AnswerBlocked.UNAVAILABLE
         turn_ended = _transcript_turn_boundary(fields)
-        if isinstance(backend, staff.CodexBackend) and turn_ended:
-            open_questions.clear()
-        elif isinstance(backend, staff.CodexBackend):
-            raw = fields.get("payload")
-            payload = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
-            kind = payload.get("type")
-            call = payload.get("call_id")
-            if isinstance(call, str) and call:
-                if kind == "function_call" and payload.get("name") == "request_user_input":
-                    if (number > boundary and previous is PreviousAnswer.ACCEPTED and call != saved_call
-                            and (not saved_call or status is herdr.AgentStatus.BLOCKED)):
-                        previous = PreviousAnswer.NEXT_REQUEST
-                    open_questions.add(call)
-                elif kind == "function_call_output" and call in open_questions:
-                    if number > boundary and call == saved_call and previous is PreviousAnswer.UNCONFIRMED:
-                        previous = PreviousAnswer.ACCEPTED
-                    open_questions.remove(call)
+        if turn_ended and isinstance(backend, staff.CodexBackend):
+            question_call = ""
+        raw = fields.get("payload")
+        payload = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+        kind = payload.get("type")
+        call = payload.get("call_id")
+        if kind == "function_call" and payload.get("name") == "request_user_input" and isinstance(call, str):
+            if number > boundary and accepted and status is herdr.AgentStatus.BLOCKED and call != saved.get("question_call"):
+                next_request = True
+            question_call = call
+        elif kind == "function_call_output" and question_call and call == question_call:
+            if number > boundary and call == saved.get("question_call"):
+                accepted = True
+            question_call = ""
         if not saved or number <= boundary:
             continue
         entry = worker_admission.transcript_entry(fields, set())
         if entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
-            if previous is PreviousAnswer.UNCONFIRMED and _answer_digest(script_prompt(body)) == saved.get("answer_digest"):
-                previous = PreviousAnswer.ACCEPTED
-        elif previous is PreviousAnswer.ACCEPTED and (entry.startswith("assistant:\n") or turn_ended):
-            previous = PreviousAnswer.NEXT_REQUEST
-    if not number or number < boundary or len(open_questions) > 1:
-        return AnswerTranscriptUnavailable.UNAVAILABLE
-    question = OpenQuestionCall(next(iter(open_questions))) if open_questions else AnswerPrompt.NORMAL
-    return AnswerRequest(number, _answer_digest(json.dumps(last, sort_keys=True)), question, previous)
+            accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
+        elif accepted and (entry.startswith("assistant:\n") or turn_ended):
+            next_request = True
+    if not number or number < boundary:
+        return AnswerBlocked.UNAVAILABLE
+    if saved and not next_request:
+        return AnswerBlocked.PENDING
+    return PendingAnswer(session, number, _answer_digest(json.dumps(last, sort_keys=True)),
+                         _answer_digest(script_prompt(text)), question_call if status is herdr.AgentStatus.BLOCKED else "")
 
 
 def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staff.StaffSnapshot,
@@ -2753,41 +2728,41 @@ def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staf
         except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                 staff.StaffRefused, staff.StaffUnreadable) as error:
             return _refuse_answer(name, str(error))
+    blocked_codex = state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend)
     scope = _answer_digest(json.dumps((row.id, instance, completion_id)))
     path = run / f".{scope}.pending-answer.json"
-    request = _answer_request(path, row, backend, state.status)
-    if isinstance(request, AnswerTranscriptUnavailable):
-        return _refuse_answer(name, request.value, ExitCode.UNCERTAIN)
+    request = _answer_request(path, row, backend, state.status, text)
+    if isinstance(request, AnswerBlocked):
+        code = ExitCode.BUSY if request is AnswerBlocked.PENDING else ExitCode.UNCERTAIN
+        return _refuse_answer(name, request.value, code)
     if owner is None:
         return _refuse_answer(name, "the owner is unavailable")
-    if request.previous in (PreviousAnswer.UNCONFIRMED, PreviousAnswer.ACCEPTED):
-        return _refuse_answer(name, "an answer is pending for this input request", ExitCode.BUSY)
-    box = request.input_path
-    submitted = text + "\n" + _done_instruction(completion_id) if ask_for_done and isinstance(box, AnswerPrompt) else text
-    target = str(row.current_session)
-    pending = PendingAnswer(target, request.record_number, request.request_digest, _answer_digest(script_prompt(submitted)),
-                            box.call if isinstance(box, OpenQuestionCall) else "")
+    use_box = blocked_codex and bool(request.question_call)
+    submitted = text
+    if ask_for_done and not use_box:
+        submitted += "\n" + _done_instruction(completion_id)
+        request = replace(request, answer_digest=_answer_digest(script_prompt(submitted)))
     artifacts = CompletionArtifacts(owner, run)
-    artifacts.write(path, json.dumps(asdict(pending)))
-    if isinstance(box, OpenQuestionCall):
+    artifacts.write(path, json.dumps(asdict(request)))
+    if use_box:
         try:
-            client.answer_question(state.pane, submitted, target=target)
+            client.answer_question(state.pane, submitted, target=str(row.current_session))
         except herdr.HerdrCommandNotStarted:
             artifacts.unlink(path)
             raise
         return ExitCode.OK
-    transport = client.answer_prompt(state.pane, submitted, target=target)
-    if isinstance(transport, herdr.AnswerDidNotSubmit):
-        artifacts.unlink(path)
-        return _refuse_answer(name, f"answer did not submit: {transport.reason}")
+    submission = herdr.TrackedPromptSubmission(lambda: None)
     try:
-        receipt = _answer_request(path, row, backend, state.status)
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        client.prompt(state.pane, submitted, target=str(row.current_session), on_submission=submission)
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        refused_before_input = isinstance(error, (herdr.AgentBlocked, herdr.HerdrCommandNotStarted)) or (
+            isinstance(error, herdr_types.HerdrFailure)
+            and error.code in ("agent_not_found", "agent_not_ready", "wrong_target"))
+        if refused_before_input or not submission.may_have_submitted:
+            artifacts.unlink(path)
+            return _refuse_answer(name, f"answer did not submit: {error}")
         return _refuse_answer(name, f"answer delivery unknown: {error}", ExitCode.UNCERTAIN)
-    if isinstance(receipt, AnswerRequest) and receipt.previous in (PreviousAnswer.ACCEPTED, PreviousAnswer.NEXT_REQUEST):
-        return ExitCode.OK
-    reason = transport.reason if isinstance(transport, herdr.AnswerDeliveryUnknown) else "no receipt in the transcript"
-    return _refuse_answer(name, f"answer delivery unknown: {reason}", ExitCode.UNCERTAIN)
+    return ExitCode.OK
 
 
 def _answer_ended_pass(row: staff.StaffRow, run: Path, passed: dict[str, object],
