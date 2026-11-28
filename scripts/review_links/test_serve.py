@@ -42,6 +42,7 @@ from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
 from io import BytesIO, StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
 
@@ -73,7 +74,7 @@ from scripts.review_links import (
 )
 from scripts.review_links import (
     accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
-    placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
+    placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, settings_page, studio_page, test_review_page,
 )
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
 from scripts.feature_log import feature_log
@@ -1168,6 +1169,479 @@ class ReviewLinksServerTests(unittest.TestCase):
         """Return the state of each saved hold file."""
         return [cast(send_hold.HoldFile, json.loads(path.read_text(encoding="utf-8")))["state"]
                 for path in sorted((self.root / send_hold.HOLD_FOLDER).glob("*.json"))]
+
+    def post_undo_time(self, seconds: str, *, token: str) -> tuple[int, str, dict[str, object]]:
+        body = urlencode({"seconds": seconds, "token": token}).encode()
+        return self.held_http("POST", settings_page.PAGE_PATH, body,
+                              headers={"Content-Type": "application/x-www-form-urlencoded"})
+
+    def test_settings_saves_at_once_and_changes_the_send_hold_time(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            status, held, saved = self.post_undo_time("20", token=self.server.new_item_token)
+            self.assertEqual((status, held, saved["seconds"], saved["previous"]), (200, "", 20, 10))
+            config = conf.read("review_links")
+            self.assertEqual(config.whole("undo_seconds"), 10)
+            self.assertEqual(settings_page.undo_seconds(self.root, config), 20)
+            page = self.request(settings_page.PAGE_PATH)
+            self.assertEqual(page.status, 200, page.body)
+            self.assertIn(b'value="20" aria-pressed="true">20 s', page.body)
+            self.assertEqual(self.request("/" + settings_page.SETTINGS_FILE).status, 404)
+            status, held, send = self.held_http("POST", images.PAGE_PATH, b"action=answer",
+                                               headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual((status, held, send["seconds"]), (202, "held", 20))
+            self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{send["hold"]}/undo')[0], 200)
+            self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{saved["hold"]}/undo')[0], 200)
+            self.assertEqual(settings_page.undo_seconds(self.root, config), 10)
+
+    def test_settings_refuses_an_unlisted_time_and_a_bad_token(self) -> None:
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            self.assertEqual(self.post_undo_time("15", token=self.server.new_item_token)[0], 400)
+            self.assertEqual(self.post_undo_time("20", token="wrong")[0], 403)
+            self.assertFalse((self.root / settings_page.SETTINGS_FILE).exists())
+
+    def test_settings_undo_restores_the_previous_choice(self) -> None:
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            token = self.server.new_item_token
+            _, _, first = self.post_undo_time("20", token=token)
+            _, _, second = self.post_undo_time("30", token=token)
+            stale = f'{send_hold.HOLD_PATH}/{first["hold"]}/undo'
+            recent = f'{send_hold.HOLD_PATH}/{second["hold"]}/undo'
+            self.assertEqual(self.held_http("POST", stale)[0], 404)
+            self.assertEqual(self.held_http("POST", recent)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(self.held_http("POST", recent)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 20)
+
+    def test_settings_confirms_visible_state_after_folder_sync_failure(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        token = self.server.new_item_token
+        sync_folder = atomic_file.sync_folder
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(atomic_file, "sync_folder", side_effect=OSError("Directory sync failed.")) as sync):
+            status, _, saved = self.post_undo_time("20", token=token)
+            self.assertEqual((status, saved["seconds"], saved["previous"]), (503, 20, 10))
+            sync.assert_called_once_with(self.root)
+            self.assertIn(b'value="20" aria-pressed="true"', self.request(settings_page.PAGE_PATH).body)
+            status, _, retry = self.post_undo_time("20", token=token)
+            self.assertEqual((status, retry["hold"], retry["previous"]), (503, saved["hold"], 10))
+            self.assertEqual(sync.call_count, 2)
+            undo = f'{send_hold.HOLD_PATH}/{saved["hold"]}/undo'
+            status, _, reply = self.held_http("POST", undo)
+            self.assertEqual((status, reply["outcome"]), (503, "undone"))
+            self.assertIn("could not confirm the save", str(reply["reason"]))
+            self.assertEqual(sync.call_count, 3)
+            self.assertIn(b'value="10" aria-pressed="true"', self.request(settings_page.PAGE_PATH).body)
+            self.assertEqual(self.held_http("POST", undo)[0], 503)
+            self.assertEqual(sync.call_count, 4)
+            sync.side_effect = sync_folder
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(sync.call_count, 5)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_settings_retries_sync_and_reports_uncertainty(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        sync_folder = atomic_file.sync_folder
+        failures = 2
+
+        def sync(folder: Path) -> None:
+            nonlocal failures
+            if failures:
+                failures -= 1
+                raise OSError("Directory sync failed.")
+            sync_folder(folder)
+
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(atomic_file, "sync_folder", side_effect=sync) as sync_mock):
+            browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const form=document.getElementById('undo-time'),error=document.getElementById('settings-error');
+ const pick=form.querySelector('button[value="20"]'), attempts=[];
+ const nativeFetch=window.fetch;
+ window.fetch=(...args)=>{
+  const response=nativeFetch(...args);
+  if(args[0]===form.action) attempts.push(response.then(reply=>reply.clone().json()));
+  return response;
+ };
+ const choose=()=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(!form.dataset.saving){observer.disconnect();resolve();}
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-saving']});
+  pick.click();
+ });
+ for(let attempt=0;attempt<2;attempt++){
+  await choose();
+  const toast=document.querySelector('[data-send-undo]');
+  if(pick.getAttribute('aria-pressed')!=='true' || !error.hidden ||
+     !toast?.textContent.includes('The server could not confirm the save.') ||
+     toast.querySelector('button')?.textContent!=='Undo')
+   throw new Error('Settings shows the active choice and the sync error.');
+ }
+ await choose();
+ const replies=await Promise.all(attempts);
+ if(!replies[0].hold || !replies.every(reply=>reply.hold===replies[0].hold))
+  throw new Error('The retries return the original Undo receipt.');
+ const toast=document.querySelector('[data-send-undo]');
+ if(!error.hidden || toast?.querySelector('span').textContent!=='Saved.' ||
+    toast.querySelector('button')?.textContent!=='Undo')
+  throw new Error('The confirmed sync clears the error and shows Saved with Undo.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+            self.assertEqual(sync_mock.call_count, 3)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_settings_can_undo_an_unconfirmed_save_until_expiry(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        failure = OSError("Directory sync failed.")
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(atomic_file, "sync_folder", side_effect=[failure, None, failure]) as sync):
+            browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const form=document.getElementById('undo-time'),error=document.getElementById('settings-error');
+ const pick=seconds=>form.querySelector(`button[value="${seconds}"]`);
+ const message='The server could not confirm the save.';
+ const removed=(target,done)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(done()){observer.disconnect();resolve();}
+  });
+  observer.observe(target,{attributes:true,childList:true});
+ });
+ const choose=async seconds=>{
+  const saved=removed(form,()=>!form.dataset.saving);
+  pick(seconds).click();
+  await saved;
+  const toast=document.querySelector('[data-send-undo]');
+  if(pick(seconds).getAttribute('aria-pressed')!=='true' || !error.hidden ||
+     !toast?.querySelector('[role=alert]')?.textContent.includes(message) ||
+     toast.querySelector('button')?.textContent!=='Undo' || !toast.querySelector('[data-send-undo-bar]'))
+   throw new Error('The sync error and Undo appear in the same message.');
+  return toast;
+ };
+ const first=await choose(20);
+ const undone=removed(first.parentElement,()=>!first.isConnected);
+ first.querySelector('button').click();
+ await undone;
+ if(pick(10).getAttribute('aria-pressed')!=='true' || !error.hidden)
+  throw new Error('Undo restores the previous choice and clears the error.');
+ const second=await choose(5);
+ const expired=removed(second.parentElement,()=>!second.isConnected);
+ second.getAnimations()[0].finish();
+ await expired;
+ if(error.hidden || !error.textContent.includes(message) || document.querySelector('[data-send-undo]'))
+  throw new Error('The sync error stays visible after Undo expires.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+            self.assertEqual(sync.call_count, 3)
+        self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 5)
+
+    def test_invalid_settings_choices_keep_held_sends_and_undo_available(self) -> None:
+        path = conf.path("review_links")
+        _ = write_config_fixture(path, "undo_seconds=10\n")
+        config = "".join(line for line in path.read_text().splitlines(keepends=True)
+                         if not line.startswith("undo_seconds_choices="))
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            token = self.server.new_item_token
+            for invalid in ("", "undo_seconds_choices=5,5\n", "undo_seconds_choices=5,no\n"):
+                with self.subTest(invalid=invalid):
+                    _ = write_config_fixture(path, "undo_seconds_choices=5,10,20,30\n")
+                    status, _, saved = self.post_undo_time("20", token=token)
+                    self.assertEqual(status, 200, saved)
+                    _ = path.write_text(config + invalid, encoding="utf-8")
+                    page = self.request(settings_page.PAGE_PATH)
+                    self.assertEqual(page.status, 200)
+                    self.assertIn(b'The undo_seconds_choices setting is missing or invalid.', page.body)
+                    self.assertNotIn(b'name="seconds"', page.body)
+                    self.assertEqual(self.post_undo_time("20", token=token)[0], 400)
+                    status, held, send = self.held_http("POST", images.PAGE_PATH, b"action=answer",
+                                                       headers={send_hold.HOLD_HEADER: "1"})
+                    self.assertEqual((status, held, send["seconds"]), (202, "held", 10))
+                    self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{send["hold"]}/undo')[0], 200)
+                    self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{saved["hold"]}/undo')[0], 200)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the sidebar label test.")
+    def test_collapsed_labels_are_visible_beside_the_scrolling_sidebar(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        pages = tuple(console.ConsolePage(f"page{index}", f"Page {index}", "inbox", f"Page {index}",
+                                          console.UnavailablePage()) for index in range(16))
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        _ = browser.command("Emulation.setDeviceMetricsOverride",
+                            {"width": 1440, "height": 700, "deviceScaleFactor": 1, "mobile": False}, browser.session)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console, "read_pages", return_value=pages),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            browser.navigate(f"http://127.0.0.1:{self.port}/console/")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const check=(ok,message)=>{if(!ok) throw new Error(message);};
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const sidebar=document.querySelector('.sidebar');
+ const toggle=document.getElementById('nav-toggle');
+ const settings=document.querySelector('[data-page=settings]');
+ const label=document.getElementById('nav-tooltip');
+ check(innerWidth===1440 && innerHeight===700,'The desktop viewport is 1440 x 700.');
+ if(toggle.getAttribute('aria-expanded')==='true') toggle.click();
+ check(sidebar.scrollHeight>sidebar.clientHeight,'The sidebar scrolls.');
+ settings.focus();
+ await frame();
+ const bounds=label.getBoundingClientRect(), icon=settings.getBoundingClientRect();
+ check(sidebar.scrollTop>0 && !label.hidden && label.textContent==='Settings',
+  'Focus scrolls to Settings and shows its label.');
+ label.style.pointerEvents='auto';
+ check(bounds.left>sidebar.getBoundingClientRect().right && bounds.top<icon.bottom &&
+  document.elementFromPoint(bounds.left+bounds.width/2,bounds.top+bounds.height/2)===label,
+  'The label is visible outside the sidebar.');
+ label.style.removeProperty('pointer-events');
+ const first=document.querySelector('[data-page=page0]');
+ first.focus();
+ await frame();
+ first.blur();
+ settings.dispatchEvent(new PointerEvent('pointerenter'));
+ check(label.hidden,'The label is hidden when its icon is outside the scroll area.');
+ settings.dispatchEvent(new PointerEvent('pointerleave'));
+ first.focus();
+ check(!label.hidden && label.textContent==='Page 0 · Not available','The label returns to the focused icon.');
+ toggle.click();
+ check(label.hidden,'Expanding the sidebar hides the floating label.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the sidebar label test.")
+    def test_collapsed_keyboard_focus_replaces_the_pointer_label(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        pages = tuple(console.ConsolePage(f"page{index}", f"Page {index}", "inbox", f"Page {index}",
+                                          console.UnavailablePage()) for index in range(4))
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console, "read_pages", return_value=pages),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            browser.navigate(f"http://127.0.0.1:{self.port}/console/")
+            session = browser.session
+            setup = browser.command("Runtime.evaluate", {"expression": r"""
+(()=>{
+ const toggle=document.getElementById('nav-toggle');
+ if(toggle.getAttribute('aria-expanded')==='true') toggle.click();
+ const first=document.querySelector('[data-page=page0]');
+ first.focus();
+ const center=entry=>{
+  const bounds=entry.getBoundingClientRect();
+  return {x:(bounds.left+bounds.right)/2,y:(bounds.top+bounds.bottom)/2};
+ };
+ return {first:center(first),last:center(document.querySelector('[data-page=page3]'))};
+})();
+""", "returnByValue": True}, session)
+            points = cast(dict[str, dict[str, dict[str, float]]], setup["result"])["value"]
+            _ = browser.command("Input.dispatchMouseEvent", {"type": "mouseMoved", **points["first"]}, session)
+            keys = {"key": "Tab", "code": "Tab", "windowsVirtualKeyCode": 9}
+            _ = browser.command("Input.dispatchKeyEvent", {"type": "rawKeyDown", **keys}, session)
+            _ = browser.command("Input.dispatchKeyEvent", {"type": "keyUp", **keys}, session)
+            result = browser.command("Runtime.evaluate", {"expression": r"""
+(()=>{
+ const first=document.querySelector('[data-page=page0]');
+ const focused=document.activeElement, label=document.getElementById('nav-tooltip');
+ if(!first.matches(':hover') || !focused.matches('[data-page=page1]:focus-visible') ||
+    label.hidden || label.textContent!=='Page 1 · Not available')
+  throw new Error('Tab replaces the label of the icon under the pointer.');
+})();
+"""}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+            _ = browser.command("Input.dispatchMouseEvent", {"type": "mouseMoved", **points["last"]}, session)
+            result = browser.command("Runtime.evaluate", {"expression": r"""
+(()=>{
+ const last=document.querySelector('[data-page=page3]');
+ const focused=document.activeElement, label=document.getElementById('nav-tooltip');
+ if(!last.matches(':hover') || !focused.matches('[data-page=page1]:focus-visible') ||
+    label.hidden || label.textContent!=='Page 3 · Not available')
+  throw new Error('A new pointer entry replaces the label of the focused icon.');
+})();
+"""}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+            _ = browser.command("Input.dispatchKeyEvent", {"type": "rawKeyDown", **keys}, session)
+            _ = browser.command("Input.dispatchKeyEvent", {"type": "keyUp", **keys}, session)
+            result = browser.command("Runtime.evaluate", {"expression": r"""
+(()=>{
+ const last=document.querySelector('[data-page=page3]');
+ const focused=document.activeElement, label=document.getElementById('nav-tooltip');
+ if(!last.matches(':hover') || !focused.matches('[data-page=page2]:focus-visible') ||
+    label.hidden || label.textContent!=='Page 2 · Not available')
+  throw new Error('Tab replaces the pointer label again.');
+})();
+"""}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_settings_shows_saved_after_undo_expires(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const form=document.getElementById('undo-time');
+ const nativeFetch=window.fetch,now=performance.now.bind(performance);
+ let delay=0;
+ Object.defineProperty(performance,'now',{value:()=>now()+delay});
+ window.fetch=async(...args)=>{
+  const response=await nativeFetch(...args);
+  if(args[0]===form.action) delay=7000;
+  return response;
+ };
+ const saved=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(!form.dataset.saving){observer.disconnect();resolve();}
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-saving']});
+ });
+ const pick=form.querySelector('button[value="5"]');
+ pick.click();
+ await saved;
+ const toast=document.querySelector('[data-send-undo]');
+ if(pick.getAttribute('aria-pressed')!=='true' || toast?.textContent!=='Saved.' ||
+    toast.querySelector('button,[data-send-undo-bar]'))
+  throw new Error('The save shows Saved without Undo after the deadline.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 5)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_settings_undo_uses_the_time_left_after_save(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        elapsed = 0
+        sync_folder = atomic_file.sync_folder
+
+        def sync(folder: Path) -> None:
+            nonlocal elapsed
+            sync_folder(folder)
+            elapsed += 2_000_000_000
+
+        def undo_clock() -> int:
+            return time.time_ns() + elapsed
+
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(settings_page, "time", SimpleNamespace(time_ns=undo_clock)),
+              patch.object(atomic_file, "sync_folder", side_effect=sync)):
+            browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const form=document.getElementById('undo-time');
+ const nativeFetch=window.fetch;
+ let save,undo;
+ window.fetch=(...args)=>{
+  const response=nativeFetch(...args);
+  if(args[0]===form.action) save=response.then(answer=>answer.clone().json());
+  if(String(args[0]).endsWith('/undo')) undo=response.then(answer=>answer.clone().json());
+  return response;
+ };
+ const toastAdded=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   const toast=document.querySelector('[data-send-undo]');
+   if(toast){observer.disconnect();resolve(toast);}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ form.querySelector('[value="5"]').click();
+ const toast=await toastAdded, reply=await save;
+ const duration=toast.getAnimations()[0].effect.getTiming().duration;
+ if(reply.seconds!==5 || !(reply.remaining_seconds>2 && reply.remaining_seconds<=3))
+  throw new Error('The server counts down from the saved deadline.');
+ if(!(duration>1000 && duration<=reply.remaining_seconds*1000))
+  throw new Error('The toast uses the remaining time from the save response.');
+ toast.querySelector('button').click();
+ if((await undo).outcome!=='undone') throw new Error('Undo restores the original choice.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 10)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_opens_settings_and_saves_with_undo_in_dark_mode(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=20\n")
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        session = browser.session
+        _ = browser.command("Emulation.setDeviceMetricsOverride",
+                            {"width": 1440, "height": 900, "deviceScaleFactor": 1, "mobile": False}, session)
+        _ = browser.command("Emulation.setEmulatedMedia", {"features": [
+            {"name": "prefers-color-scheme", "value": "dark"}]}, session)
+
+        def evaluate(expression: str) -> None:
+            result = browser.command("Runtime.evaluate", {"expression": expression, "awaitPromise": True}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            browser.navigate(f"http://127.0.0.1:{self.port}/console/")
+            evaluate(r"""
+(async()=>{
+ window.settingsCheck=(ok,message)=>{if(!ok) throw new Error(message);};
+ window.settingsWhen=(root,find)=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(check);
+  const timeout=setTimeout(()=>{observer.disconnect();reject(new Error('Settings did not update.'));},4000);
+  function check(){
+   if(!find()) return;
+   clearTimeout(timeout);observer.disconnect();resolve();
+  }
+  observer.observe(root,{attributes:true,childList:true,subtree:true});check();
+ });
+ const link=document.querySelector('[data-page=settings]');
+ link.click();
+ const frame=document.querySelector('.workspace iframe[data-console-page=settings]');
+ settingsCheck(link.getAttribute('aria-current')==='page' && frame && !frame.hidden,'Settings opens in the main area.');
+ settingsCheck(link.parentElement.firstElementChild.matches('.for-you-slot') && link===link.parentElement.lastElementChild,
+  'Settings is below For you.');
+ if(!frame.contentDocument?.querySelector('#undo-time')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+ window.settingsDocument=frame.contentDocument;
+ const choices=[...settingsDocument.querySelectorAll('#undo-time button')];
+ settingsCheck(innerWidth===1440 && innerHeight===900 && matchMedia('(prefers-color-scheme:dark)').matches,
+  'The browser uses the dark 1440 x 900 view.');
+ settingsCheck(settingsDocument.querySelector('h1').textContent==='Settings' && choices.map(button=>button.textContent).join(',')===
+  '5 s,10 s,20 s,30 s','Settings shows the four approved choices.');
+ choices[1].click();
+ await settingsWhen(document.body,()=>document.querySelector('[data-send-undo] button'));
+ settingsCheck(choices[1].getAttribute('aria-pressed')==='true','The 10 s choice is selected.');
+ const toast=document.querySelector('[data-send-undo]');
+ settingsCheck(toast.querySelector('span').textContent==='Saved.' && toast.querySelector('button').textContent==='Undo',
+  'The shared Saved. message offers Undo.');
+ await settingsWhen(document.body,()=>document.querySelector('.for-you-slot button[data-state=quiet]'));
+})();
+""")
+            if proof := os.environ.get("SETTINGS_PROOF"):
+                picture = cast(dict[str, str], browser.command("Page.captureScreenshot", {"format": "png"}, session))
+                _ = Path(proof).write_bytes(base64.b64decode(picture["data"]))
+            evaluate(r"""
+(async()=>{
+ document.querySelector('[data-send-undo] button').click();
+ await settingsWhen(settingsDocument.body,()=>settingsDocument.querySelector('#undo-time button[aria-pressed=true]').value==='20');
+ settingsCheck(!document.querySelector('[data-send-undo]'),'Undo removes the saved message.');
+})();
+""")
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 20)
 
     def held_new_item(self) -> tuple[test_review_page.ReviewPageTests, staff.StaffRow, bytes]:
         case = self.review_fixture()

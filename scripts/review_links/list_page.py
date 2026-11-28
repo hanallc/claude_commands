@@ -29,7 +29,7 @@ from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_question, question_path
 from scripts.review_links import record_table, review_actions, review_items, review_legacy, review_link, review_page
-from scripts.review_links import search_fold, staff_names
+from scripts.review_links import search_fold, settings_page, staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
 
@@ -1929,7 +1929,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
-    undo_enabled = settings.whole("undo_seconds") > 0
+    undo_enabled = settings_page.undo_seconds(root, settings) > 0
     delivery_window = record_table.delivery_window_seconds(settings)
     park_retry = settings.number("frame_retry_seconds")
     card_motion = page_frame.CardMotion.read(settings)
@@ -3032,7 +3032,7 @@ function bindFeedbackForm(form){
    const post=async()=>{
     const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
     const receiver=action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
-    const response=await (usesWords || heldSave
+    const response=await (usesWords || saveAction
      ? hold.post(actionPath,options,saveAction ? null : receiver)
      : fetch(actionPath,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
