@@ -31,11 +31,12 @@ from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import transcripts, unit_runs
+from scripts.lib import models_registry, transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_models_registry import write_registry
 from scripts.lib.transcript_test_support import compressed_copy
 
 
@@ -1758,6 +1759,120 @@ class StaffTests(StaffCommandTestCase):
             _ = staff.transfer_producer(staff.native_id(fixture_runtime_id("absent")), session, home, folder)
         back = staff.transfer_producer(morty.id, morty.id, staff.SessionHome(self.root / ".codex2"), folder)
         self.assertEqual(back, replace(morty, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
+
+    def test_remote_producer_clone_records_the_source_and_launch_in_one_write(self) -> None:
+        source = fixture_member("producer", name="morty")
+        identity = staff.native_id(fixture_runtime_id("morty-copy"))
+        home = staff.SessionHome(self.root / "mac/.claude4")
+        folder = staff.PresentWorktree("mac", self.root / "mac/launch")
+        clone_of = staff.ProducerClone(source.id)
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"}})
+        profile = models_registry.ProducerProfile("claude", "sonnet", "medium")
+        with (self.machine("mac"),
+              mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                          "MODELS_CONFIG_TIER_ONLY": "1"})):
+            clone = staff.create_producer_clone("morty-copy", identity, clone_of, folder, home, profile=profile)
+        self.assertEqual([command[0] for command in self.ssh_commands()], ["create-producer-clone"])
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"][clone.name], profile.value())
+        expected = staff.StaffRow(identity, "producer", "morty-copy", staff.StaffRoot(),
+                                  worktree=folder, current_session=identity, home=home, clone_of=clone_of)
+        self.assertEqual(clone, expected)
+        self.assertEqual(staff.by_id(identity), expected)
+        self.assertEqual(clone.to_json()["clone_of"], source.id)
+        self.assertEqual(staff.StaffRow.from_json(clone.to_json()), expected)
+        legacy = source.to_json()
+        self.assertNotIn("clone_of", legacy)
+        self.assertEqual(staff.StaffRow.from_json(legacy).clone_of, staff.NotAClone())
+
+    def test_producer_clone_refuses_a_name_claimed_before_admission(self) -> None:
+        source = fixture_member("producer", name="morty")
+        _ = fixture_member("producer", name="MORTY-COPY")
+        folder = staff.PresentWorktree("natedev", self.root / "launch")
+        home = staff.SessionHome(self.root / ".claude4")
+        before = self.staff_state()
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"}})
+        profiles_before = registry.read_bytes()
+        with (mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                          "MODELS_CONFIG_TIER_ONLY": "1"}),
+              self.assertRaisesRegex(staff.StaffRefused, "another staff row has this name")):
+            _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"), staff.ProducerClone(source.id),
+                                           folder, home, profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(registry.read_bytes(), profiles_before)
+
+    def test_producer_clone_preserves_an_occupied_profile_key(self) -> None:
+        source = fixture_member("producer", name="morty")
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium", "MORTY-COPY": "claude:sonnet:low"}})
+        profiles_before = registry.read_bytes()
+        staff_before = self.staff_state()
+        folder = staff.PresentWorktree("natedev", self.root / "launch")
+        home = staff.SessionHome(self.root / ".claude4")
+        with (mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                          "MODELS_CONFIG_TIER_ONLY": "1"}),
+              self.assertRaisesRegex(staff.StaffRefused, "registry already has a producer key")):
+            _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"), staff.ProducerClone(source.id),
+                                           folder, home, profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
+        self.assertEqual(registry.read_bytes(), profiles_before)
+        self.assertEqual(self.staff_state(), staff_before)
+
+    def producer_clone_admission(self) -> tuple[Callable[[], staff.StaffRow], Path, staff.StaffId]:
+        source = fixture_member("producer", name="morty")
+        identity = staff.native_id(fixture_runtime_id("fork"))
+        registry = write_registry(self.root / "models.conf", {"producers": {"morty": "claude:sonnet:medium"}})
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "1",
+        })))
+
+        def admit() -> staff.StaffRow:
+            return staff.create_producer_clone("morty-copy", identity, staff.ProducerClone(source.id),
+                staff.PresentWorktree("natedev", self.root / "launch"), staff.SessionHome(self.root / ".claude4"),
+                profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
+
+        return admit, registry, identity
+
+    def assert_producer_clone_retry(self, admit: Callable[[], staff.StaffRow], registry: Path, identity: staff.StaffId) -> None:
+        self.assertIsNone(staff.by_id(identity))
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"], {"morty": "claude:sonnet:medium"})
+        clone = admit()
+        self.assertEqual(staff.by_id(identity), clone)
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:sonnet:medium")
+
+    def test_producer_clone_retries_after_a_staff_write_failure(self) -> None:
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch("scripts.production.staff._store", side_effect=OSError("staff write failed")),
+              self.assertRaisesRegex((staff.StaffUnreadable, staff.StaffRefused), "staff write failed")):
+            _ = admit()
+        self.assert_producer_clone_retry(admit, registry, identity)
+
+    def test_producer_clone_retries_after_a_registry_publish_failure(self) -> None:
+        save = models_registry.save_registry
+
+        def fail_publication(path: Path, before: str, after: str, description: str, *, additive_catalog: bool = False,
+                             preserve_producer_rows: bool = False) -> models_registry.SavedRegistry:
+            saved = save(path, before, after, description, additive_catalog=additive_catalog,
+                         preserve_producer_rows=preserve_producer_rows)
+            if description.startswith("morty-copy producer uses "):
+                return saved._replace(publication=models_registry.RegistryPublication.UNCONFIRMED,
+                                      detail="registry publish failed")
+            return saved
+
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch.object(models_registry, "save_registry", side_effect=fail_publication),
+              self.assertRaisesRegex((staff.StaffUnreadable, staff.StaffRefused), "registry publish failed")):
+            _ = admit()
+        self.assert_producer_clone_retry(admit, registry, identity)
+
+    def test_producer_clone_reports_unconfirmed_profile_removal(self) -> None:
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch("scripts.production.staff._store", side_effect=OSError("staff write failed")),
+              mock.patch.object(models_registry, "remove_failed_clone_profile", side_effect=OSError("remote unavailable")),
+              self.assertRaisesRegex(staff.StaffUnreadable, "Cannot confirm removal of the clone profile: remote unavailable")):
+            _ = admit()
+        self.assertIsNone(staff.by_id(identity))
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:sonnet:medium")
 
     def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
         morty = fixture_member("producer", name="morty")
