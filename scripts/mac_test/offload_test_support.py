@@ -613,8 +613,12 @@ def capture(self, arguments, *args, **kwargs):
         clock[0] = 102.0
     return answer
 
-def stream(self, arguments, *args, **kwargs):
-    answer = real_stream(self, arguments, *args, **kwargs)
+def stream(self, arguments, cleanup_limit=offload.NO_COMMAND_TIME_LIMIT):
+    # The launcher hang guard bounds this wait for the fixture SSH stream to close.
+    # The leftover check still uses its configured deadline.
+    if isinstance(cleanup_limit, offload.CleanupAfterVerdict):
+        cleanup_limit = offload.NO_COMMAND_TIME_LIMIT
+    answer = real_stream(self, arguments, cleanup_limit)
     clock[0] = 103.0
     return answer
 
