@@ -16,7 +16,7 @@ from typing import Self, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
+from scripts.aws_target import aws_trial, cloud_gate, gate_box, gate_source, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.aws_target.ledger_test_support import write_gate_config
 from scripts.lib.python_startup import sitecustomize as python_startup
@@ -300,6 +300,74 @@ subprocess.run = fail_log_put
             self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
+    def test_guest_checks_the_current_files_hash_and_both_trees(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / 'source'
+            repo.mkdir()
+            _ = gate_source.git(repo, 'init', '-q')
+            _ = gate_source.git(repo, 'config', 'user.name', 'Fixture')
+            _ = gate_source.git(repo, 'config', 'user.email', 'fixture@example.invalid')
+            _ = (repo / 'removed').write_text('Historical file')
+            _ = gate_source.git(repo, 'add', 'removed')
+            historical_blob = gate_source.git(repo, 'rev-parse', ':removed')
+            _ = gate_source.git(repo, 'commit', '-qm', 'Fixture history')
+            previous = gate_source.git(repo, 'rev-parse', 'HEAD')
+            _ = gate_source.git(repo, 'rm', 'removed')
+            _ = (repo / 'tracked').write_text('Main file')
+            _ = gate_source.git(repo, 'add', 'tracked')
+            _ = gate_source.git(repo, 'commit', '-qm', 'Fixture main')
+            main = gate_source.git(repo, 'rev-parse', 'HEAD')
+            _ = (repo / 'tracked').write_text('Candidate file')
+            _ = gate_source.git(repo, 'commit', '-qam', 'Fixture candidate')
+            candidate = gate_source.git(repo, 'rev-parse', 'HEAD')
+            gate_source.archive(repo, root, (candidate, main))
+            archive = root / gate_source.SOURCE_ARCHIVE
+            links = {'commit': candidate, 'tree': gate_source.git(repo, 'rev-parse', 'HEAD^{tree}'),
+                     'source_sha256': gate_source.archive_sha256(archive)}
+            request: dict[str, object] = {'origin_main': main,
+                'origin_main_tree': gate_source.git(repo, 'rev-parse', main + '^{tree}')}
+
+            def get(name: str, destination: Path) -> None:
+                self.assertEqual(name, 'source')
+                _ = destination.write_bytes(archive.read_bytes())
+
+            box = root / 'valid'
+            box.mkdir()
+            checkout = gate_box.restore_current_files(box, links, request, get)
+            self.assertEqual(gate_source.git(checkout, 'rev-parse', 'HEAD'), candidate)
+            self.assertEqual(gate_source.git(checkout, 'rev-parse', 'origin/main'), main)
+            self.assertEqual(gate_source.git(checkout, 'show', 'origin/main:tracked'), 'Main file')
+            self.assertEqual((checkout / 'tracked').read_text(), 'Candidate file')
+            self.assertEqual(set(gate_source.git(checkout, 'rev-list', '--all').splitlines()), {candidate, main})
+            lookup = subprocess.run(['git', '-C', str(checkout), 'cat-file', '--batch-check'],
+                input=f'{previous}\n{historical_blob}\n', text=True, capture_output=True, check=True)
+            self.assertEqual(lookup.stdout.splitlines(), [f'{previous} missing', f'{historical_blob} missing'])
+            self.assertFalse((box / gate_source.SOURCE_ARCHIVE).exists())
+
+            for field, diagnostic in (('source_sha256', 'source checksum'),
+                                      ('tree', 'commit or tree'), ('origin_main_tree', 'commit or tree')):
+                with self.subTest(field=field):
+                    box = root / field
+                    box.mkdir()
+                    modified_links = {**links, field: '0' * 64} if field in links else links
+                    modified_request = {**request, field: '0' * 40} if field in request else request
+                    with self.assertRaisesRegex(gate_box.GuestSourceRejected, diagnostic):
+                        _ = gate_box.restore_current_files(box, modified_links, modified_request, get)
+
+    def test_private_boot_uses_only_verified_nix_store_paths(self) -> None:
+        links = {**dict.fromkeys(('guest', 'request', 'log', 'result', 'boot_error'), 'https://example.invalid/fixture'),
+                 'production': 'true', 'expires': '1800000000', 'step': 'size'}
+        paths = ('/nix/store/' + 'a' * 32 + '-fixture',)
+        script = gate_box.user_data(links, 'a' * 40, 20, 5, 30, tool_paths=paths)
+        self.assertNotIn('github', script)
+        self.assertIn('set -- ' + paths[0], script)
+        self.assertIn('path-info --recursive "$@"', script)
+        self.assertIn('copy --from https://cache.nixos.org "$@"', script)
+        self.assertIn('shell "$@"', script)
+        self.assertIn("message='GateToolsUnavailable'", script)
+        self.assertLess(len(script.encode()), 16 * 1024)
+
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
         self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'bwrap unavailable',
                                     'source ready', 'tests start', 'result upload'))
@@ -316,6 +384,9 @@ subprocess.run = fail_log_put
 
     def test_shell_boot_error_filters_the_completed_record(self) -> None:
         self.production_boot_stubs(('boot error record',))
+
+    def test_shell_retries_the_source_rejection_after_the_guest_put_fails(self) -> None:
+        self.production_boot_stubs(('source rejection upload',))
 
     def test_production_boot_powers_off_when_the_error_record_write_fails(self) -> None:
         self.production_boot_stubs(('boot error write',))
@@ -381,6 +452,7 @@ with mock.patch.object(gate, 'process_memory_mib'):
             'bwrap unavailable': 'stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial (exit 1)',
             'result upload': 'The box failed at stage result upload (exit 1)',
             'paired request download': 'The box failed at stage tools ready (exit 7)',
+            'source rejection upload': 'GuestSourceRejected: source checksum differs',
         }
         for failure in failures:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
@@ -390,6 +462,9 @@ with mock.patch.object(gate, 'process_memory_mib'):
                 (root / 'home').mkdir()
                 if failure == 'boot error write':
                     (box / 'boot-error.json').mkdir(parents=True)
+                if failure == 'boot error record':
+                    box.mkdir()
+                    _ = (box / 'boot-error.json').write_text('{"verdict":"error","error":"previous boot"}')
                 for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
@@ -438,10 +513,12 @@ def run_guest(root, links, result):
 ''')
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 request_mode = mode.wire if wire else mode.value
+                source_fields = ({'source_form': 'current-files', 'origin_main_tree': 'e' * 40}
+                                 if failure == 'source rejection upload' else {})
                 _ = (root / 'request.json').write_text(json.dumps({
                     'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
                     'mode': request_mode,
-                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
+                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py'], **source_fields}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, signal, subprocess, sys
 from urllib.parse import urlsplit
 root = pathlib.Path(os.environ['FIXTURE'])
@@ -504,6 +581,12 @@ elif name == 'curl':
     else:
         source = args[args.index('--data-binary') + 1]
         body = sys.stdin.read() if source == '@-' else pathlib.Path(source[1:]).read_text()
+        if destination.endswith('/boot-error.json') and os.environ['FAIL_STAGE'] == 'source rejection upload':
+            box = root / 'box'
+            assert json.loads(body)['error'] in (box / 'gate.log').read_text()
+            if not (root / 'failed').exists():
+                event('source rejection upload failed')
+                fail('source rejection upload', url)
         if destination.endswith('/gate.log') and 'Cloud gate: uploading' in body:
             fail('final log upload', url)
         event('upload result' if destination.endswith(('result.json', 'boot-error.json')) else 'upload log')
@@ -565,6 +648,8 @@ else:
                     links['paired'] = 'true'
                 if failure == 'timings download':
                     links['module_seconds'] = 'https://fixture.invalid/artifacts/attempt/module_seconds.json'
+                if failure == 'source rejection upload':
+                    links['source_sha256'] = '0' * 64
                 signed = {key: value + '?key=' + key + '&signature=' + TRANSFER_MARKER
                           if key != 'origin' and value.startswith('https://') else value for key, value in links.items()}
                 script = gate_box.user_data(signed, 'f' * 40, 20, 5, 1800)
@@ -577,8 +662,10 @@ else:
                 self.assertNotIn('instance-id', script)
                 boot_script = root / 'boot.sh'
                 _ = boot_script.write_text(script)
+                environment = dict(os.environ)
+                _ = environment.pop('PYTHONPATH', None)
                 reply = subprocess.run(['bash', '-x', str(boot_script)], text=True, capture_output=True, check=False,
-                    timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**os.environ, 'FIXTURE': str(root),
+                    timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**environment, 'FIXTURE': str(root),
                     'GATE_BOX_DIR': str(box), 'FAIL_STAGE': failure, 'FIXTURE_SIGNED_LINK': signed['log'],
                     'PATH': str(tools) + os.pathsep + os.environ['PATH']})
                 log = (box / 'boot.log').read_text()
@@ -599,7 +686,18 @@ else:
                 self.assertTrue(results, log + reply.stderr)
                 passed = failure in ('', 'final log upload', 'shell log signal', 'transient result upload')
                 expected_error = not passed or candidate_change in ('missing', 'old transfer')
-                self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass', log)
+                self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass',
+                                 log + '\n' + str(results[-1].get('error', '')))
+                if failure == 'source rejection upload':
+                    rejection = boot_errors[failure]
+                    self.assertEqual(reply.returncode, 1, log + reply.stderr)
+                    self.assertIn('source rejection upload failed', trace)
+                    self.assertIn(rejection, (box / 'gate.log').read_text())
+                    self.assertIn(rejection, ledger.text(uploads[-2], 'body'))
+                    self.assertNotIn('stage=tests start', log)
+                    self.assertNotIn('stage=result upload', log)
+                    self.assertEqual(len(results), 1)
+                    self.assertFalse(any(row['destination'] == links['result'] for row in uploads))
                 if candidate_change == 'old transfer':
                     error = ledger.text(results[-1], 'error')
                     self.assertIn('CalledProcessError', error)
@@ -615,6 +713,7 @@ else:
                     self.assertEqual(json.loads(ledger.text(refusals[0], 'body'))['error'],
                                      'candidate predates guest entry point')
                     self.assertNotIn('stage=tests start', log)
+                    self.assertFalse(any(row['destination'] == links['result'] for row in uploads))
                 if failure == 'shell log signal':
                     self.assertTrue((root / 'signaled').exists())
                     self.assertIn('PUT log failed (curl exit 143, HTTP 000)', log)
@@ -743,7 +842,7 @@ else:
                     }
                     with (mock.patch.object(gate, "checked_git", return_value="head"),
                           mock.patch.object(cloud_gate, "import_record") as import_record):
-                        result = cloud_gate.run_service(folder, folder, request, (), lambda _: 0)
+                        result = cloud_gate.run_service(folder, folder, request, (), lambda _: 0, ledger.CostLedger(folder))
                     self.assertIsInstance(result, cloud_gate.CloudCompleted)
                     import_record.assert_called_once_with(folder, {**row, "record": {**guest_record, "selection": selection}})
 

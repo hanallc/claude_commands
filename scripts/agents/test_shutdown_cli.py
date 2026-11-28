@@ -223,7 +223,7 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
-        self.assertIn("clone NAME --as NEW", output)
+        self.assertIn("clone NAME NEW_NAME", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("set-model ROLE MODEL [EFFORT]", output)
