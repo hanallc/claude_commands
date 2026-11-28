@@ -400,6 +400,9 @@ If retirement cannot confirm the staff write, it prints a retry command with the
 A caller timeout leaves the result unknown. The staff authority can still finish the removal.
 A retry by staff ID reports when the rows are gone and deletes a remaining journal.
 Retirement checks that the checkout is absent before the final origin read.
+One deadline covers both final checks. It uses half the staff operation lock wait limit.
+The deadline applies only to these final checks.
+If a final check times out, retirement keeps the rows and prints the check name and retry command.
 A later change to the checkout folder can escape that check.
 Removal of the staff record preserves the checkout files and Git refs.
 Cleanup excludes only that pane's proved idle shell from the remaining processes.

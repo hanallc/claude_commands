@@ -1019,15 +1019,19 @@ def retirement_run(argv: list[str], cwd: Path | None = None, *, settings: conf.C
     if isinstance(settings, UseConfiguredValue):
         settings = conf.read("production")
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
-    limit = settings.number("retire_command_timeout_seconds")
-    operation_limit = worker_lifecycle.effective_deadline()
-    remaining = operation_limit
-    if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE:
-        remaining = operation_limit - time.monotonic()
-        if remaining <= 0:
-            raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
     return subprocess.run(argv, pass_fds=staff.operation_fds(), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
-                          timeout=min(limit, remaining))
+                          timeout=retirement_command_seconds(settings))
+
+
+def retirement_seconds_remaining() -> float:
+    remaining = worker_lifecycle.effective_deadline() - time.monotonic()
+    if remaining <= 0:
+        raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
+    return remaining
+
+
+def retirement_command_seconds(settings: conf.ConfigRead) -> float:
+    return min(settings.number("retire_command_timeout_seconds"), retirement_seconds_remaining())
 
 def retirement_branch(folder: Path) -> str:
     """The checked-out branch from Git's files; "" when HEAD is detached or the folder is no checkout."""
@@ -1395,9 +1399,14 @@ def retired_origin_tip(run: git_merge_tree.GitRunner, ref: str) -> str | staff.O
 
 def retired_origin_tip_at(checkout: Path, branch: str) -> str | staff.OriginBranchAbsent:
     settings = conf.read("production")
+    environment = staff.child_environment(os.environ)
+    _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
 
     def run(*arguments: str) -> subprocess.CompletedProcess[str]:
-        return retirement_run(["git", "-C", str(checkout), *arguments], settings=settings)
+        # Git and its transport must not inherit the staff locks.
+        return subprocess.run(["git", "-C", str(checkout), *arguments],
+                              env=environment, capture_output=True, text=True,
+                              check=False, timeout=retirement_command_seconds(settings))
 
     return retired_origin_tip(run, f"refs/heads/{branch}")
 
@@ -1406,19 +1415,30 @@ def retired_remote_read(machine: str, arguments: list[str]) -> str:
     route = remote.machine_alias(machine)
     if not isinstance(route, remote.MachineAlias) or route.alias != other_machine():
         raise ValueError(f"no route to {machine}")
-    status, output = run_remote(arguments)
+    seconds = min(remote.STANDARD_TIME_LIMIT["seconds"], retirement_seconds_remaining())
+    status, output = run_remote(arguments, limit={"kind": "time limit", "seconds": seconds},
+                                propagate_timeout=True)
+    _ = retirement_seconds_remaining()
     if status:
         raise ValueError(output or f"cannot read from {machine}")
     return output
 
 
-def require_retired_record_unchanged(branch: staff.ParkedBranch, checked: staff.RetiredUnitOrigin,
+def retired_check_timeout(identity: staff.StaffId, check: str) -> staff.StaffRefused:
+    return staff.StaffRefused(f"{check} did not finish in time. Run agents retire {identity} again.")
+
+
+def require_retired_record_unchanged(identity: staff.StaffId, branch: staff.ParkedBranch, checked: staff.RetiredUnitOrigin,
                                      location: staff.RemovedWorktree) -> None:
     try:
+        _ = retirement_seconds_remaining()
         if unit_machine_is_local(location.machine):
             check_retired_checkout(location)
         else:
             _ = retired_remote_read(location.machine, ["_retired-checkout-absent", location.machine, str(location.path)])
+        _ = retirement_seconds_remaining()
+    except (worker_lifecycle.OperationDeadlineExpired, subprocess.TimeoutExpired) as error:
+        raise retired_check_timeout(identity, "Checkout absence check") from error
     except (OSError, ValueError, RetirementRefused, subprocess.SubprocessError) as error:
         raise staff.StaffRefused(f"cannot confirm checkout absence: {error}") from error
     try:
@@ -1430,6 +1450,9 @@ def require_retired_record_unchanged(branch: staff.ParkedBranch, checked: staff.
             if advertised is not None and not isinstance(advertised, str):
                 raise ValueError(f"invalid origin tip from {checked.machine}")
             tip = staff.OriginBranchAbsent() if advertised is None else advertised
+        _ = retirement_seconds_remaining()
+    except (worker_lifecycle.OperationDeadlineExpired, subprocess.TimeoutExpired) as error:
+        raise retired_check_timeout(identity, f"Origin branch {branch.value} check") from error
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise staff.StaffRefused(f"cannot recheck origin branch {branch.value}: {error}") from error
     if tip != checked.tip:

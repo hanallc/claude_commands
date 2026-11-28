@@ -2722,9 +2722,13 @@ def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> Retire
             pending.difference_update(members)
 
         def recheck() -> None:
-            check = cast(Callable[[ParkedBranch, RetiredUnitOrigin, RemovedWorktree], None],
+            from scripts.agents import worker_lifecycle
+
+            check = cast(Callable[[StaffId, ParkedBranch, RetiredUnitOrigin, RemovedWorktree], None],
                 import_module("scripts.agents.shutdown").require_retired_record_unchanged)
-            check(branch, origin, location)
+            # Reserve half the lock wait limit for the write and cleanup.
+            with worker_lifecycle.operation_deadline(timeout=_seconds("operation_lock_seconds") / 2):
+                check(unit.id, branch, origin, location)
 
         _record_transaction(edit, before_replace=recheck)
     _forget_restart(list(members))
