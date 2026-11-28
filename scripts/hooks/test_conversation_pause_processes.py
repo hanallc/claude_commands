@@ -11,12 +11,13 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from typing import ClassVar
-
+from typing import ClassVar, cast
+from unittest.mock import patch
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.hooks import hook_budget, idle_update, pause_record
 from scripts.hooks.conversation_pause_test_support import (
-    LIBRARY, PROMPT_HOOK, QUESTION, SESSION, STOP_HOOK, ConversationPauseFixture,
+    LIBRARY, NOW, PROMPT_HOOK, QUESTION, SESSION, STOP_HOOK, ConversationPauseFixture,
     asked_read, cross_session, scheduled_wakeup,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -30,7 +31,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
 """
 
 
-def _block_pause_import(marker: Path) -> str:
+def _block_pause_import(marker: Path, module: str = "conversation_pause") -> str:
     return f"""
 import builtins
 import os
@@ -40,7 +41,7 @@ from pathlib import Path
 real_import = builtins.__import__
 
 def block_pause_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name == "scripts.hooks" and fromlist and "conversation_pause" in fromlist:
+    if name == "scripts.hooks" and fromlist and {module!r} in fromlist:
         marker = Path({str(marker)!r})
         pending = marker.with_suffix(".tmp")
         pending.write_text(str(os.getpid()))
@@ -84,14 +85,62 @@ signal.signal = refuse_handler
                 result = self.run_hook_probe(hook, payload, preamble, budget=5)
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
 
+    def test_pause_state_root_override_applies_to_all_records(self) -> None:
+        root = self.root / "override"
+        record = pause_record.PauseRecord(SESSION, (), pause_record.Replying(NOW))
+        prompts = (pause_record.ScheduledTaskPrompt("task", "prompt", False),)
+        with patch.object(hook_budget, "pause_state_root", return_value=root):
+            with pause_record.record_lock():
+                pause_record.write_record(record)
+            pause_record.write_scheduled_task_prompts(SESSION, prompts)
+            self.assertEqual(idle_update.state_dir(), root / "idle-update")
+
+        self.assertTrue((root / ".lock").is_file())
+        self.assertEqual(pause_record.read_record(root / f"{SESSION}.json"), record)
+        self.assertTrue((root / "scheduled-prompts" / f"{SESSION}.json").is_file())
+
+    def test_stop_worker_imports_no_message_or_production_modules(self) -> None:
+        modules_path = self.root / "stop-worker-modules.json"
+        _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
+        preamble = f"""
+import json
+import os
+import sys
+from pathlib import Path
+
+real_exit = os._exit
+
+def record_modules(status):
+    if "scripts.hooks.pause_record" in sys.modules or "scripts.hooks.conversation_pause" in sys.modules:
+        Path({str(modules_path)!r}).write_text(json.dumps(sorted(sys.modules)))
+    real_exit(status)
+
+os._exit = record_modules
+"""
+        result = self.run_hook_probe(
+            STOP_HOOK, {"session_id": SESSION, "session_crons": [scheduled_wakeup("task")]}, preamble, budget=5,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        modules = cast(list[str], json.loads(modules_path.read_text()))
+        self.assertIn("scripts.hooks.pause_record", modules)
+        self.assertNotIn("scripts.hooks.conversation_pause", modules)
+        forbidden_modules = {"scripts.lib.conf", "scripts.message", "scripts.production"}
+        forbidden_prefixes = ("scripts.message.", "scripts.production.")
+        self.assertEqual([
+            name for name in modules if name in forbidden_modules or name.startswith(forbidden_prefixes)
+        ], [])
+        self.assertEqual(self.record()["phase"], {
+            "kind": "quiet", "user_wrote_at": 50, "reply_ended_at": NOW,
+        })
+        self.assertEqual(self.scheduled_prompts(), ["task"])
+
     def test_hook_budget_covers_the_pause_library_import(self) -> None:
         marker = self.root / "pause-import"
-        preamble = _block_pause_import(marker)
         _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
-        for hook in (STOP_HOOK, PROMPT_HOOK):
+        for hook, module in ((STOP_HOOK, "pause_record"), (PROMPT_HOOK, "conversation_pause")):
             with self.subTest(hook=hook.name):
                 marker.unlink(missing_ok=True)
-                result = self.run_hook_probe(hook, {"session_id": SESSION}, preamble, budget=1)
+                result = self.run_hook_probe(hook, {"session_id": SESSION}, _block_pause_import(marker, module), budget=1)
                 self.assertTrue(marker.exists())
                 self.assertEqual((result.returncode, result.stdout), (0, ""))
                 self.assertEqual(result.stderr, "conversation-pause: HookBudgetSpent: gave up after 1 seconds\n")
