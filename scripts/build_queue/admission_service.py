@@ -6189,10 +6189,17 @@ done
         choices = {owner: self._placement_choices(request) for owner, request in owners.items()}
         preview_inputs, deferred = self._placement_preview_inputs(inputs, owners, choices)
         local_starts: set[str] = set()
+        guest_order_holds: dict[str, str] = {}
         if preview_inputs.ordered:
             preview_with_returns, _ = with_guest_claim_returns(preview_inputs, ordered, deferred, policy)
             preview = gate.admission_pass(preview_with_returns, inputs.now, policy)
-            local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
+            for row in preview.rows:
+                if isinstance(row.admission, gate.ProposedAdmission):
+                    local_starts.add(row.owner)
+                elif isinstance(hold := row.decision.order_hold, records.HeldBehindHead):
+                    head = records.waiter_owner(hold.waiter)
+                    if gate.guest_reading_targets(preview_with_returns, head):
+                        guest_order_holds[row.owner] = head
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
@@ -6216,6 +6223,7 @@ done
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
+            local_waits_for_guest = False
             for candidate in choices[owner]:
                 destination = candidate.destination
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
@@ -6244,9 +6252,12 @@ done
                 if destination.provider == "local":
                     if owner in local_starts:
                         break
+                    head = guest_order_holds.get(owner)
+                    local_waits_for_guest = head is not None and head not in removed and head not in pending_remote_starts
                     continue
                 if destination.provider == "scaler":
-                    if self._cloud_slots_full():
+                    # A guest reading delays the local choice without sending it to the scaler.
+                    if local_waits_for_guest or self._cloud_slots_full():
                         continue
                     spending = self._aws_gate_spending()
                     if isinstance(spending, placement.TemporaryExclusion):
