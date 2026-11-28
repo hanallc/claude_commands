@@ -978,9 +978,7 @@ def execute_durable(args: Arguments) -> int:
     """Start or dispatch a durable role through its explicit target."""
     name = staff.WorkerName.parse(args.to or args.new_worker)
     role = cast(staff.WorkerRole, args.policy)
-    run = (worker_panes.DispatchRun(Path(args.session_dir).expanduser()) if args.session_dir
-           else worker_panes.HolderRun.CURRENT)
-    target = worker_panes.DurableDesignRole(staff.StaffId(args.parent), name, role, run)
+    target = worker_panes.DurableDesignRole(staff.StaffId(args.parent), name, role)
     policy = pane_policy(args.policy, model=args.model, effort=args.effort)
     if not args.prompt:
         current = launch(target, policy, phase=args.phase or None)

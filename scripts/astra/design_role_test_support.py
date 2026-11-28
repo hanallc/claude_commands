@@ -122,9 +122,8 @@ class HeldRolePaneFixture:
         if result.returncode:
             raise design_roles.RoleRefused(result.stderr.strip() or "held dispatch recording did not complete")
 
-    def open(self, role: design_roles.Role, *, bound: bool = True,
-             document: str = "design.md") -> design_roles.HeldDesign:
-        return design_roles.open_role("private-repo", document, role, "design",
+    def open(self, role: design_roles.Role, *, bound: bool = True) -> design_roles.HeldDesign:
+        return design_roles.open_role("private-repo", "design.md", role, "design",
                                       binding=self.binding if bound else design_roles.UNBOUND)
 
     def resume(self, design: design_roles.HeldDesign, role: design_roles.Role) -> Path:
