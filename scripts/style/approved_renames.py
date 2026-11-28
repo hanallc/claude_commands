@@ -1730,13 +1730,27 @@ def stated_file_renames(kind: str, path: str, after: str, *, before: str = "") -
     return parsed.moves if isinstance(parsed, FileRenamePlan) and not reused_file_rename_paths(parsed.moves) else ()
 
 
+def _split_destination(folder: PurePosixPath, name: str) -> str:
+    if "/" not in name:
+        return str(folder / name)
+    first = name.partition("/")[0]
+    ancestors = (folder, *folder.parents)
+    source_root = next((ancestor for ancestor in ancestors if ancestor.name == "src"), None)
+    if source_root is not None and first in ("src", "tests", "benches", "examples"):
+        return str(source_root.parent / name)
+    for ancestor in ancestors:
+        if ancestor.name == first:
+            return str(ancestor.parent / name)
+    return name if source_root is None else str(source_root / name)
+
+
 def stated_split_destinations(kind: str, path: str, after: str) -> tuple[str, ...]:
-    """Return Rust file paths that a restructure names as move destinations."""
+    """Resolve destinations from the finding's folder, its crate folder, an ancestor folder or the crate source root."""
     if kind != "restructure":
         return ()
     folder = PurePosixPath(path).parent
     names = (match[1] for match in MOVE_DESTINATION.finditer(after))
-    return tuple(dict.fromkeys(name if "/" in name else str(folder / name) for name in names))
+    return tuple(dict.fromkeys(_split_destination(folder, name) for name in names))
 
 
 def edits_module_owners(kind: str, path: str, after: str) -> bool:

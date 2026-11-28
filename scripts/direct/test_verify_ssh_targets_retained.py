@@ -74,7 +74,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
                 "TEST_SSH_MODES": json.dumps({"mac": mode})})
             try:
                 self.wait_for_path(self.runner_state / "mac-loss-ready", (process,))
-                output, errors = process.communicate(timeout=8)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 self.fail("Verify did not exit after the Mac lost its result or cleanup.")
             finally:

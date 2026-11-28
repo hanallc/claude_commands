@@ -2140,7 +2140,7 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name], prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(opened.row, self.fixture.world)
         states = worker_panes.observe(self.fixture.parent.id, staff.snapshot())
-        first, second = states
+        _, second = states
         request = self.fixture.world.socket_request
         failed = False
         def fail_one_layout(method: str, **params: object) -> dict[str, object]:
@@ -2152,8 +2152,9 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.object(self.fixture.world, "socket_request", side_effect=fail_one_layout), patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK):
             with redirect_stderr(io.StringIO()) as errors:
                 code = worker.restore(self.fixture.parent.id)
-        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
-        self.assertEqual(errors.getvalue().splitlines(), [f"anomaly: {first.row.name}: restore layout unavailable"])
+        self.assertEqual(code, worker.ExitCode.OK)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         [f"herdr {self.fixture.parent.id}: skipped worker layout. restore layout unavailable"])
         resumed = {state.row.id for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())
                    if isinstance(state, worker_panes.OpenWorker)}
         self.assertIn(second.row.id, resumed)
@@ -5665,6 +5666,68 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(state_path.read_bytes(), state_before)
             self.assertEqual(len(self.agent.submitted), 1)
             input_command.assert_not_called()
+
+    def test_assignment_uses_the_newest_pass_for_a_running_status_file(self) -> None:
+        row = self.opened().row
+        availability = worker.CheckAssignmentAvailability.for_worker(staff.snapshot(), row, self.run_dir)
+
+        def check(requested: str = "") -> worker_panes.CloseAllowed | worker_panes.DispatchHoldsWorker:
+            with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse(row.name)) as hold:
+                assert isinstance(hold, worker_panes.WorkerLockHold)
+                return replace(availability, status_file=requested).check(row, hold,
+                    retry=worker.AssignmentCheckStage.DELIVERY)
+
+        status = self.run_dir / "impl_status"
+        atomic_file.write_text_atomic(status, "running\n")
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        state = worker_panes.run_state(self.run_dir)
+        passed: dict[str, object] = {
+            "instance_id": "canceled-pass", "worker_id": row.id, "started_at": 10, "status": "canceled",
+        }
+        for path_field in ({"assign_status_file": str(status)},
+                           {"delivery": {"actions": {"status_file": str(status)}}}):
+            with self.subTest(path_field=path_field):
+                canceled = {**passed, **path_field}
+                state["pass"] = {"impl": canceled}
+                atomic_file.write_text_atomic(state_path, json.dumps(state))
+                for requested in ("", str(status)):
+                    self.assertIsInstance(check(requested), worker_panes.CloseAllowed)
+
+                state["pass"] = {"impl": {**canceled, "instance_id": "active-pass", "status": "active"}}
+                atomic_file.write_text_atomic(state_path, json.dumps(state))
+                self.assertIsInstance(check(str(status)), worker_panes.DispatchHoldsWorker)
+
+                state["pass"] = {"newer": {**canceled, "instance_id": "newer-pass",
+                                          "started_at": 20, "status": "completed"}, "impl": canceled}
+                atomic_file.write_text_atomic(state_path, json.dumps(state))
+                self.assertEqual(check(str(status)), worker_panes.DispatchHoldsWorker("the assignment status is running"))
+
+        state["pass"] = {}
+        atomic_file.write_text_atomic(state_path, json.dumps(state))
+        self.assertEqual(check(str(status)), worker_panes.DispatchHoldsWorker("the assignment status is running"))
+
+    def test_cancel_assignment_with_only_a_pass_status_file(self) -> None:
+        row = self.opened().row
+        status = self.run_dir / "impl_status"
+        atomic_file.write_text_atomic(status, "running\n")
+        with patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}):
+            instance = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt,
+                kind="assign", lens="")
+        passed = progress_history.pass_for_finalization(self.run_dir, instance)
+        self.assertEqual(passed["assign_status_file"], str(status))
+        self.assertNotIn("delivery", passed)
+
+        self.assertEqual(progress_history.cancel_worker_passes(self.run_dir, row.id), 1)
+        self.assertEqual(status.read_text(), "error\n")
+
+        atomic_file.write_text_atomic(status, "running\n")
+        availability = worker.CheckAssignmentAvailability.for_worker(staff.snapshot(), row, self.run_dir)
+        check = replace(availability, status_file=str(status))
+        with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse(row.name)) as hold:
+            assert isinstance(hold, worker_panes.WorkerLockHold)
+            self.assertIsInstance(check.check(row, hold, retry=worker.AssignmentCheckStage.DELIVERY),
+                                  worker_panes.CloseAllowed)
 
     def test_assignment_recovers_saved_reply_before_checking_running_status(self) -> None:
         self.check_assignment_recovers_done(saved_reply=True)

@@ -49,6 +49,8 @@ Standalone named module tests use the same default targets as full gates.
 Direct gates can use natedev or `mac-linux`.
 The prepared gate wrappers can also use AWS when the queue grants an AWS assignment.
 Named module tests on `mac-linux` use `run.time_limit_seconds` for each module and the full run.
+The controller writes a gate record for a full-suite guest request in the `mac-linux` folder of Buildlog.
+The record includes module times and Mac load at the start and end.
 A nested named gate reuses its live parent reservation on natedev.
 Copy wrappers apply this rule before target overrides.
 Promotion without tests uses natedev.
@@ -548,7 +550,7 @@ Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
 The affected gate takes the shared lock after it accepts the prepared copy.
-The merge gate takes the shared lock before tests start.
+The integrate job takes the shared lock before tests start.
 The tmp sweep takes an exclusive lock on existing busy marks without waiting before it lists a copy.
 The floor sweep also checks existing busy marks before it lists build output.
 Scratch end records task completion and keeps the folders.

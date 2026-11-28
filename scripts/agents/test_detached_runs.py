@@ -37,7 +37,7 @@ from unittest.mock import ANY, MagicMock, call, patch
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
-from scripts.agents import detached_run_process, detached_runs, pane_record, worker_lifecycle
+from scripts.agents import detached_run_process, detached_run_record, detached_runs, pane_record, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.astra import astra_roles
 from scripts.buildlog import treekey
@@ -47,7 +47,7 @@ from scripts.lib import atomic_file, conf, process_group, process_start, process
 from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
-from scripts.herdr import herdr, herdr_types, pass_notices, turn_end, worker_panes
+from scripts.herdr import herdr, herdr_types, pane_launch, pass_notices, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, send_later, sessions
@@ -166,7 +166,7 @@ class DetachedRunsTests(unittest.TestCase):
     def record(self, command: list[str], *, run_id: str = "r1", **extra: str) -> Path:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
-        record: detached_runs.RunRecord = {
+        record: detached_run_record.RunRecord = {
             "run_id": run_id, "status": "running", "session_dir": str(self.session), "worker": WORKER,
             "staff_id": self.worker_id,
             "label": "verify.sh check", "command": command,
@@ -188,7 +188,7 @@ class DetachedRunsTests(unittest.TestCase):
 
     def test_damaged_record_does_not_hide_a_live_run(self) -> None:
         path = self.live_run(["fixture", "check"])
-        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         damaged = path.with_name("000-damaged.json")
         _ = damaged.write_text("{", encoding="utf-8")
         evidence = detached_runs.live_run_evidence_for_staff(path.parent, frozenset({self.worker_id}))
@@ -284,7 +284,7 @@ class DetachedRunsTests(unittest.TestCase):
         paths = self.seat_runs(2)
         text = detached_runs.resume_context(paths[0].parent, WORKER)
         for index, path in enumerate(paths):
-            record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
             log = record["log"]
             self.assertIn(f"Detached run live-{index} remains live.", text)
             self.assertIn(f"Result: {path}; log: {log}", text)
@@ -315,9 +315,9 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(code, 0)
         return popen, output.getvalue()
 
-    def supervise(self, path: Path) -> detached_runs.RunRecord:
+    def supervise(self, path: Path) -> detached_run_record.RunRecord:
         self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
-        return cast(detached_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+        return cast(detached_run_record.RunRecord, json.loads(path.read_text(encoding="utf-8")))
 
     def test_supervisor_keeps_completion_when_the_command_changes_its_module(self) -> None:
         module_name = "_fixture_detached_completion"
@@ -502,7 +502,7 @@ class DetachedRunsTests(unittest.TestCase):
         def fail_prune(runs: Path) -> list[str]:
             spawn.assert_called_once()
             record, = runs.glob("*.json")
-            saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+            saved = cast(detached_run_record.RunRecord, json.loads(record.read_text()))
             self.assertEqual((saved["status"], saved["pid"]), ("running", 4321))
             raise error
 
@@ -540,7 +540,7 @@ class DetachedRunsTests(unittest.TestCase):
                 popen.assert_not_called()
                 self.assertFalse((self.session / detached_runs.DETACHED_RUNS_DIR).exists())
                 self.assertEqual(errors.getvalue().splitlines(), [
-                    "detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+                    "detached_runs: Start with systemd-run --scope --collect or systemd-run --user --scope --collect. "
                     + "Use the exact option names in that order.",
                 ])
 
@@ -561,7 +561,7 @@ class DetachedRunsTests(unittest.TestCase):
                 popen.assert_called_once()
                 arguments = cast(list[str], popen.call_args.args[0])
                 path = Path(arguments[-1])
-                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 self.assertEqual(record["command"], command)
                 path.unlink()
 
@@ -662,7 +662,7 @@ class DetachedRunsTests(unittest.TestCase):
     def completion_that_prunes(self, path: Path) -> Generator[list[str]]:
         completed: list[str] = []
 
-        def complete(record: detached_runs.RunRecord) -> None:
+        def complete(record: detached_run_record.RunRecord) -> None:
             with worker_panes.worker_id_lock(self.worker_id), (path.parent / ".start.lock").open("a") as admission:
                 fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
             saved = cast(dict[str, object], json.loads(path.read_text()))
@@ -837,12 +837,12 @@ class DetachedRunsTests(unittest.TestCase):
             with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
                 self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
                 complete.assert_not_called()
-            saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
             self.assertTrue(saved.get("completion_pending"))
         with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
             self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
             complete.assert_called_once()
-        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertFalse(saved.get("completion_pending"))
 
     def test_hold_stop_lookup_uses_requests_from_both_confirmed_records(self) -> None:
@@ -855,9 +855,9 @@ class DetachedRunsTests(unittest.TestCase):
 
         for request_id in (older, newer):
             with self.subTest(request_id=request_id):
-                self.assertTrue(detached_runs.confirms_hold_stop(path, path.stem, request_id))
-        self.assertFalse(detached_runs.confirms_hold_stop(path, path.stem, staged))
-        self.assertFalse(detached_runs.confirms_hold_stop(path, "different-run", older))
+                self.assertTrue(detached_run_record.confirms_hold_stop(path, path.stem, request_id))
+        self.assertFalse(detached_run_record.confirms_hold_stop(path, path.stem, staged))
+        self.assertFalse(detached_run_record.confirms_hold_stop(path, "different-run", older))
 
     def test_prune_keeps_only_the_finished_runs_that_a_reader_needs(self) -> None:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
@@ -1185,7 +1185,7 @@ sys.exit(1)
                 self.assertEqual(connection.recv(5), b"ready")
                 paths = list((self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
                 self.assertEqual(len(paths), 1)
-                record = cast(detached_runs.RunRecord, json.loads(paths[0].read_text()))
+                record = cast(detached_run_record.RunRecord, json.loads(paths[0].read_text()))
                 self.assertGreater(record["pid"], 0)
                 self.assertTrue(detached_run_process.supervises(record["pid"], paths[0]))
                 supervisor = os.pidfd_open(record["pid"])
@@ -1266,7 +1266,7 @@ sys.exit(1)
         self.assertIn(str(legacy), lines[0])
         self.assertEqual(cast(object, json.loads(legacy.read_text())), legacy_record)
         popen.assert_called_once()
-        record = cast(detached_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+        record = cast(detached_run_record.RunRecord, json.loads(path.read_text(encoding="utf-8")))
         self.assertEqual((record["status"], record.get("ended"), record.get("exit_code")),
                          ("finished", "supervisor gone", None))
         messages = cast(list[str], self.pending()["messages"])
@@ -1295,7 +1295,7 @@ sys.exit(1)
                 saved_newer = newer.read_bytes()
                 detached_runs.reap_orphan(older)
                 self.assertEqual(newer.read_bytes(), saved_newer)
-                older_record = cast(detached_runs.RunRecord, json.loads(older.read_text(encoding="utf-8")))
+                older_record = cast(detached_run_record.RunRecord, json.loads(older.read_text(encoding="utf-8")))
                 self.assertIn("a newer run of the same command answers", older_record.get("delivery", ""))
                 self.assertEqual(detached_runs.reap_orphans(str(self.session), WORKER), ["r2"])
                 messages = cast(list[str], self.pending()["messages"])
@@ -1304,7 +1304,7 @@ sys.exit(1)
 
     def test_a_supervisor_for_a_different_record_is_not_trusted(self) -> None:
         path = self.live_run(["echo", "x"])
-        original = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        original = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertTrue(detached_run_process.supervises(original["pid"], path))
         another = path.with_name("another.json")
         _ = another.write_text(path.read_text())
@@ -2083,7 +2083,7 @@ sys.exit(status)
                                 # The command leads its own session, so a stop of its group spares the supervisor.
                                 self.assertEqual((observed["command"]["group"], observed["command"]["session"]),
                                                  (command_pid, command_pid))
-                                saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                                saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                                 self.assertEqual(saved.get("command_group"), command_pid)
                                 self.assertEqual(process_start.process_start(supervisor.pid),
                                                  process_start.Started(saved.get("supervisor_started", "")))
@@ -2104,7 +2104,7 @@ sys.exit(status)
                                         process_group.send_process_group(group, signal.SIGKILL)
                                 _ = supervisor.wait(timeout=guard.remaining())
                         address.unlink()
-                        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                        record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                         if cancel is None:
                             self.assertEqual(delivered["verb"], "deliver")
                             self.assertIn(f"Result: FAIL (cleanup; exit {stopped})", str(delivered["text"]))
@@ -2714,10 +2714,10 @@ sys.exit(status)
                            command_pid=owner, command_started=started.start)
         with patch.object(os, "getppid", return_value=DEAD_PID):
             self.assertEqual(detached_runs.main(["record-exit", str(path), "143"]), 0)
-        self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(path.read_text())))
+        self.assertNotIn("exit_code", cast(detached_run_record.RunRecord, json.loads(path.read_text())))
         with patch.object(os, "getppid", return_value=owner):
             self.assertEqual(detached_runs.main(["record-exit", str(path), "143"]), 0)
-        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual((record["status"], record.get("exit_code"), record.get("stop_reason")),
                          ("running", 143, "fixture group stop"))
         self.assertEqual(self.pending(), {})
@@ -2757,7 +2757,7 @@ sys.exit(status)
         self.update_record(path, command_pid=owner, command_started=started.start + "-previous")
         with patch.object(os, "getppid", return_value=owner):
             self.assertEqual(detached_runs.main(["record-exit", str(path), "0"]), 0)
-            self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(path.read_text())))
+            self.assertNotIn("exit_code", cast(detached_run_record.RunRecord, json.loads(path.read_text())))
             self.update_record(path, status="finished", command_started=started.start, exit_code=143)
             saved = path.read_bytes()
             self.assertEqual(detached_runs.main(["record-exit", str(path), "0"]), 0)
@@ -2783,7 +2783,7 @@ exit 143
                 "TEST_DETACHED_SCRIPT": str(checkout / "scripts/agents/detached_runs.py"),
                 "TEST_NESTED_RECORD": str(nested), "TEST_OWNER_RECORD": str(owner)}):
             record = self.supervise(self.record(["bash", str(script)]))
-        self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(nested.read_text())))
+        self.assertNotIn("exit_code", cast(detached_run_record.RunRecord, json.loads(nested.read_text())))
         self.assertEqual(json.loads(owner.read_text())["exit_code"], 143)
         self.assertEqual(record.get("exit_code"), 143)
 
@@ -2879,7 +2879,7 @@ exit 143
         output, _ = child.communicate("finish\n", timeout=guard.remaining())
         self.assertEqual(child.returncode, 143, output)
         self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
-        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        finished = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
         messages = cast(list[str], self.pending()["messages"])
         self.assertEqual(len(messages), 1)
@@ -3109,7 +3109,7 @@ send.deliver_worker_text = fake_sender
                             cancelled.set()
                         return read_start(pid, proc_root)
 
-                    def supervise_at_recheck() -> detached_runs.RunRecord:
+                    def supervise_at_recheck() -> detached_run_record.RunRecord:
                         self.assertTrue(rechecking.wait(timeout=guard.remaining()))
                         return self.supervise(path)
 
@@ -3169,7 +3169,7 @@ send.deliver_worker_text = fake_sender
         self.assertEqual(record.get("exit_code"), 76)
 
     def test_stopped_results_keep_the_exit_instructions(self) -> None:
-        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(self.record(["true"]).read_text()))
         record["stop_reason"] = "Build hold."
         cancellation = "verify.sh: cancelled — The worktree changed."
         _ = Path(record["log"]).write_text(cancellation + "\n" + "cleanup\n" * 30, encoding="utf-8")
@@ -3203,7 +3203,7 @@ send.deliver_worker_text = fake_sender
     def test_result_text_caps_the_total_size_including_the_header(self) -> None:
         config = self.root / "config/detached_runs.conf"
         _ = write_config_fixture(config, "result_line_chars=200\nresult_text_chars=1800\n")
-        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(self.record(["true"]).read_text()))
         record["label"] = "verification " * 1_000
         _ = Path(record["log"]).write_text("line " * 1_000 + "\n" + ("x" * 5_000 + "\n") * 20 + "last line\n")
 
@@ -3223,7 +3223,7 @@ send.deliver_worker_text = fake_sender
         self.assertTrue(text.endswith("\nlast line"))
 
     def test_result_text_collapses_consecutive_memory_wait_lines_before_taking_the_tail(self) -> None:
-        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(self.record(["true"]).read_text()))
         lines = ["first diagnostic", *(f"still waiting for memory: {n}" for n in range(30)),
                  "second diagnostic", "still waiting for memory: retry", "still waiting for memory: ready", "last line"]
         _ = Path(record["log"]).write_text("\n".join(lines))
@@ -3352,12 +3352,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
     def run_dir(self) -> Path:
         return self.fixture.root / "run"
 
-    def record(self, row: staff.StaffRow, run_id: str = "pane-result") -> detached_runs.RunRecord:
+    def record(self, row: staff.StaffRow, run_id: str = "pane-result") -> detached_run_record.RunRecord:
         runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
         log = runs / f"{run_id}.log"
         write_text_atomic(log, "private verification output\n")
-        record: detached_runs.RunRecord = {"run_id": run_id, "status": "running", "session_dir": str(self.run_dir),
+        record: detached_run_record.RunRecord = {"run_id": run_id, "status": "running", "session_dir": str(self.run_dir),
                 "worker": row.name, "staff_id": row.id, "label": "fixture gate", "command": ["true"],
                 "log": str(log), "started_at": time.time(), "pid": 0,
                 "director_dir": str(self.run_dir), "done_message_file": ""}
@@ -3377,7 +3377,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             signal_group=lambda pid, number: signal_group(detached_runs.CommandGroup(pid, group.started), number),
             stop_pass=True, self_stop=self_stop)
 
-    def assert_holder_result(self, record: detached_runs.RunRecord, reason: str) -> None:
+    def assert_holder_result(self, record: detached_run_record.RunRecord, reason: str) -> None:
         result = detached_runs.deliver(record, detached_runs.CompletedCommand(1))
         self.assertIn("sent", result)
         self.assertEqual(self.inputs, [])
@@ -3424,7 +3424,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                                         "--", "private-land"]), 0, output.getvalue())
                     spawn.assert_called_once()
                     path, = (session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
-                    record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                    record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                     self.assertEqual((record["session_dir"], record["worker"], record["staff_id"]),
                                      (str(session), director.name, director.id))
                     write_text_atomic(Path(record["log"]), "Private land completed.\n")
@@ -3496,7 +3496,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         spawn.assert_called_once()
         self.assertIs(cast(object, spawn.call_args.kwargs["start_new_session"]), True)
         path, = (run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
-        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual((record["session_dir"], record["worker"], record["staff_id"], record.get("pane_dispatch_id")),
                          (str(run_dir), showrunner.name, showrunner.id, ""))
         write_text_atomic(Path(record["log"]), "Private land completed.\n")
@@ -3531,7 +3531,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual(code, 0, errors.getvalue())
                 spawn.assert_called_once()
                 path, = set(runs.glob("*.json")) - before
-                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 self.assertEqual((record["session_dir"], record["worker"], record["staff_id"]),
                                  (str(self.run_dir), row.name, row.id))
                 self.assertEqual(errors.getvalue().splitlines(),
@@ -3575,7 +3575,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     code = detached_runs.main(["start", *route, "--", "true"])
                 self.assertEqual(code, 0, output.getvalue())
                 path, = set(runs.glob("*.json")) - before
-                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 self.assertEqual((record["worker"], record["staff_id"]), (row.name, row.id))
                 self.assertEqual(record.get("pane_dispatch_id"), dispatch_id)
                 record["pid"] = private_supervisor(self, path)
@@ -3996,7 +3996,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         with patch.object(test_worker, "datetime", SimpleNamespace(now=done_time)):
             agent.append(pane, "assistant", f"DONE {instance}")
-        records: dict[str, tuple[Path, detached_runs.RunRecord]] = {}
+        records: dict[str, tuple[Path, detached_run_record.RunRecord]] = {}
         for kind in ("covered", "uncertain", "uncovered", "unknown", "other-pass"):
             record = self.record(row, f"{name}-{kind}")
             record.update(status="finished", pid=DEAD_PID, exit_code=0, completion_pending=True,
@@ -4332,7 +4332,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                         _ = case.doCleanups()
 
     def prepare_holder_pass(self, state: str) -> tuple[staff.StaffRow, pass_recorder.DispatchDelivery,
-                                                       detached_runs.RunRecord, Path]:
+                                                       detached_run_record.RunRecord, Path]:
         agent = test_worker.DispatchAgent(self.fixture)
         row = self.fixture.worker("holder-stage", family="codex")
         pane = "w1:p1"
@@ -4947,7 +4947,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir),
                                       progress_history.ActiveDispatch)
         self.assertEqual(signals, 2 if interrupted else 1)
-        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual(saved.get("stop_reason"), reason)
         self.assertIs(saved.get("stop_pass_requested"), True)
         self.assertTrue(process_stop.slice_has_ended(identity))
@@ -5013,7 +5013,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                       patch.object(detached_runs, "_signal_stopped_command"),
                       contextlib.redirect_stdout(io.StringIO())):
                     self.assertTrue(self.record_confirmed_group_stop(path, "Private stop."))
-                saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 saved["exit_code"] = 143
                 write_text_atomic(path, json.dumps(saved))
                 with (patch.object(detached_runs, "_group_is_live", return_value=live),
@@ -5114,7 +5114,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), True)
                     with self.subTest(delivery="early DONE after holder fallback"):
                         self.fixture.world.locations[pane]["agent_status"] = "blocked"
-                        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                        finished = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                         self.assertEqual(detached_runs.deliver(finished, detached_runs.CompletedCommand(143)),
                                          "sent: private director")
                         self.assertIn(f"Detached run: {finished['run_id']}", agent.notices[-1])
@@ -5209,6 +5209,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                             self.fixture.world.foreground[pane] = (pid, family, [
                                 family, *worker_panes.launch_arguments(policy, row.current_session, self.fixture.root)])
                             self.fixture.world.processes[pid].environment["CODEX_HOME"] = os.environ["CODEX_HOME"]
+                            self.fixture.world.processes[pid].environment[pane_launch.BERTH_SESSION_ENV] = (
+                                f"{self.fixture.parent.current_session}.phase-40")
                             config = self.fixture.root / "conf/direct.conf"
                             write_text_atomic(config, config.read_text() + "# range: 1..600\nworker_settle_seconds=1\n")
                             launches = len(self.fixture.world.launches)
@@ -6056,7 +6058,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         def release_group(_seconds: float) -> None:
             nonlocal group_live
             self.assertTrue(group_live)
-            pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            pending = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
             self.assertEqual((pending["status"], pending.get("exit_code")), ("running", 143))
             self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
             self.assertEqual(agent.notices, [])
@@ -6087,7 +6089,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 actual_stop = turn_end.stop_pass
 
                 def stop_with_cleanup_retry(
-                    run: Path, record: detached_runs.RunRecord,
+                    run: Path, record: detached_run_record.RunRecord,
                     guard: Callable[[], contextlib.AbstractContextManager[worker_panes.CloseAllowed | worker_panes.Kept]],
                 ) -> worker_panes.StoppedRunPassCompletion | worker_panes.Kept | worker_panes.NoOwningPanePass:
                     completion = actual_stop(run, record, guard)
@@ -6108,11 +6110,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertEqual(detached_runs.main(["supervise", str(path)]), int(retry_cleanup))
                     deliver.assert_called_once_with(path)
                 if retry_cleanup:
-                    pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                    pending = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                     self.assertTrue(pending.get("completion_pending"))
                     self.assertFalse(pending.get("delivery"))
                     self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
-                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 self.assertEqual((record["status"], record.get("completion_pending")), ("finished", False))
                 self.assertEqual(record.get("delivery"), "finished: the pane pass stopped")
                 self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
@@ -6146,7 +6148,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                   contextlib.redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
                 self.assertIn("the command group has no confirmed end", errors.getvalue())
-                pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                pending = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 self.assertEqual(pending["status"], "running")
                 self.assertNotIn("finished_at", pending)
                 identities = frozenset((row.id,))
@@ -6330,14 +6332,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(detached_runs.main(["start", "--", "true"]), 0)
         runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         path, = runs.glob("*.json")
-        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual(record.get("pane_dispatch_id"), {"unavailable": reason})
         record.update(stop_pass_requested=True, stop_reason="Private stop.", exit_code=143, command_group=DEAD_PID)
         write_text_atomic(path, json.dumps(record))
         # Round 18 rule: unknown ownership stays pending until restore or the director acts.
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
-        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual(saved.get("delivery"), "deferred: the result's pass ownership is unknown")
         self.assertIn(reason, errors.getvalue())
         active = progress_history.active_dispatch(row.id, self.run_dir)
@@ -6369,7 +6371,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
             sender.assert_called_once()
         self.assertIn("Director unavailable.", errors.getvalue())
-        pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        pending = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertTrue(pending.get("completion_pending"))
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
@@ -6378,7 +6380,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         active = progress_history.active_dispatch(row.id, self.run_dir)
         assert isinstance(active, progress_history.ActiveDispatch)
         self.assertEqual(active.instance_id, replacement)
-        self.assertFalse(cast(detached_runs.RunRecord, json.loads(path.read_text())).get("completion_pending"))
+        self.assertFalse(cast(detached_run_record.RunRecord, json.loads(path.read_text())).get("completion_pending"))
 
     def test_stop_and_phase_finish_keep_the_pass_outcome_and_status_together(self) -> None:
         row = self.fixture.worker("impl", family="codex")
@@ -6792,7 +6794,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 refusal = send.RefusedRelayRequest("failed", "fixture refusal")
                 concurrent = send.Result("sent", "received") if accepted else TimeoutError("reply lost")
 
-                def publish_after_delivery(target: Path, stale: detached_runs.RunRecord) -> detached_runs.CompletionReplay:
+                def publish_after_delivery(target: Path, stale: detached_run_record.RunRecord) -> detached_runs.CompletionReplay:
                     self.assertEqual(stale.get("delivery"), detached_runs.FAILED_RESULT_PUSH + "failed: fixture refusal")
                     if accepted:
                         self.assertEqual(detached_runs.deliver(stale, detached_runs.CompletedCommand(7)), "sent: received")
@@ -7417,7 +7419,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         record = self.record(row)
         path = Path(record["log"]).with_suffix(".json")
         self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
-        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        finished = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual(finished["status"], "finished")
         self.assertEqual(finished.get("delivery"), "deferred: worker is working")
         self.assertTrue(finished.get("completion_pending"))
@@ -7430,7 +7432,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.inputs), 1)
         self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
         self.assertEqual(self.pending_transcripts, [])
-        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        saved = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
         self.assertEqual(saved.get("delivery"), f"sent: worker {row.name} at {pane}")
         self.assertTrue(saved.get("completion_pending"))
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
@@ -7448,7 +7450,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         def interrupt_finish(target: Path, text: str) -> None:
             if target == path:
-                saved = cast(detached_runs.RunRecord, json.loads(text))
+                saved = cast(detached_run_record.RunRecord, json.loads(text))
                 if saved["status"] == "finished":
                     raise SystemExit("interrupted before the finished record")
             write_text_atomic(target, text)
@@ -7493,7 +7495,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                              sys.executable, "-c", "print('result after launcher exit')"]), 0)
         paths = list((self.run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
         self.assertEqual(len(paths), 1)
-        record = cast(detached_runs.RunRecord, json.loads(paths[0].read_text()))
+        record = cast(detached_run_record.RunRecord, json.loads(paths[0].read_text()))
         self.assertEqual(record["staff_id"], row.id)
         self.assertEqual(record["session_dir"], str(self.run_dir))
         self.assertIn("supervise", str(supervisors))
@@ -7882,7 +7884,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.inputs), 2)
         self.assertEqual(self.notices, [])
 
-    def assert_offline_director_result(self, record: detached_runs.RunRecord, path: Path) -> None:
+    def assert_offline_director_result(self, record: detached_run_record.RunRecord, path: Path) -> None:
         self.holder_sender.close()
         self.fixture.world.remove_pane("w1:p0")
         tree_key = "private-tree"

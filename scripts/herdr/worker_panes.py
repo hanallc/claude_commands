@@ -40,7 +40,7 @@ from scripts.production import session_staff, staff, worker_admission
 from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
 from scripts.production.staff import serving_merge_unit
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
-from scripts.direct import progress_history, recorder_state
+from scripts.direct import phase_reservation, progress_history, recorder_state
 
 if TYPE_CHECKING:
     from scripts.accounts import accounts
@@ -1606,6 +1606,26 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
 
+def _worker_phase(state: dict[str, object], owner: staff.StaffRow, row: staff.StaffRow | None,
+                  record: staff.StaffSnapshot) -> str:
+    """Read the worker's phase from the pass, the only open phase, or the saved launch."""
+    phases = recorder_state.open_phase_ids(state)
+    if len(phases) == 1:
+        return phases[0]
+    if row is not None:
+        passed = _pass_in(row, state, record)
+        phase = pass_recorder.string((pass_recorder.object_dict(passed.get("phase")) or {}).get("id"))
+        if phase in phases:
+            return phase
+        launch = (pane_launch.newest_publication(pane_launch.record_directory(), (row.id, row.current_session))
+                  if phases else None)
+        if launch is not None:
+            saved = launch.entry["environment"].get(phase_reservation.SESSION_ENVIRONMENT)
+            return next((phase for phase in phases
+                         if phase_reservation.phase_session_id(owner.current_session, phase) == saved), "")
+    return ""
+
+
 @herdr.pane_evidence_run()
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
@@ -1613,6 +1633,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
+                    phase: str | None = None,
                     ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
@@ -1658,14 +1679,18 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 if policy.sandbox != READ_ONLY_SANDBOX or policy.permission != "plan":
                     return AdmissionRefused("showrunner review requires a read-only launch policy")
                 policy = replace(policy, tools=ToolAccess.SHOWRUNNER_REVIEW)
-            if unit_runs.terminal_run(unit_runs.read_run_fields(run)):
+            run_fields = unit_runs.read_run_fields(run)
+            if unit_runs.terminal_run(run_fields):
                 return AdmissionRefused(f"{run}: the run has ended dispatch admission")
+            phase = _worker_phase(run_fields, owner, existing, record) if phase is None else phase
+            berth_session = (phase_reservation.phase_session_id(owner.current_session, phase)
+                             if phase and phase not in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE) else "")
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
                 worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
-                                       keep_model=keep_model, selection=target)
+                                       keep_model=keep_model, selection=target, berth_session=berth_session)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1715,7 +1740,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows, berth_session: str) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1799,12 +1824,16 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     if row is not None:
                         return _uncertain(row, f"launch proof is incomplete: {error}")
                     return UnpublishedWorker(identity, str(error))
-                recovered = read_evidence(staff.snapshot())
+                record = staff.snapshot()
+                recovered = read_evidence(record)
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
-                if isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
-                    _layout(owner.id, recovered)
+                if isinstance(state, OpenWorker) and berth_session:
+                    current, evidence = state, recovered
+                elif isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
+                    _layout_after_open(owner.id, recovered, publish_lock_seconds)
                     return state
-                return _uncertain(row, "retained launch proof is incomplete")
+                else:
+                    return _uncertain(row, "retained launch proof is incomplete")
     if isinstance(current, OpenWorker):
         passed = worker_pass(current.row, allowed.run)
         dispatch = worker_dispatch_state(current.row, worker_run(current.row, record=record), lock)
@@ -1816,15 +1845,17 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 return matches
             same_run = True
             same_account = True
+            same_berth = True
             check_run = owner.kind == "unit" and not passed
             if matches:
                 try:
                     pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
                     launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    if passed.get("status") != "active":
+                    if berth_session or passed.get("status") != "active":
                         return _uncertain(current.row, f"running launch environment is unproved: {error}")
                 else:
+                    same_berth = launched.environment.get(phase_reservation.SESSION_ENVIRONMENT, "") == berth_session
                     if check_run:
                         same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
                     expected = launch_environment(policy, account, True)
@@ -1837,8 +1868,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     running_home = Path(launched.environment.get(key, default_home)).expanduser().resolve()
                     selected_home = Path(expected.get(key, default_home)).expanduser().resolve()
                     same_account = running_home == selected_home
-            if matches and same_run and same_account:
-                _layout(owner.id, evidence)
+            if matches and same_run and same_account and same_berth:
+                _layout_after_open(owner.id, evidence, publish_lock_seconds)
                 return current
             closable = can_close(current, lock=lock)
             if isinstance(closable, Kept):
@@ -1853,6 +1884,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
                    if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
+    unset_environment = frozenset({"STAFF_ID"})
+    if berth_session:
+        environment[phase_reservation.SESSION_ENVIRONMENT] = berth_session
+    else:
+        unset_environment |= {phase_reservation.SESSION_ENVIRONMENT}
     if owner.kind == "unit" or isinstance(paths, EnrolledPaths):
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
@@ -1864,7 +1900,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     else:
         directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
     prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
-                                               frozenset({"STAFF_ID"}))
+                                               unset_environment)
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
     if isinstance(current, OpenWorker) and not switching:
@@ -2055,7 +2091,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     herdr.forget_pane_evidence(client.session, launched.pane)
     fresh = read_evidence(staff.snapshot())
     result = next((state for state in fresh.states if state.row.id == row.id), None)
-    _layout(owner.id, fresh)
+    _layout_after_open(owner.id, fresh, publish_lock_seconds)
     if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
         return replace(result, created_pane=created_pane())
     if isinstance(result, UncertainWorker):
@@ -2186,7 +2222,14 @@ def forget_restart(row: staff.StaffRow) -> None:
         print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
 
 
-def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
+def _layout_after_open(parent: StaffId, evidence: PaneEvidence, publish_lock_seconds: float) -> None:
+    try:
+        _layout(parent, evidence, layout_deadline=time.monotonic() + publish_lock_seconds)
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"herdr {parent}: skipped worker layout. {' '.join(str(error).splitlines())}", file=sys.stderr)
+
+
+def _layout(parent: StaffId, evidence: PaneEvidence, *, layout_deadline: float | Literal["no_wait"] = "no_wait") -> None:
     client = _client()
     parent_tabs = {_text(pane, "tab_id") for pane in evidence.scan.found.get(parent, [])} - {""}
     selected = {item.terminal for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
@@ -2197,7 +2240,15 @@ def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
     tabs = {pane.get("tab_id", "") for pane in panes if pane.get("terminal_id", "") in selected}
     for tab in tabs - {""}:
         key = hashlib.sha256(f"layout:{client.session}:{tab}".encode()).hexdigest()
-        with staff.slot_operation(key, "worker layout"):
+        with ExitStack() as locks:
+            try:
+                _ = locks.enter_context(staff.slot_operation(key, "worker layout", layout_deadline=layout_deadline))
+            except staff.StaffRefused as error:
+                if layout_deadline == "no_wait":
+                    raise
+                holder = " ".join(error.holder.split()) or "an unknown process"
+                print(f"herdr {client.session}:{tab}: skipped worker layout. The slot holder is {holder}.", file=sys.stderr)
+                continue
             layout = herdr.json_object(client.socket_request("layout.export", tab_id=tab).get("layout"), "worker layout")
             terminals = {pane["pane_id"] for pane in panes
                          if pane.get("terminal_id", "") in selected and pane.get("tab_id", "") == tab}

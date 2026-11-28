@@ -19,6 +19,7 @@ from dataclasses import replace
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -1533,6 +1534,38 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertEqual(self.world.requests[-1][2][key], str(destination))
                     self.assertIn(str(first.row.current_session), self.world.requests[-1][1])
                 self.assertEqual(self.world.closed, [])
+
+    def test_standalone_start_and_resume_keep_the_recorded_phase_session(self) -> None:
+        run = self.run_state()
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        key = "CARGO_BERTH_SESSION_ID"
+        expected = f"{self.parent.current_session}.phase-earlier"
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+        entries = pane_launch.read(pane_launch.record_directory() / f"{self.world.session}.json")
+        self.assertEqual(entries[opened.pane]["environment"].get(key), expected)
+
+        path = run / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        phases = cast(list[dict[str, object]], state["open_phases"])
+        phases.append({"id": "later", "instance_id": "later-phase", "status": "active"})
+        write_text_atomic(path, json.dumps(state))
+        self.assertTrue(self.world.stop(opened.row, self.world))
+        retained = self.start()
+        assert isinstance(retained, worker_panes.OpenWorker)
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+
+        state["pass"] = {opened.row.name: {"instance_id": "dispatch-impl", "worker_id": opened.row.id,
+                                         "team_slot": opened.row.name, "kind": "impl", "status": "active",
+                                         "phase": {"id": "earlier", "instance_id": "earlier-phase"}}}
+        write_text_atomic(path, json.dumps(state))
+        self.assertTrue(self.world.stop(retained.row, self.world))
+        account = accounts.CodexWorkersAccount("codex2", self.root / "codex2")
+        resumed = self.start(account=account)
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertEqual((resumed.terminal, resumed.row.current_session), (opened.terminal, opened.row.current_session))
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+        self.assertEqual(self.world.requests[-1][2]["CODEX_HOME"], str(account.home))
 
     def test_unreadable_launch_environment_without_a_current_dispatch_is_uncertain(self) -> None:
         for status in ("missing", "completed", "refused", "error"):
@@ -3459,6 +3492,55 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.layouts["w1:t1"], expected)
         self.assertEqual(self.world.closed, [])
 
+    def test_open_waits_for_the_layout_slot_and_succeeds_if_it_stays_busy(self) -> None:
+        self.assertIsInstance(self.start("first"), worker_panes.OpenWorker)
+        tab = "w1:t1"
+        key = sha256(f"layout:{self.world.session}:{tab}".encode()).hexdigest()
+        slot = staff.record_path().parent / "rows" / f"{key}.lock"
+        holder = {"pid": os.getpid(), "command": "close the previous worker"}
+        config = self.root / "conf/direct.conf"
+        settings = config.read_text()
+        flock = fcntl.flock
+
+        for name, releases, seconds in (("second", True, 1), ("third", False, 0.05)):
+            with self.subTest(releases=releases), slot.open("wb", buffering=0) as held:
+                write_text_atomic(config, settings.replace("worker_publish_lock_seconds=15",
+                                                          f"worker_publish_lock_seconds={seconds}"))
+                before = len(self.world.layout_changes)
+                busy = False
+                flock(held, fcntl.LOCK_EX)
+                _ = held.write(json.dumps(holder).encode())
+
+                def acquire(handle: int | worker_lifecycle.LockFileDescriptor, mode: int) -> None:
+                    nonlocal busy
+                    try:
+                        flock(handle, mode)
+                    except BlockingIOError:
+                        if str(cast(object, getattr(handle, "name", ""))) == str(slot):
+                            busy = True
+                            if releases:
+                                flock(held, fcntl.LOCK_UN)
+                        raise
+
+                with patch.object(fcntl, "flock", side_effect=acquire), redirect_stderr(io.StringIO()) as notes:
+                    result = self.start(name)
+                self.assertIsInstance(result, worker_panes.OpenWorker, notes.getvalue())
+                self.assertTrue(busy)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual(staff.by_id(result.row.id), result.row)
+                self.assertIn(result.pane, self.world.locations)
+                if releases:
+                    self.assertGreater(len(self.world.layout_changes), before)
+                    self.assertEqual(notes.getvalue(), "")
+                else:
+                    self.assertEqual(len(self.world.layout_changes), before)
+                    self.assertEqual(notes.getvalue().splitlines(), [
+                        f"herdr {self.world.session}:{tab}: skipped worker layout. "
+                        + f"The slot holder is pid {os.getpid()}: close the previous worker.",
+                    ])
+        self.assertEqual(len(self.world.launches), 3)
+        self.assertEqual(self.world.closed, [])
+
     def test_start_rerun_finishes_layout_after_a_failed_layout_read(self) -> None:
         for name in ("a", "b", "c"):
             self.assertIsInstance(self.start(name), worker_panes.OpenWorker)
@@ -3476,9 +3558,10 @@ class WorkerPaneTests(StaffTestCase):
                 raise OSError("interrupted before layout")
             return request(method, **params)
 
-        with patch.object(self.world, "socket_request", side_effect=interrupt):
-            with self.assertRaises(OSError):
-                _ = self.start("c")
+        with patch.object(self.world, "socket_request", side_effect=interrupt), redirect_stderr(io.StringIO()) as notes:
+            opened = self.start("c")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        self.assertIn("interrupted before layout", notes.getvalue())
         started = self.observation(row)
         self.assertIsInstance(started, worker_panes.OpenWorker)
         assert isinstance(started, worker_panes.OpenWorker)
@@ -3647,6 +3730,7 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(arguments[arguments.index("--model") + 1],
                                  models_registry.launch_settings("direct", "impl", family).model)
                 self.assertEqual(environment["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
+                self.assertEqual(environment.get("CARGO_BERTH_SESSION_ID"), f"{self.parent.current_session}.phase-earlier")
 
     def test_account_move_to_the_current_account_does_nothing(self) -> None:
         from scripts.accounts import pane_moves

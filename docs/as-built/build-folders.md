@@ -26,6 +26,8 @@ Item 191 B3 will keep the Mac claim at the unreachable bound until the guest pro
 The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the last part of the Git origin path without the `.git` suffix. The local alias for `claude_commands` is `claude`. The path has no showrunner component.
 
 The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
+The Mac Linux guest stores its affected-module fact cache under `<build root>/claude/main/gate/affected-module-facts.sqlite` and holds the main output lease during use.
+The guest copies the cache through the default gate state folder in the run. It skips the cache when `GATE_STATE_DIR` is set.
 Each numbered copy uses its own real `target` directory.
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
@@ -150,7 +152,17 @@ It checks all these paths for process use.
 
 Migration scans the sources together and checks each source again before source relocation. The scan cannot stop a process that enters the source after the scan. The pass ends with `moved N, kept in use M, kept K`. The dry run uses `would move`. Run the same command again later to move kept folders.
 
-Linux migration checks the working directory of each live thread. It checks for live threads when the thread leader is a zombie. After `EACCES`, it checks whom the working directory link in `/proc` belongs to. It also checks whether the process has a permitted capability the caller lacks. Either cause can account for the missing paths. Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process. Other read errors for processes of the current user keep every candidate. An incomplete process scan keeps every candidate on either host.
+Linux migration uses `process_paths` to scan each live process and its threads.
+On the live `/proc`, the scan can skip a thread after it reads the leader without errors or ignored descriptors.
+It skips the thread only when `kcmp` confirms that it shares the leader's descriptor table and filesystem state.
+The comparison runs before the scan reads the thread's status.
+The scan reads the other threads if the leader has exited or the comparison fails.
+After `EACCES`, the scan checks the owner of the working directory link in `/proc`.
+It also checks whether the process has a permitted capability the caller lacks.
+Either check can explain why the kernel hides the paths.
+Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process.
+Other read errors for processes of the current user keep every candidate.
+An incomplete process scan keeps every candidate on either host.
 
 Migration holds busy claims and copy leases through source relocation. A copy request waits for another process to release the unit allocation lock. A second request from the same process fails immediately.
 
@@ -314,24 +326,28 @@ The list shows `t-` and `targeted-test-` rows first.
 A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
 The newest time includes the lock and lease files.
 If the command cannot read the gate root, it shows one kept row for that root and lists the other places.
-The command keeps a gate row that contains a `.git` file or folder at any depth.
+The standard list keeps a gate row that contains a `.git` file or folder at any depth.
 It also keeps a bare repository that it identifies by name.
 The standard list shows `holds a Git repository; manual review` for these rows.
-The sudo list can approve a move for a folder with top-level or nested Git checkouts or bare repositories.
-It keeps linked worktrees because a `.git` file points to a registration elsewhere.
+The sudo list can approve a move for a gate folder of a known kind.
+A `.git` file can move if its `gitdir` points inside the folder or to a missing path.
+An existing path outside the folder keeps the row for review.
+A `gitdir` with a `.` or `..` component or a symbolic link inside the folder also keeps the row.
 It keeps folders with an `objects/info/alternates` file at any depth and shows `Git alternates; manual review`.
 The target is `/build/claude/resources/shm-moved/<entry name>`. The child refuses an existing target.
 The sudo caller must own the source entries and the target parent.
 The child copies the folder and its lock and lease files into a staging folder with mode `0700`.
 It preserves modes, times, and hard links.
-It copies links as links.
+It copies symbolic links as links. It copies FIFOs without opening them.
+A socket, device, or read-only directory keeps the source in place.
 The child compares the paths, types, sizes, file hashes, and link targets.
 The child renames the verified folder to the target first. It then renames the lock and lease files.
 If publication fails, the child returns the paths it published to staging.
 The child verifies the published copy again.
 The removal guard compares the proof's final path with the target on the approved list.
-It walks the source and checks the published tree's path, identity, and entry stamps.
-The final live-use scan runs after these checks.
+It walks the source and runs the final live-use scan.
+It checks the published tree's path, identity, and entry stamps.
+It checks the copied side files just before it removes the source.
 The copy proof permits removal of the source only.
 The standard removal guard removes the lock and lease files after the source is gone.
 Cleanup can miss a write by a process with the same user ID between the entry's last check and source removal.
@@ -340,7 +356,7 @@ The gate check uses file names and runs no Git commands.
 The command keeps other rows whose Git directory, registration, alternates, or local origin use the gate root's filesystem.
 These rows show `Git data in the gate root; manual review`.
 The command keeps every folder with a `run.json` recovery record.
-It keeps unknown entries, links, mounts, and folders in use.
+It keeps unknown entries, top-level links, mounts, and folders in use.
 It keeps orphan side files and entries with unreadable evidence.
 Without sudo, the process scan checks only the current user.
 On natedev, the parent uses `/proc` to check thread paths.

@@ -24,12 +24,12 @@ import time
 import unittest
 from collections.abc import Callable, Collection, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -44,8 +44,9 @@ from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
 from scripts.lib.sizes import MIB, gib
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import floor_claims
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.mac_test import claim_state, floor_claims, mac_test
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
@@ -6890,7 +6891,7 @@ raise SystemExit(int(os.environ[variable]))
             messages.append(message)
             if len(messages) == 1:
                 sending.set()
-                if not finish_send.wait(5):
+                if not finish_send.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("the competing floor operation did not release the delayed send")
             return DELIVERED_NATEDEV_ALERT
 
@@ -6901,9 +6902,10 @@ raise SystemExit(int(os.environ[variable]))
         with mock.patch.object(sweep, "send_floor_alert", side_effect=send), ThreadPoolExecutor(2) as workers:
             first = workers.submit(sweep.alert_floor_lock, str(path), 2 * GIB, 300 * GIB)
             try:
-                self.assertTrue(sending.wait(5), "the first overdue hold must reach the send")
+                self.assertTrue(sending.wait(TEST_HANG_GUARD_SECS), "the first overdue hold must reach the send")
                 second = workers.submit(run_competing)
-                self.assertTrue(competing_started.wait(5))
+                self.assertTrue(competing_started.wait(TEST_HANG_GUARD_SECS),
+                                "the competing floor operation did not start")
                 try:
                     _ = second.result(timeout=1)
                 except TimeoutError:
@@ -6911,8 +6913,8 @@ raise SystemExit(int(os.environ[variable]))
                     pass
             finally:
                 finish_send.set()
-            _ = first.result(timeout=5)
-            _ = second.result(timeout=5)
+            _ = LauncherHangGuard("first floor operation after the send release").result(first)
+            _ = LauncherHangGuard("competing floor operation after the send release").result(second)
         return messages
 
     def test_overlapping_waiters_deliver_one_alert_for_the_same_hold(self) -> None:
@@ -7689,6 +7691,406 @@ def git(*args: str, cwd: Path) -> None:
 
 
 NO_MAC_CLAIMS: frozenset[str] = frozenset()
+NO_BUSY_MAC_MIRRORS: frozenset[Path] = frozenset()
+NO_MAC_OPEN_FILES: tuple[tuple[str, int, str], ...] = ()
+
+
+class MacCullTests(SweepCase):
+    def mirror(self) -> Path:
+        return MacMirrorRoot.read(conf.read("mac_test")).local_path()
+
+    def output(self, name: str, used: float) -> tuple[Path, Path]:
+        tree, payload = cargo_target(self.mirror(), name, APP, used)
+        self.date_output(tree.parent, used)
+        (tree.parents[1] / floor_claims.MIRROR_MARK).touch()
+        return tree, payload
+
+    def date_output(self, target: Path, used: float) -> None:
+        for path in (target, *target.rglob("*")):
+            os.utime(path, (used, used), follow_symlinks=False)
+
+    def cull(self, free: Callable[[str], int], *,
+             claims: frozenset[str] | Callable[[], floor_claims.ClaimSnapshot] = NO_MAC_CLAIMS,
+             busy: frozenset[Path] = NO_BUSY_MAC_MIRRORS,
+             open_files: Sequence[tuple[str, int, str]] = NO_MAC_OPEN_FILES) -> sweep.FloorOutcome:
+        mirror = self.mirror()
+
+        def read_claims(_timeout: float) -> floor_claims.ClaimSnapshot:
+            return claims() if callable(claims) else floor_claims.ClaimSnapshot(claims)
+
+        policy = sweep.MacFloor((str(mirror),), read_claims(0), mirror, busy)
+        settings = sweep.MacCullSettings(conf.read("mac_test"), 48 * 3600)
+        with (mock.patch.object(sweep, "free_bytes", side_effect=free),
+              mock.patch.object(floor_claims, "read_claims", side_effect=read_claims),
+              mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown(list(open_files))),
+              mock.patch.object(sweep, "mac_build_process_use", return_value=sweep.NoBuildProcessUse())):
+            return sweep.cull_mac_floor(policy, settings, 1, 0, str(self.build_home), False,
+                                        lint_settings=conf.read("lint"))
+
+    def test_floor_removes_the_oldest_idle_output_and_stops_at_the_floor(self) -> None:
+        now = time.time()
+        fresh, fresh_payload = self.output("fresh-write", now - 5 * DAY)
+        os.utime(fresh_payload, (now - 5 * DAY, now))
+        old, _ = self.output("old", now - 4 * DAY)
+        later, _ = self.output("later", now - 3 * DAY)
+        used, _ = self.output("used", now - DAY)
+        target = old.parent
+        result = self.cull(lambda _: int(not target.exists()))
+        self.assertEqual(result.status, 0)
+        self.assertGreater(result.removed, 0)
+        self.assertFalse(target.exists())
+        self.assertTrue(fresh_payload.is_file())
+        self.assertTrue(fresh.parent.is_dir())
+        self.assertTrue(later.parent.is_dir())
+        self.assertTrue(used.parent.is_dir())
+
+    def test_a_recent_repository_within_its_budget_takes_no_exclusive_hold(self) -> None:
+        now = time.time()
+        tree, payload = self.output("sample", now - DAY)
+        leases = sweep.mac_floor_mirror_leases
+        taken: list[frozenset[Path]] = []
+
+        def record(mirrors: set[Path]) -> AbstractContextManager[bool]:
+            taken.append(frozenset(mirrors))
+            return leases(mirrors)
+
+        # A scan that removes nothing must not keep a Mac run or probe out of the mirror.
+        with mock.patch.object(sweep, "mac_floor_mirror_leases", side_effect=record):
+            self.assertEqual(self.cull(lambda _: 0).status, 0)
+        self.assertEqual(taken, [])
+        self.assertTrue(payload.is_file())
+        self.assertTrue(tree.parent.is_dir())
+
+    def test_recent_output_sets_the_age_of_every_folder_in_the_repository(self) -> None:
+        now = time.time()
+        recent, recent_payload = self.output("sample", now - DAY)
+        held, held_payload = self.output("held", now - 4 * DAY)
+        leased, leased_payload = self.output("leased", now - 5 * DAY)
+        old, old_payload = cargo_target(self.build_home / "build", "sample", DEMO, now - 3 * DAY)
+        main = old.parents[1] / "main"
+        _ = old.parent.rename(main)
+        os.utime(main / old_payload.relative_to(old.parent), (now - 3 * DAY, now))
+        source = self.build_home / "rust" / "sample"
+        source.mkdir(parents=True)
+        (source / "target").symlink_to(main)
+        config = conf.path("mac_test")
+        _ = write_config_fixture(config, "# range: 5e-324..\nmac_budget_gib.sample=0.0001\n")
+        result = self.cull(lambda _: 0, claims=frozenset({"held"}), busy=frozenset({leased.parents[1]}))
+        self.assertEqual(result.status, 0)
+        self.assertTrue(main.is_dir())
+        self.assertTrue((source / "target").is_symlink())
+        self.assertFalse((main / old_payload.relative_to(old.parent)).exists())
+        self.assertTrue(recent_payload.is_file())
+        self.assertTrue(recent.parent.is_dir())
+        self.assertTrue(held_payload.is_file())
+        self.assertTrue(held.parent.is_dir())
+        self.assertTrue(leased_payload.is_file())
+
+    def test_floor_keeps_open_files_and_uses_the_mirror_run_record(self) -> None:
+        now = time.time()
+        opened, opened_payload = self.output("open", now - 4 * DAY)
+        recent, recent_payload = self.output("recent", now - 4 * DAY)
+        record_path = recent.parents[1] / floor_claims.MIRROR_RECORD
+        _ = record_path.write_text(json.dumps({"last_use": now, "repo": "recent"}))
+        build = self.build_home / "build"
+        old, _ = cargo_target(build, "old", APP, now - 3 * DAY)
+        main = build / "old" / "main"
+        _ = old.parent.rename(main)
+        self.date_output(main, now - 3 * DAY)
+        source = self.build_home / "rust" / "old"
+        source.mkdir(parents=True)
+        link = source / "target"
+        link.symlink_to(main)
+        outcome = self.cull(lambda _: 0, open_files=((str(opened_payload), 1, "open for reading"),))
+        self.assertEqual(outcome.status, 0)
+        self.assertEqual(outcome.held_targets, (str(opened.parent),))
+        self.assertTrue(opened_payload.is_file())
+        self.assertTrue(recent_payload.is_file())
+        self.assertFalse(main.exists())
+        self.assertEqual(link.readlink(), main)
+
+    def test_a_build_in_a_numbered_copy_keeps_the_mirror_target(self) -> None:
+        now = time.time()
+        tree, payload = self.output("sample", now - 4 * DAY)
+        copy_tree, copy_payload = cargo_target(self.build_home / "build/sample/gates", "1", DEMO, now)
+        (copy_tree.parents[1] / ".git").mkdir()
+        outcome = self.cull(lambda _: 0)
+        self.assertEqual(outcome.status, 0)
+        self.assertTrue(tree.parent.is_dir())
+        self.assertTrue(payload.is_file())
+        self.assertTrue(copy_payload.is_file())
+
+    def test_a_copy_built_after_discovery_keeps_the_mirror_target(self) -> None:
+        now = time.time()
+        tree, payload = self.output("sample", now - 4 * DAY)
+        copy_root = self.build_home / "build/sample/gates"
+        with mock.patch.object(sweep, "mac_build_outputs", wraps=sweep.mac_build_outputs) as discover:
+            def free(_: str) -> int:
+                self.assertGreater(discover.call_count, 0)
+                if not copy_root.exists():
+                    _tree, _payload = cargo_target(copy_root, "1", DEMO, now)
+                return 0
+
+            outcome = self.cull(free)
+        self.assertEqual(outcome.status, 0)
+        self.assertTrue(tree.parent.is_dir())
+        self.assertTrue(payload.is_file())
+
+    def test_a_repository_with_a_later_build_returns_to_its_new_place(self) -> None:
+        now = time.time()
+        recent, payload = self.output("sample", now - 5 * DAY)
+        old, _ = self.output("old", now - 4 * DAY)
+        copy_root = self.build_home / "build/sample/gates"
+        _ = write_config_fixture(conf.path("mac_test"), "# range: 5e-324..\nmac_budget_gib.sample=0.00001\n")
+
+        def free(_: str) -> int:
+            if not copy_root.exists():
+                _tree, _payload = cargo_target(copy_root, "1", DEMO, now)
+            return int(not old.parent.exists() or not payload.exists())
+
+        outcome = self.cull(free)
+        self.assertEqual(outcome.after, 1)
+        self.assertFalse(old.parent.exists())
+        self.assertTrue(recent.parent.is_dir())
+        self.assertTrue(payload.is_file())
+
+    def test_file_reads_do_not_renew_the_repository_age(self) -> None:
+        now = time.time()
+        tree, payload = self.output("sample", now - 4 * DAY)
+        os.utime(payload, (now, now - 4 * DAY))
+        outcome = self.cull(lambda _: 0)
+        self.assertEqual(outcome.status, 0)
+        self.assertFalse(tree.parent.exists())
+
+    def test_the_floor_reorders_repositories_after_removing_one_folder(self) -> None:
+        now = time.time()
+        first, _ = self.output("sample", now - 5 * DAY)
+        other, _ = self.output("other", now - 4 * DAY)
+        build = self.build_home / "build"
+        tree, payload = cargo_target(build, "sample", APP, now - 5 * DAY)
+        main = build / "sample/main"
+        _ = tree.parent.rename(main)
+        payload = main / payload.relative_to(tree.parent)
+        self.date_output(main, now - 5 * DAY)
+        _ = write_config_fixture(conf.path("mac_test"), "# range: 5e-324..\nmac_budget_gib.sample=0.00001\n")
+        copies_root = build / "sample/gates"
+
+        def free(_: str) -> int:
+            if not first.parent.exists() and not copies_root.exists():
+                copy_tree, _payload = cargo_target(copies_root, "1", DEMO, now)
+                (copy_tree.parents[1] / ".git").mkdir()
+            return int(not other.parent.exists() or not payload.exists())
+
+        outcome = self.cull(free)
+        self.assertEqual(outcome.status, 0)
+        self.assertFalse(first.parent.exists())
+        self.assertFalse(other.parent.exists())
+        self.assertTrue(payload.is_file())
+
+    def test_a_run_takes_the_mirror_lease_between_floor_groups(self) -> None:
+        now = time.time()
+        tree, older = self.output("sample", now - 4 * DAY)
+        remaining = unit(tree, "deps", "newer", DEMO, now)
+        _ = write_config_fixture(conf.path("mac_test"), "# range: 5e-324..\nmac_budget_gib.sample=0.00001\n")
+        lease = floor_claims.mirror_lock_path(tree.parents[1])
+        with lease.open("a+") as running:
+            started = False
+
+            def free(_: str) -> int:
+                nonlocal started
+                if not older.exists() and not started:
+                    fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    started = True
+                return 0
+
+            outcome = self.cull(free)
+        self.assertEqual(outcome.status, 0)
+        self.assertTrue(started)
+        self.assertFalse(older.exists())
+        self.assertTrue(remaining.is_file())
+        self.assertIn(str(tree.parent), outcome.held_targets)
+
+    def test_a_claim_written_between_groups_keeps_the_second_group(self) -> None:
+        now = time.time()
+        tree, older = self.output("sample", now - 4 * DAY)
+        newer = unit(tree, "deps", "newer", DEMO, now)
+        _ = write_config_fixture(conf.path("mac_test"), "# range: 5e-324..\nmac_budget_gib.sample=0.00001\n")
+        state = claim_state.StatePaths(self.build_home / "fixture-claims")
+        repository = claim_state.MacRepositoryIdentity("sample", "sample", "sample.json", "sample",
+                                                        claim_state.KnownMacHistoryKey("sample")).for_new_claim()
+        args = mac_test.CliArguments()
+        args.pid, args.worktree, args.what = os.getpid(), str(tree.parents[1]), "unit tests"
+        record_path = state.claims / repository.claim_file
+
+        def free(_: str) -> int:
+            if not older.exists() and not record_path.exists():
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(mac_test.command_claim(args, state, watch_claim=False, mac_repository=repository), 0)
+            return 0
+
+        def read_claims() -> floor_claims.ClaimSnapshot:
+            repositories = frozenset(claim.scope.name for claim in claim_state.read_claims(state)
+                                     if isinstance(claim.scope, claim_state.RepositoryScope))
+            return floor_claims.ClaimSnapshot(repositories)
+
+        outcome = self.cull(free, claims=read_claims)
+        self.assertEqual(outcome.status, 0)
+        self.assertFalse(older.exists())
+        self.assertTrue(record_path.is_file())
+        self.assertTrue(newer.is_file())
+        self.assertIn(str(tree.parent), outcome.held_targets)
+
+    def test_reaching_the_floor_succeeds_with_a_repository_over_budget(self) -> None:
+        now = time.time()
+        tree, older = self.output("sample", now - 4 * DAY)
+        remaining = unit(tree, "deps", "newer", DEMO, now)
+        _ = write_config_fixture(conf.path("mac_test"), "# range: 5e-324..\nmac_budget_gib.sample=0.00001\n")
+        outcome = self.cull(lambda _: int(not older.exists()))
+        self.assertEqual(outcome.after, 1)
+        self.assertEqual(outcome.status, 0)
+        self.assertFalse(older.exists())
+        self.assertTrue(remaining.is_file())
+
+    def test_removing_a_group_does_not_renew_the_repository_age(self) -> None:
+        now = time.time()
+        tree, older = self.output("sample", now - 4 * DAY)
+        remaining = unit(tree, "deps", "newer", DEMO, now - 3 * DAY)
+        self.date_output(tree.parent, now - 3 * DAY)
+        os.utime(older, (now - 4 * DAY, now - 4 * DAY))
+        self.date_output(tree / ".fingerprint" / f"sample-{APP}", now - 4 * DAY)
+        with mock.patch.object(sweep, "mac_output_in_use", return_value=False):
+            self.assertEqual(self.trim(tree, 84 * 1024), 0)
+        self.assertFalse(older.exists())
+        self.assertTrue(remaining.is_file())
+        self.assertGreater(tree.joinpath("deps").stat().st_mtime, now - DAY)
+        self.assertEqual(self.cull(lambda _: 0).status, 0)
+        self.assertFalse(tree.parent.exists())
+
+    def test_the_floor_leases_a_repository_before_removing_build_output(self) -> None:
+        self.mirror().mkdir(parents=True)
+        tree, _ = cargo_target(self.build_home / "build", "sample", APP, time.time())
+        target = tree.parents[1] / "main"
+        _ = tree.parent.rename(target)
+        self.date_output(target, time.time() - 3 * DAY)
+        lease = floor_claims.mirror_lock_path(self.mirror() / "sample")
+        remove = sweep.remove_checked_entry
+
+        def check_lease(entry: removal_guard.CheckedEntry,
+                        held: build_folders.FreeFolderRemovalLease | sweep.LeasedCargoGroup,
+                        ) -> sweep.ConfirmedDeletion:
+            with lease.open("a+") as probe, self.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return remove(entry, held)
+
+        with mock.patch.object(sweep, "remove_checked_entry", side_effect=check_lease):
+            self.assertEqual(self.cull(lambda _: 0).status, 0)
+        self.assertFalse(target.exists())
+        with lease.open("r") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_post_run_trim_skips_a_group_opened_after_the_first_removal(self) -> None:
+        now = time.time()
+        tree, older = self.output("sample", now - 4 * DAY)
+        opened = unit(tree, "deps", "opened", DEMO, now - 3 * DAY)
+        later = unit(tree, "deps", "later", "0000000000000003", now - 2 * DAY)
+        os.utime(opened, (now - 3 * DAY, now - 3 * DAY))
+        os.utime(later, (now - 2 * DAY, now - 2 * DAY))
+
+        def uses(path: str, *, require_complete: bool) -> tmp_sweep.ProcessUsesKnown:
+            self.assertEqual(path, str(tree.parent))
+            self.assertTrue(require_complete)
+            paths = [] if older.exists() else [(str(opened), 1, "open for reading")]
+            return tmp_sweep.ProcessUsesKnown(paths)
+
+        with mock.patch.object(tmp_sweep, "lsof_paths", side_effect=uses):
+            self.assertEqual(self.trim(tree, 84 * 1024), 0)
+        self.assertFalse(older.exists())
+        self.assertTrue(opened.is_file())
+        self.assertFalse(later.exists())
+
+    def test_post_run_trim_orders_loose_cargo_files_and_reports_remaining_bytes(self) -> None:
+        now = time.time()
+        tree, grouped = self.output("sample", now - 2 * DAY)
+        older = write(tree / "deps" / "loose.rmeta")
+        newer = write(tree / "build" / "loose-cache" / "stale.o")
+        fingerprint = write(tree / ".fingerprint" / "loose.json")
+        incremental = write(tree / "incremental" / "loose.bin")
+        for payload, used in ((older, now - 5 * DAY), (newer, now - DAY),
+                              (fingerprint, now - 3 * DAY), (incremental, now - 4 * DAY)):
+            os.utime(payload, (used, used))
+        outside = write(tree.parent / "notes")
+        budget = sum(path.stat().st_blocks * 512 for path in (newer, outside, grouped, fingerprint)) + 8 * 1024
+        with mock.patch.object(sweep, "mac_output_in_use", return_value=False):
+            self.assertEqual(self.trim(tree, budget), 0)
+            self.assertFalse(older.exists())
+            self.assertFalse(incremental.exists())
+            self.assertTrue(fingerprint.is_file())
+            self.assertTrue(grouped.is_file())
+            self.assertTrue(newer.is_file())
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(self.trim(tree, 0), 1)
+        self.assertFalse(grouped.exists())
+        self.assertFalse(newer.exists())
+        self.assertFalse(fingerprint.exists())
+        self.assertTrue(outside.is_file())
+        marker = tree.parent / sweep.RUSTC_INFO
+        retained_bytes = (outside.stat().st_blocks + marker.stat().st_blocks) * 512
+        self.assertIn(f"over budget: {retained_bytes} bytes, budget 0 bytes", output.getvalue())
+
+    def trim(self, tree: Path, budget: int) -> int:
+        checkout = tree.parents[1]
+        with (floor_claims.mirror_lock_path(checkout).open("a+") as owner,
+              build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.SHARED) as descriptor):
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.dict(os.environ, {sweep.BUDGET_ENV: str(budget / GIB),
+                                              floor_claims.MIRROR_LEASE_FDS: f"{owner.fileno()},{descriptor}"}):
+                return sweep.sweep_workspace(str(tree.parent), conf.read("lint"), False, 60,
+                                             mac_trim=sweep.MacRunTrim.LEASED_MIRROR)
+
+    def test_queued_mirror_command_blocks_the_post_run_trim(self) -> None:
+        tree, older = self.output("sample", time.time() - 3 * DAY)
+        checkout = tree.parents[1]
+        budget = (tree.parent / sweep.RUSTC_INFO).stat().st_blocks * 512
+        program = "import sys; print('ready', flush=True); sys.stdin.readline()"
+        run = ("import sys; from scripts.mac_test.mac_queue_run import run_in_mac_cwd; "
+               + "run_in_mac_cwd(sys.argv[1], sys.argv[2:])")
+        with (subprocess.Popen([sys.executable, "-c", run, str(checkout), sys.executable, "-c", program],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=os.environ) as queued,
+              mock.patch.object(sweep, "mac_output_in_use", return_value=False)):
+            stdout = cast(BinaryIO, queued.stdout)
+            try:
+                self.assertTrue(select.select([stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                self.assertEqual(stdout.readline(), b"ready\n")
+                self.assertEqual(self.trim(tree, budget), 1)
+                self.assertTrue(older.is_file())
+                _ = queued.communicate(input=b"done\n", timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(queued.returncode, 0)
+            finally:
+                if queued.poll() is None:
+                    queued.kill()
+            self.assertEqual(self.trim(tree, budget), 0)
+            self.assertFalse(older.exists())
+
+    def test_post_run_trim_requires_the_exact_mirror_lease_and_uses_atime(self) -> None:
+        now = time.time()
+        tree, older = self.output("sample", now - 3 * DAY)
+        newer = unit(tree, "deps", "new", DEMO, now - 4 * DAY)
+        os.utime(newer, (now, now - 4 * DAY))
+        marker = tree.parent / "unrelated"
+        _ = marker.write_text("keep")
+        with (build_folders.mac_mirror_hold(tree.parents[1], build_folders.MacMirrorHold.SHARED) as descriptor,
+              mock.patch.object(sweep, "mac_output_in_use", return_value=False),
+              mock.patch.dict(os.environ, {sweep.BUDGET_ENV: str(84 * 1024 / GIB),
+                                           floor_claims.MIRROR_LEASE_FDS: ""})):
+            arguments = (str(tree.parent), conf.read("lint"), False, 60)
+            self.assertEqual(sweep.sweep_workspace(*arguments, mac_trim=sweep.MacRunTrim.LEASED_MIRROR), 1)
+            self.assertTrue(older.is_file())
+            os.environ[floor_claims.MIRROR_LEASE_FDS] = str(descriptor)
+            self.assertEqual(sweep.sweep_workspace(*arguments, mac_trim=sweep.MacRunTrim.LEASED_MIRROR), 0)
+        self.assertFalse(older.exists())
+        self.assertTrue(newer.is_file())
+        self.assertEqual(marker.read_text(), "keep")
 
 
 class MacFloorTests(SweepCase):
@@ -7870,7 +8272,16 @@ class MacFloorTests(SweepCase):
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
         _ = config.write_text(original)
 
-    def test_mac_entry_uses_mac_floor_and_skips_the_tmp_sweep(self) -> None:
+    def test_mac_idle_hours_below_48_refuses_before_the_floor_pass(self) -> None:
+        _ = write_config_fixture(conf.path("mac_test"), "cull_idle_hours=47\n")
+        output = io.StringIO()
+        with redirect_stderr(output), mock.patch.object(sweep, "hold_floor") as take:
+            self.assertEqual(sweep.main(["--floor-only", "--host", "mac"]), 2)
+        take.assert_not_called()
+        self.assertIn("cull_idle_hours", output.getvalue())
+        self.assertIn("at least 48", output.getvalue())
+
+    def test_mac_entry_uses_the_mac_floor_without_bulk_mirror_leases(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
         _ = write_config_fixture(conf.path("build_targets"), "platform.mac=macos\n")
         _ = write_config_fixture(config,
@@ -7878,11 +8289,13 @@ class MacFloorTests(SweepCase):
             + "sweep_floor_roots=/tmp ~/rust ~/.local/state/mac-test/test-mirror\n")
         claims = floor_claims.ClaimSnapshot(frozenset())
         with (mock.patch.object(floor_claims, "read_claims", return_value=claims),
+              mock.patch.object(copies, "mirror_sweep_leases") as bulk_leases,
               mock.patch.object(sweep, "hold_floor", return_value=0) as take,
               mock.patch.object(tmp_sweep, "run_if_due") as tmp):
             self.assertEqual(sweep.main(["--floor-only", "--host", "mac", "--dry-run"]), 0)
         self.assertEqual(take.call_args.args, (101 * GIB, True))
         self.assertIsInstance(cast(object, take.call_args.kwargs["policy"]), sweep.MacFloor)
+        bulk_leases.assert_not_called()
         tmp.assert_not_called()
 
     def test_standalone_mac_sweep_skips_a_held_floor_lock(self) -> None:
@@ -7899,8 +8312,8 @@ class MacFloorTests(SweepCase):
 
     def test_mac_sweep_releases_the_floor_lock_when_the_session_ends(self) -> None:
         base = self.output_fixture()
-        blocked = base / "one" / "two" / "three"
-        blocked.mkdir(parents=True)
+        mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path()
+        mirror.mkdir(parents=True)
         program = base / "sweep_fixture.py"
         _ = program.write_text("""
 import fcntl
@@ -7912,17 +8325,20 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.environ["FLOOR_TEST_PACKAGE_ROOT"])
+from scripts.lib import conf
 from scripts.lint import sweep
 from scripts.mac_test import floor_claims
+from scripts.mac_test.mirror_root import MacMirrorRoot
 
 base = Path(__file__).parent
 mode = os.environ["FLOOR_TEST_MODE"]
 scandir = os.scandir
 flock = fcntl.flock
 register = signal.signal
+mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path()
 
 def discover(path):
-    if Path(path) == base / "one" / "two" / "three":
+    if path == mirror:
         with (base / "scan.lock").open("r") as barrier:
             print("discovery blocked", file=sys.stderr, flush=True)
             flock(barrier, fcntl.LOCK_EX)
@@ -7948,8 +8364,6 @@ if not worker:
 with (mock.patch.object(sweep, "__file__", __file__),
       mock.patch.object(sweep, "mac_floor_settings", return_value=(1, (str(base),))),
       mock.patch.object(sweep, "floor_record_path", return_value=base / "floor.json"),
-      mock.patch.object(sweep.removal_guard, "read", side_effect=sweep.removal_guard.Refused(
-          sweep.removal_guard.RefusalReason.INVALID_ROOT)),
       mock.patch.object(sweep, "free_bytes", return_value=1 if mode == "retry" else 0),
       mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
       mock.patch.object(os, "scandir", side_effect=discover),

@@ -22,8 +22,7 @@ from scripts.build_queue import memory_files
 from scripts.review_links.browser_test_support import assert_status_states
 from scripts.disks import disks_page
 from scripts.production import staff
-from scripts.review_links import staff_names
-from scripts.lib import file_lock, test_hang_guard
+from scripts.lib import file_lock, session_folder, test_hang_guard
 from scripts.lib.process_group import run_process_group
 from scripts.review_links import page_frame, test_page_frame
 
@@ -65,25 +64,109 @@ class DisksPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
-        _ = (configuration / "statusline.conf").write_text("role.unit-director=#ffaf02\nrole.showrunner=#a379fd\n")
+        _ = (configuration / "statusline.conf").write_text(
+            "role.unit-director=#ffaf02\nrole.showrunner=#a379fd\nrole.producer=#90fe42\nrole.worker=#ff9898\n")
         staff_file = configuration / "staff.json"
         _ = staff_file.write_text('{"schema": 1, "rows": []}')
+        session_root = configuration / "sessions"
+        session_root.mkdir()
         # Staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file)})))
+            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file), session_folder.ROOT_ENV: str(session_root)})))
+
+    def test_session_names_use_owner_roles_and_held_folder_names_stay_plain(self) -> None:
+        members = staff.StaffSnapshot((
+            staff.StaffRow(staff.StaffId("runner-id"), "showrunner", "builds", staff.StaffRoot(),
+                           current_session=staff.StaffId("runner-session")),
+            staff.StaffRow(staff.StaffId("report-id"), "unit", "report", staff.StaffRoot(),
+                           current_session=staff.StaffId("report-session")),
+            staff.StaffRow(staff.StaffId("tracker-id"), "producer", "tracker", staff.StaffRoot(),
+                           current_session=staff.StaffId("tracker-session")),
+            staff.StaffRow(staff.StaffId("worker-id"), "worker", "impl", staff.StaffRoot(),
+                           current_session=staff.StaffId("worker-session")),
+        ))
+        session_root = Path(os.environ[session_folder.ROOT_ENV])
+        for folder, owner in (("report-impl-2", "worker-id"), ("impl", "unknown")):
+            path = session_root / folder
+            path.mkdir()
+            session_folder.write_record(path, {"owner": owner, "session_id": "test-session"})
+        cases = (("builds", "role.showrunner", "#a379fd"), ("report", "role.unit-director", "#ffaf02"),
+                 ("tracker", "role.producer", "#90fe42"), ("report-impl-2", "role.worker", "#ff9898"),
+                 ("impl", "", ""), ("<b>", "", ""))
+        report = {"sessions": [session(name, GIB, "running", [{"name": "builds", "task": "builds", "ended": False}])
+                               for name, _, _ in cases]}
+        with mock.patch.object(staff, "snapshot", return_value=members):
+            registry = re.search(r"<script>(window\.staffNames=.*?)</script>", self.page_html(), re.DOTALL)
+            assert registry is not None
+            rendered = cast(list[str], self.run_drive("globalThis.window = globalThis;" + registry[1] + """
+                sessionReport = input.report;
+                result = [sessionRows(sessionReport, KEEP, 0),
+                    ...sessionReport.sessions.map(row => tipFor("session:" + row.name))];
+            """, extra={"report": report}))
+        rows = ElementTree.fromstring(f"<tbody>{rendered[0]}</tbody>")
+        for row, tip, (name, role, color) in zip(rows, rendered[1:], cases, strict=True):
+            with self.subTest(name=name):
+                grid = ElementTree.fromstring(tip)
+                for label in (row[0], grid[0]):
+                    self.assertEqual("".join(label.itertext()), name)
+                    if role:
+                        span = label.find("span")
+                        assert span is not None
+                        self.assertEqual((span.get("data-color-text"), span.get("style")), (role, f"color:{color}"))
+                    else:
+                        self.assertEqual(list(label), [])
+                self.assertEqual(grid[4].text, "builds")
+                self.assertEqual(grid[5].text, "held · Task builds")
+                self.assertEqual((list(grid[4]), list(grid[5])), ([], []))
+
+    def test_a_refresh_colors_a_new_session_folder(self) -> None:
+        page = self.page_html()
+        registry = re.search(r"<script>(window\.staffNames=.*?)</script>", page, re.DOTALL)
+        assert registry is not None
+        name = "report-impl-2"
+        root = Path(os.environ[session_folder.ROOT_ENV])
+        path = root / name
+        path.mkdir()
+        session_folder.write_record(path, {"owner": "worker-id", "session_id": "worker-session"})
+        member = staff.StaffRow(staff.StaffId("worker-id"), "worker", "impl", staff.StaffRoot(),
+                                current_session=staff.StaffId("worker-session"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            answer = {"state": "current", "sessions": {"root": str(root), "sessions": [session(name, GIB, "running")]},
+                      "staff_names": disks_page.session_name_registry(disks_page.current_session_folders())}
+        rendered = cast(list[str], self.run_drive(page_frame.ACTION_STATUS_SCRIPT
+            + "globalThis.window = globalThis;" + registry[1] + """
+            const card = new Element();
+            const measureFailure = new Element();
+            document.getElementById = () => card;
+            const updateSessions = sessionsView(card);
+            const fetch = async () => ({ok: true, json: async () => input.answer});
+            const before = window.staffNames.html(input.name);
+            result = askMeasure(() => true).then(() => [
+                before, card.querySelector("tbody").innerHTML, tipFor("session:" + input.name)
+            ]);
+        """, extra={"answer": answer, "name": name}, page=page))
+        self.assertEqual(rendered[0], name)
+        row = ElementTree.fromstring(f"<tbody>{rendered[1]}</tbody>")[0]
+        tip = ElementTree.fromstring(rendered[2])
+        for label in (row[0], tip[0]):
+            span = label.find("span")
+            assert span is not None
+            self.assertEqual((span.text, span.get("data-color-text"), span.get("style")),
+                             (name, "role.worker", "color:#ff9898"))
 
     def test_session_tooltip_keeps_held_folder_names_plain(self) -> None:
-        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
-                                current_session=staff.StaffId("builds"))
-        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
-        page = self.page_html()
-        self.assertIn('"roleLabels": {"showrunner"', page)
-        session_tip = page[page.index("const SESSION_TIP_FOLDER_LIMIT"):page.index("function fitSessionTip(")]
-        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9] + session_tip
-        session_body = str(self.run_page("(()=>{" + setup
-            + "return stepTip.tipRowsHtml(sessionTip({name:'builds',state:'running',size:0,"
-            + "held:[{name:'builds',task:'builds'}]},0));})()"))
+        runner = staff.StaffRow(staff.StaffId("runner-id"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner,))):
+            page = self.page_html()
+        self.assertIn('"roleLabels": {}', page)
+        registry = re.search(r"<script>(window\.staffNames=.*?)</script>", page, re.DOTALL)
+        assert registry is not None
+        row = session("builds", 0, "running", [{"name": "builds", "task": "builds", "ended": False}])
+        session_body = cast(str, self.run_drive("globalThis.window = globalThis;" + registry[1] + """
+            result = stepTip.tipRowsHtml(sessionTip(input.row, 0));
+        """, extra={"row": row}, page=page))
         session_grid = ElementTree.fromstring(session_body)
         name = session_grid[0].find("span")
         assert name is not None
@@ -1049,9 +1132,10 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
         kept = self.run_page(f"[...knownFolders({json.dumps(drives)}, {json.dumps(paths)})]")
         self.assertEqual(kept, ["/build/cargo/project", "/build/|other", "other:/build", "/home/kept", "other:/"])
 
-    def run_drive(self, script: str, storage: str | None = None, extra: dict[str, object] | None = None) -> object:
+    def run_drive(self, script: str, storage: str | None = None, extra: dict[str, object] | None = None,
+                  page: str | None = None) -> object:
         """Run the page code on a fake document: each element counts its innerHTML writes and keeps its listeners."""
-        html = self.page_html()
+        html = self.page_html() if page is None else page
         functions = html[html.index("const GIB ="):html.index("const updateSessions =")]
         fake = ("""
             const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -1073,7 +1157,7 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
             const localStorage = {getItem: key => saved.has(key) ? saved.get(key) : null, setItem: (key, value) => saved.set(key, value)};
             let result = null;
         """)
-        javascript = fake + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
+        javascript = fake + functions + script + "\nPromise.resolve(result).then(value => process.stdout.write(JSON.stringify(value)));\n"
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP, "storage": storage,
                                                                                 **(extra or {})}),

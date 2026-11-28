@@ -97,6 +97,33 @@ class RemoteEntryTests(unittest.TestCase):
         return copies.RemoteMirror(owner, copies.SelectedRepository("repository"), "host",
                                    str(self.mirror if path is None else path), "holder-session")
 
+    def test_legacy_mirror_removal_respects_the_shared_floor_lease(self) -> None:
+        _ = write_config_fixture(conf.path("mac_test"), "mirror_root=~/mirrors\n")
+        self.assertEqual(self.mirror.parent, Path.home() / "mirrors")
+        mirror = self.mirror_record()
+        self.assertEqual(publish_mirror(mirror), 0)
+        args = mirror_arguments(mirror, "mirror-remove")
+        with (build_folders.mac_mirror_hold(self.mirror, build_folders.MacMirrorHold.SHARED),
+              self.assertRaisesRegex(copies.CopyError, "busy")):
+            _ = copies.mirror_remove(args)
+        self.assertTrue(self.mirror.is_dir())
+        self.assertEqual(copies.mirror_remove(args), 0)
+        self.assertFalse(self.mirror.exists())
+
+    def test_direct_mac_receive_recovers_a_pending_removal_under_its_own_hold(self) -> None:
+        _ = write_config_fixture(conf.path("mac_test"), "mirror_root=~/mirrors\n")
+        original = self.mirror_record()
+        self.assertEqual(publish_mirror(original), 0)
+        _ = (self.mirror / "old-payload").write_text("old content")
+        authority = floor_claims.removal_authority_path(self.mirror)
+        write_text_atomic(authority, (self.mirror / floor_claims.MIRROR_RECORD).read_text())
+        receive = mirror_arguments(replace(original, owner="beta", session="beta-session"), "mirror-receive")
+        # No wrapper passed a lease down, so the receiver upgrades the shared hold it took itself.
+        with mock.patch.dict(os.environ, {floor_claims.MIRROR_LEASE_FDS: ""}):
+            self.assertEqual(copies.mirror_run(receive), 0)
+        self.assertFalse(authority.exists())
+        self.assertFalse((self.mirror / "old-payload").exists())
+
     def test_idle_removal_exempts_its_lease_and_keeps_a_busy_sibling(self) -> None:
         mine = self.mirror_record()
         other = self.mirror_record("beta", self.mirror.parent / "other")
@@ -903,9 +930,11 @@ subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.executio
         def hold(*arguments: object, **keywords: object) -> int:
             self.assertTrue(arguments)
             self.assertIn("policy", keywords)
-            entered.set()
-            self.assertTrue(cancel.wait(TEST_HANG_GUARD_SECS), "the sweep did not receive cancellation")
-            raise InterruptedError("cancelled sweep")
+            # The sweep holds a mirror only while it removes one group from it.
+            with build_folders.mac_mirror_hold(Path(mirror.path), build_folders.MacMirrorHold.EXCLUSIVE):
+                entered.set()
+                self.assertTrue(cancel.wait(TEST_HANG_GUARD_SECS), "the sweep did not receive cancellation")
+                raise InterruptedError("cancelled sweep")
 
         with (mock.patch.object(floor_claims, "subprocess", subprocess),
               mock.patch.object(sweep, "hold_floor", side_effect=hold),

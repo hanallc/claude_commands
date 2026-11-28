@@ -25,6 +25,7 @@ from scripts.lib import build_copies, build_folder_lock, build_folders, copy_rec
 from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -113,6 +114,27 @@ class BuildCopiesTests(unittest.TestCase):
         self.assertNotIn("slot", lease)
         self.assertNotIn("number", lease)
         self.assertIs(lease["released"], True)
+
+    def test_mac_numbered_copy_holds_the_floor_lease_from_allocation_to_release(self) -> None:
+        configuration = self.root / "config/mac_test.conf"
+        _ = write_config_fixture(configuration, "mirror_root=~/mirrors\nfloor_sweep_timeout_s=0.02\n")
+        lease = self.root / "mirrors/.widget.copy-lease.floor-group"
+        lease.parent.mkdir()
+        candidate = build_folders.copy_path("widget", "queue", 1)
+        with (mock.patch.dict(os.environ, {"HOME": str(self.root)}),
+              mock.patch.object(build_folders, "mac_build_host", return_value=True, create=True),
+              lease.open("a+") as floor):
+            fcntl.flock(floor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(TimeoutError, "Mac floor sweep"), self.take_queue_copy():
+                self.fail("the copy allocated while the sweep held the repository")
+            self.assertFalse(candidate.exists())
+            fcntl.flock(floor, fcntl.LOCK_SH)
+            with self.take_queue_copy() as copy:
+                fcntl.flock(floor, fcntl.LOCK_UN)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(floor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(copy.path, candidate)
+            fcntl.flock(floor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_sweep_respects_the_numbered_copy_lease(self) -> None:
         from scripts.lint import sweep
@@ -988,9 +1010,12 @@ with folders.temporary_build_folder(request) as path:
         common = self.source / ".git"
         lock_path = common / "build-copy-config.lock"
         first_read, resume_first = threading.Event(), threading.Event()
+        release_first = threading.Event()
+        rescue_git = cast(Callable[..., subprocess.CompletedProcess[bytes]], getattr(git_rescue, "_git"))
         git = cast(Callable[..., str], getattr(build_copies, "_git"))
         flock = fcntl.flock
         first_copy = build_folders.copy_path("widget", "queue", 1)
+        second_copy = first_copy.with_name("2")
 
         def pause_after_read(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                              accepted: tuple[int, ...] = (0,)) -> str:
@@ -1011,12 +1036,23 @@ with folders.temporary_build_folder(request) as path:
             else:
                 flock(descriptor, mode)
 
+        def release_after_status(folder: Path, *arguments: str, data: bytes = b"", index: Path | None = None,
+                                 accepted: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
+            result = rescue_git(folder, *arguments, data=data, index=index, accepted=accepted)
+            if folder == second_copy and arguments[:1] == ("status",):
+                release_first.set()
+                self.assertEqual(first.result(timeout=TEST_HANG_GUARD_SECS), first_copy)
+            return result
+
         def take(number: int) -> Path:
             with build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
                     work="proof", purpose="test", selection=build_copies.ExactCopyRequest(number)) as copy:
+                if number == 1:
+                    self.assertTrue(release_first.wait(TEST_HANG_GUARD_SECS), "The second rescue did not run status.")
                 return copy.path
 
         with (mock.patch.object(build_copies, "_git", side_effect=pause_after_read),
+              mock.patch.object(git_rescue, "_git", new=release_after_status),
               mock.patch.object(fcntl, "flock", new=observe_contention),
               ThreadPoolExecutor(max_workers=1) as worker):
             first = worker.submit(take, 1)
@@ -1025,9 +1061,10 @@ with folders.temporary_build_folder(request) as path:
                 second_path = take(2)
             finally:
                 resume_first.set()
+                release_first.set()
             first_path = first.result(timeout=TEST_HANG_GUARD_SECS)
 
-        self.assertEqual((first_path, second_path), (first_copy, first_copy.with_name("2")))
+        self.assertEqual((first_path, second_path), (first_copy, second_copy))
         self.assertEqual(self.git(self.source, "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
         self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
         self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
@@ -1144,6 +1181,39 @@ with folders.temporary_build_folder(request) as path:
                 backups = tuple(restored.glob(".rescue-index-*"))
                 self.assertEqual(len(backups), 1)
                 self.assertEqual(backups[0].read_bytes(), damaged)
+
+    def test_rescue_read_tree_survives_release_of_another_copy(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            index = Path(self.git(path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+            _ = index.write_bytes(b"damaged index")
+
+        held, release = threading.Event(), threading.Event()
+        run = cast(Callable[..., subprocess.CompletedProcess[str | bytes]], subprocess.run)
+        read_tree = ["git", "-C", str(path), "read-tree", "HEAD"]
+
+        def hold_other_copy() -> None:
+            with build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                    work="proof", purpose="test", selection=build_copies.ExactCopyRequest(2)):
+                held.set()
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS), "The first copy did not rebuild its index.")
+
+        def release_before_read_tree(command: list[str], **options: object) -> subprocess.CompletedProcess[str | bytes]:
+            if command == read_tree:
+                release.set()
+                other.result(timeout=TEST_HANG_GUARD_SECS)
+            return run(command, **options)
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            other = worker.submit(hold_other_copy)
+            try:
+                self.assertTrue(held.wait(TEST_HANG_GUARD_SECS), "The second copy did not take its lease.")
+                with mock.patch.object(subprocess, "run", new=release_before_read_tree), self.take_queue_copy() as recovered:
+                    self.assertEqual(recovered.path, path)
+                    self.assertTrue(release.is_set(), "The test did not rebuild the damaged index.")
+                    self.assertEqual(self.git(path, "status", "--porcelain"), "")
+            finally:
+                release.set()
 
     def test_copy_size_limit_deletes_output_after_rescue_and_retains_source_times(self) -> None:
         with self.take_queue_copy() as copy:

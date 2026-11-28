@@ -81,7 +81,7 @@ Both callers read the value when they use it.
 
 ## gate.conf
 
-`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
+`merge_gate.conf` links to `gate.conf`.
 
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.
@@ -542,6 +542,13 @@ The configured platform selects the mirror layout.
 `targets` lists active targets in routing order. The AWS target remains inactive before the user gate.
 Each SSH target names its platform and settings file.
 Natedev reads the SSH host from each active target's settings file before each record exchange.
+
+`notices.<machine>` controls the phone push when that machine does not answer.
+Set `notices.mac=off` to disable the Mac push.
+The allowed values are `on` and `off`.
+The default is `on`.
+`off` stops a new push only. A push that was already sent can repeat until its alert clears.
+The machine watch ignores keys for machines outside its target list.
 
 `unreachable_wait_seconds` is one value for every machine that the queue sends a run to.
 A run on a machine that does not answer for this many seconds ends as failed with the reason `unreachable`.

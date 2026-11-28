@@ -44,8 +44,9 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         result = self.verify_after_ssh_result("mac", extra={"TEST_SSH_MODES": '{"mac":"no-tests"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         attempt = self.only_attempt()
+        self.assertNotIn("cleanup", self.ssh_events()[0]["actions"])
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
-                         ("no_tests", "confirmed", "confirmed"))
+                         ("no_tests", "confirmed", "unconfirmed"))
         self.assertEqual(len(self.local_runs()), 1)
 
     def test_mac_loss_keeps_the_attempt_and_queue_age_after_local_success(self) -> None:
@@ -109,6 +110,8 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
         attempt = self.only_attempt()
-        self.assertEqual(self.ssh_events()[0]["result_type"], "FailedOnMac")
+        event = self.ssh_events()[0]
+        self.assertEqual(event["result_type"], "FailedOnMac")
+        self.assertNotIn("cleanup", event["actions"])
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
-                         ("failed", "confirmed", "confirmed"))
+                         ("failed", "confirmed", "unconfirmed"))
