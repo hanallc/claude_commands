@@ -2485,7 +2485,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             saved = settings_page.save(server.store_folder, conf.read("review_links"), fields["seconds"][0])
         except settings_page.SaveSyncUnconfirmed as error:
             print(f"review-links settings sync: {error.__cause__}", file=sys.stderr)
-            self.json_response(503, {**error.visible, "reason": str(error)})
+            self.json_response(503, {**error.visible, "reason": str(error),
+                                     "processing_seconds": time.monotonic() - started})
         except ValueError as error:
             self.json_response(400, {"reason": str(error)})
         except OSError as error:

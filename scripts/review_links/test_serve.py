@@ -1317,9 +1317,10 @@ class ReviewLinksServerTests(unittest.TestCase):
  });
  for(let attempt=0;attempt<2;attempt++){
   await choose();
-  if(pick.getAttribute('aria-pressed')!=='true' || error.hidden ||
-     !error.textContent.includes('The server could not confirm the save.') ||
-     document.querySelector('[data-send-undo]'))
+  const toast=document.querySelector('[data-send-undo]');
+  if(pick.getAttribute('aria-pressed')!=='true' || !error.hidden ||
+     !toast?.textContent.includes('The server could not confirm the save.') ||
+     toast.querySelector('button')?.textContent!=='Undo')
    throw new Error('Settings shows the active choice and the sync error.');
  }
  await choose();
@@ -1334,6 +1335,57 @@ class ReviewLinksServerTests(unittest.TestCase):
 """}, browser.session)
             self.assertNotIn("exceptionDetails", result, result)
             self.assertEqual(sync_mock.call_count, 3)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_settings_can_undo_an_unconfirmed_save_until_expiry(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        failure = OSError("Directory sync failed.")
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(atomic_file, "sync_folder", side_effect=[failure, None, failure]) as sync):
+            browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const form=document.getElementById('undo-time'),error=document.getElementById('settings-error');
+ const pick=seconds=>form.querySelector(`button[value="${seconds}"]`);
+ const message='The server could not confirm the save.';
+ const removed=(target,done)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(done()){observer.disconnect();resolve();}
+  });
+  observer.observe(target,{attributes:true,childList:true});
+ });
+ const choose=async seconds=>{
+  const saved=removed(form,()=>!form.dataset.saving);
+  pick(seconds).click();
+  await saved;
+  const toast=document.querySelector('[data-send-undo]');
+  if(pick(seconds).getAttribute('aria-pressed')!=='true' || !error.hidden ||
+     !toast?.querySelector('[role=alert]')?.textContent.includes(message) ||
+     toast.querySelector('button')?.textContent!=='Undo' || !toast.querySelector('[data-send-undo-bar]'))
+   throw new Error('The sync error and Undo appear in the same message.');
+  return toast;
+ };
+ const first=await choose(20);
+ const undone=removed(first.parentElement,()=>!first.isConnected);
+ first.querySelector('button').click();
+ await undone;
+ if(pick(10).getAttribute('aria-pressed')!=='true' || !error.hidden)
+  throw new Error('Undo restores the previous choice and clears the error.');
+ const second=await choose(5);
+ const expired=removed(second.parentElement,()=>!second.isConnected);
+ second.getAnimations()[0].finish();
+ await expired;
+ if(error.hidden || !error.textContent.includes(message) || document.querySelector('[data-send-undo]'))
+  throw new Error('The sync error stays visible after Undo expires.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+            self.assertEqual(sync.call_count, 3)
+        self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 5)
 
     def test_invalid_settings_choices_keep_held_sends_and_undo_available(self) -> None:
         path = conf.path("review_links")
@@ -1414,7 +1466,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
 
         pages = tuple(console.ConsolePage(f"page{index}", f"Page {index}", "inbox", f"Page {index}",
-                                          console.UnavailablePage()) for index in range(2))
+                                          console.UnavailablePage()) for index in range(4))
         browser = _Chrome(self.root.parent)
         self.addCleanup(browser.close)
         with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
@@ -1428,12 +1480,15 @@ class ReviewLinksServerTests(unittest.TestCase):
  if(toggle.getAttribute('aria-expanded')==='true') toggle.click();
  const first=document.querySelector('[data-page=page0]');
  first.focus();
- const bounds=first.getBoundingClientRect();
- return {x:(bounds.left+bounds.right)/2,y:(bounds.top+bounds.bottom)/2};
+ const center=entry=>{
+  const bounds=entry.getBoundingClientRect();
+  return {x:(bounds.left+bounds.right)/2,y:(bounds.top+bounds.bottom)/2};
+ };
+ return {first:center(first),last:center(document.querySelector('[data-page=page3]'))};
 })();
 """, "returnByValue": True}, session)
-            pointer = cast(dict[str, dict[str, float]], setup["result"])["value"]
-            _ = browser.command("Input.dispatchMouseEvent", {"type": "mouseMoved", **pointer}, session)
+            points = cast(dict[str, dict[str, dict[str, float]]], setup["result"])["value"]
+            _ = browser.command("Input.dispatchMouseEvent", {"type": "mouseMoved", **points["first"]}, session)
             keys = {"key": "Tab", "code": "Tab", "windowsVirtualKeyCode": 9}
             _ = browser.command("Input.dispatchKeyEvent", {"type": "rawKeyDown", **keys}, session)
             _ = browser.command("Input.dispatchKeyEvent", {"type": "keyUp", **keys}, session)
@@ -1444,6 +1499,29 @@ class ReviewLinksServerTests(unittest.TestCase):
  if(!first.matches(':hover') || !focused.matches('[data-page=page1]:focus-visible') ||
     label.hidden || label.textContent!=='Page 1 · Not available')
   throw new Error('Tab replaces the label of the icon under the pointer.');
+})();
+"""}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+            _ = browser.command("Input.dispatchMouseEvent", {"type": "mouseMoved", **points["last"]}, session)
+            result = browser.command("Runtime.evaluate", {"expression": r"""
+(()=>{
+ const last=document.querySelector('[data-page=page3]');
+ const focused=document.activeElement, label=document.getElementById('nav-tooltip');
+ if(!last.matches(':hover') || !focused.matches('[data-page=page1]:focus-visible') ||
+    label.hidden || label.textContent!=='Page 3 · Not available')
+  throw new Error('A new pointer entry replaces the label of the focused icon.');
+})();
+"""}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+            _ = browser.command("Input.dispatchKeyEvent", {"type": "rawKeyDown", **keys}, session)
+            _ = browser.command("Input.dispatchKeyEvent", {"type": "keyUp", **keys}, session)
+            result = browser.command("Runtime.evaluate", {"expression": r"""
+(()=>{
+ const last=document.querySelector('[data-page=page3]');
+ const focused=document.activeElement, label=document.getElementById('nav-tooltip');
+ if(!last.matches(':hover') || !focused.matches('[data-page=page2]:focus-visible') ||
+    label.hidden || label.textContent!=='Page 2 · Not available')
+  throw new Error('Tab replaces the pointer label again.');
 })();
 """}, session)
             self.assertNotIn("exceptionDetails", result, result)

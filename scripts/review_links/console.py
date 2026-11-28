@@ -653,10 +653,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const entries = [...document.querySelectorAll('.nav-entry')];
   const sidebar = document.querySelector('.sidebar');
   const tooltip = document.getElementById('nav-tooltip');
-  let hoveredEntry;
+  let hoveredEntry, keyboardEntry;
   function showNavLabel() {
-    const focused = document.activeElement;
-    const entry = focused?.matches('.nav-entry:focus-visible') ? focused : hoveredEntry || focused;
+    const entry = keyboardEntry || hoveredEntry || document.activeElement;
     if (phone.matches || !shell.classList.contains('collapsed') || !entry?.matches('.nav-entry')) {
       tooltip.hidden = true;
       return;
@@ -673,10 +672,13 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     tooltip.style.setProperty('--label-top', middle + 'px');
   }
   for (const entry of entries) {
-    entry.addEventListener('pointerenter', () => { hoveredEntry = entry; showNavLabel(); });
+    entry.addEventListener('pointerenter', () => { hoveredEntry = entry; keyboardEntry = undefined; showNavLabel(); });
     entry.addEventListener('pointerleave', () => { hoveredEntry = undefined; showNavLabel(); });
-    entry.addEventListener('focus', showNavLabel);
-    entry.addEventListener('blur', showNavLabel);
+    entry.addEventListener('focus', () => {
+      if (entry.matches(':focus-visible')) keyboardEntry = entry;
+      showNavLabel();
+    });
+    entry.addEventListener('blur', () => { keyboardEntry = undefined; showNavLabel(); });
   }
   sidebar.addEventListener('scroll', showNavLabel);
   addEventListener('resize', showNavLabel);

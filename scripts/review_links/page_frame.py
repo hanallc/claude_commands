@@ -1180,7 +1180,7 @@ function trackHeldRequest(key,id){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver,resumable,saved=false){
+function showSendUndo(request,seconds,receiver,resumable,saved=false,reason=''){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1192,7 +1192,8 @@ function showSendUndo(request,seconds,receiver,resumable,saved=false){
  const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
  const bar=host.createElement('div');
  const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
- toast.dataset.sendUndo='';text.textContent=receiver || receiver===null ? sent : 'Sending.';
+ toast.dataset.sendUndo='';text.textContent=reason || (receiver || receiver===null ? sent : 'Sending.');
+ if(reason) text.setAttribute('role','alert');
  button.type='button';button.textContent='Undo';
  const canUndo=!saved || Boolean(hold);
  toast.append(text);
@@ -1334,9 +1335,9 @@ async function readHeldResult(hold,request,undo,resumable){
  }
 }
 heldFetch.newId=newHoldId;
-heldFetch.showSaved=({hold,seconds})=>{
+heldFetch.showSaved=({hold,seconds,reason})=>{
  const request={hold,closed:false};
- const done=showSendUndo(request,seconds,null,true,true);
+ const done=showSendUndo(request,seconds,null,true,true,reason);
  return {done,close(){request.closed=true;request.closeToast();}};
 };
 heldFetch.resume=id=>{

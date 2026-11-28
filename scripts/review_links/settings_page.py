@@ -281,23 +281,26 @@ SCRIPT = r'''
    const response=await fetch(form.action,{method:'POST',body});
    const result=await response.json();
    if(Number.isInteger(result.seconds)) select(result.seconds);
-   if(result.hold) toast?.close();
-   if(!response.ok){
-    showActionFailure(error,result.reason || 'The Undo time could not be saved.');
-    return;
-   }
+   const reason=response.ok ? '' : result.reason || 'The Undo time could not be saved.';
    if(result.hold){
+    toast?.close();
+    toast=undefined;
     const transit=Math.max(0,(performance.now()-started)/1000-result.processing_seconds);
     const remaining=result.remaining_seconds-transit;
-    const current=toast=heldFetch.showSaved({hold:remaining>0 ? result.hold : '',seconds:remaining>0 ? remaining : 3});
+    if(reason && remaining<=0){showActionFailure(error,reason);return;}
+    showActionFailure(error);
+    const current=toast=heldFetch.showSaved({hold:remaining>0 ? result.hold : '',
+     seconds:remaining>0 ? remaining : 3,reason});
     current.done.then(undone=>{
-     if(undone && toast===current) select(result.previous);
+     if(toast!==current) return;
+     if(undone) select(result.previous);
+     else if(reason && error.hidden) showActionFailure(error,reason);
     }).catch(failure=>{
      if(toast!==current) return;
      if(failure.undone) select(result.previous);
      showActionFailure(error,failure.message);
     });
-   }
+   }else if(reason) showActionFailure(error,reason);
   }catch(failure){
    showActionFailure(error,'The Undo time could not be saved. '+(failure.message || ''));
   }finally{delete form.dataset.saving;}
