@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.production.change_review_test_support import pictured_changes
 
-from scripts.agents import remote
+from scripts.agents import pane_record, remote
 
 import json
 import os
@@ -11,20 +11,58 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import conf
+from scripts.lib import conf, user_zone
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
-from scripts.lint.memory_test_support import config_environment, copy_config_file_fixture, write_config_fixture
-from scripts.production import change_review, change_routing, staff, unrouted_alert
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production import change_review, change_routing, showrunners, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
 from scripts.production.unrouted_alert import notify as notify_unrouted
+
+
+@contextmanager
+def routing_fixture_environment(root: Path) -> Generator[None]:
+    home = root / "home"
+    home.mkdir()
+    config = root / "fixture-config"
+    configuration = config_environment(config)
+    _ = write_config_fixture(config / "change_review.conf",
+                             f"lists_directory={root / 'published-lists'}\nreview_links_directory={root / 'links'}\n")
+    _ = write_config_fixture(config / "staff.conf", f"producer_folder_root={root / 'productions'}\n")
+    _ = write_config_fixture(config / "scratch.conf", f"holds_file={root / 'holds.json'}\n")
+    _ = write_config_fixture(config / "review_links.conf", f"studio_avatar_root={root / 'avatars'}\n")
+    git = fixture_git_environment(root)
+    zone = str(config / "user_zone.conf")
+    notifier = root / "notifier"
+    panes = root / "panes"
+    environment = {
+        **configuration, "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_CONFIG_GLOBAL": git["GIT_CONFIG_GLOBAL"], "GIT_CONFIG_NOSYSTEM": git["GIT_CONFIG_NOSYSTEM"],
+        "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_STATE_HOME": str(home / ".local/state"), "XDG_CACHE_HOME": str(home / ".cache"),
+        "STAFF_FILE": str(root / "staff.json"), "STAFF_CONFIG": str(config / "staff.conf"),
+        "CHANGE_REVIEW_DIR": str(root), "REVIEW_LINKS_ROOT": str(root / "links"),
+        "SHOWRUNNER_STATE_DIR": str(root / "showrunner-state"), "NOTIFIER_STATE_DIR": str(notifier),
+        "NOTIFIER_SESSIONS_DIR": str(root / "sessions"), "NEXT_STATE_DIR": str(root / "next"),
+        "HERDR_PANE_RECORD_DIR": str(panes),
+        "UNIT_HISTORY_DIR": str(root / "history"), "USER_ZONE_CONF": zone,
+        "FEATURE_LOG_VAULT": str(root / "vault"), "SCRATCH_ROOT": str(root / "scratch"),
+        "SCRATCH_COPIES_ROOT": str(root / "copies"), "SESSION_TEMP_ROOT": str(root / "session"),
+    }
+    with (mock.patch.dict(os.environ, environment, clear=True),
+          mock.patch.object(user_zone, "CONF", zone),
+          mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
+          mock.patch.object(pane_record, "RECORD_DIR", panes)):
+        yield
 
 
 class StaffRoutingTests(unittest.TestCase):
@@ -44,13 +82,7 @@ class StaffRoutingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {
-            **fixture_git_environment(self.root), **config_environment(self.root / "fixture-config"),
-            "STAFF_FILE": str(self.root / "staff.json"),
-            "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
-            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
-            "NEXT_STATE_DIR": str(self.root / "next"),
-        }, clear=True))
+        self.enterContext(routing_fixture_environment(self.root))
         self.alert = cast(mock.Mock, self.enterContext(mock.patch.object(unrouted_alert, "notify")))
         self.top = fixture_member("showrunner", name="top")
         self.child = fixture_member("showrunner", name="child", parent=self.top.id)
@@ -599,18 +631,8 @@ class StaffRoutingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = root / "config"
-            config.mkdir()
-            config_env = config_environment(config)
-            _ = write_config_fixture(config / "scratch.conf",
-                                     f"holds_file={root / 'holds.json'}")
-            settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-            _ = copy_config_file_fixture(settings, config / "change_review.conf")
-            _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
-            environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
-                           "REVIEW_LINKS_ROOT": str(root / "links"),
-                           "NEXT_STATE_DIR": str(root / "next"), "FEATURE_LOG_VAULT": str(root / "vault")}
-            with mock.patch.dict(os.environ, environment):
+            with routing_fixture_environment(root):
+                _ = write_config_fixture(conf.path("review_links"), "delivery_pause_seconds=0\n")
                 listing = root / "change-review - natedev.md"
                 _ = listing.write_text("## To review\n\n| # | Change | Production |\n| --- | --- | --- |\n| C1 | Known | natedev |\n")
                 docs = {name: root / f"{name}-production.md" for name in ("natedev", "builds")}
@@ -660,7 +682,7 @@ class MergeWriterRoutingTests(ProducerFixture):
     @override
     def setUp(self) -> None:
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, fixture_git_environment(directory), clear=True))
+        self.enterContext(routing_fixture_environment(directory))
         super().setUp()
 
     def test_a_gate_written_producer_routes_to_the_unit_and_receives_return_feedback(self) -> None:
