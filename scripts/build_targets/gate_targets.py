@@ -14,6 +14,10 @@ from scripts.lib.build_steps import (
 from scripts.mac_test.claim_state import WHOLE_MAC
 
 
+SSH_CONNECT_TIMEOUT_SECONDS = 8
+SSH_OPTIONS = ("-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no")
+
+
 @dataclass(frozen=True)
 class NoEnabledTarget:
     """No enabled target can run the requested Claude gate."""

@@ -3809,7 +3809,10 @@ try {
             await show(readings.mac_three);
             const macProof=await evaluate(`(() => {
               const rows=latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build');
-              const unit=document.querySelector('#barwrap').getBoundingClientRect().width/latest.total;
+              const trackWidth=document.querySelector('#walk .track').getBoundingClientRect().width;
+              const totalBytes=latest.ram.total_bytes;
+              const totalGiB=recorded(totalBytes) && totalBytes>0 ? totalBytes/GIB : latest.total;
+              const unit=trackWidth/totalGiB;
               return rows.map(({row,index})=>{
                 const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');
