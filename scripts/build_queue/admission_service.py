@@ -504,6 +504,11 @@ class OrderNotStarted:
 
 
 @dataclass(frozen=True)
+class NoLostLaunch:
+    """The queue has no lost launch for this episode."""
+
+
+@dataclass(frozen=True)
 class TokenNotLeft:
     pass
 
@@ -528,6 +533,7 @@ class WaiterPlace:
     run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
     # The saved job start keeps the place of a CI step through a service restart.
     ci_job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
+    lost_launch_at: float | NoLostLaunch = field(default=NoLostLaunch(), kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -881,6 +887,14 @@ class VerifyRunSlot:
 
 
 @dataclass(frozen=True)
+class MacOutageFence:
+    """Require a reading taken after the loss report."""
+
+    reported_at: float
+    recovery_observed: bool = False
+
+
+@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -901,6 +915,7 @@ class ServiceState:
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
     held_places: tuple[records.HeldPlace, ...] = field(default=(), kw_only=True)
     placement_replacements: dict[str, ReplayEntry] = field(default_factory=dict, kw_only=True)
+    mac_outages: dict[str, MacOutageFence] = field(default_factory=dict, kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -2223,6 +2238,7 @@ class AdmissionServer:
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
+        self.mac_outages: dict[str, MacOutageFence] = {}
         self.mac_linux_state: MacLinuxStateReady | MacLinuxStateUnavailable = MacLinuxStateUnavailable(
             "The Mac Linux state root setup has not run.")
         self.manual_guest_settlement: set[str] = set()
@@ -2393,6 +2409,7 @@ class AdmissionServer:
                 for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
+            self.mac_outages = state.mac_outages
             self.pending_cloud_groups = state.pending_cloud_groups
             self._check_saved_remote_slots()
         self.persist()
@@ -2514,7 +2531,8 @@ class AdmissionServer:
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
             queue_pins=self.queue_pins, bumps=self.bumps, verify_run_slots=self.verify_run_slots,
-            held_places=self.held_places, placement_replacements=self.placement_replacements)
+            held_places=self.held_places, placement_replacements=self.placement_replacements,
+            mac_outages=self.mac_outages)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2794,8 +2812,10 @@ class AdmissionServer:
         return self.move_line
 
     def _movable_wait_ids(self, *, check_owners: bool = False) -> set[str]:
+        restarting = {place.move_id for place in self.places.values() if isinstance(place.lost_launch_at, float)}
         return {waiting.row.get("move_id", "") for episode, waiting in self.waiters.items()
-            if episode not in self.current_assignments and waiting.row.get("move_id") and (not check_owners or
+            if episode not in self.current_assignments and waiting.row.get("move_id")
+            and waiting.row.get("move_id") not in restarting and (not check_owners or
                 self.proc.owner_start(waiting.request.owner.pid) == LiveOwnerIdentity(waiting.request.owner.start_time))
             and ((request := self.placement_requests.get(episode)) is None
                  or (request.owner.host == self.host
@@ -4247,13 +4267,29 @@ class AdmissionServer:
         place = waiter_place(row, request.episode, run=run)
         if previous is not None:
             if previous.episode == request.episode:
-                place = replace(place, queue_identity=previous.queue_identity)
+                place = replace(place, queue_identity=previous.queue_identity, lost_launch_at=previous.lost_launch_at)
             elif previous.move_id:
                 self._depart_queue_id(previous.move_id)
         if not place.move_id:
             row["move_id"] = uuid.uuid4().hex
             place = replace(place, move_id=row["move_id"])
         self.places[key] = place
+
+    def _pin_lost_run(self, request: wire.PlacementRequest, consumed_at: float) -> None:
+        """Insert the existing move ID in the head chain by its first lost authorization."""
+        key = _place_key(request.owner, request.since)
+        place = self.places[key]
+        first_launch = place.lost_launch_at
+        if not isinstance(first_launch, float):
+            first_launch = float(consumed_at)
+        self.places[key] = replace(place, lost_launch_at=first_launch)
+        order = [row["move_id"] for _, row in self._full_queue_order(self._ranked_waiters()) if "move_id" in row]
+        index = order.index(place.move_id)
+        rank = (first_launch, place.since, place.owner.pid)
+        earlier = {item.move_id for item in self.places.values() if item.move_id and isinstance(item.lost_launch_at, float)
+                   and (item.lost_launch_at, item.since, item.owner.pid) < rank}
+        destination = queue_anchor_at(order, len(earlier))
+        self._move_pin(place.move_id, destination, order, index, queue_anchor_at(order, index))
 
     def _set_queue_pins(self, pins: QueuePins) -> None:
         if pins != self.queue_pins:
@@ -5016,7 +5052,12 @@ class AdmissionServer:
         disk_recovery: build_targets.MacDiskRecoveryPending | build_targets.MacDiskRecoveryInactive
         disk_recovery = build_targets.MacDiskRecoveryInactive()
         if build_targets.mac_run_bypasses_repository_policy(target, kind):
-            eligibility = placement.AllowedHost()
+            fence = self.mac_outages.get(destination.target)
+            if (fence is not None and not fence.recovery_observed and isinstance(shared, _MacHostReading)
+                    and isinstance(shared.probe, _MacHostExcluded) and shared.probe.reason in ("unreachable", "backoff")):
+                eligibility = placement.TemporaryExclusion(shared.probe.reason)
+            else:
+                eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
             return placement.FreshHostEvidence(key, observed_at, "", placement.FixedExclusion("command"))
@@ -5636,6 +5677,18 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+                fence = self.mac_outages.get(destination.target)
+                if fence is not None:
+                    after_outage = (isinstance(evidence, placement.FreshHostEvidence)
+                                    and evidence.observed_at > fence.reported_at)
+                    if not fence.recovery_observed:
+                        if after_outage and isinstance(permitted, placement.AllowedHost):
+                            self.mac_outages[destination.target] = replace(fence, recovery_observed=True)
+                        elif not after_outage or isinstance(permitted, placement.TemporaryExclusion) and (
+                                permitted.reason in ("unreachable", "backoff", MAC_LINUX_NO_ANSWER)):
+                            permitted = placement.TemporaryExclusion(placement.MAC_OUTAGE_WAIT)
+                    elif not after_outage and isinstance(permitted, placement.AllowedHost):
+                        permitted = placement.EvidenceNeeded("the target reading predates the outage")
             if is_mac_linux_guest(destination):
                 pair = (request.episode, destination)
                 if isinstance(permitted, placement.EvidenceNeeded):
@@ -6011,7 +6064,7 @@ done
             refusal = next((candidate.eligibility.reason for candidate in candidates
                 if candidate.destination.target == "mac"
                 and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                and candidate.eligibility.reason != "busy"), "")
+                and candidate.eligibility.reason not in ("busy", placement.MAC_OUTAGE_WAIT)), "")
             if refusal:
                 return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
@@ -6044,7 +6097,7 @@ done
             return wire.PlacementWait(request.episode, request.since, position, candidates, provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
         blocked = [candidate for candidate in candidates
             if isinstance(candidate.eligibility, placement.TemporaryExclusion)
-            and candidate.eligibility.reason in ("blocked", "busy", "starting")]
+            and candidate.eligibility.reason in ("blocked", "busy", "starting", placement.MAC_OUTAGE_WAIT)]
         blocked.sort(key=lambda candidate: candidate.destination.provider != "local")
         local_possible = any(candidate.destination.provider == "local"
             and isinstance(candidate.eligibility, (placement.AllowedHost, placement.EvidenceNeeded))
@@ -6806,17 +6859,62 @@ done
             self._close_placement(saved, outcome.reason,
                 placement.retry_decision(saved.assignment.destination, outcome, report.received_at),
                 persist_change=persist_change)
-        elif not self._settle_hana_prelaunch(saved, report):
+        elif (isinstance(outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))
+                and not self._settle_hana_prelaunch(saved, report)):
             self._close_placement(saved, outcome.reason,
                 saved.retry if isinstance(saved.retry, placement.RetryAt) else
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at),
                 persist_change=persist_change)
+
+    def _report_lost_attempt(self, request: wire.ExecutionReport, outcome: placement.AttemptLost) -> wire.DispatchStatus:
+        assignment = request.assignment
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        saved = self.assignments.get(key)
+        submitted = self.placement_requests.get(assignment.episode)
+        if (saved is None or saved.assignment != assignment or submitted is None
+                or (submitted.owner, submitted.since) != (assignment.owner, assignment.since)
+                or self.current_assignments.get(assignment.episode) != key
+                or not isinstance(saved.state, placement.CurrentAssignment)):
+            return self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)
+        destination = assignment.destination
+        target_matches = (destination.provider == "mac" if outcome.evidence is placement.MacOutage.MAC_STATUS_MISSING
+                          else is_mac_linux_guest(destination))
+        if (not target_matches or not isinstance(saved.permission, placement.PermissionConsumed)
+                or not isinstance(request.claim, placement.ProviderClaimReference) or request.claim != saved.provider):
+            return self._placement_status(assignment, "the outage does not match the authorized attempt",
+                                          check_lifetime=False)
+        previous = saved.terminal_report
+        if isinstance(previous, placement.TerminalAttemptReport) and previous.outcome != GUEST_SETTLEMENT_REQUESTED:
+            return self._placement_status(assignment, "the attempt already has a terminal report", check_lifetime=False)
+        now = self.clock.now()
+        limit = _guest_wait_limit()
+        if not isinstance(limit, int) or not now >= outcome.outage_since + limit:
+            return self._placement_status(assignment, "the Mac outage wait has not expired", check_lifetime=False)
+
+        self.mac_outages[destination.target] = MacOutageFence(now)
+        terminal = placement.TerminalAttemptReport(outcome, placement.DispatchPathSettled(), now)
+        self._close_placement(replace(saved, terminal_report=terminal), "lost", placement.RetryAt(0),
+                              persist_change=False)
+        _ = self.execution_evidence.pop(key, None)
+        if self._placement_waiting(submitted):
+            self._pin_lost_run(submitted, saved.permission.consumed_at)
+        # Offers made before the outage cannot authorize a start.
+        for offer in tuple(self.assignments.values()):
+            if (offer.assignment.destination.target == destination.target
+                    and isinstance(offer.state, placement.CurrentAssignment)
+                    and isinstance(offer.permission, placement.PermissionAvailable)
+                    and isinstance(offer.terminal_report, placement.NoTerminalReport)):
+                self._close_placement(offer, placement.MAC_OUTAGE_WAIT, placement.RetryAt(0), persist_change=False)
+        self.persist()
+        return self._placement_status(assignment, check_lifetime=False)
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
                           | wire.PrerequisiteReport | wire.CancelPlacement,
                           connection: Connection | NoConnection = NO_CONNECTION) -> list[wire.Reply]:
         if isinstance(request, wire.ConsumePermission):
             return [self._consume_permission(request)]
+        if isinstance(request, wire.ExecutionReport) and isinstance(request.outcome, placement.AttemptLost):
+            return [self._report_lost_attempt(request, request.outcome)]
         if isinstance(request, (wire.PrerequisiteReport, wire.CancelPlacement)):
             submitted = self.placement_requests.get(request.episode)
             if submitted is None:
@@ -7443,13 +7541,13 @@ done
                 return wire.QueueMoved(row_id, line, old_index + 1, old_index + 1), previous_anchor
             destination = QueueHeadAnchor() if place == 0 else drop
 
-        self._move_pin(row_id, destination, full_order, full_index, previous_anchor)
+        self._move_pin(row_id, destination, full_order, full_index, previous_anchor, after_lost_runs=True)
         updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id), line.kept_runs)
         new_index = next(index for index, member in enumerate(updated.members) if member.row_id == row_id)
         return wire.QueueMoved(row_id, updated, old_index + 1, new_index + 1), previous_anchor
 
     def _move_pin(self, row_id: str, destination: wire.QueueDrop | QueueAnchor, order: list[str],
-                  old_index: int, old_anchor: QueueAnchor) -> None:
+                  old_index: int, old_anchor: QueueAnchor, *, after_lost_runs: bool = False) -> None:
         pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
         moved = QueueRowAnchor(row_id)
         del order[old_index]
@@ -7462,6 +7560,10 @@ done
             index = order.index(destination.row_id) + 1
         else:
             index = order.index(destination.neighbor) + int(destination.side == "after")
+        if after_lost_runs:
+            restarting = {place.move_id for place in self.places.values()
+                          if place.move_id and isinstance(place.lost_launch_at, float)}
+            index = max(index, len(restarting))
         anchor = queue_anchor_at(order, index)
         if index < len(order) and pins.get(order[index]) == anchor:
             pins[order[index]] = moved

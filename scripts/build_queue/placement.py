@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
@@ -116,7 +117,26 @@ class AttemptOutcomeUnavailable:
     reason: str
 
 
-TerminalAttemptOutcome = AttemptCompleted | PrelaunchRefused | AttemptDeclined | execution_identity.HanaCommandAdmissionRefused | AttemptCancelled
+class MacOutage(Enum):
+    """The outage evidence identifies the missing Mac or guest result."""
+
+    MAC_STATUS_MISSING = auto()
+    GUEST_END_UNPROVEN = auto()
+
+
+@dataclass(frozen=True)
+class AttemptLost:
+    """The attempt has no verdict after the Mac outage wait."""
+
+    evidence: MacOutage
+    outage_since: float
+
+
+MAC_OUTAGE_WAIT = "the Mac must answer before the run can start"
+
+
+TerminalAttemptOutcome = (AttemptCompleted | PrelaunchRefused | AttemptDeclined
+                          | execution_identity.HanaCommandAdmissionRefused | AttemptCancelled | AttemptLost)
 AttemptOutcome = AttemptRunning | TerminalAttemptOutcome | AttemptOutcomeUnavailable
 
 

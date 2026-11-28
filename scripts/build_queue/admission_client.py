@@ -1784,6 +1784,8 @@ class WaitOutput:
                 "holder": holder}, separators=(",", ":")))
             if self.local_reason:
                 self.status(f"waiting for {reply.resource}: {reply.reason}; runs on natedev: {self.local_reason}")
+            elif reply.reason == placement.MAC_OUTAGE_WAIT:
+                self.status(f"waiting for {reply.resource}: {reply.reason}")
         self.held = True
         self.last_resource = reply
 
@@ -1801,7 +1803,7 @@ class WaitOutput:
             print(file=sys.stderr, flush=True)
             self.status_open = False
 
-    def __call__(self, reply: wire.Wait) -> None:
+    def __call__(self, reply: wire.Wait, *, since: float | None = None) -> None:
         from scripts.build_queue import admission_records as records
         from scripts.lib.user_zone import user_zone
         if isinstance(self.last_resource, wire.PlacementResourceWait):
@@ -1847,8 +1849,11 @@ class WaitOutput:
         if not first and reasons == self.last_reasons and reply.position == self.last_position:
             return
         self.last_reasons, self.last_position = reasons, reply.position
-        prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
-                  if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
+        if first:
+            arrival = CLOCK.now() if since is None else since
+            prefix = "waiting for memory since " + datetime.fromtimestamp(arrival, user_zone()).strftime("%H:%M %Z")
+        else:
+            prefix = f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)"
         place = ("this build is the queue head" if reply.position == 1 else
                  f"place {reply.position} in line" if reply.position > 1 else "")
         subject = " ".join(name for value in (snapshot.repo, snapshot.step)
@@ -2266,7 +2271,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             token_check = (isinstance(prerequisite, placement.TokenRequired)
                            and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             if isinstance(answer.wait, wire.Wait) and not token_check:
-                output(answer.wait)
+                output(answer.wait, since=answer.since)
                 last_wait = answer.wait
             elif isinstance(answer.wait, wire.PlacementResourceWait):
                 output.resource_wait(answer.wait)

@@ -14,6 +14,8 @@ from string import Formatter
 from types import UnionType
 from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict, override
 
+from scripts.build_queue import placement
+
 if TYPE_CHECKING:
     from scripts.message.unit_labels import UnitLabels
     from scripts.production.staff import StaffId, StaffSnapshot
@@ -364,6 +366,8 @@ def snapshot_value(value: object) -> object:
             return converted[identity]
         if isinstance(item, Path):
             result: object = str(item)
+        elif isinstance(item, placement.MacOutage):
+            result = item.name
         elif is_dataclass(item) and not isinstance(item, type):
             result = legacy_wait_shape(type(item), legacy_pressure_shape(wire_record(type(item),
                 {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
@@ -436,6 +440,10 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         return None
     if schema is Path:
         return Path(cast(str, parse_snapshot_value(value, str)))
+    if schema is placement.MacOutage:
+        if not isinstance(value, str) or value not in placement.MacOutage.__members__:
+            raise ValueError("invalid Mac outage evidence")
+        return placement.MacOutage[value]
     if origin in (list, tuple, frozenset, Sequence):
         if not isinstance(value, list):
             raise ValueError("invalid snapshot sequence")
