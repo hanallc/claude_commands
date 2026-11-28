@@ -2691,11 +2691,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 print(f'Cannot save the Mac Linux guest end: {error}', file=sys.stderr, flush=True)
 
 
-def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:
+def sandboxed_suite_command(tmp: Path, command: Sequence[str], *, gate_parent: Path) -> list[str]:
     # Mount the guest root before mounting proc for the new PID namespace.
     return ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
             '--proc', '/proc', '--bind', str(tmp), str(TEMP), '--tmpfs', '/dev/shm',
-            '--setenv', 'TMPDIR', str(TEMP), '--', *command]
+            '--setenv', 'TMPDIR', str(TEMP), '--bind', str(gate_parent), str(gate_parent), '--', *command]
 
 
 def guest_tool(real: Path, copy: Path) -> bool:
@@ -2986,6 +2986,18 @@ def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[st
         os.close(status_read)
 
 
+def prepare_guest_gate_parent(checkout: Path, account_home: Path) -> Path:
+    """Prepare the host directory before Bubblewrap binds it."""
+    root = build_folders.configured_target_gate_root(TARGET)
+    parent = build_folders.numbered_copy_gate_test_runs_parent(checkout, root)
+    if parent.is_relative_to(account_home.resolve()) or build_folders.gate_parent_in_checkout(parent):
+        raise GuestUnavailable(f'{parent}: the guest gate parent must be outside the account home and Git checkouts')
+    if not root.is_dir():
+        raise GuestUnavailable(f'{root}: the configured guest gate root must be an existing directory')
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
 def run_guest(request_path: Path) -> int:
     """Take a numbered copy, then run the gate or the argv of the request in it."""
     from scripts.lib import build_copies
@@ -3023,33 +3035,36 @@ def run_guest(request_path: Path) -> int:
                 return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
-            environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
+            account_home = Path.home()
+            gate_parent = prepare_guest_gate_parent(copy.path, account_home)
+            environment['MAC_LINUX_GUEST_HOME'] = str(account_home)
             environment['MAC_LINUX_GUEST_BUILD_ROOT'] = str(build_root)
+            environment['MAC_LINUX_GUEST_GATE_PARENT'] = str(gate_parent)
             reply = os.dup(1)
             try:
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
                                                                   request_path, reply),
-                                          copy.path, environment, reply)
+                                          copy.path, environment, reply, gate_parent=gate_parent)
             finally:
                 os.close(reply)
 
 
 def run_sandboxed_gate(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str],
-                       reply: int) -> int:
+                       reply: int, *, gate_parent: Path) -> int:
     """Run the gate in the sandbox with its standard output on standard error.
 
     The gate sends progress and the result through the reply descriptor.
     """
-    return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
-                          stdout=sys.stderr.fileno(), check=False,
+    return subprocess.run(session_command(tmp, command, gate_parent=gate_parent), cwd=copy, env=environment,
+                          stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(), check=False,
                           pass_fds=(*build_folders.held_build_folder_descriptors(), reply)).returncode
 
 
-def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
+def session_command(tmp: Path, command: Sequence[str], *, gate_parent: Path) -> list[str]:
     """The sandbox command, under dbus-run-session if the guest has it."""
     if shutil.which('dbus-run-session'):
         command = ['dbus-run-session', '--', *command]
-    return sandboxed_suite_command(tmp, command)
+    return sandboxed_suite_command(tmp, command, gate_parent=gate_parent)
 
 
 def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
@@ -3096,6 +3111,7 @@ def run_copy(request_path: Path, reply: int) -> None:
     selection = request['selection']
     token = copies.COMMAND_LOCKS.set(descriptors)
     home = Path(os.environ.pop('MAC_LINUX_GUEST_HOME'))
+    gate_parent = Path(os.environ.pop('MAC_LINUX_GUEST_GATE_PARENT'))
     print(guest_start_line(request['attempt'], repo, home), file=sys.stderr, flush=True)
     try:
         with (build_folders.use_build_root(Path(os.environ.pop('MAC_LINUX_GUEST_BUILD_ROOT'))),
@@ -3113,8 +3129,7 @@ def run_copy(request_path: Path, reply: int) -> None:
                 machine = gate.WholeMachine()
             suites = gate.run_suites
             if hasattr(gate, 'MacLinuxGuestGateParent'):
-                suites = partial(suites, suite_location=gate.MacLinuxGuestGateParent(
-                    build_folders.inherited_temporary_parent(), home))
+                suites = partial(suites, suite_location=gate.MacLinuxGuestGateParent(gate_parent, home))
             run = suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),

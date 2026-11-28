@@ -177,12 +177,17 @@ class GateFolderGuardTests(unittest.TestCase):
             ("config/build_folders.conf", f"{mac_key}=/private/tmp"),
             ("scripts/mac_test/mac_gate.py", f'root = conf.read_or_repository("build_folders").text("{mac_key}")'),
         }
-        # Keep these lines for sandbox isolation. They do not select a test folder.
+        guest_parent = {
+            ("config/build_folders.conf", f"{gate_key}.mac-linux=/build"),
+            ("scripts/lib/build_folders.py",
+             'return _settings().value(f"' + gate_key + '.{target}", Path, recover_invalid=False,'),
+        }
+        # Keep these mounts for sandbox isolation.
         guest_isolation = {
             ("scripts/build_targets/mac_linux.py",
-             f"'--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '{memory}', '--', *command]"),
+             f"'--proc', '/proc', '--bind', str(tmp), str(TEMP), '--tmpfs', '{memory}',"),
             ("scripts/build_targets/test_mac_linux.py",
-             f"'--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '{memory}', '--']"),
+             f"'--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '{memory}',"),
             ("scripts/build_targets/test_mac_linux.py",
              f"assert os.stat('{memory}').st_dev != shm_device, 'The suite {memory} must have its own file system.'"),
             ("scripts/build_targets/test_mac_linux.py",
@@ -191,6 +196,8 @@ class GateFolderGuardTests(unittest.TestCase):
         }
         # Keep this mount for the removal sandbox.
         removal_isolation = {
+            ("scripts/lint/test_removal_bwrap.py",
+             f"# Restore the fixture when the private /dev hides a fixture under {memory}."),
             ("scripts/lib/removal_bwrap_test_support.py",
              f'LINUX_PRIVATE_PATHS = tuple(Path(name) for name in ("/home", "/tmp", "/build", "/session", "{memory}", "/var/tmp"))'),
         }
@@ -200,7 +207,7 @@ class GateFolderGuardTests(unittest.TestCase):
              r'f"roots.build={self.build}\n' + gate_key
              + r'={self.gate}\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")'),
         }
-        allowed = move_worker | native_mac | guest_isolation | removal_isolation | move_fixtures
+        allowed = move_worker | native_mac | guest_parent | guest_isolation | removal_isolation | move_fixtures
         checkout = Path(__file__).resolve().parents[2]
         excluded = {".git", "__pycache__", "docs", "node_modules", "target", "test-runs", "typecheck-venv"}
         source_suffixes = {".bash", ".conf", ".js", ".json", ".mjs", ".nix", ".py", ".rs", ".sh", ".toml",

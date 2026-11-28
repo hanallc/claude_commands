@@ -335,6 +335,14 @@ def configured_gate_root() -> Path:
     return Path(_settings().text("roots.gate"))
 
 
+def configured_target_gate_root(target: str) -> Path:
+    """Read the gate root for the build target by its exact key."""
+    from scripts.lib import conf
+
+    return _settings().value(f"roots.gate.{target}", Path, recover_invalid=False,
+                             host_override=conf.HostOverride.IGNORED)
+
+
 def _parent(parent: BuildFolderParent) -> Path:
     if isinstance(parent, InheritedTemporaryParent):
         return inherited_temporary_parent()
@@ -821,6 +829,29 @@ def test_runs_parent(checkout: Path, *, placement: TestRunPlacement = TestRunPla
     if inherited == build or any(folder.is_relative_to(root) for root in protected for folder in (inherited, resolved)):
         raise InvalidFolderForm(f"{checkout}: test runs from {inherited} require an assigned build output")
     return parent
+
+
+def numbered_copy_gate_test_runs_parent(checkout: Path, root: Path) -> Path:
+    """Place the gate suites under a separate root with the copy's identity."""
+    base = build_root().resolve()
+    copy = checkout.resolve()
+    if not isinstance(parse_resolved_form(copy, base), BuildCopy):
+        raise InvalidFolderForm(f"{checkout}: the gate requires a numbered copy")
+    parent = root / "test-runs" / copy.relative_to(base)
+    if parent.resolve() != parent:
+        raise InvalidFolderForm(f"{parent}: the gate parent must be an absolute path without links")
+    return parent
+
+
+def gate_parent_in_checkout(parent: Path) -> bool:
+    """Check the gate parent or its first existing ancestor for a Git checkout."""
+    resolved = parent.resolve()
+    ancestor = next(path for path in (resolved, *resolved.parents) if path.is_dir())
+    try:
+        _ = git_files.locate(ancestor)
+    except git_files.NotACheckout:
+        return False
+    return True
 
 
 def repository_git_timeout() -> float:

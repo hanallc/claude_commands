@@ -851,7 +851,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Both gate modes use `<build root>/test-runs/<repo>/<unit>/<copy>` for numbered copies.
   Worktrees use their output name in place of the copy number.
   The main checkout uses `<build root>/test-runs/<repo>/main`.
-  The guest uses its account build root.
+  The Mac Linux guest gate uses `/build/test-runs/<repo>/<unit>/<copy>`.
+  The guest runner reads `roots.gate.mac-linux` by its exact key. Bubblewrap binds the parent at the same path.
   A gate without a modeled checkout uses `$TMPDIR/gate-test-runs`. Direct tests use `$TMPDIR/test-runs`.
   Both routes reuse the temporary root when `DEVTOOLS_TEST_RUN_FOLDER` matches a `TMPDIR` run directly under either parent.
   The gate refuses a parent inside a Git checkout.

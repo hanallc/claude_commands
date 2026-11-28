@@ -824,6 +824,22 @@ class FolderFormTests(unittest.TestCase):
         self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "new-disk/hana/demo")
         self.assertIsInstance(folders.parse_form(self.root / "disk/hana/demo/try-2"), folders.OutsideFolderLayout)
 
+    def test_gate_root_uses_the_exact_target_key(self) -> None:
+        key = "roots." + "gate"
+        root = self.root / "guest-gates"
+        _ = self.config.write_text(f"{key}=/unused\n{key}.nixos=/other\n"
+                                   + f"{key}.mac-linux={root}\n{key}.mac-linux.nixos=/wrong\n")
+        with mock.patch("socket.gethostname", return_value="nixos"):
+            self.assertEqual(folders.configured_target_gate_root("mac-linux"), root)
+
+    def test_gate_root_refuses_a_missing_target_key(self) -> None:
+        key = "roots." + "gate"
+        _ = self.config.write_text(f"{key}=/unused\n{key}.nixos=/other\n"
+                                   + f"{key}.mac-linux.nixos=/wrong\n")
+        with (mock.patch("socket.gethostname", return_value="nixos"),
+              self.assertRaisesRegex(conf.Unusable, rf"{key}\.mac-linux=.*missing")):
+            _ = folders.configured_target_gate_root("mac-linux")
+
     def test_mac_uses_the_common_build_root(self) -> None:
         with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
             path = folders.output_path("hana", "demo", "mac")

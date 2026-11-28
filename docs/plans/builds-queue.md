@@ -1238,7 +1238,8 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - The merge gate uses `<build root>/test-runs/<repo>/<unit>/<copy>` for a numbered copy.
   Worktrees use their output name in place of the copy number.
   The main checkout uses `<build root>/test-runs/<repo>/main`.
-  The Mac Linux guest gate uses `<guest temporary root>/gate-test-runs` outside the account home and any Git checkout.
+  The Mac Linux guest gate uses `/build/test-runs/<repo>/<unit>/<copy>`.
+  The guest runner reads `roots.gate.mac-linux` by its exact key. Bubblewrap binds the parent at the same path.
   Direct tests on a guest numbered copy use `<copy>/target/test-runs`.
   A gate without a modeled checkout uses `$TMPDIR/gate-test-runs`. Direct tests use `$TMPDIR/test-runs`.
   Both routes reuse the temporary root when `DEVTOOLS_TEST_RUN_FOLDER` matches a `TMPDIR` run directly under either parent.

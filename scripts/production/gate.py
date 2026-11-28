@@ -233,9 +233,9 @@ class NativeMacGateParent:
 
 @dataclass(frozen=True)
 class MacLinuxGuestGateParent:
-    """Use the Mac Linux sandbox's temporary root for the gate suites."""
+    """Use the guest gate parent that Bubblewrap binds at the same path."""
 
-    temporary_root: Path
+    path: Path
     account_home: Path
 
 
@@ -1800,19 +1800,14 @@ def gate_suite_parent(repo: Path, location: GateSuiteLocation) -> PreparedTestRu
     """Prepare the suite parent for this checkout."""
     try:
         if isinstance(location, MacLinuxGuestGateParent):
-            parent = location.temporary_root.resolve() / "gate-test-runs"
-            if parent.is_symlink() or parent.is_relative_to(location.account_home.resolve()):
+            parent = location.path
+            if parent.resolve() != parent or parent.is_relative_to(location.account_home.resolve()):
                 raise GateRefused(f"{parent}: the guest gate folder must be a directory outside the account home")
         elif isinstance(location, NativeMacGateParent):
             parent = location.path
         else:
             parent = build_folders.test_runs_parent(repo, placement=build_folders.TestRunPlacement.GATE)
-        resolved = parent.resolve()
-        try:
-            _ = git_files.locate(next(path for path in (resolved, *resolved.parents) if path.is_dir()))
-        except git_files.NotACheckout:
-            pass
-        else:
+        if build_folders.gate_parent_in_checkout(parent):
             raise GateRefused(f"{parent}: the gate folder is inside a Git checkout")
         if isinstance(location, (CheckoutTestRuns, MacLinuxGuestGateParent)):
             parent.mkdir(parents=True, exist_ok=True)
