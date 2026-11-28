@@ -925,8 +925,11 @@ A missing folder uses its nearest existing parent until the folder appears.
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
-  The model checks how the parts relate on each review of a structured question.
-  The cache reuses independent checks for unchanged parts with the same rules, date, and time zone.
+  The model checks how the parts of a structured question relate and returns a draft verdict.
+  The cache reuses an approval when the title, exact draft text, rules, date, time zone, and caption layout match.
+  The model reviews a held split draft again.
+  Changes to the draft, including spaces between parts, require a new draft verdict.
+  The cache reuses independent verdicts for unchanged parts with the same rules, date, and time zone.
   It keeps the latest valid verdicts and removes drafts inactive for seven days.
   If a cache lock stays busy until the deadline, the filing command holds the draft.
   The review allows at most three questions for missing facts across all verdicts.
