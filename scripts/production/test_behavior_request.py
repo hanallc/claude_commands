@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 from unittest.mock import Mock, patch
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.production import behavior_request, delivery_state, staff, the_list
 from scripts.production.staff_test_support import fixture_member
@@ -35,11 +36,15 @@ class BehaviorRequestImagesTests(TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.root = Path(self.enterContext(TemporaryDirectory(dir="/tmp")))
+        config = self.root / "config"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
-            "REVIEW_LINKS_ROOT": str(self.root),
+            "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1", "CONF_DIR": str(config),
         })))
+        keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(config / "console.conf", f"page.list.owner={keeper.id}\n")
+        _ = write_config_fixture(config / "review_links.conf")
 
     def new_list_item(self) -> tuple[staff.StaffId, the_list.ListItem, Path]:
         keeper = fixture_member("producer", name="morty").id
