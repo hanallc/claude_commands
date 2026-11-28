@@ -11,7 +11,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import conf, user_zone
+from scripts.lib import conf, git_files, user_zone
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -31,6 +31,7 @@ from scripts.production.unrouted_alert import notify as notify_unrouted
 
 @contextmanager
 def routing_fixture_environment(root: Path) -> Generator[None]:
+    root = root.resolve()
     home = root / "home"
     home.mkdir()
     config = root / "fixture-config"
@@ -44,9 +45,17 @@ def routing_fixture_environment(root: Path) -> Generator[None]:
     zone = str(config / "user_zone.conf")
     notifier = root / "notifier"
     panes = root / "panes"
+    checkout_at = git_files.at
+
+    def fixture_checkout_at(folder: Path, *, on_link: Callable[[Path], None] | None = None) -> git_files.Checkout:
+        if not folder.resolve().is_relative_to(root):
+            raise git_files.NotACheckout(f"{folder}: outside the routing fixture")
+        return checkout_at(folder, on_link=on_link)
+
     environment = {
         **configuration, "PATH": os.environ.get("PATH", os.defpath),
         "GIT_CONFIG_GLOBAL": git["GIT_CONFIG_GLOBAL"], "GIT_CONFIG_NOSYSTEM": git["GIT_CONFIG_NOSYSTEM"],
+        "GIT_CEILING_DIRECTORIES": str(root.parent), "TMPDIR": str(root),
         "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_STATE_HOME": str(home / ".local/state"), "XDG_CACHE_HOME": str(home / ".cache"),
         "STAFF_FILE": str(root / "staff.json"), "STAFF_CONFIG": str(config / "staff.conf"),
@@ -59,6 +68,8 @@ def routing_fixture_environment(root: Path) -> Generator[None]:
         "SCRATCH_COPIES_ROOT": str(root / "copies"), "SESSION_TEMP_ROOT": str(root / "session"),
     }
     with (mock.patch.dict(os.environ, environment, clear=True),
+          mock.patch.object(tempfile, "tempdir", str(root)),
+          mock.patch.object(git_files, "at", new=fixture_checkout_at),
           mock.patch.object(user_zone, "CONF", zone),
           mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
           mock.patch.object(pane_record, "RECORD_DIR", panes)):
