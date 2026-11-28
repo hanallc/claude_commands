@@ -209,6 +209,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn('the source is "nate via Images" and `image_answer.signed` is true.', prompt)
         self.assertIn("Use `image_text` for context. Quote only its approval line, `Image <id>: your image is approved.`", prompt)
         self.assertNotIn("quote only Nate's feedback", prompt)
+        self.assertIn("Count only a decision whose `answer` is `approved`.", prompt)
         self.assertIn("You can cite Nate's Images page answer from the store or the List log.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
         self.assertIn("saved question answer or feedback.", prompt)

@@ -221,6 +221,7 @@ Use these sources:
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 6. Nate's Images page answers in {image_answers}/*.json.
    Check the completed Images page delivery for the same decision.
+   Count only a decision whose `answer` is `approved`.
    Use `image_text` for context. Quote only its approval line, `Image <id>: your image is approved.`
 
 Check that Nate wrote the words and used them to set behavior.
