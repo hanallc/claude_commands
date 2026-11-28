@@ -205,10 +205,10 @@ print(getfile(update_registration))
 
 Use these sources:
 1. List records and their questions and answers in {state_root}/*/list/L*.md.
-   Cite Nate's List question when its List page receipt has a matching sent delivery.
+   Cite Nate's List question when its List page receipt matches a saved send receipt in state `sent`.
    For a signed Images answer, check that the source is "nate via Images" and `image_answer.signed` is true.
-   An unsigned Images approval needs the same source and a matching server record.
-   Match the List item, keeper, delivery key, and words. Cite only the approval line as approval.
+   Check the completed Images page delivery for the same List item, keeper, key, and words.
+   Cite only the approval line as approval.
    For a feedback answer on the List, quote only Nate's feedback.
 2. Question records and change review verdicts.
    Read `{checker_root}/scripts/production/update_registration.py` for the question record code.
@@ -221,6 +221,7 @@ Use these sources:
 4. Commit messages in {repo}.
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 6. Nate's Images page answers in {image_answers}/*.json.
+   Check the completed Images page delivery for the same decision.
    Use `image_text` for context. Quote only `answer` and `feedback`.
 
 Check that Nate wrote the words and used them to set behavior.

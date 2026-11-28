@@ -11,7 +11,7 @@ import secrets
 import shutil
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -87,6 +87,7 @@ class ImageDecision:
 
 class NoImageDecision(Enum):
     OUTSIDE_STORE = auto()
+    UNVERIFIED = auto()
 
 
 class _AnswerAttemptLookup(Enum):
@@ -166,6 +167,11 @@ def _signed_answer_key(saved: image_store.ImageAnswers, signed: image_store.Sign
     return "review:" + hashlib.sha256(json.dumps(fields).encode()).hexdigest()
 
 
+def _legacy_decision_key(saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer) -> str:
+    fields = (saved["registered_at"], signed["round_id"])
+    return hashlib.sha256(json.dumps(fields).encode()).hexdigest()
+
+
 def _save_image_decision(root: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer) -> None:
     """Save this distinct signed answer while the Images lock is held."""
     folder = decision_root(root)
@@ -179,7 +185,7 @@ def _save_image_decision(root: Path, saved: image_store.ImageAnswers, signed: im
         raise OSError(f"{path}: Expected an Images answer file.")
     if not path.exists() and "previous_answer_key" not in signed and "form_request_key" not in signed:
         # Keep old evidence at the path that reviewers can already cite.
-        old_key = hashlib.sha256(json.dumps((saved["registered_at"], signed["round_id"])).encode()).hexdigest()
+        old_key = _legacy_decision_key(saved, signed)
         old_path = folder / f"{identity}-{old_key}.json"
         if old_path.is_file():
             try:
@@ -606,6 +612,80 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
 def _answer_words(identity: str, answer: str, feedback: str) -> str:
     summary = f"Image {identity}: {ANSWERS[answer]}"
     return summary + "\n" + feedback if feedback else summary
+
+
+def _signed_delivery_key_matches(folder: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer,
+                                 position: int, key: str) -> bool:
+    if key == signed.get("form_request_key"):
+        return True
+    # A signed form can reuse a delivery key from before the form request.
+    round_id = signed["round_id"]
+    draft = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
+    if key in (draft.new_decision_key(folder, saved, round_id, position),
+               draft.delivery_key(folder, saved, round_id, purpose="images-answer")):
+        return True
+    purposes = ("message", _signed_answer_key(saved, signed)) if "previous_answer_key" in signed else ("message",)
+    return any(key == draft.delivery_key(folder, saved, round_value, purpose=purpose)
+               for purpose in purposes for round_value in (round_id, None))
+
+
+def _completed_signed_answers(directory: Path, saved: image_store.ImageAnswers, recipients: set[str]
+                              ) -> Iterator[tuple[str, image_store.SignedImageAnswer]]:
+    folder = directory / saved["id"]
+    for position, (key, attempt) in enumerate(saved["attempts"].items()):
+        signed = attempt.get("signed_answer")
+        if signed is None or set(attempt["recipients"]) != recipients or not _answer_delivered(attempt):
+            continue
+        answer, feedback = signed["answer"], signed["feedback"]
+        if (attempt.get("words") == _answer_words(saved["id"], answer, feedback)
+                and attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS[answer]
+                and _signed_delivery_key_matches(folder, saved, signed, position, key)):
+            yield key, signed
+
+
+def matches_list_answer(root: Path, identity: str, item: str, keeper: staff.StaffId,
+                        event: the_list.ImageAnswerChange) -> bool:
+    """Check the List entry against its completed Images page delivery."""
+    directory = images_root(root)
+    saved = image_store.find_answers(directory, identity)
+    if (isinstance(saved, image_store.ImageAnswersUnavailable)
+            or saved.get("list_item") != item or saved.get("list_keeper") != keeper):
+        return False
+    for key, signed in _completed_signed_answers(directory, saved, {saved["owner"], event.producer}):
+        if (event.what != _answer_words(identity, signed["answer"], signed["feedback"])
+                or event.time != datetime.fromisoformat(signed["time"])):
+            continue
+        if event.key == _signed_answer_key(saved, signed):
+            return True
+        # The first signed List entries used the original delivery key.
+        if event.key == key and "form_request_key" not in signed and "previous_answer_key" not in signed:
+            folder = directory / identity
+            round_id = signed["round_id"]
+            draft = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
+            if any(key == draft.delivery_key(folder, saved, value) for value in (round_id, None)):
+                return True
+    return False
+
+
+def verified_image_decision(root: Path, path: Path) -> ImageDecision | NoImageDecision:
+    """Require a completed Images page delivery for the archived decision."""
+    decision = read_image_decision(root, path)
+    if isinstance(decision, NoImageDecision):
+        return decision
+    directory = images_root(root)
+    saved = image_store.find_answers(directory, decision.image_id)
+    if isinstance(saved, image_store.ImageAnswersUnavailable) or "list_item" in saved:
+        return NoImageDecision.UNVERIFIED
+    decision_key = path.stem.removeprefix(decision.image_id + "-")
+    for _, signed in _completed_signed_answers(directory, saved, {saved["owner"]}):
+        if (decision.answer, decision.feedback, decision.time) != (
+                signed["answer"], signed["feedback"], datetime.fromisoformat(signed["time"])):
+            continue
+        if (decision_key == _signed_answer_key(saved, signed).removeprefix("review:")
+                or ("previous_answer_key" not in signed and "form_request_key" not in signed
+                    and decision_key == _legacy_decision_key(saved, signed))):
+            return decision
+    return NoImageDecision.UNVERIFIED
 
 
 def _legacy_answer_words(identity: str, item: str, message: str, answer: str) -> str:

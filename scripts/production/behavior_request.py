@@ -113,44 +113,36 @@ def list_question_words(item: the_list.ListItem, keeper: staff.StaffId) -> Itera
     questions = {question.question_id: question for question in item.questions}
     questions.update((event.what.question.question_id, event.what.question)
                      for event in item.log if isinstance(event.what, the_list.QuestionClosed))
+    status = change_page.DeliveryStatus(review_link.review_root())
     for event in item.log:
         receipt = event.what
         if event.source != the_list.PAGE_SOURCE or not isinstance(receipt, the_list.QuestionRequestReceipt):
             continue
         question = questions.get(receipt.question_id)
-        if question is None or question.words != receipt.request.words:
+        if receipt.request.action != "question" or question is None or question.words != receipt.request.words:
             continue
-        target = the_list.list_question_target(keeper, item, question.recipient_id(keeper))
-        status = change_page.DeliveryStatus(review_link.review_root())
-        delivery = change_page.published_question_delivery_view(status, target.saved(question))
-        if delivery.state is delivery_state.QuestionSendState.SENT:
+        saved = the_list.list_question_target(keeper, item, question.recipient_id(keeper)).saved(question)
+        try:
+            attempt = change_page.read_question_attempt(status.path(saved.page(), saved.source.row))
+        except (OSError, ValueError):
+            continue
+        if (attempt.state is delivery_state.QuestionSendState.SENT
+                and isinstance(attempt.receipt, delivery_state.QuestionSendReceipt) and saved.matches(attempt)):
             yield NateWords(question.words, event.time)
 
 
-def legacy_image_approval_matches(event: the_list.ImageAnswerChange, item: str,
-                                  keeper: staff.StaffId, identity: str) -> bool:
-    directory = images.images_root(review_link.review_root())
-    answers = image_store.find_answers(directory, identity)
-    if (isinstance(answers, image_store.ImageAnswersUnavailable)
-            or answers.get("list_item") != item or answers.get("list_keeper") != keeper):
-        return False
-    attempt = answers["attempts"].get(event.key)
-    approval_message = images.ANSWER_PREFIX + images.ANSWERS["approved"]
-    return (attempt is not None and attempt.get("words") == event.what
-            and attempt["message"].partition("\n")[0] == approval_message)
-
-
 def list_image_words(event: the_list.ImageAnswerChange, item: str, keeper: staff.StaffId) -> Iterator[NateWords]:
-    if event.source != the_list.IMAGE_ANSWER_SOURCE:
+    if event.source != the_list.IMAGE_ANSWER_SOURCE or not event.signed:
         return
     line, _, feedback = event.what.partition("\n")
     label, _, answer = line.partition(": ")
     identity = label.removeprefix("Image ")
-    if not label.startswith("Image ") or not image_store.IDENTITY.fullmatch(identity):
+    if (not label.startswith("Image ") or not image_store.IDENTITY.fullmatch(identity)
+            or not images.matches_list_answer(review_link.review_root(), identity, item, keeper, event)):
         return
-    if answer == images.ANSWERS["approved"] and (event.signed or legacy_image_approval_matches(event, item, keeper, identity)):
+    if answer == images.ANSWERS["approved"]:
         yield NateWords(line, event.time)
-    if event.signed and feedback and answer in images.ANSWERS.values():
+    if feedback:
         yield NateWords(feedback, event.time)
 
 
@@ -194,7 +186,7 @@ def source_words(path: Path) -> Iterator[NateWords]:
         yield from transcript_words(path)
         return
     if path.suffix == ".json":
-        decision = images.read_image_decision(review_link.review_root(), path)
+        decision = images.verified_image_decision(review_link.review_root(), path)
         if isinstance(decision, images.ImageDecision):
             yield NateWords(decision.answer, decision.time)
             if decision.feedback:

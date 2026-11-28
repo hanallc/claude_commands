@@ -3438,7 +3438,7 @@ class ImagesServerTests(ImagesFixture):
         status, _, answer = self.http("POST", images.PAGE_PATH, body)
         self.assertEqual((status, cast(dict[str, str], json.loads(answer))), (200, {"state": "done"}))
         self.assertEqual(len(self.sent), 1)
-        self.assertNotIn(record["id"], self.http("GET", images.PAGE_PATH)[2].decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', self.http("GET", images.PAGE_PATH)[2].decode())
 
     def test_image_answer_reports_the_failed_producer_or_list_save(self) -> None:
         _, producer, item = self.list_item()
