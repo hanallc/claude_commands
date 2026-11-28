@@ -929,10 +929,7 @@ def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], lis
     """Select the configured producer settings without a resume identity."""
     settings = models_registry.launch_settings("producers", name)
     if settings.kind == "codex":
-        arguments = ["--model", settings.model,
-                     "-c", f'model_reasoning_effort="{settings.effort}"']
-        if settings.service_tier:
-            arguments.extend(("-c", f'service_tier="{settings.service_tier}"'))
+        arguments = models_registry.codex_model_arguments(settings)
     else:
         arguments = ["--name", name, "--remote-control", name,
                      "--model", settings.model, "--effort", settings.effort,

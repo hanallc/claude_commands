@@ -8,14 +8,17 @@ import json
 import os
 from pathlib import Path
 from typing import Literal, cast, final, override
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
-from scripts.agents import member_account, pane_record, shutdown, shutdown_record, stop_resume
-from scripts.herdr import herdr
-from scripts.lib import copy_record, scratch, session_folder
+from scripts.accounts import accounts
+from scripts.agents import member_account, pane_record, restart, shutdown, shutdown_record, stop_resume
+from scripts.herdr import herdr, pane_launch
+from scripts.lib import conf, copy_record, models_registry, scratch, session_folder
+from scripts.lib.test_models_registry import write_registry
 from scripts.message import roster, send, sessions
-from scripts.production import staff
+from scripts.production import broadcast, staff
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.review_links import review_submissions
 
 SOURCE = "019b3a40-4250-7000-8000-000000000201"
 FORK = "019b3a40-4250-7000-8000-000000000202"
@@ -90,17 +93,18 @@ class CloneCommandTests(StaffTestCase):
 
     def source(self, kind: Literal["claude", "codex"], home: Path, args: list[str], *,
                footer: str = "", clone_home: Path | None = None, implicit_account: bool = False,
-               clone_uses_explicit_account: bool = False, identity: str = SOURCE) -> None:
+               clone_uses_explicit_account: bool = False, identity: str = SOURCE,
+               fork_identity: str = FORK, fork_options: tuple[str, ...] = ()) -> None:
         key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         account = {"HOME": str(home.parent)} if implicit_account else {key: str(home)}
         clone_account = {key: str(clone_home or home)} if clone_home or clone_uses_explicit_account else account
         origin = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "source-start", {**account, "STAFF_ID": SOURCE})
-        fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(FORK), "fork-start", clone_account)
+        fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(fork_identity), "fork-start", clone_account)
 
         def foreground_launch(pane: str, _kind: str) -> herdr.ForegroundLaunch:
             if pane == PANE:
                 return herdr.ForegroundLaunch(origin, 42, str(self.folder), args)
-            return herdr.ForegroundLaunch(fork, 43, str(self.folder), [kind])
+            return herdr.ForegroundLaunch(fork, 43, str(self.folder), [kind, *fork_options])
 
         _ = self.enterContext(patch.object(self.client, "foreground_launch", side_effect=foreground_launch))
         cast(Mock, self.processes).return_value = sessions.SessionProcesses((42,) if kind == "claude" else ())
@@ -128,6 +132,190 @@ class CloneCommandTests(StaffTestCase):
         call = cast(Mock, self.launch).call_args
         assert call is not None
         return cast(herdr.PreparedAgentEnvironment, call.args[2])
+
+    def clone_producer(self, *, profile: str = "claude:opus:high", sonnet_model: str = "sonnet"
+                       ) -> tuple[staff.StaffRow, staff.StaffRow]:
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": profile}, "claude.families": {"sonnet": sonnet_model}})
+        _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "1",
+        })))
+        document = self.root / "morty"
+        document.mkdir()
+        producer = staff.ensure("producer", name="morty", runtime_id=THIRD,
+                                doc=staff.LiveDoc("natedev", document),
+                                worktree=staff.PresentWorktree("natedev", self.folder))
+        current = staff.native_id("019b3a40-4250-7000-8000-000000000204")
+        producer = staff.update_current_session(producer.current_session, current)
+        self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high", identity=current)
+        cast(Mock, self.client.tab_sessions).return_value = [herdr.TabSession(PANE, producer.name, "workspace", current)]
+
+        def native_session(pane: str, _kind: str, _timeout: float) -> str:
+            return current if pane == PANE else FORK
+
+        cast(Mock, self.native).side_effect = native_session
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            result = shutdown.main(["clone", producer.name, "morty-copy"])
+        self.assertEqual(result, 0, diagnostic.getvalue())
+        record = staff.initial_snapshot()
+        clone = record.by_current_session(FORK)
+        assert clone is not None
+        return producer, clone
+
+    def test_producer_clone_admits_a_separate_root_and_opens_for_new_actions(self) -> None:
+        producer, clone = self.clone_producer()
+        self.assertEqual((clone.id, clone.current_session, clone.kind, clone.name), (FORK, FORK, "producer", "morty-copy"))
+        self.assertEqual(clone.clone_of, staff.ProducerClone(producer.id))
+        self.assertEqual(clone.parent, staff.StaffRoot())
+        self.assertEqual(clone.doc, staff.DocUnfilled())
+        self.assertEqual(clone.worktree, staff.PresentWorktree("natedev", self.folder))
+        self.assertEqual(clone.home, staff.SessionHome(self.clone_scratch / ".claude4"))
+        record = staff.initial_snapshot()
+        self.assertEqual(record.by_id(producer.id), producer)
+        self.assertFalse(any(row.reports_to(clone.id) for row in record.rows))
+        self.assertIsNotNone(pane_record.publication_for_session(FORK, record=record))
+        cast(Mock, self.remember).assert_called_once_with(clone.id, FORK_PANE)
+        launched = cast(Mock, self.launch).call_args
+        assert launched is not None
+        arguments = cast(list[str], launched.args[4])
+        self.assertEqual(arguments[:3], ["--resume", producer.current_session, "--fork-session"])
+        self.assertEqual(arguments[-1], "You are morty-copy, a clone of morty. "
+                         + "Do not continue the ongoing work of morty. Do new actions that Nate gives you.")
+
+    def test_producer_clone_has_its_own_profile_and_resumes_by_name(self) -> None:
+        producer, clone = self.clone_producer()
+        profiles = models_registry.parse_registry(models_registry.registry_text())["producers"]
+        self.assertEqual(profiles[producer.name], "claude:opus:high")
+        self.assertEqual(profiles[clone.name], "claude:opus:high")
+        self.assert_producer_resume(clone.name, "opus", "high")
+
+    def test_producer_clone_forks_and_resumes_with_the_source_profile(self) -> None:
+        producer, clone = self.clone_producer(profile="claude:sonnet:medium", sonnet_model="claude-sonnet-4-6")
+        profiles = models_registry.parse_registry(models_registry.registry_text())["producers"]
+        self.assertEqual(profiles[producer.name], "claude:sonnet:medium")
+        self.assertEqual(profiles[clone.name], profiles[producer.name])
+        launched = cast(Mock, self.launch).call_args
+        assert launched is not None
+        arguments = models_registry.claude_arguments(cast(list[str], launched.args[4]), self.launched_environment().env)
+        self.assertEqual(arguments[arguments.index("--model") + 1], "claude-sonnet-4-6")
+        self.assertEqual(arguments[arguments.index("--effort") + 1], "medium")
+        self.assert_producer_resume(clone.name, "claude-sonnet-4-6", "medium")
+
+    def test_codex_producer_clone_uses_the_same_model_arguments_on_fork_and_resume(self) -> None:
+        producer = staff.ensure("producer", name="morty", runtime_id=THIRD,
+                                worktree=staff.PresentWorktree("natedev", self.folder))
+        registry = self.root / "models.conf"
+        profile = "codex:gpt-test:high"
+        saved_options = ("--sandbox", "read-only", "-c", 'notify=["/fixture/notify"]')
+        cases = (
+            ("fast", "", "fast"),
+            ("flex", "fast", "flex"),
+            ("", "", ""),
+        )
+        with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                     "MODELS_CONFIG_TIER_ONLY": "1"}):
+            for index, (shared, source_override, tier) in enumerate(cases, start=1):
+                with self.subTest(shared=shared, source_override=source_override):
+                    name = f"morty-copy-{index}"
+                    identity = f"019b3a40-4250-7000-8000-00000000021{index}"
+                    _ = write_registry(registry, {"producers": {producer.name: profile}, "producers.options": {
+                        "codex_service_tier": shared or None, f"codex_service_tier.{producer.name}": source_override or None,
+                    }})
+                    self.source("codex", self.clone_scratch / ".codex4", ["codex"], identity=producer.current_session,
+                                fork_identity=identity, fork_options=("--model", "old-model", "-c",
+                                    'model_reasoning_effort="low"', "-c", 'service_tier="default"', *saved_options))
+                    cast(Mock, self.native).return_value = identity
+                    cast(Mock, self.native).side_effect = None
+                    cast(Mock, self.client.tab_sessions).return_value = [
+                        herdr.TabSession(PANE, producer.name, "workspace", producer.current_session)]
+                    self.assertEqual(shutdown.main(["clone", producer.name, name]), 0)
+                    clone = staff.initial_snapshot().by_current_session(identity)
+                    assert clone is not None
+                    self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"][name], profile)
+                    saved = pane_record.publication_for_session(identity)
+                    assert saved is not None
+                    launched = cast(Mock, self.launch).call_args
+                    assert launched is not None
+                    fork_arguments = cast(list[str], launched.args[4])
+                    fork_settings = fork_arguments[2:fork_arguments.index("--")]
+                    resume_arguments = stop_resume.resume_arguments(pane_record.resume_launch(saved.entry))
+                    expected = ["--model", "gpt-test", "-c", 'model_reasoning_effort="high"']
+                    if tier:
+                        expected.extend(("-c", f'service_tier="{tier}"'))
+                    self.assertEqual(resume_arguments, ["resume", identity, *expected, *saved_options])
+                    self.assertEqual(restart.producer_launch(clone), ("codex", {}, ["resume", identity, *expected]))
+                    self.assertEqual(fork_settings, expected)
+
+    def assert_producer_resume(self, name: str, model: str, effort: str) -> None:
+        home = self.clone_scratch / ".claude4"
+
+        def start(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, label: str, _message: str) -> sessions.LiveSessionProcess:
+            self.assertEqual((tab.pane_id, tab.session_id, label), (FORK_PANE, FORK, "claude4"))
+            self.assertEqual(entry["cwd"], str(self.folder))
+            self.assertEqual(entry["environment"]["CLAUDE_CONFIG_DIR"], str(home))
+            environment = {**os.environ, **entry["environment"]}
+            arguments = models_registry.claude_arguments(stop_resume.resume_arguments(entry), environment)
+            self.assertEqual(arguments[:2], ["--resume", FORK])
+            self.assertEqual(arguments[arguments.index("--model") + 1], model)
+            self.assertEqual(arguments[arguments.index("--effort") + 1], effort)
+            return sessions.LiveSessionProcess(456)
+
+        with (patch.object(self.client, "panes", return_value=[]),
+              patch.object(self.client, "producer_row_tab", return_value=herdr.ExistingPane(FORK_PANE, "fixture-terminal")),
+              patch.object(self.client, "retitle", return_value=True),
+              patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", home)),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_resume_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_start_session", side_effect=start) as launch,
+              patch.object(stop_resume, "_watch_resume")):
+            diagnostic = io.StringIO()
+            with redirect_stderr(diagnostic):
+                result = shutdown.main(["resume", name])
+            self.assertEqual(result, 0, diagnostic.getvalue())
+        launch.assert_called_once()
+
+    def test_producer_clone_rename_moves_only_its_profile(self) -> None:
+        producer, clone = self.clone_producer()
+        with patch.object(shutdown, "rename_repair_displays", return_value=True) as displays:
+            diagnostic = io.StringIO()
+            with redirect_stderr(diagnostic):
+                result = shutdown.main(["rename", clone.name, "morty-new"])
+            self.assertEqual(result, 0, diagnostic.getvalue())
+        profiles = models_registry.parse_registry(models_registry.registry_text())["producers"]
+        self.assertEqual(profiles[producer.name], "claude:opus:high")
+        self.assertNotIn(clone.name, profiles)
+        self.assertEqual(profiles["morty-new"], "claude:opus:high")
+        renamed = staff.initial_snapshot().by_id(clone.id)
+        assert renamed is not None
+        self.assertEqual((renamed.name, renamed.current_session, renamed.clone_of),
+                         ("morty-new", clone.current_session, clone.clone_of))
+        displays.assert_called_once_with(renamed)
+
+    def test_producer_broadcast_delivers_to_the_source_and_its_clone(self) -> None:
+        producer, clone = self.clone_producer()
+        members = (self.owner, producer, clone)
+        entries = [roster.RosterEntry("natedev", "claude", "freestanding", row.name, "idle",
+                                      roster.Messageable(f"session:{row.current_session}"), str(self.folder),
+                                      roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
+                                      session=roster.ClaudeSession(row.current_session)) for row in members]
+        cast(Mock, roster.roster).return_value = roster.Roster(entries, [])
+        with patch.object(broadcast, "_send", return_value=("sent", "")) as deliver:
+            self.assertEqual(broadcast.main(["--here", "--from", "nate", "--producers", "Review update."]), 0)
+        message = "Review update.\n\nSent directly to producers on this machine; do not pass it on."
+        self.assertCountEqual(deliver.call_args_list, [
+            call(f"session:{producer.current_session}", "nate", message, "--here"),
+            call(f"session:{clone.current_session}", "nate", message, "--here"),
+        ])
+
+    def test_new_item_offers_a_producer_clone(self) -> None:
+        producer, clone = self.clone_producer()
+        record = staff.initial_snapshot()
+        options = review_submissions.new_item_routing("review", conf.read_or_repository("console"), record)
+        self.assertEqual(options["recipients"], [
+            {"id": row.id, "name": row.name, "proposal": True} for row in (producer, clone)
+        ])
+        self.assertEqual(review_submissions.selected_recipient(clone.id, record), clone)
 
     def test_clone_refuses_the_removed_as_option(self) -> None:
         diagnostic = io.StringIO()
