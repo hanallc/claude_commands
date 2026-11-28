@@ -5,12 +5,14 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
 import json
 import re
 import sys
 from textwrap import indent
+from threading import Lock
 from typing import cast
 from unicodedata import category
 
@@ -43,9 +45,23 @@ class ClaimedNateRequest(BehaviorEvidence):
     """The reviewer found a request. The source still needs verification."""
 
 
+class BehaviorVerdict(StrEnum):
+    AGAINST = "against"
+    FOLLOWS = "follows"
+    DIFFERENT = "different"
+    UNCLEAR = "unclear"
+
+    @property
+    def asks_nate(self) -> bool:
+        return self in (BehaviorVerdict.AGAINST, BehaviorVerdict.UNCLEAR)
+
+
 @dataclass(frozen=True)
 class NateSpecified(BehaviorEvidence):
-    """The change needs a decision from Nate."""
+    """The review gives a verdict on quoted words."""
+
+    verdict: BehaviorVerdict
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -86,12 +102,25 @@ def read_findings(text: str) -> dict[str, ReviewFinding]:
                 case {"test": str(test), "finding": "none"} if len(row) == 2:
                     finding = NoNateDecision(test)
                 case {"test": str(test), "finding": "specified" | "requested" as kind, "quote": str(quote), "source": str(source),
-                      "date": str(day), "change": str(change)} if len(row) == 6:
+                      "date": str(day), "change": str(change)}:
                     path = Path(source)
                     if not path.is_absolute() or not quote.strip() or not change.strip() or len(change.splitlines()) != 1:
                         raise ValueError(f"{test}: expected a quote, an absolute source path and one line about the change")
-                    evidence = ClaimedNateRequest if kind == "requested" else NateSpecified
-                    finding = evidence(test, quote, path, date.fromisoformat(day), change.strip())
+                    if kind == "requested" and len(row) == 6:
+                        finding = ClaimedNateRequest(test, quote, path, date.fromisoformat(day), change.strip())
+                    elif kind == "specified":
+                        try:
+                            verdict = BehaviorVerdict(row.get("verdict"))
+                        except ValueError as error:
+                            raise ValueError(f"{test}: expected a verdict of against, follows, different or unclear") from error
+                        reason = row.get("reason")
+                        if not isinstance(reason, str) or not reason.strip() or reason.splitlines() != [reason]:
+                            raise ValueError(f"{test}: expected a reason on one nonempty line")
+                        if len(row) != 8:
+                            raise ValueError("invalid finding")
+                        finding = NateSpecified(test, quote, path, date.fromisoformat(day), change.strip(), verdict, reason.strip())
+                    else:
+                        raise ValueError("invalid finding")
                 case _:
                     raise ValueError("invalid finding")
             if test in findings:
@@ -120,7 +149,8 @@ def verify_requests(findings: Iterable[ReviewFinding]) -> list[BehaviorFinding]:
         elif (day := verified[finding.source].get(finding.quote)) is not None:
             results.append(NateRequest(finding.test, finding.quote, finding.source, day, finding.change))
         else:
-            results.append(NateSpecified(finding.test, finding.quote, finding.source, finding.day, finding.change))
+            results.append(NateSpecified(finding.test, finding.quote, finding.source, finding.day, finding.change,
+                                         BehaviorVerdict.UNCLEAR, "The cited source did not verify the quote."))
     return results
 
 
@@ -157,28 +187,37 @@ Use these sources:
 2. Question records from scripts/production/update_registration.py and change review verdicts.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
-   Use scripts/lib/transcripts.py to find distinct paths and read plain and compressed transcripts.
+   Use scripts/lib/transcripts.py to find distinct paths.
+   Import `transcript_lines` from `scripts.lib.transcripts`.
+   Read plain and compressed transcripts with `with contextlib.closing(transcript_lines(Path(path))) as lines:`.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
 4. Commit messages in {repo}.
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 
-Count only words that Nate used to set the affected behavior. Check who wrote the words.
+Check that Nate wrote the words and used them to set behavior.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
-Quote only the words that apply to the changed behavior.
+Quote the words you used to decide the finding.
 In `change`, write one plain line for the author about how the behavior changes.
 If you cannot complete the review, report the blocker instead of a finding.
 
 Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
-Use "specified" when the change departs from those words or you cannot tell whether it follows them.
-For "requested", cite a typed Claude turn, a sent List Tell from Nate, or Nate's saved answer.
-Quote one or more complete sentences or lines in order. Use the source date.
-Use "specified" when you cannot cite one of these sources.
+For "requested", cite Nate's typed Claude turn, sent List Tell, or saved question answer.
+Quote one or more complete sentences or lines in order from one source message only.
+If several messages contain relevant words, quote the newest message that sets the behavior.
+Use the source date.
 Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",
 "date":"YYYY-MM-DD","change":"how the behavior changes"}}
-Use the same fields for "specified".
+Use "specified" when you find words to assess and cannot return "requested".
+Use the same fields as "requested" and add "verdict" and "reason".
+1. Use "against" only when the change removes or changes behavior Nate explicitly asked for.
+   A refinement of a term Nate did not define, such as "history", does not warrant "against".
+2. Use "follows" when the change follows the quoted words.
+3. Use "different" when the quoted words describe a different behavior.
+4. Use "unclear" when you cannot tell how the change relates to the quoted words.
+In "reason", write one plain line that explains the verdict.
 
 Read only. Do not edit files, run builds or tests, send messages, or file a question.
 """
@@ -351,7 +390,7 @@ def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
 
 
 def reviewer_reply(change: behavior_check.GitRange, key: str, part: ReviewPart,
-                   pointer: Path, lock: file_lock.ExclusiveLock) -> Path | ReviewPending:
+                   pointer: Path, lock: file_lock.ExclusiveLock, staff_open_lock: Lock) -> Path | ReviewPending:
     """Recover the prior reply or start one review while the lock is held."""
     instructions_digest = sha256(part.instructions.encode("utf-8")).hexdigest()
     try:
@@ -377,7 +416,8 @@ def reviewer_reply(change: behavior_check.GitRange, key: str, part: ReviewPart,
     reply = folder / "review.md"
     log = folder / "codex.log"
     write_text_atomic(pointer, str(folder) + "\n", new_file_mode=0o600)
-    result = astra_review.run_review(reply, prompt, log, cwd=change.repo, dispatch_lock=lock)
+    result = astra_review.run_review(reply, prompt, log, cwd=change.repo, dispatch_lock=lock,
+                                    staff_open_lock=staff_open_lock)
     if result is worker.DispatchSubmission.SUBMITTED:
         return ReviewPending(folder)
     if result != 0:
@@ -398,9 +438,10 @@ class ReviewFailure:
 
 
 def collect_part(change: behavior_check.GitRange, key: str, part: ReviewPart,
-                 pointer: Path, lock: file_lock.ExclusiveLock, number: int) -> ReviewedPart | ReviewPending | ReviewFailure:
+                 pointer: Path, lock: file_lock.ExclusiveLock, number: int,
+                 staff_open_lock: Lock) -> ReviewedPart | ReviewPending | ReviewFailure:
     try:
-        reply = reviewer_reply(change, key, part, pointer, lock)
+        reply = reviewer_reply(change, key, part, pointer, lock, staff_open_lock)
         if isinstance(reply, ReviewPending):
             return reply
         data = reply.read_bytes()
@@ -422,10 +463,11 @@ def part_pointer(record: Path, number: int) -> Path:
 
 def collect_reviews(change: behavior_check.GitRange, key: str, plan: ReviewPart | tuple[ReviewPart, ...],
                     path: Path, lock: file_lock.ExclusiveLock) -> tuple[ReviewedPart | ReviewPending | ReviewFailure, ...]:
+    staff_open_lock = Lock()
     if isinstance(plan, ReviewPart):
-        return (collect_part(change, key, plan, path.with_suffix(".run"), lock, 1),)
+        return (collect_part(change, key, plan, path.with_suffix(".run"), lock, 1, staff_open_lock),)
     with ThreadPoolExecutor() as pool:
-        reviews = [pool.submit(collect_part, change, key, part, part_pointer(path, number), lock, number)
+        reviews = [pool.submit(collect_part, change, key, part, part_pointer(path, number), lock, number, staff_open_lock)
                    for number, part in enumerate(plan, start=1)]
         return tuple(review.result() for review in reviews)
 
@@ -591,16 +633,20 @@ def read_clear_findings(key: str, record: behavior_check.Clear) -> dict[str, Rev
     return findings
 
 
-def clear_proof(tests: behavior_check.ChangedTests, record: behavior_check.Clear) -> tuple[NateRequest, ...] | InvalidClearProof:
+def verify_clear_findings(saved: Iterable[ReviewFinding]) -> tuple[BehaviorFinding, ...]:
+    findings = tuple(verify_requests(saved))
+    if any(isinstance(finding, NateSpecified) and finding.verdict.asks_nate for finding in findings):
+        raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
+    return findings
+
+
+def clear_proof(tests: behavior_check.ChangedTests, record: behavior_check.Clear) -> tuple[BehaviorFinding, ...] | InvalidClearProof:
     try:
         saved = read_clear_findings(tests.key, record)
         require_findings(saved, tests.tests)
-        findings = verify_requests(saved.values())
+        return verify_clear_findings(saved.values())
     except (behavior_check.BehaviorCheckError, OSError, ValueError):
         return InvalidClearProof()
-    if any(isinstance(finding, NateSpecified) for finding in findings):
-        return InvalidClearProof()
-    return tuple(finding for finding in findings if isinstance(finding, NateRequest))
 
 
 def verify_approval(tests: behavior_check.ChangedTests, record: behavior_check.Clear | behavior_check.Answered) -> bool:
@@ -615,11 +661,10 @@ def verify_approval(tests: behavior_check.ChangedTests, record: behavior_check.C
 
 
 def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoReview,
-           requests: Iterable[NateRequest] = ()) -> int:
+           findings: Iterable[BehaviorFinding] = ()) -> int:
     if isinstance(record, behavior_check.Clear):
         print(f"{key} clear")
-        for finding in requests:
-            print(finding.test, f"Nate's request ({finding.day}, {finding.source}): {finding.quote}", sep="\n")
+        print_clear_findings(findings)
         return 0
     if isinstance(record, behavior_check.Answered):
         print(f"{key} {record.approval} ({record.question_id})")
@@ -633,10 +678,22 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
     return 1
 
 
+def verdict_line(finding: NateSpecified) -> str:
+    return f"{finding.test} {finding.verdict} {finding.reason}"
+
+
+def print_clear_findings(findings: Iterable[BehaviorFinding], *, include_requests: bool = True) -> None:
+    for finding in findings:
+        if isinstance(finding, NateRequest) and include_requests:
+            print(finding.test, f"Nate's request ({finding.day}, {finding.source}): {finding.quote}", sep="\n")
+        elif isinstance(finding, NateSpecified) and not finding.verdict.asks_nate:
+            print(verdict_line(finding))
+
+
 def print_findings(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
                    evidence: list[NateSpecified]) -> None:
     for finding in evidence:
-        print(finding.test, f"Nate's words ({finding.day}, {finding.source}): {finding.quote}",
+        print(verdict_line(finding), f"Nate's words ({finding.day}, {finding.source}): {finding.quote}",
               f"Change: {finding.change}", sep="\n", file=sys.stderr)
     names = {finding.test for finding in evidence}
     try:
@@ -689,7 +746,9 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
             return 1
         parts = [result for result in results if isinstance(result, ReviewedPart)]
         findings = verify_requests(finding for part in parts for finding in part.findings.values())
-        evidence = [finding for finding in findings if isinstance(finding, NateSpecified)]
+        evidence = [finding for finding in findings if isinstance(finding, NateSpecified) and finding.verdict.asks_nate]
+        if evidence:
+            print_clear_findings(findings, include_requests=False)
         if not evidence:
             reply = parts[0].reply if isinstance(plan, ReviewPart) else save_split_proof(path, parts)
             record = behavior_check.Clear(reply)
@@ -709,7 +768,7 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
                 print(f"Nate was not asked. Revise {question} and run again.", file=sys.stderr)
                 return 1
         behavior_check.write_record(key, record)
-        return report(key, record, (finding for finding in findings if isinstance(finding, NateRequest)))
+        return report(key, record, findings)
     finally:
         lock.close()
 
@@ -729,13 +788,13 @@ def status(key: str) -> int:
             record = refresh_answer(key, record)
         elif isinstance(record, behavior_check.Clear):
             try:
-                evidence = verify_requests(read_clear_findings(key, record).values())
+                findings = verify_clear_findings(read_clear_findings(key, record).values())
             except (behavior_check.BehaviorCheckError, OSError, ValueError):
-                evidence = []
-            if not evidence or any(isinstance(finding, NateSpecified) for finding in evidence):
+                findings = ()
+            if not findings:
                 print(f"{key}: the saved approval has no valid proof.")
                 return 1
-            return report(key, record, (finding for finding in evidence if isinstance(finding, NateRequest)))
+            return report(key, record, findings)
         return report(key, record)
 
 
