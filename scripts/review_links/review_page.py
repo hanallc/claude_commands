@@ -2313,7 +2313,12 @@ mountCard(document);
 setInterval(updateHandoffAges,5000);
 })();'''
 
-CARD_REQUEST_SCRIPT = record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''
+RECORD_LINK_SCRIPT = r'''
+const reviewRecordLinks={stableItemLinks:true,hasKey:key=>index.has(key),
+ resolveItem:value=>resolveShownRecordId(index,value)};
+'''
+
+CARD_REQUEST_SCRIPT = record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + RECORD_LINK_SCRIPT + r'''
 const kinds=''' + json.dumps(WIRE_TYPES) + ''',states=''' + json.dumps(INDEX_STATES) + r''';
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
@@ -2326,7 +2331,6 @@ function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
 let index=readIndex(JSON.parse(document.querySelector('[data-review-index]').textContent));
-const reviewRecordLinks={stableItemLinks:true,resolveItem:value=>resolveShownRecordId(index,value)};
 function reviewRequestSignal(){
  const seconds=Number(document.querySelector('[data-review]').dataset.requestTimeoutSeconds);
  return AbortSignal.timeout(seconds*1000);
@@ -2347,8 +2351,8 @@ const firstReviewCard=(()=>{
  }
  const params=recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(params);
- const key=recordItemLink(params,reviewRecordLinks.resolveItem,reviewRecordLinks);
- if(!index.has(key)) return null;
+ const {key,pending}=recordItemLink(params,reviewRecordLinks);
+ if(pending || !index.has(key)) return null;
  const version=document.querySelector('[data-review]').dataset.version;
  const result=requestReviewCard(key,version);
  void result.catch(()=>{});
@@ -2527,7 +2531,6 @@ const view=createRecordTable({...reviewPlaceOptions,...reviewRecordLinks,content
  },
  selectOwner:(rows,filters)=>!filters.owner || rows.some(({dataset:entry})=>
   availableForFilters(entry,filters) && ownerHasType(entry,filters)) ? filters.owner : '',
- hasKey:key=>index.has(key),
  shows:showValues,
  staffChipFilters:['owner'],
  visible:isListed,
@@ -3003,7 +3006,7 @@ function applyReviewIndex(payload){
   missingCard=true;view.closeCard(openKey);
  }
  bind();
- const openedLink=view.retryItemLink();
+ const openedLink=view.retryLinks();
  if(!openedLink) view.apply(false);
  if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
  if(focusedOwner && (!ownerRow.contains(document.activeElement) || document.activeElement.hidden))
@@ -3033,7 +3036,7 @@ function followItemLink(options){
  const linked = recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(linked);
  const linkedItem = linked.get('jump') || linked.get('item');
- if(linkedItem && !index.has(recordItemLink(linked,reviewRecordLinks.resolveItem,reviewRecordLinks))){
+ if(linkedItem && !index.has(recordItemLink(linked,reviewRecordLinks).key)){
   const current=location.href;
   const query=new URLSearchParams({filed:linkedItem});
   void fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})

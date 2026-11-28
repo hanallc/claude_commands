@@ -252,7 +252,7 @@ const location={search:queryString,hash:fragment,pathname:'/console/review.html'
 const history={replaceState(_state,_title,url){this.url=url;}};
 const window={},parent=window,pendingSaves=new Map(),saved=new Map();
 const loadBodies=()=>{},rememberItem=()=>{};
-''' + record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''
+''' + record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + review_page.RECORD_LINK_SCRIPT + r'''
 const createTable=createRecordTable;
 {
 const createRecordTable=options=>createTable({...options,entries:undefined,mount:undefined});

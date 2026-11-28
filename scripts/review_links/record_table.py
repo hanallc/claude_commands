@@ -634,17 +634,16 @@ const filterControl={
   }
  }
 };
-function isStoredItemLink(params){
- if(params.get('jump')) return false;
- const kind=params.get('item-kind');
- if(kind) return kind==='key';
- // Older saved addresses include all five table fields.
- return ['owner','show','q','sort','dir'].every(name=>params.has(name));
+function resolveRecordLink(value,kind,{resolveItem,hasKey}){
+ if(!value || kind==='key') return {key:value,pending:false};
+ const key=resolveItem?.(value) ?? value;
+ return {key,pending:Boolean(resolveItem && hasKey && !hasKey(key))};
 }
-function recordItemLink(params,resolve,{stableItemLinks=false}={}){
- const item=params.get('jump') || params.get('item'),saved=history.state?.recordTable;
- const lookup=saved?.pendingItem || !saved && !(stableItemLinks && isStoredItemLink(params));
- return item && lookup ? resolve(item) : item;
+function recordItemLink(params,options){
+ const jump=params.get('jump'),saved=history.state?.recordTable;
+ const kind=options.stableItemLinks && !jump ? params.get('item-kind') : null;
+ const legacyKind=saved && !saved.pendingItem ? 'key' : 'id';
+ return resolveRecordLink(jump || params.get('item'),kind || legacyKind,options);
 }
 function resolveShownRecordId(index,value){
  if(!value || index.has(value)) return value;
@@ -661,6 +660,7 @@ function createRecordTable(options){
 const contentProxy=()=>options.content();
 const defaultShow=options.defaultShow ?? 'open';
 let content=contentProxy(),owner='',show=defaultShow,query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
+const pendingFilterIds=new Set();
 let linkedItem='',revealedLinkedItem='',pendingItem=false;
 let placeHash=location.hash;
 let highlightedRow,highlightTimer;
@@ -1067,7 +1067,24 @@ function placeParams(){
 const resolveStoredItem=value=>options.resolveStoredItem?.(value) ?? value;
 const resolveItem=value=>options.resolveItem?.(value) ?? resolveStoredItem(value);
 const canResolveItem=Boolean(options.resolveItem || options.resolveStoredItem);
-const itemLinkKey=()=>recordItemLink(placeParams(),resolveItem,options);
+const linkLookup={stableItemLinks:options.stableItemLinks,hasKey:options.hasKey,resolveItem:canResolveItem ? resolveItem : undefined};
+const itemLinkKey=()=>recordItemLink(placeParams(),linkLookup).key;
+const hasFilterKeys=()=>keys.size>0 || pendingFilterIds.size>0;
+function readFilterKeys(params,saved){
+ if(!options.stableItemLinks){
+  keys=new Set(params.getAll('key').map(saved ? resolveStoredItem : resolveItem));
+  return;
+ }
+ keys=new Set();
+ pendingFilterIds.clear();
+ const legacyKind=saved ? 'key' : 'id';
+ for(const [field,kind] of [['key',legacyKind],['filter-key','key'],['filter-id','id']]){
+  for(const value of params.getAll(field)){
+   const {key,pending}=resolveRecordLink(value,kind,linkLookup);
+   if(pending) pendingFilterIds.add(value);else keys.add(key);
+  }
+ }
+}
 function place(){return readPlace(placeParams());}
 function itemWithKey(key){
  if(options.hasKey && !options.hasKey(key)) return;
@@ -1077,7 +1094,7 @@ function itemWithKey(key){
 function readPlace(params,{followingItemLink=false,keepKeys=false}={}){
  placeHash=location.hash;
  const saved=followingItemLink ? null : history.state?.recordTable;
- if(!keepKeys) keys=new Set(params.getAll('key').map(saved ? resolveStoredItem : resolveItem));
+ if(!keepKeys) readFilterKeys(params,saved);
  owner=ownerQueryKeys.map(key=>params.get(key)).find(Boolean) || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
@@ -1092,7 +1109,7 @@ function readPlace(params,{followingItemLink=false,keepKeys=false}={}){
   const key=savedKeys.includes(item) ? item : savedKeys[0];
   if(key) openCard(key);else opened.clear();
  }else if(!followingItemLink && item){
-  if(keys.size) keys.add(item);
+  if(hasFilterKeys()) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
@@ -1112,12 +1129,7 @@ function readPlace(params,{followingItemLink=false,keepKeys=false}={}){
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
  if(unappliedOnly && location.hash===placeHash) return false;
  const params=placeParams();
- let unresolved=false;
- const key=recordItemLink(params,value=>{
-  const resolved=resolveItem(value);
-  unresolved=Boolean(canResolveItem && !options.hasKey?.(resolved));
-  return resolved;
- },options);
+ const {key,pending}=recordItemLink(params,linkLookup);
  if(!key) return false;
  const motion=rowMotion.size ? motionsByKey().get(key) : undefined;
  if(motion){
@@ -1132,16 +1144,30 @@ function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}
   for(const [name,value] of Object.entries({owner,show,q:query,sort,dir:direction,type,'source-owner':sourceOwner,...filters}))
    if(!params.has(name)) params.set(name,value);
  }
- readPlace(params,{followingItemLink:true,keepKeys:inheritFilters && !params.has('key')});
- jump(key,{pushPlace:false,focusTarget:Boolean(params.get('jump')),keepMatchingFilters:true,unresolved});
+ const hasKeyParams=['key','filter-key','filter-id'].some(name=>params.has(name));
+ readPlace(params,{followingItemLink:true,keepKeys:inheritFilters && !hasKeyParams});
+ jump(key,{pushPlace:false,focusTarget:Boolean(params.get('jump')),keepMatchingFilters:true,unresolved:pending});
  return true;
 }
-function retryItemLink(){
- if(!pendingItem || !linkedItem || location.hash!==placeHash) return false;
- const key=resolveItem(linkedItem);
- if(!options.hasKey?.(key)) return false;
- jump(key,{pushPlace:false,focusTarget:false,keepMatchingFilters:true});
- return true;
+function retryLinks(){
+ if(location.hash!==placeHash) return false;
+ let filtersResolved=false;
+ for(const value of pendingFilterIds){
+  const {key,pending}=resolveRecordLink(value,'id',linkLookup);
+  if(pending) continue;
+  pendingFilterIds.delete(value);
+  keys.add(key);
+  filtersResolved=true;
+ }
+ if(pendingItem && linkedItem){
+  const {key,pending}=resolveRecordLink(linkedItem,'id',linkLookup);
+  if(!pending && options.hasKey?.(key)){
+   jump(key,{pushPlace:false,focusTarget:false,keepMatchingFilters:true});
+   return true;
+  }
+ }
+ if(filtersResolved) writePlace(false,history.state?.recordTable?.top);
+ return false;
 }
 function compare(a,b){
  if(Array.isArray(a)) return a[0]-b[0] || compare(a[1],b[1]);
@@ -1229,7 +1255,6 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }
-function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
@@ -1259,7 +1284,8 @@ function matches(item,selection,counts){
 }
 const normalizeWords=value=>options.normalizeWords?.(value) ?? value.trim().toLowerCase();
 function currentSelection(overrides={}){
- return {owner,show,query:normalizeWords(query),type,sourceOwner,keys,filters:{...filters},...overrides};
+ const selectedKeys=pendingFilterIds.size ? new Set([...keys,...pendingFilterIds]) : keys;
+ return {owner,show,query:normalizeWords(query),type,sourceOwner,keys:selectedKeys,filters:{...filters},...overrides};
 }
 function apply(write=true,layout={}){
  holdLog();
@@ -1273,7 +1299,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const hasKey=options.hasKey ?? (key=>rows.some(item=>item.dataset.key===key));
  const missingLinkedItem=linkedItem!=='' && !hasKey(linkedItem);
  if(missingLinkedItem){
-  keys.delete(linkedItem);
+  if(!options.stableItemLinks) keys.delete(linkedItem);
   if(openItem?.dataset.key!==linkedItem) opened.delete(linkedItem);
   if(dismissMissingItem) linkedItem='';
  }
@@ -1374,7 +1400,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   button.querySelector('[data-sort-mark]').textContent=active ? direction==='desc' ? ' ↓' : ' ↑' : '';
  });
  const empty=content.querySelector('[data-empty]');
- const missing=[...keys].filter(key=>!hasKey(key));
+ const missing=[...active.keys].filter(key=>!hasKey(key));
  let notice=content.querySelector('[data-missing-keys]');
  if(missing.length || notice || options.missingItem){
   if(!notice){
@@ -1393,11 +1419,11 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   if(detailLinkNotice) showActionFailure(detailLinkNotice,inside || '');
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
- if(group) group.hidden=!keys.size;
- const selection=items.filter(isSelected);
+ if(group) group.hidden=!hasFilterKeys();
+ const selection=items.filter(item=>!active.keys.size || active.keys.has(item.dataset.key));
  if(counts) for(const [name,values] of Object.entries(counts)) filterSelection(name).setCounts?.(values);
  const countLine=content.querySelector('[data-list-count]');
- if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
+ if(countLine) countLine.textContent=options.counts(selection,count,{show,keys:active.keys,counts});
  if(!options.mount) showHiddenActionResults(items);
  restoreLog();
  options.applied?.(selection,active,{rows,matches,count});
@@ -1433,7 +1459,8 @@ function writePlace(push=false,top){
  }
  if(options.persistLinkedTarget && linkedItem) place.set('linked','1');
  if(linkedItem && revealedLinkedItem===linkedItem) place.set('reveal','1');
- keys.forEach(key=>place.append('key',key));
+ keys.forEach(key=>place.append(options.stableItemLinks ? 'filter-key' : 'key',key));
+ pendingFilterIds.forEach(id=>place.append('filter-id',id));
  const hash='#'+place,state=placeState(top);
  if(push && hash!==location.hash) history.pushState(state,'',location.pathname+hash);
  else history.replaceState(state,'',location.pathname+hash);
@@ -1444,8 +1471,9 @@ function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
  if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
- if(retryItemLink()) return;
- apply(false,{top,normalizeOwner:!history.state?.recordTable});
+ if(retryLinks()) return;
+ const newPlace=!history.state?.recordTable;
+ apply(Boolean(newPlace && options.stableItemLinks && hasFilterKeys()),{top,normalizeOwner:newPlace});
  if(options.keepItemOnMissingLink && !history.state?.recordTable && linkedItem && !itemWithKey(linkedItem))
   history.replaceState(placeState(scrollY),'');
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
@@ -1464,7 +1492,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  linkedItem=options.missingItem ? key : '';
  pendingItem=unresolved;
  if(target){
-  if(keys.size) keys.add(key);
+  if(hasFilterKeys()) keys.add(key);
   openCard(key);
   const selection=currentSelection();
   if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
@@ -1542,6 +1570,7 @@ function resetSelection(now){
 function resetFilters(){
  const reset=resetSelection();
  ({owner,sourceOwner,show,type,query,keys}=reset);
+ pendingFilterIds.clear();
  Object.assign(filters,reset.filters);
  if(sharedWords()) filterControl.setWords(words(),query);
  apply(true);
@@ -1554,7 +1583,7 @@ function bind(){
  };
  const changeFilter=()=>{if(sharedWords()) query=currentWords();changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
-  keys.clear();changeFilter();words().focus({preventScroll:true});
+  keys.clear();pendingFilterIds.clear();changeFilter();words().focus({preventScroll:true});
  });
  content.addEventListener('click',followRecordLink);
  filterSelection('owner').bind(value=>{
@@ -1582,7 +1611,7 @@ function bind(){
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
  preserveRecordRowTop,holdLog,restoreLog,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryLinks,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
   return openItem && !openItem.hidden && location.hash===placeHash && openItem.dataset.key===key &&
    opened.has(key) && detailMissing.hidden && viewDetail.contains(form);
