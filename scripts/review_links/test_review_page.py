@@ -894,7 +894,8 @@ window.fetch=(url,options)=>{
     def test_investigation_shows_its_question_title_once_in_details(self) -> None:
         title = 'Why did the gate stop?'
         filed = investigation.file(self.fixture.unit.id, title, title, waiting_why='The owner must complete the investigation.')
-        investigation_record = investigation.answer(filed.owner, filed.id, 'The test failed. The repair is ready.')
+        with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+            investigation_record = investigation.answer(filed.owner, filed.id, 'The test failed. The repair is ready.')
         item = next(item for item in review_items.read(self.root)
                     if item.key == f'investigation/{investigation_record.owner}/{investigation_record.id}')
         self.assertEqual(item.title, investigation_record.question)
@@ -953,6 +954,11 @@ window.fetch=(url,options)=>{
     def investigation(self, ready: bool = True) -> investigation.Investigation:
         item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.', waiting_why='The owner must complete the investigation.')
         return investigation.answer(item.owner,item.id,'The test failed. The repair is ready.') if ready else item
+
+    def legacy_investigation(self) -> investigation.Investigation:
+        """Keep the answer on Review when List filing fails."""
+        with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+            return self.investigation()
 
     def decisions(self) -> tuple[str, str]:
         """File one proposal and one efficiency for the page owner; return their Review keys."""
@@ -1631,7 +1637,7 @@ window.fetch=(url,options)=>{
 
         def rebuild(root: Path) -> review_page.ReviewSnapshot:
             if read.is_set():
-                during_retry.append(key in cache.get().records)
+                during_retry.append(any(entry['key'] == key for entry in cache.get().entries))
                 retry.set()
                 return original(root)
             read.set()
@@ -1639,6 +1645,7 @@ window.fetch=(url,options)=>{
                 raise TimeoutError('The test did not release the old read.')
             return previous
 
+        destination: investigation.ListDestination
         with patch.object(review_page, 'build_snapshot', side_effect=rebuild):
             cache.start()
             cache.invalidate()
@@ -1646,13 +1653,19 @@ window.fetch=(url,options)=>{
                 self.assertTrue(read.wait(TEST_HANG_GUARD_SECS))
                 saved = cache.save(self.card_body(previous, key, 'answer', 'Use the first layout.'), self.status)
                 self.assertEqual(cache.get().version, saved.version)
-                self.assertNotIn(key, cache.get().records)
+                self.assertNotIn(key, {entry['key'] for entry in cache.get().entries})
+                handoff = cache.get().records[key].exchange_handoff
+                assert isinstance(handoff, review_items.FiledReviewExchange)
+                self.assertTrue(handoff.hides_card)
+                destination = handoff.destination
             finally:
                 release.set()
             self.assertTrue(retry.wait(TEST_HANG_GUARD_SECS))
             cache.synchronize()
         self.assertEqual(during_retry, [False])
-        self.assertNotIn(key, cache.get().records)
+        self.assertNotIn(key, {entry['key'] for entry in cache.get().entries})
+        item = the_list.load(destination.keeper, f'L{destination.number}')
+        self.assertIs(item.state, the_list.ItemState.WORKING)
 
     def test_snapshot_skips_a_malformed_question_at_startup_and_during_updates(self) -> None:
         key = self.question()
@@ -4169,7 +4182,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
 
     def test_page_reuses_the_list_table_and_has_only_this_phases_actions(self) -> None:
         _ = self.question()
-        _ = self.investigation()
+        _ = self.legacy_investigation()
         source = review_page.render(self.root).decode()
         self.assertIn(record_table.STYLE,source)
         self.assertIn(record_table.SCRIPT,source)
@@ -4178,7 +4191,8 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         for kind in ('question','change','investigation'):
             self.assertIn(f'data-filter-value="{kind}"',source)
         cards = ''.join(review_page.build_snapshot(self.root).body(item.key).decode() for item in review_items.read(self.root))
-        for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
+        self.assertRegex(cards, r'<button[^>]*value="works"[^>]*>Works<template data-send-with-words')
+        for action in ('Answer','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',cards)
         self.assertIn('data-later-toggle>Later <span',cards)
         self.assertIn('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',source)
@@ -4188,7 +4202,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
     def test_open_state_replaces_for_you_without_changing_the_user_totals(self) -> None:
         _ = self.decisions()
         _ = self.question()
-        _ = self.investigation()
+        _ = self.legacy_investigation()
         _ = self.investigation(False)
         records = review_items.read(self.root)
         actionable = [item for item in records if item.for_you(datetime.now(user_zone()))]
@@ -4316,7 +4330,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         self.maxDiff: int | None = None
         proposals = self.decisions()
         question = self.question()
-        ready = self.investigation()
+        ready = self.legacy_investigation()
         waiting = self.investigation(False)
         finished = self.investigation()
         _ = investigation.mark_read(finished.owner, finished.id)
@@ -4555,7 +4569,13 @@ window.fetch=async(url,options)=>{
   const ownerChips=()=>[...document.querySelectorAll('[data-filter-row="owner"] [data-filter-value]:not([hidden])')];
   const selectedOwner=(doc=document)=>doc.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]');
   const chooseOwner=value=>ownerChip(value).click();
-  const chooseType=value=>document.querySelector('[data-filter-row="type"] [data-filter-value="'+(value || 'all')+'"]').click();
+  const chooseType=async value=>{
+   const button=document.querySelector('[data-filter-row="type"] [data-filter-value="'+(value || 'all')+'"]');
+   if(!button.hidden){button.click();return;}
+   const params=new URLSearchParams(location.hash.slice(1));params.set('type',value);
+   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   location.hash=params;await changed;
+  };
   chip('open').click();await flush();await flush();
   const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
   const builderChip=ownerChip(builder),builderName=builderChip.querySelector('.staff-name');
@@ -4566,7 +4586,7 @@ window.fetch=async(url,options)=>{
   check(builderChip.getAttribute('aria-pressed')==='true' &&
     getComputedStyle(builderName).color===getComputedStyle(builderChip).color,
     'A selected Owner name inherits the chip color');
-  chooseType('question');
+  await chooseType('question');
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1' &&
     ownerChips().some(button=>button.textContent==='page-owner 1') &&
     ownerChip(builder).hidden,
@@ -4583,7 +4603,7 @@ window.fetch=async(url,options)=>{
   check(ownerChips()[0].textContent==='All 2' && filterControl.ownerId(selectedOwner())===builder,
     'Show limits Owner counts and retains an owner with matching loaded rows');
   chip('open').click();await flush();await flush();
-  chooseType('question');chooseOwner(filterControl.ownerId(ownerChips().find(button=>button.dataset.ownerName==='page-owner')));
+  await chooseType('question');chooseOwner(filterControl.ownerId(ownerChips().find(button=>button.dataset.ownerName==='page-owner')));
   chip('Done').click();await flush();await flush();
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && filterControl.ownerId(selectedOwner())!=='' &&
     ownerChips()[1].textContent==='page-owner 0',
@@ -4602,7 +4622,7 @@ window.fetch=async(url,options)=>{
     [...legacy.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     !new URLSearchParams(legacy.contentWindow.location.hash.slice(1)).get('owner'),
     'F007: a legacy owner without the selected type resets to All.');legacy.remove();
-  chooseType('question');
+  await chooseType('question');
   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams({owner:'builder-unit',type:'investigation',show:'open'});
   await navigated;await flush();await flush();
@@ -4620,7 +4640,7 @@ window.fetch=async(url,options)=>{
     count('open',translatedPage)?.textContent==='1',
     'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
   translated.remove();
-  chooseType('question');chooseOwner(filterControl.ownerId(ownerChips().find(button=>button.dataset.ownerName==='page-owner')));
+  await chooseType('question');chooseOwner(filterControl.ownerId(ownerChips().find(button=>button.dataset.ownerName==='page-owner')));
   const questionOwner=filterControl.ownerId(selectedOwner());
   const hasEmptyOwnerSelection=()=>ownerChips().length===2 && ownerChips()[0].textContent==='All 0' &&
    filterControl.ownerId(selectedOwner())===questionOwner && selectedOwner().textContent==='page-owner 0';
@@ -4772,7 +4792,10 @@ window.fetch=async(url,options)=>{
    'An empty filtered view has zero in every applicable count.');
   search('');show('all').click();await flush();await flush();
   check(type('change').querySelector('b').textContent==='2','Type counts include the selected Show.');
-  type('question').click();
+  check(type('question').hidden,'Questions are absent from the Review Type choices.');
+  const place=new URLSearchParams(location.hash.slice(1));place.set('type','question');
+  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=place;await navigated;
   const row=document.querySelector('[data-list-item][data-type="question"]');
   row.querySelector('.list-toggle').click();await readyReviewCard(row);
   const form=recordDetails(row).querySelector('form');form.elements.feedback.value='Use the first layout.';
@@ -5819,7 +5842,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         producer = fixture_member('producer', name='builds')
         bug = investigation.file(producer.id, 'Check the build', 'Which step stopped?', waiting_why='builds checks the failure.',
                                  kind=investigation.InvestigationKind.BUG)
-        _ = investigation.answer(bug.owner, bug.id, 'The test step.')
+        with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+            _ = investigation.answer(bug.owner, bug.id, 'The test step.')
         key = f'investigation/{bug.owner}/{bug.id}'
         before = review_page.build_snapshot(self.root)
         request = console.NewsRequest(self.root)
@@ -6034,7 +6058,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
     def test_each_type_has_the_approved_action_groups_and_later(self) -> None:
         proposal, efficiency = self.decisions()
         question = self.question()
-        ready = self.investigation()
+        ready = self.legacy_investigation()
         expected = {question:('answer','feedback','question'),
                     'page-owner/C1':('works','not works','validate','feedback','question'),
                     f'investigation/{ready.owner}/{ready.id}':('read','feedback','question'),
@@ -7030,7 +7054,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
             producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
         decisions = self.decisions()
         question = self.question()
-        ready = self.investigation()
+        ready = self.legacy_investigation()
         keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions)
         until = datetime.now(user_zone()).replace(second=0,microsecond=0)+timedelta(days=1)
         for key in keys:
@@ -7042,7 +7066,8 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                     change_page.deliver(delivery, self.status)
                     request = self.status.slots(delivery.page, delivery.row).question
                     assert isinstance(request, change_page.OpenQuestion)
-                    self.assertTrue(change_page.answer_item(key, 'The check passed.', request.question_id, self.status))
+                    with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+                        self.assertTrue(change_page.answer_item(key, 'The check passed.', request.question_id, self.status))
                     item = review_page.build_snapshot(self.root).records[key]
                     self.assertTrue(item.unread_answer)
                 body = self.body(key,'later','Read this tomorrow.')+'&'+urlencode({'later':until.isoformat()})
@@ -7373,7 +7398,7 @@ window.fetch=async(url,options={})=>{
         self.assertNotIn('proposal_id', body, 'The issue front matter stays off the card.')
         efficiency_body = review_page.build_snapshot(self.root).body(efficiency).decode()
         self.assertIn('<button data-send-receiver="" name="outcome" value="decline">Decline</button>', efficiency_body)
-        report = self.investigation()
+        report = self.legacy_investigation()
         report_body = review_page.build_snapshot(self.root).body(f'investigation/{report.owner}/{report.id}').decode()
         self.assertIn('<button data-send-receiver="" name="outcome" value="read"', report_body)
         commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
@@ -7633,7 +7658,7 @@ window.fetch=async(url,options={})=>{
         self.assertEqual(firefox_probe_results(page), [[]])
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
-        _ = self.investigation()
+        _ = self.legacy_investigation()
         _ = self.investigation(False)
         proposals = self.fixture.temporary / 'issues'
         proposals.mkdir()

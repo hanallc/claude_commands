@@ -4963,7 +4963,8 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                          ['owner', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>', shows),
-                         [("all", "All"), ("needs-me", "Needs me"), ("producer-answering", "Producer answering"),
+                         [("all", "All"), ("needs-me", "Needs me"), ("questions", "Questions"), ("answers", "Answers"),
+                          ("producer-answering", "Producer answering"),
                           ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked"),
                           ("scheduled", "Scheduled")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
@@ -5652,7 +5653,7 @@ document.body.append(result);
         def check_counts(page: str, needs_me: int, parked: int) -> None:
             controls = page.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
             self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls),
-                             ["2", str(needs_me), "0", "0", "0", str(parked), "0"])
+                             ["2", str(needs_me), "0", "0", "0", "0", "0", str(parked), "0"])
 
         check_counts(initial, 0, 2)
         answered = list_page.render(root, include_counts=False).decode()
@@ -9010,7 +9011,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
   const retry=submit('question',current);
   check(retry.id===first.id && retry.token===first.token,'The retry keeps the signed Ask.');
  });
- check(toast==='Sent to '+name+'.','The retry toast names the receiver on the Ask button.');
+ check(toast==='Saved.','The retry toast confirms the save.');
 """
         self.browser_action_sequence(steps.replace("AFTER_PAGE", after), add_item=False, markup=before,
                                      reduced_motion=True)
@@ -9694,6 +9695,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                               self.assertRaisesRegex(OSError, "Cannot save the question")):
                             _ = list_page.submit(root, fields, status)
                         self.assertEqual(the_list.load(MORTY.id, item.id), item)
+                        place.assert_called_once_with(DWIGHT.current_session)
+                        place.reset_mock()
                     if producer_state in ("failed save", "exited"):
                         place.return_value = HerdrPlace("native", "w1:p1")
                     asked = list_page.submit(root, fields, status)
@@ -13810,7 +13813,7 @@ try{
   await until(()=>!form.dataset.sending,'the '+action+' response');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
-  check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
+  check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh: '+action);
   const motions=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
   await Promise.allSettled(motions.map(animation=>animation.finished));
   if(action==='tell'){

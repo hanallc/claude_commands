@@ -1608,6 +1608,7 @@ def resolve_legacy_question_destination(
             return QuestionRoute.UNRESOLVED
 
     transferred = False
+    staged_transfer = False
     has_receipt = False
     if folder is not None:
         has_receipt = any((folder / name).exists() for name in ("receipt.json", "pending.json", "move.json", "moved.json"))
@@ -1617,7 +1618,7 @@ def resolve_legacy_question_destination(
             if isinstance(submission, new_item_dialog.ReviewSubmission):
                 try:
                     recipient = new_item_dialog.request_recipient(new_item_dialog.SubmissionKind.QUESTION, request)
-                except new_item_dialog.SubmissionError:
+                except record_store.SubmissionError:
                     recipient = record.owner
                 transferred = transferred or recipient != record.owner
                 if (folder / "moved.json").is_file():
@@ -1632,6 +1633,9 @@ def resolve_legacy_question_destination(
                         if len(original_rows) == 1:
                             primary = origin if created else the_list.NoQuestionItem.ORDINARY
                             return ResolvedQuestionDestination(original_rows[0], primary)
+                        # A verified transfer can resume a Studio send before its first List row.
+                        staged_transfer = (not original_rows and studio is StudioRouteOwner.STUDIO_SEND
+                                           and studio_route is QuestionRoute.STAGED_STUDIO)
                 try:
                     receipt = review_submissions._read_request_file(folder / "receipt.json", folder.name)  # pyright: ignore[reportPrivateUsage]
                 except (OSError, ValueError):
@@ -1642,7 +1646,7 @@ def resolve_legacy_question_destination(
 
     if isinstance(exchange, the_list.ExchangeDestination):
         return ResolvedQuestionDestination(exchange.destination, the_list.NoQuestionItem.ORDINARY)
-    if transferred or move_markers:
+    if move_markers or (transferred and not staged_transfer):
         return QuestionRoute.UNRESOLVED
     if origin.source_key in links.filed_sources or the_list.exchange_filing_started(origin.source_key):
         return QuestionRoute.UNRESOLVED

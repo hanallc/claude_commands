@@ -329,7 +329,12 @@ class ReviewRepairsTests(unittest.TestCase):
                         page = review_actions.delivery_page(item, case.status)
                         question = case.status.slots(page, page.rows[0]).question
                     identity = question.question_id if isinstance(question, change_page.OpenQuestion) else ''
-                    _ = change_page.answer_item(key,'The owner checked the next case.',identity,case.status)
+                    if isinstance(item.source, review_items.ChangeSource):
+                        _ = change_page.answer_item(key,'The owner checked the next case.',identity,case.status)
+                    else:
+                        # Keep the legacy Review card when the List cannot accept the answer.
+                        with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+                            _ = change_page.answer_item(key,'The owner checked the next case.',identity,case.status)
                 if self.path in ('/problem', '/passed'):
                     row, verdict = ('C1', 'not works: The spacing differs.') if self.path == '/problem' else ('C2', 'works')
                     page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, (row,), '')
@@ -457,8 +462,10 @@ window.fetch=(url,options)=>{
    visibleOwners().every(button=>button.type==='button' && button.tabIndex===0 && button.querySelector('b')),
    'Owner uses native chips with All first and pressed.');
   const search=document.querySelector('#list-search');
-  reviewChip('type','question').click();
-  check(count('')==='2' && count(PAGE_OWNER)==='2','Owner counts use the selected Type.');
+  check(reviewChip('type','question').hidden,'Questions are absent from the Review Type choices.');
+  await navigate({type:'question',show:'open'});
+  check(count('')==='2' && count(PAGE_OWNER)==='2',
+   'Owner counts use the selected Type. All '+count('')+', page owner '+count(PAGE_OWNER)+'.');
   search.value='layout';search.dispatchEvent(new Event('input'));
   check(count('')==='1' && count(PAGE_OWNER)==='1','Owner counts use the words filter.');
   ownerChip(PAGE_OWNER)?.click();
@@ -476,9 +483,9 @@ window.fetch=(url,options)=>{
   check(pressed(UNIT_OWNER) && count(UNIT_OWNER)==='0' && document.activeElement===ownerChip(UNIT_OWNER),
    'Refresh keeps the selected Owner chip, its count and its focus.');
   const unitChip=ownerChip(UNIT_OWNER);
-  reviewChip('type','question').click();
+  await navigate({owner:UNIT_OWNER,type:'question',show:'open'});
   check(pressed('') && !address().get('owner') && unitChip && unitChip===ownerChip(UNIT_OWNER) && unitChip.hidden,
-   'A Type without the selected owner resets to All and hides the same chip.');
+   'A Type without the selected owner resets to All and hides the same chip. Owner '+address().get('owner')+'.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
@@ -488,12 +495,13 @@ window.fetch=(url,options)=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_legacy_source_owner_does_not_limit_owner_chip_counts(self) -> None:
-        first = self.case.investigation()
+        first = self.case.legacy_investigation()
         owner = fixture_member('showrunner', name='second-owner')
         second = investigation.file(
             owner.id, 'Why did the second gate stop?', 'Read the log.',
             waiting_why='The owner must complete the investigation.')
-        _ = investigation.answer(second.owner, second.id, 'The repair is ready.')
+        with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+            _ = investigation.answer(second.owner, second.id, 'The repair is ready.')
         _ = self.case.investigation(False)
         probe = r'''
 (()=>{
@@ -516,7 +524,7 @@ window.fetch=(url,options)=>{
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_refresh_keeps_the_selected_owner_and_focus_without_matches(self) -> None:
         without_owner = test_review_page.browser_markup(self.case.root)
-        ready = self.case.investigation()
+        ready = self.case.legacy_investigation()
         before = test_review_page.browser_markup(self.case.root)
         key = f'investigation/{ready.owner}/{ready.id}'
         until = datetime.now(user_zone()) + timedelta(days=1)
@@ -557,7 +565,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_refresh_focuses_selected_owner_when_another_chip_disappears(self) -> None:
-        selected = self.case.investigation()
+        selected = self.case.legacy_investigation()
         fresh = test_review_page.browser_markup(self.case.root)
         other = fixture_member('showrunner', name='second-owner')
         _ = investigation.file(
@@ -592,7 +600,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_index_refresh_and_owner_constraints(self) -> None:
         _ = self.case.question()
-        ready = self.case.investigation()
+        ready = self.case.legacy_investigation()
         _ = self.case.investigation(False)
         setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
 window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
@@ -612,7 +620,13 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
  const selectedOwner=()=>pressedChip('owner');
  const chooseOwner=value=>ownerChip(value).click();
 
- const type=value=>reviewChip('type',value).click();
+  const type=async value=>{
+   const button=reviewChip('type',value);
+   if(!button.hidden){button.click();return;}
+   const params=new URLSearchParams(location.hash.slice(1));params.set('type',value);
+   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   location.hash=params;await changed;
+  };
  const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
  const save=async form=>{
   const complete=new Promise(resolve=>{
@@ -651,7 +665,7 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
    'F007: the owner chip counts only the Open records.');
   check(!ownerChip(UNIT_OWNER).hidden,
    'F007: Owner lists matching type and words across every Show');
-  type('question');
+  await type('question');
   check(selectedOwner().dataset.filterValue==='all' && visibleOwners().length===2 &&
    visibleOwners()[1].dataset.ownerName==='page-owner' &&
    !new URLSearchParams(location.hash.slice(1)).get('owner'),
@@ -677,7 +691,7 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
     def test_showrunner_check_stays_out_of_open_after_refresh_and_returns_only_for_a_problem(self) -> None:
         decisions = self.case.decisions()
         question = self.case.question()
-        ready = self.case.investigation()
+        ready = self.case.legacy_investigation()
         markup = review_page.render(self.case.root).decode()
         setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
 let allowReviewRefresh=Promise.resolve();
@@ -819,9 +833,9 @@ window.fetch=async(url,options={})=>{
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_legacy_list_count_links_keep_the_review_owner(self) -> None:
         question_key = self.case.question()
-        ready = self.case.investigation()
+        ready = self.case.legacy_investigation()
         _ = self.case.investigation(False)
-        read = self.case.investigation()
+        read = self.case.legacy_investigation()
         _ = investigation.mark_read(read.owner, read.id)
         members = staff.snapshot()
         owner = next(row for row in members.rows if row.name == 'page-owner')

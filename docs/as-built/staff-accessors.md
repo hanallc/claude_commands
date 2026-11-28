@@ -282,6 +282,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fake_unit_host.py` | read | by_path |
 | `scripts/production/footer_counts.py` | read | snapshot |
 | `scripts/production/investigation.py` | read | snapshot, by_current_session and by_id find the caller and the owner of an investigation |
+| `scripts/production/list_exchange.py` | read | StaffId and StaffSnapshot identify the participants in a List exchange. |
 | `scripts/production/waiting_why.py` | read | snapshot supplies the filer name for missing Waiting reasons |
 | `scripts/production/live_units.py` | read | snapshot |
 | `scripts/production/producer_map.py` | read | snapshot, active, by_id, by_path and qualified_name resolve members, find the producer that each showrunner or unit reports to, and name the member to map |
@@ -345,6 +346,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/production/worker_capacity.py` | read | snapshot, local_snapshot, WorkerName.parse, CodexBackend; staff writes go through restart.stop_row and worker_panes.close |
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
+| `scripts/review_links/answer_sources.py` | read | snapshot and StaffSnapshot identify the owners of Review and List records. |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
 | `scripts/review_links/console.py` | read | local_snapshot gives the staff rows for the page owner controls in the unavailable view; StaffRow (type) checks the shown owner |

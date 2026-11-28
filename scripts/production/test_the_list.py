@@ -29,7 +29,7 @@ from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf, main_publish
 from scripts.message import send_result, session_send
 from scripts.notify import review
-from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
+from scripts.production import change_review, delivery_state, investigation, list_exchange, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, new_item_dialog, question_record, review_items, review_submissions
 
@@ -3217,8 +3217,13 @@ the_list.fire_scheduled(timedelta(minutes=2))
         assert isinstance(answer, question_record.Answer)
         self.assertEqual(answer.text, words)
         self.assertEqual(saved.questions, (replace(closed.questions[0], answer=answer),))
+        exchange, = saved.filed_exchanges
+        self.assertIs(exchange.source, list_exchange.Source.LIST)
+        self.assertEqual(exchange.question, closed.questions[0].words)
+        self.assertEqual(exchange.answer, list_exchange.ExchangeAnswer(
+            words, datetime.fromisoformat(answer.answered_at), list_exchange.AnswerRead.UNREAD))
         self.assertEqual(replace(saved, updated=closed.updated, unread_since=closed.unread_since,
-                                 log=closed.log, questions=closed.questions), closed)
+                                 log=closed.log, questions=closed.questions, filed_exchanges=closed.filed_exchanges), closed)
 
     def test_list_command_keeps_an_item_while_its_question_waits(self) -> None:
         item = self.add("Check the List")

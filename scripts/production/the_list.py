@@ -2393,9 +2393,12 @@ def display_list_records(*, include_closed: bool, sources: list[Path] | None = N
     for owner in owners:
         keeper = staff.StaffId(owner.name)
         path = folder(keeper)
-        if sources is not None:
-            sources.append(path)
         try:
+            # Do not watch the statusline cache directory for an absent List folder.
+            if owner.name == "counts" and not path.exists():
+                continue
+            if sources is not None:
+                sources.append(path)
             if owner.is_symlink() or not owner.is_dir():
                 continue
             physical = list_folder_identity(keeper)

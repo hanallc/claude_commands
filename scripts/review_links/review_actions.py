@@ -301,7 +301,7 @@ def studio_question_target(item: review_items.ReviewItem) -> StudioQuestionTarge
 def studio_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
                            action: Literal['answer', 'question'], words: str,
                            status: change_page.DeliveryStatus, route: change_browser.QuestionRoute,
-                           target: StudioQuestionTarget
+                           target: StudioQuestionTarget, *, verify_revision: Callable[[], object]
                            ) -> tuple[change_page.MessageDelivery, str]:
     question = change_browser.WaitingQuestion(item.key, '', record, update_registration.question_source(route.production),
                                               record.owner, '')
@@ -326,7 +326,7 @@ def studio_question_action(item: review_items.ReviewItem, record: update_registr
             if current.owner != target.owner:
                 raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
             change_browser.save_question_record(route.production, question, action, words,
-                                                change_browser.SelectedQuestionSave(), before_write=lambda: None)
+                                                change_browser.ExactQuestionSave(verify_revision), before_write=lambda: None)
 
     return save_delivery(page, target.owner, save, status, opened), words
 

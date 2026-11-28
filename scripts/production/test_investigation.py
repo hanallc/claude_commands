@@ -18,7 +18,7 @@ from unittest.mock import patch
 from scripts.console_text.test_support import accepting_console_text, real_review_question
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
-from scripts.production import investigation, staff, the_list
+from scripts.production import investigation, list_exchange, staff, the_list
 from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
 
 RUNNER = staff.StaffRow(staff.StaffId("32102748-cf44-498e-9a53-b710c2a70916"), "showrunner", "show", staff.StaffRoot(),
@@ -322,9 +322,19 @@ class InvestigationTests(unittest.TestCase):
             self.assertEqual(self.command("answer", "--id", "I1", "--owner", OWNER.id, "--text", "Found it.")[0], 0)
             self.assertEqual(self.command("read", "--id", "I1", "--owner", OWNER.id)[0], 0)
         self.assertEqual(investigation.load(OWNER.id, "I1").state, investigation.InvestigationState.READ)
-        self.assertEqual(investigation.load(OTHER.id, "I14").state, investigation.InvestigationState.OPEN)
-        row, = the_list.records(LIST_KEEPER.id)
+        other = investigation.load(OTHER.id, "I14")
+        self.assertEqual(other.state, investigation.InvestigationState.OPEN)
+        destination = other.list_destination
+        assert isinstance(destination, investigation.ListDestination)
+        self.assertEqual(destination.keeper, LIST_KEEPER.id)
+        row = the_list.load(destination.keeper, f"L{destination.number}")
         self.assertEqual((row.owner, row.producer), (OTHER.id, OTHER.id))
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, f"investigation/{OTHER.id}/I14")
+        answers = {exchange.source_key: exchange.answer.text
+                   for item in the_list.records(LIST_KEEPER.id) for exchange in item.filed_exchanges
+                   if isinstance(exchange.answer, list_exchange.ExchangeAnswer)}
+        self.assertEqual(answers, {f"investigation/{OWNER.id}/{identity}": "Found it." for identity in ("I1", "I12")})
 
     def test_missing_callers_and_invalid_inputs_get_one_refusal_line(self) -> None:
         for args in (("file", "--title", "Two\nlines", "--question", "Why?"),

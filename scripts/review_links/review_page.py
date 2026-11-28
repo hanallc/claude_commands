@@ -121,11 +121,10 @@ def record_revision(item: ReviewItem, assets: Mapping[str, str],
     """Identify the complete retained record and its displayed assets."""
     source = item.source
     if isinstance(source, review_items.ChangeSource):
-        change_route = source.validators if item.state == ReviewState.VALIDATING else source.assignment
-        if isinstance(members, staff_names.NameReading):
-            members = staff.snapshot()
-        receivers = review_receivers(item, members)
-        record = (source.path, source.row, source.slots, item.times.later, change_route, receivers)
+        # A verdict follows the current production. The form checks any named recipient separately.
+        record = (source.path, source.row, source.slots, item.times.later)
+        if item.state == ReviewState.VALIDATING:
+            record = (record, item.owner, source.validators)
     elif isinstance(source, review_items.QuestionSource):
         if isinstance(members, staff_names.NameReading):
             members = staff.snapshot()
@@ -1652,15 +1651,15 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             action = cast(change_page.QuestionOutcome, outcome)
             if isinstance(studio_target, review_actions.StudioQuestionTarget) and outcome in ('answer', 'question'):
                 delivery, answer = review_actions.studio_question_action(
-                    item, source.record, outcome, words, status, route, studio_target)
+                    item, source.record, outcome, words, status, route, studio_target, verify_revision=validate)
             elif 'review_submission' in source.record.item:
                 delivery, answer = review_actions.sent_question_action(
-                    item, source.record, route.production, action, words, status)
+                    item, source.record, route.production, action, words, status, verify_revision=validate)
             else:
                 question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
                     update_registration.question_source(route.production), item.owner, review_items.name(source.record.asker, members))
                 delivery, answer = change_browser.submit_question(
-                    question, action, words, status, save=change_browser.SelectedQuestionSave(), route=route)
+                    question, action, words, status, save=change_browser.ExactQuestionSave(validate), route=route)
             if outcome == 'question':
                 if studio_target is NoStudioQuestion.ABSENT:
                     with review_items.after_store_write(item.key):

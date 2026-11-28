@@ -639,7 +639,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                                      (the_list.ReportKind.INVESTIGATION, saved["key"]))
                     retry = self.new_item_http(body, finished=True)
                     self.assertEqual(retry.status, 200, retry.body)
-                    self.assertEqual(json.loads(retry.body), saved)
+                    repeated = cast(dict[str, str], json.loads(retry.body))
+                    self.assertEqual(repeated["version"], cache.get().version)
+                    self.assertEqual(repeated, saved | {"version": repeated["version"]})
                     send.assert_called_once_with(f"session:{producer.current_session}", change_page.SENDER, ANY)
                     if assignee is not None:
                         self.assertIn(f"{assignee.name} is the assignee.", cast(str, send.call_args.args[2]))
@@ -3120,8 +3122,18 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn("Answer: " + words, [event.words for event in answered.log])
             with patch.object(cache, "get", return_value=rebuilt):
                 card = self.request(review_page.PAGE_PATH + "?" + urlencode({"body": saved["key"]}))
-            self.assertEqual(card.status, 200)
-            self.assertIn(b"The second line reached Review.", card.body)
+            if kind == new_item_dialog.SubmissionKind.INVESTIGATION:
+                self.assertNotIn(answered.key, {entry["key"] for entry in rebuilt.entries})
+                handoff = answered.exchange_handoff
+                assert isinstance(handoff, review_items.FiledReviewExchange)
+                self.assertEqual((card.status, card.headers.get("location")),
+                                 (303, review_page.report_url(handoff.destination)))
+                row = the_list.load(handoff.destination.keeper, f"L{handoff.destination.number}")
+                self.assertEqual([exchange.answer.text for exchange in row.filed_exchanges
+                                  if isinstance(exchange.answer, list_exchange.ExchangeAnswer)], [words])
+            else:
+                self.assertEqual(card.status, 200)
+                self.assertIn(b"The second line reached Review.", card.body)
 
     def test_f024_question_retry_after_lost_response_reuses_one_sender_record(self) -> None:
         case = self.review_fixture()
@@ -5981,7 +5993,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
                     self.finish_new_item_posts()
                     saved = cast(dict[str, str | int], json.loads(replies[0].body))
-                    self.assertEqual(saved, json.loads(replies[1].body))
+                    repeated = cast(dict[str, str | int], json.loads(replies[1].body))
+                    self.assertEqual(repeated, saved | {"version": repeated["version"]})
                     self.assertEqual(saved['reply_owner'], owner.id)
                     fields = {'id', 'key', 'version', 'reply_owner'}
                     if kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION):
@@ -6486,7 +6499,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                                              headers={"Accept-Encoding": "gzip"})
                     self.assertEqual(status, 200, body)
                     self.assertIsInstance(cast(object, json.loads(body)), dict)
-        self.assertNotIn(answer, cache.get().records)
+        self.assertNotIn(answer, {entry['key'] for entry in cache.get().entries})
+        self.assertTrue(review_items.on_list(cache.get().records[answer]))
         self.assertIsInstance(cache.get().records[later].times.later, datetime)
 
     def test_review_verdict_uses_the_current_production_after_a_transfer(self) -> None:
@@ -6973,9 +6987,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         new_owner = fixture_member("producer", name="new-layout-owner")
         action = review_actions.studio_question_action
 
-        def reassign_then_save(*args: object) -> object:
+        def reassign_then_save(*args: object, **kwargs: object) -> object:
             _ = the_list.update(row.keeper, row.item.id, {"owner": new_owner.id}, source="nate")
-            return cast(Callable[..., object], action)(*args)
+            return cast(Callable[..., object], action)(*args, **kwargs)
 
         with (capture_sender("send_to_staff") as send,
               patch.object(review_actions, "studio_question_action", side_effect=reassign_then_save) as save):
@@ -7798,7 +7812,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         log = page.partition(b'class="list-log-scroll"')[2].partition(b'</ol>')[0]
         self.assertRegex(log, rb'<strong>Answer</strong>[^<]*<small>[^<]*<span[^>]*>layout-owner</span>')
         self.assertEqual(log.count(words.encode()), 1)
-        self.assertEqual(page.count(words.encode()), 1)
+        questions = page.partition(b'<h3>Answer from ')[2].partition(b'<div data-list-item-content>')[0]
+        self.assertEqual(questions.count(words.encode()), 1)
+        self.assertEqual(page.count(words.encode()), 2)
 
         self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
         self.assertEqual(the_list.load(keeper.id, item.id), first)
@@ -7822,7 +7838,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(body.get("unread_answer"), "false")
         detail = body.get("detail_html", "")
         self.assertNotIn('<small data-new-answer>New answer</small>', detail)
-        self.assertEqual(detail.count(words), 1)
+        self.assertEqual(detail.count(words), 2)
 
     def test_proposal_reply_retry_saves_the_missing_list_receipt(self) -> None:
         case = self.review_fixture()
@@ -8581,7 +8597,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_rechecks_each_record_after_the_first_read(self) -> None:
         case = self.review_fixture(changes=1)
         question = case.question()
-        report = case.investigation()
+        report = case.legacy_investigation()
         change = 'page-owner/C1'
         investigation_key = f'investigation/{report.owner}/{report.id}'
         self.assert_stale_review_actions(case, (
@@ -8617,9 +8633,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         before = path.read_bytes()
 
         def insert_later_after_read(root: Path, item: review_items.ReviewItem,
-                                    members: staff.StaffSnapshot) -> review_items.ReviewItem:
+                                    members: staff.StaffSnapshot, *, include_filed: bool = False,
+                                    sources: list[Path] | None = None) -> review_items.ReviewItem:
             nonlocal changed
-            current = read(root, item, members)
+            current = read(root, item, members, include_filed=include_filed, sources=sources)
             if not changed:
                 changed = True
                 review_later.save(key, until)

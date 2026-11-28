@@ -24,7 +24,7 @@ from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
-from scripts.review_links import list_draft, question_record, review_events
+from scripts.review_links import list_draft, question_record, review_events, review_items
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -52,9 +52,12 @@ MOVE_QUESTION = update_registration.QuestionParts(
 
 class BehaviorReviewTests(ScriptRepositoryTestCase):
     producer: staff.StaffRow = staff.StaffRow(staff.StaffId("e31b40f3-fd25-4c3c-97e3-f80783736401"), "producer",
-                                             "fixture", staff.STAFF_ROOT, current_session=staff.StaffId("claude-fixture"))
+                                             "fixture", staff.STAFF_ROOT,
+                                             current_session=staff.StaffId("8251a203-1684-4dc3-b197-76d352fc34e5"))
+    keeper: staff.StaffRow = staff.StaffRow(staff.StaffId("b4fa4921-ac38-4516-ac9d-c4a0478aca47"), "producer", "morty",
+                                           staff.STAFF_ROOT, current_session=staff.StaffId("ed841238-6636-42b1-b2b7-d68ae37f45fc"))
     identities: update_registration.QuestionStaff = update_registration.QuestionStaff(
-        staff.StaffSnapshot((producer,)), session_staff.MemberSources(()))
+        staff.StaffSnapshot((producer, keeper)), session_staff.MemberSources(()))
     folder: Path = Path()
 
     @override
@@ -62,6 +65,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         super().setUp()
         self.environment["SHOWRUNNER_STATE_DIR"] = str(self.root / "showrunner")
         self.environment["ASTRA_ROLES_STATE"] = str(self.root / "astra-roles")
+        config = self.root / "config"
+        _ = self.write(config / "console.conf", f"page.list.owner={self.keeper.id}\n")
+        self.environment["CONF_DIR"] = str(config)
+        self.environment["USER_ZONE"] = "UTC"
+        self.environment["STAFF_FILE"] = str(self.write(self.root / "staff.json", self.identities.record.encode()))
         self.folder = self.root / "review-run"
         self.folder.mkdir()
         _ = self.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root))
@@ -70,6 +78,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         _ = self.enterContext(mock.patch.object(update_registration.QuestionStaff, "read", return_value=self.identities))
         _ = self.enterContext(mock.patch.object(staff, "local_snapshot", return_value=self.identities.record))
         _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", return_value=self.identities.record))
+        _ = self.enterContext(staff.supplied_snapshot(self.identities.record))
         _ = self.enterContext(mock.patch.object(update_registration, "user_zone", return_value=ZoneInfo("UTC")))
         self.seed()
 
@@ -131,10 +140,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return finding
 
     def new_list_record(self) -> tuple[record_store.NumberedRecords, str]:
-        keeper = replace(self.producer, name="morty")
-        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
-            item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
-        return list_draft.list_records(keeper.id), item.id
+        item = the_list.add(self.keeper.id, "Set the move timing", owner=self.producer.id, source="nate", changes={})
+        return list_draft.list_records(self.keeper.id), item.id
 
     def question_file(self, parts: update_registration.QuestionParts) -> Path:
         return self.write(self.root / "question.json", json.dumps(parts))
@@ -736,6 +743,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
         self.assertEqual(len(records), 1)
         question = records[0]
+        item, = the_list.records(self.keeper.id)
+        origin = item.native_question
+        assert isinstance(origin, the_list.NativeQuestionItem)
+        self.assertEqual(origin.source_key, review_items.question_record_key(question))
+        self.assertIs(item.state, the_list.ItemState.WAITING_FOR_NATE)
         self.assertEqual(question.item.get("parts"), parts)
         self.assertIn(finding["quote"], (self.folder / "completed-reply.txt").read_text())
         self.assertNotIn("scripts/direct/assign.py", question.item.get("question", ""))

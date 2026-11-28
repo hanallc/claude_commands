@@ -828,7 +828,8 @@ class NewItemServerTests(unittest.TestCase):
                     native = next(record for record in investigation.records(keeper.id) if record.question == request.words)
                     key = review_items.investigation_record_key(native)
                     snapshot = review_page.build_snapshot(case.root)
-                    self.assertFalse(any(entry["key"] == key for entry in snapshot.entries))
+                    self.assertIn(key, {entry["key"] for entry in snapshot.entries})
+                    self.assertFalse(review_items.on_list(snapshot.records[key]))
 
                     if recover:
                         review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
@@ -846,6 +847,9 @@ class NewItemServerTests(unittest.TestCase):
                     self.assertEqual(recovered.owner, owner.id)
                     self.assertEqual(len(the_list.records(keeper.id)), count + 1)
                     send.assert_called_once()
+                    current = review_page.build_snapshot(case.root)
+                    self.assertNotIn(key, {entry["key"] for entry in current.entries})
+                    self.assertTrue(review_items.on_list(current.records[key]))
 
     def test_initial_report_delivery_checks_the_transferred_native_record(self) -> None:
         case = test_review_submissions.ReviewSubmissionTests()

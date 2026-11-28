@@ -2342,7 +2342,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         with (patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search,
               patch.object(review, "review_question", return_value=review.QuestionAccepted("Answer in the archive"))):
             self.assertTrue(submissions.answer(saved.key, 'Answer in the archive', token, members=wrapped))
-            self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 3)
             search.reset_mock()
             retry = submissions.submit(payload, members=wrapped)
             search.assert_called_once_with(PRODUCER, strict=True)

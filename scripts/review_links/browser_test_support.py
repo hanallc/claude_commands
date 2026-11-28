@@ -266,9 +266,11 @@ window.fetch=async(url,options={})=>{
    'the title uses the shared size and weight');
   check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px',
    'the line uses the shared font');
-  const lowerSpace=header.getBoundingClientRect().bottom-Math.max(lineBox.bottom,search?.bottom ?? lineBox.bottom)
+  const frozen=header.querySelector('[data-page-top-controls]')?.getBoundingClientRect();
+  if(frozen) check(Math.abs(frozen.top-lineBox.bottom-20)<1,'the frozen controls follow the status row by 20 pixels');
+  const lowerSpace=header.getBoundingClientRect().bottom-Math.max(lineBox.bottom,search?.bottom ?? 0,frozen?.bottom ?? 0)
    +parseFloat(getComputedStyle(header).marginBottom);
-  check(Math.abs(lowerSpace-(search ? 12 : 20))<1,'the header keeps the expected space below the status row');
+  check(Math.abs(lowerSpace-(search ? 12 : 20))<1,'the header keeps the expected space below its last row');
   const ink=document.createElement('span');ink.style.color='var(--ink)';line.append(ink);
   check(getComputedStyle(title).color===getComputedStyle(ink).color,'the title uses the shared ink color');ink.remove();
   check(getComputedStyle(document.body).backgroundColor===getComputedStyle(line).backgroundColor,

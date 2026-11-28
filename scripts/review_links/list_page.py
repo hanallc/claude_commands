@@ -3314,7 +3314,7 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- resolveItem:key=>resolveListKey(content,key),
+ resolveStoredItem:key=>resolveListKey(content,key),
  hasKey:raw=>{
   const key=resolveListKey(content,raw);
   const row=rowIn(content,key);
@@ -4216,7 +4216,10 @@ function bindFeedbackForm(form,view=tableView){
     if(!rejectsRepair && (saved || refused)) unconfirmed.delete(attempt);
     view.preserveRecordRowTop(()=>{
      setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell();
-     if(!stale) retainDraft();
+     if(!stale){
+      if(retiredDraft) identity(fresh);
+      else retainDraft();
+     }
      if(nextForm && !stale){
       bindFeedbackForm(nextForm,view);
       if(view.currentItemRequest(request))
