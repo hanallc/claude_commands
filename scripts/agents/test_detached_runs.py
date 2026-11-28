@@ -9269,9 +9269,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 write_text_atomic(path, json.dumps(record))
                 result = detached_runs.CompletedCommand(143)
                 pending = detached_runs.deliver(record, result)
-                prefix = (detached_runs.UNCONFIRMED_RESULT_PUSH if earlier_refusal
-                          else detached_runs.UNCONFIRMED_WORKER_RESULT)
-                self.assertEqual(pending, prefix + "the worker transcript has no result receipt")
+                self.assertEqual(pending, detached_runs.UNCONFIRMED_WORKER_RESULT
+                                 + "the worker transcript has no result receipt")
                 self.fixture.world.remove_pane(pane)
                 self.assertIsNotNone(staff.retire(row.id))
 
