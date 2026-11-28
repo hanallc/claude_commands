@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, chdir, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
+import errno
 import fcntl
 import io
 import json
@@ -27,9 +28,9 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib.build_copies_test_support import private_copy_config
-from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
-from scripts.lib import conf, file_lock, scratch
+from scripts.lib import build_folder_lock, build_folders, conf, file_lock, scratch
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims, mac_gate
@@ -86,6 +87,336 @@ class RemoteCopiesTests(unittest.TestCase):
         owner = fixture_member("unit", name="mirror-owner", parent=parent.id)
         holder = fixture_worker("live-holder", owner.id)
         return owner, holder
+
+    def write_fixed_folder_record(self, folder: copies.RemoteMirror) -> Path:
+        record = copies.remote_record_path(folder)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        fields = {"kind": "remote-fixed-folder", "owner": folder.owner, "repo": folder.repository.name,
+                  "host": folder.host, "path": folder.path, "session": folder.session}
+        write_text_atomic(record, json.dumps(fields) + "\n")
+        return record
+
+    def test_owner_removal_leaves_the_fixed_folder_and_its_record(self) -> None:
+        folder = self.remote(path=str(self.root / "fixed-build"))
+        output = Path(folder.path) / "target" / "compiled"
+        output.parent.mkdir(parents=True)
+        _ = output.write_text("Cargo output\n")
+        record = self.write_fixed_folder_record(folder)
+        before = record.read_bytes()
+        mirror = self.remote()
+        copies.record_remote_holder(mirror)
+
+        def remove_mirror(selected: copies.RemoteMirror) -> None:
+            copies.unregister_remote(selected.host, selected.path)
+
+        with mock.patch.object(copies, "remove_remote_mirror", side_effect=remove_mirror) as remove:
+            copies.remove_trees(folder.owner)
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual(output.read_text(), "Cargo output\n")
+        remove.assert_called_once_with(mirror)
+
+    def test_mirror_remove_refuses_an_idle_fixed_folder(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            output = build_folders.fixed_cargo_folder(folder) / "compiled"
+            output.parent.mkdir(exist_ok=True)
+            _ = output.write_text("Cargo output\n")
+            mirror = replace(self.remote(path=str(folder)), repository=copies.SelectedRepository("hana"))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+        record = folder / floor_claims.MIRROR_RECORD
+        before = record.read_bytes()
+        for root in (build_folders.build_root(), self.root / "new-build"):
+            with (self.subTest(build_root=root),
+                  mock.patch.object(build_folders, "build_root", return_value=root),
+                  mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(copies, "_remove_mirror_tree",
+                                    side_effect=AssertionError("The fixed build folder reached removal")),
+                  self.assertRaisesRegex(copies.CopyError, "fixed build folder")):
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual(output.read_text(), "Cargo output\n")
+        self.assertFalse(floor_claims.removal_authority_path(folder).exists())
+
+    def test_mirror_remove_refuses_a_tree_with_fixed_build_folders(self) -> None:
+        builds = build_folders.build_root()
+        layouts = ((builds, "hana"), (builds / "archived" / "old-build", "other"))
+        for index, (root, repository) in enumerate(layouts):
+            with mock.patch.object(build_folders, "build_root", return_value=root):
+                with build_folders.fixed_repository_build_folder(repository, machine="mac", unit="alpha") as folder:
+                    output = build_folders.fixed_cargo_folder(folder) / "compiled"
+                    output.parent.mkdir(exist_ok=True)
+                    _ = output.write_text("Cargo output\n")
+            tree = builds / ("hana" if root == builds else "archived")
+            mirror = self.remote(path=str(tree))
+            copies.mark_mirror(tree, mirror.owner, mirror.repository.name, mirror.session)
+            record = tree / floor_claims.MIRROR_RECORD
+            before = record.read_bytes()
+            authority = floor_claims.removal_authority_path(tree)
+            remove = mirror_arguments(mirror, "mirror-remove")
+            receive = mirror_arguments(mirror, "mirror-receive")
+            with (self.subTest(folder=folder),
+                  mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                    side_effect=AssertionError("The fixed build folder reached removal"))):
+                with self.assertRaisesRegex(copies.CopyError, "fixed build folder"):
+                    _ = copies.mirror_remove(remove)
+                self.assertFalse(authority.exists())
+                self.assertFalse(build_folders.remove_build_folder(tree, wait=False))
+                with self.assertRaisesRegex(copies.CopyError, "fixed build folder"):
+                    _ = copies.mirror_run(receive)
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual(output.read_text(), "Cargo output\n")
+
+                stage = tree.with_name(f".removing-123-{index:016x}")
+                _ = tree.rename(stage)
+                info = stage.stat()
+                with stage.with_suffix(".lock").open("wb") as lock:
+                    build_folder_lock.mark_lock(lock.fileno())
+                write_text_atomic(build_folders.lease_path(stage), json.dumps({
+                    "device": info.st_dev, "inode": info.st_ino,
+                }))
+                pending = floor_claims.read_mirror_record(stage / floor_claims.MIRROR_RECORD)
+                pending.update(build_folders.StagedRemoval(stage.name, info.st_dev, info.st_ino).fields())
+                write_text_atomic(authority, json.dumps(pending))
+                with self.assertRaisesRegex(copies.CopyError, "staged mirror could not be removed"):
+                    _ = copies.mirror_remove(remove)
+                self.assertEqual((stage / output.relative_to(tree)).read_text(), "Cargo output\n")
+                self.assertTrue(authority.is_file())
+
+    def test_mirror_receive_refreshes_a_fixed_folder_with_pending_removal(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            cargo = build_folders.fixed_cargo_folder(folder)
+            cargo.mkdir(exist_ok=True)
+            output = cargo / "compiled"
+            _ = output.write_text("Cargo output\n")
+            keep = build_folders.copy_keep_file(folder)
+            _ = keep.write_text("The transfer holds this checkout.\n")
+            mirror = replace(self.remote(path=str(folder)), repository=copies.SelectedRepository("hana"))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+            record = folder / floor_claims.MIRROR_RECORD
+            authority = floor_claims.removal_authority_path(folder)
+            _ = authority.write_bytes(record.read_bytes())
+            received = folder / "received"
+            args = mirror_arguments(replace(mirror, session="new-session"), "mirror-receive")
+            args.command = [sys.executable, "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).touch()",
+                            str(received)]
+            with (mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                    side_effect=AssertionError("The fixed build folder reached removal"))):
+                self.assertEqual(copies.mirror_run(args), 0)
+            self.assertTrue(received.is_file())
+            self.assertFalse(authority.exists())
+            self.assertEqual(json.loads(record.read_bytes())["session"], "new-session")
+            self.assertEqual(output.read_text(), "Cargo output\n")
+            self.assertEqual(keep.read_text(), "The transfer holds this checkout.\n")
+
+    def test_mirror_receive_accepts_an_ordinary_lease_named_file(self) -> None:
+        mirror = self.remote(path=str(self.mirror))
+        self.mirror.mkdir(parents=True)
+        payload = self.mirror / "fixtures/ordinary.lease.json"
+        payload.parent.mkdir()
+        _ = payload.write_text("[]\n")
+        received = self.mirror / "received"
+        args = mirror_arguments(mirror, "mirror-receive")
+        args.command = [sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                        str(received)]
+        with mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())):
+            self.assertEqual(copies.mirror_run(args), 0)
+        self.assertTrue(received.is_file())
+        self.assertEqual(payload.read_text(), "[]\n")
+
+    def test_row_34_fixed_refresh_keeps_the_mirror_and_recovery_files(self) -> None:
+        from scripts.mac_test import claim_state, eligibility, offload
+
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            mirror = self.remote(path=str(folder))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+            keep = build_folders.copy_keep_file(folder)
+            _ = keep.write_text("saved run\n")
+            _ = (folder / "source.txt").write_text("receiver edit\n")
+            _ = (folder / "receiver-only.txt").write_text("stale\n")
+            files = (folder / keep.name, folder / ".mac-smoke-launch-123", folder / ".git",
+                     folder / "target", folder / "ignored.txt")
+            for path in files:
+                _ = path.write_text(f"{path.name}\n")
+        _ = (self.source / "source.txt").write_text("local source edit\n")
+        _ = (self.source / ".gitignore").write_text("/ignored.txt\n")
+        _ = (self.source / "ignored.txt").write_text("ignored source\n")
+        request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
+                                         owner=mirror.owner, holder_session=mirror.session, target="mac")
+        repository = eligibility.KnownRepository(mirror.repository.name)
+        config = eligibility.OffloadConfig(
+            True, eligibility.SshConnectionSettings(mirror.host, 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
+            1, 1, 1, "1", {})
+        controller = offload.ProcessController()
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        controller.claim_identity = identity
+        fence = self.root / offload.start_fence_relative(identity, request.target)
+        write_text_atomic(fence.with_suffix(".lock"), "")
+        write_text_atomic(self.root / offload.fixed_folder_record(identity, request.target, "run").path,
+                          str(folder) + "\n")
+
+        with local_remote_transport(self.root):
+            held = offload.offload_fixed_folder.set(offload.HeldOffloadFolder(folder))
+            try:
+                self.assertTrue(offload.copy_tree(controller, config, request, repository),
+                                controller.copy_failure_detail)
+            finally:
+                offload.offload_fixed_folder.reset(held)
+
+        for path in files:
+            self.assertEqual(path.read_text(), f"{path.name}\n")
+        self.assertEqual(keep.read_text(), "saved run\n")
+        record = floor_claims.read_mirror_record(folder / floor_claims.MIRROR_RECORD)
+        self.assertEqual((record["owner"], record["repo"], record["session"]),
+                         (mirror.owner, mirror.repository.name, mirror.session))
+        self.assertIn("last_use", record)
+        self.assertEqual((folder / "source.txt").read_text(), "local source edit\n")
+        self.assertFalse((folder / "receiver-only.txt").exists())
+
+    def test_row_37_fetch_cleanup_refuses_a_former_fixed_folder(self) -> None:
+        root = build_folders.build_root()
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            _ = (folder / "compiled").write_text("Cargo output")
+        fetch = self.mirror / "artifacts"
+        self.mirror.mkdir(parents=True)
+        _ = root.rename(fetch)
+        saved = fetch / folder.relative_to(root) / "compiled"
+        with copies.local_mirror_lease(self.mirror, "fetch"), chdir(self.mirror):
+            descriptors = ",".join(map(str, copies.COMMAND_LOCKS.get()))
+            with (mock.patch.dict(os.environ, {floor_claims.MIRROR_LEASE_FDS: descriptors}),
+                  self.assertRaisesRegex(copies.CopyError, "guarded fetch cleanup refused")):
+                copies.clear_mirror_fetch_folder(fetch.name)
+        self.assertEqual(saved.read_text(), "Cargo output")
+
+    def test_mirror_receive_refuses_a_staged_fixed_checkout(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            output = folder / "compiled"
+            _ = output.write_text("Cargo output\n")
+        mirror = self.remote(path=str(folder.parent))
+        copies.mark_mirror(folder.parent, mirror.owner, mirror.repository.name, mirror.session)
+        stage = folder.with_name(".removing-123-0123456789abcdef")
+        _ = folder.rename(stage)
+        info = stage.stat()
+        write_text_atomic(build_folders.lease_path(stage), json.dumps({"device": info.st_dev, "inode": info.st_ino}))
+        lease = build_folders.lease_path(folder)
+        before = lease.read_bytes()
+        with (mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+              mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                side_effect=AssertionError("The fixed checkout reached deletion"))):
+            with self.assertRaisesRegex(copies.CopyError, "fixed build folder"):
+                _ = copies.mirror_run(mirror_arguments(mirror, "mirror-receive"))
+            self.assertFalse(build_folders.remove_build_folder(folder.parent, wait=False))
+        self.assertEqual((stage / output.name).read_text(), "Cargo output\n")
+        self.assertEqual(lease.read_bytes(), before)
+
+    def test_mirror_remove_refuses_a_former_fixed_checkout_with_an_empty_lease(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            mirror = self.remote(path=str(folder))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+        for lease in (b"", b"\xff"):
+            _ = build_folders.lease_path(folder).write_bytes(lease)
+            with (self.subTest(lease=lease),
+                  mock.patch.object(build_folders, "build_root", return_value=self.root / "new-build"),
+                  mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                    side_effect=AssertionError("The fixed checkout reached deletion")),
+                  self.assertRaisesRegex(copies.CopyError, "invalid build folder lease")):
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+            self.assertTrue(folder.is_dir())
+
+    def test_mac_fetch_setup_refuses_a_symlink_in_the_path(self) -> None:
+        from scripts.mac_test import eligibility, nextest_log, offload
+        from scripts.build_targets import target_config
+
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            with build_folders.fixed_repository_build_folder("other", machine="mac", unit="alpha") as other:
+                protected = other / "output"
+                protected.mkdir()
+                (folder / "linked").symlink_to(other, target_is_directory=True)
+                (folder / "linked-output").symlink_to(protected, target_is_directory=True)
+        home = Path(os.environ["HOME"])
+        launcher = home / ".claude/scripts/lib/py"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.symlink_to(sys.executable)
+        stub = self.root / "bin"
+        stub.mkdir()
+        unchecked = self.root / "unchecked-rm"
+        rm = stub / "rm"
+        _ = rm.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(unchecked))}\n")
+        rm.chmod(0o755)
+        checkout = Path(copies.__file__).resolve().parents[2]
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": f"{stub}:{os.environ['PATH']}",
+                                                     "PYTHONPATH": str(checkout)}))
+        config = eligibility.OffloadConfig(
+            True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
+            1, 1, 1, "1", {"abandoned_session_minutes": "60"})
+        _ = self.enterContext(mock.patch.object(eligibility, "configured_ssh_target",
+                              return_value=target_config.SshTarget("mac", "macos", self.root / "settings")))
+        _ = self.enterContext(mock.patch.object(offload, "remote_mirror", return_value=str(folder)))
+        _ = self.enterContext(mock.patch.object(offload, "removal_script", return_value="true"))
+        _ = self.enterContext(mock.patch.object(nextest_log, "capture_function",
+                                               return_value="run_nextest_logged() { echo mac_exit=0; }"))
+        _ = self.enterContext(mock.patch.object(floor_claims, "read_claims",
+                                               return_value=floor_claims.ClaimSnapshot(frozenset())))
+        request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
+                                         owner="alpha", holder_session="holder-session")
+        mirror = self.remote(path=str(folder))
+        diagnostic = self.root / "fetch-result"
+        for fetch in ("linked/output", "linked-output"):
+            with self.subTest(fetch=fetch):
+                command = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder(fetch)),
+                                                      eligibility.KnownRepository("hana"))
+                args = mirror_arguments(mirror, "mirror-use")
+                args.command = ["sh", "-c", "{ " + command + "; } >" + shlex.quote(str(diagnostic)) + " 2>&1"]
+                _ = copies.mirror_run(args)
+                self.assertIn("symbolic link", diagnostic.read_text())
+                self.assertNotIn("mac_exit=0", diagnostic.read_text())
+                self.assertFalse(unchecked.exists())
+                self.assertTrue(protected.is_dir())
+        output = folder / "local/output"
+        output.mkdir(parents=True)
+        _ = (output / "stale").write_text("stale output\n")
+        command = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("local/output")),
+                                              eligibility.KnownRepository("hana"))
+        unleased = subprocess.run(["sh", "-c", command], capture_output=True, check=False, text=True)
+        self.assertIn("fetch cleanup requires the mirror lease", unleased.stderr)
+        self.assertTrue(output.is_dir())
+        args = mirror_arguments(mirror, "mirror-use")
+        args.command = ["sh", "-c", "{ " + command + "; } >" + shlex.quote(str(diagnostic)) + " 2>&1"]
+        self.assertEqual(copies.mirror_run(args), 0)
+        self.assertIn("mac_exit=0", diagnostic.read_text())
+        self.assertFalse(output.exists())
+
+    def test_deferred_removal_reports_missing_ssh_and_keeps_the_request(self) -> None:
+        mirror = self.remote()
+        copies.record_remote_holder(mirror)
+        copies.defer_remote_removal(mirror)
+        record = copies.remote_record_path(mirror)
+        before = record.read_bytes()
+        diagnostic = io.StringIO()
+        with (mock.patch.object(subprocess, "run",
+                                side_effect=FileNotFoundError(errno.ENOENT, "No such file or directory", "ssh")) as run,
+              redirect_stderr(diagnostic)):
+            copies.remove_deferred_mirrors(mirror.host)
+        run.assert_called_once()
+        self.assertEqual(record.read_bytes(), before)
+        self.assertRegex(diagnostic.getvalue(), r"anomaly: deferred mirror removal: .*'ssh'")
+
+    def test_list_shows_other_rows_when_a_fixed_folder_record_disappears(self) -> None:
+        vanished = self.write_fixed_folder_record(self.remote(path=str(self.root / "fixed-build")))
+        mirror = self.remote()
+        copies.record_remote_holder(mirror)
+        read_text = Path.read_text
+
+        def remove_before_read(path: Path, **options: str | None) -> str:
+            if path == vanished:
+                path.unlink()
+            return read_text(path, **options)
+
+        with mock.patch.object(Path, "read_text", remove_before_read):
+            row, = self.list_rows()
+        self.assertFalse(vanished.exists())
+        self.assertEqual((row["owner"], row["host"], row["path"]), (mirror.owner, mirror.host, mirror.path))
 
     def test_mac_gate_reconciles_only_selected_mirrors_without_removal_markers(self) -> None:
         shim = Path.home() / ".claude/scripts/lib/py"
@@ -325,11 +656,17 @@ class RemoteCopiesTests(unittest.TestCase):
         try:
             fixture.wait_for_path(fixture.stub_directory / "run-started")
             with mock.patch.dict(os.environ, fixture.environment):
-                mirror, = copies.owned_remote_mirrors("verify")
-                record = cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
+                folder, = copies.remote_registrations()
+                self.assertIsInstance(folder, copies.RemoteFixedFolder)
+                self.assertEqual(copies.owned_remote_mirrors("verify"), [])
+                fixed_path = (fixture.stub_directory / "fixed-checkout").read_text().strip()
+                self.assertEqual(folder.path, fixed_path)
+                record = cast(dict[str, object], json.loads(copies.remote_record_path(folder).read_text()))
+                self.assertEqual(record["kind"], "remote-fixed-folder")
                 self.assertEqual(record["holder_pid"], process.pid)
                 row, = self.list_rows()
                 self.assertEqual(row["owner"], "verify")
+                self.assertEqual(row["path"], fixed_path)
                 self.assertEqual((row["state"], row["session"], row["holder_pid"]),
                                  expected_remote_lease_columns("held", "live-holder", str(process.pid)))
             _ = (fixture.stub_directory / "finish-run").write_text("continue\n")

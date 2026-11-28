@@ -28,9 +28,11 @@ from scripts.buildlog import repository, store, sync as buildlog_sync
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
-from scripts.lib import conf, process_start as process_identity
+from scripts.lib import build_folders, conf, process_start as process_identity
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
+from scripts.lint.memory_test_support import (
+    UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture,
+)
 from scripts.mac_test import claim_state, eligibility, mac_queue_run, mac_test, offload
 from scripts.production.gate_routes import SuiteMode
 from scripts.worktree import worktrees
@@ -73,15 +75,38 @@ class MacRunTests(unittest.TestCase):
         _ = (self.root / "mac_test.conf").write_text("offload=on\n")
         copies_config = self.root / "copies.conf"
         _ = copies_config.write_text("# range: 5e-324..\ngit_timeout_seconds=5\n")
-        _ = (self.root / "build_folders.conf").write_text("# whole: 1..\nnames.repository_key_length=8\n")
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 f"roots.build={self.root / 'build'}\nforms.build.mac=per-repository\n")
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root), "COPIES_CONFIG": str(copies_config),
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         }))
         _ = self.enterContext(mock.patch.object(claim_state, "submitting_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(copies, "remote_registry", return_value=self.root / "remote-registry"))
+        _ = self.enterContext(mock.patch.object(offload, "remote_fixed_folder", self.hold_fixed_folder))
         _ = self.enterContext(redirect_stdout(StringIO()))
         self.paths = claim_state.state_paths("mac")
+
+    @contextmanager
+    def hold_fixed_folder(self, _controller: offload.ProcessController, _config: eligibility.OffloadConfig,
+                          request: offload.OffloadRequest, repository: eligibility.KnownRepository) -> Generator[None]:
+        name = build_folders.build_repository_name(repository.policy_name)
+        with build_folders.fixed_repository_build_folder(name, machine=request.target, unit=request.owner) as path:
+            token = offload.offload_fixed_folder.set(offload.HeldOffloadFolder(path))
+            try:
+                yield
+            finally:
+                offload.offload_fixed_folder.reset(token)
+
+    @contextmanager
+    def private_claims(self, name: str) -> Generator[None]:
+        previous = self.paths
+        with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(self.root / name)}):
+            self.paths = claim_state.state_paths("mac")
+            try:
+                yield
+            finally:
+                self.paths = previous
 
     def repository(self, name: str, *, origin: str = "") -> Path:
         path = self.root / name
@@ -660,7 +685,8 @@ sys.exit(71)
         self.addCleanup(step_estimator.clear_git_identity_cache)
         cases = ((True, True, False), (False, True, False), (True, False, False), (False, False, True))
         for assigned, changed, structured in cases:
-            with self.subTest(assigned=assigned, changed=changed, structured=structured):
+            with (self.subTest(assigned=assigned, changed=changed, structured=structured),
+                  self.private_claims(f"legacy-{assigned}-{changed}-{structured}")):
                 _ = subprocess.run([*remote, str(self.repo)], check=True)
                 waiting = self.native_claim(self.checkout)
                 self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 0)
@@ -704,18 +730,21 @@ sys.exit(71)
                 def claim_child(command: list[str], **options: object) -> object:
                     if command[0] == "git":
                         return launch(command, **options)
-                    self.assertEqual(command[2], "claim")
-                    claim_calls.append(command[2])
-                    with self.assertRaises(copies.BusyRemoteMirror), copies.remote_lease(mirror):
-                        self.fail("The runner did not hold the execution lease during the claim")
                     args = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
                     output = StringIO()
-                    if "--from-pid" in command:
-                        self.assertEqual(legacy.read_bytes(), before)
-                        self.assertIn("--retire-wait", command)
                     with redirect_stdout(output):
-                        status = mac_test.command_claim(args, self.paths, watch_claim=False)
-                    self.assertIn("--mac-repository", command)
+                        if command[2] == "release":
+                            status = mac_test.command_release(args, self.paths)
+                        else:
+                            self.assertEqual(command[2], "claim")
+                            claim_calls.append(command[2])
+                            with self.assertRaises(copies.BusyRemoteMirror), copies.remote_lease(mirror):
+                                self.fail("The runner did not hold the execution lease during the claim")
+                            if "--from-pid" in command:
+                                self.assertEqual(legacy.read_bytes(), before)
+                                self.assertIn("--retire-wait", command)
+                            status = mac_test.command_claim(args, self.paths, watch_claim=False)
+                            self.assertIn("--mac-repository", command)
                     return mock.Mock(returncode=status, communicate=mock.Mock(return_value=(output.getvalue(), "")),
                                      poll=mock.Mock(return_value=status))
 
@@ -1279,10 +1308,14 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             handoffs.append("--from-pid" in command)
             return [sys.executable, "-c", script, "none", str(completed.path), *command[2:]]
 
-        def finish_cleanup(*_args: object) -> offload.LeftoversEnded:
+        def finish_cleanup(*_args: object,
+                           saved_folder: offload.SavedOffloadFolder | offload.NoFixedOffloadFolder) -> offload.LeftoversEnded:
             retained, = claim_state.read_claims(self.paths)
             self.assertEqual(retained.path, completed.path)
             self.assertTrue(retained.record.get("cleanup_pending"))
+            identity = claim_state.claim_identity(completed.record)
+            scope = claim_state.claim_fence_scope_key(completed.path, completed.record)
+            self.assertEqual(saved_folder, offload.fixed_folder_record(identity, "mac", scope))
             return offload.LeftoversEnded()
 
         with (
@@ -1477,7 +1510,9 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     self.assertIsInstance(offload.run_offload(controller, config, request, time.monotonic()),
                                           offload.PassedOnMac)
                     self.assertEqual(take.call_count, 2)
-                    check.assert_called_once_with(config, "old-mac", offload.ALL_MIRRORS if legacy else repo, "mac", 1)
+                    saved_folder = offload.fixed_folder_record(identity, "mac", "run")
+                    check.assert_called_once_with(config, "old-mac", offload.ALL_MIRRORS if legacy else repo,
+                                                  "mac", 1, saved_folder=saved_folder)
                     release_child.assert_called_once()
                     run.assert_called_once()
 
@@ -1623,7 +1658,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
             self.assertIsInstance(result, offload.PassedOnMac)
             self.assertEqual(claim.call_count, 3)
-            check.assert_called_once_with(config, config.host, offload.ALL_MIRRORS, "mac", 1)
+            check.assert_called_once_with(config, config.host, offload.ALL_MIRRORS, "mac", 1,
+                                          saved_folder=offload.NO_FIXED_OFFLOAD_FOLDER)
             release.assert_called_once()
             run.assert_called_once()
 

@@ -17,12 +17,12 @@ from typing import NotRequired, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.gate_state_paths import DEFAULT_GATE_STATE_DIR, LEGACY_GATE_STATE_DIR
 from scripts.lib.process_start import Started, Unreadable, process_start
 
 
 # The results file keeps only this many newest rows.
 KEPT_RESULTS = 300
-DEFAULT_STATE_DIR = "~/.local/state/gate"
 
 
 class GateStateMoveRequired(Exception):
@@ -52,9 +52,9 @@ class LandResult(TypedDict):
 
 def default_state_dir() -> Path:
     """Return the default gate state folder after the deploy move."""
-    directory = Path(DEFAULT_STATE_DIR).expanduser()
+    directory = Path(DEFAULT_GATE_STATE_DIR).expanduser()
     # Chunk 6 removes this guard and the old folder path.
-    old = Path("~/.local/state/merge-gate").expanduser()
+    old = Path(LEGACY_GATE_STATE_DIR).expanduser()
     if os.path.lexists(old) and not os.path.lexists(directory):
         raise GateStateMoveRequired(
             "Gate state move required: set /build:hold drain natedev, then run "

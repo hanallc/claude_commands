@@ -6,7 +6,57 @@ Editable source lives under `~/worktrees`. Cargo output lives under the configur
 
 The build root is `/build` on natedev and `~/build` on the Mac and the Hana AWS guest. The table uses `/build` for the build root.
 
+`config/build_folders.conf` selects the build folder form with `forms.build.<machine>`.
+`forms.build.natedev=per-unit` uses numbered copies at `/build/<repo>/<unit>/<number>`.
+`forms.build.mac=per-repository` selects the fixed folder at `~/build/<repo>/mac`.
+`forms.build.mac-linux=per-repository` selects `~/build/<repo>/mac-linux` for the guest.
+The form reader refuses an unknown value or a missing machine entry.
+
+`fixed_repository_build_folder` runs on the machine that owns the build root.
+It holds an exclusive folder lease and records the machine, repository, and run unit.
+When the lease ends, the folder stays available for the next run.
+The Mac has one test claim per repository.
+Native Mac offload and smoke runs share the same fixed folder and Cargo output.
+Offload saves the exact folder under the start fence for cleanup after a lost connection.
+The holder releases the start fence before the receiver and the test start.
+The probe, source receiver, test, fetch, and cleanup use the same start fence.
+The holder retires the start fence when it clears the folder.
+A busy start fence prevents folder clearance.
+A retained keep file prevents allocation until cleanup confirms clearance.
+The smoke runner preserves the Cargo output when it prepares the requested commit.
+An offload run replaces the content of the fixed folder with the sent source, as it does with the mirror on main. A file that a sender copied there is kept only if a smoke or guest run rescues it first; a KILL in that rescue can lose it.
+
+Allocation can create parent directories and lock files before it checks the registration state.
+
+If fixed checkout registration refuses, run the printed `git worktree list --porcelain` command.
+
+1. Check each listed path for work. Use `git -C <path> --no-optional-locks status` and `git -C <path> log -1` in each associated checkout.
+2. If the start mark has no associated checkout, list the fixed folder files and compare them with the source.
+3. If a check fails, stop and keep the registration.
+4. Save the work you want to keep.
+5. Stop Git and offload work on the repository.
+6. Clear each leftover, including the registration start mark in the lease.
+
+Each smoke upload uses its own directory.
+Cleanup renames the directory before deletion to prevent a late upload.
+Recovery can remove the renamed directory if deletion stops.
+The smoke worker saves its recovery record before the coordinator permits the keep file.
+Each smoke episode has its own Terminal launcher path.
+Verify checks the natedev folder form before it takes the local Cargo token.
+It supplies the selected route and the outer run identity to offload.
+It prints the binary path from the output folder that the runner reports.
+
+Drain native Mac runs before this route change.
+Confirm that the old claims and leases are clear.
+Install the new folder holder and its allocator before you enable the route.
+Confirm that the Hana output and its new parent share one APFS volume.
+Move the Hana `target/` directory under the new folder lease before you enable the route.
+Check the Cargo rebuild list after the move.
+
 The Mac Linux guest uses the default build root `~/build` and the main checkout `~/.claude` for the `gate-runner` user.
+The guest gate and hand-made commands hold the fixed folder lease during the run.
+The guest gate replaces source from SSH offload and retains its Cargo output.
+Recovery clears the keep file for the saved folder after the guest proves the run ended.
 The route takes the Mac's repository claim through `mac_run.held` before it contacts the guest.
 The guest run holds a separate lock.
 The route waits up to `unreachable_wait_seconds` (`build_targets.conf`) for proof that the guest run ended.
@@ -20,6 +70,7 @@ Item 191 B3 will keep the Mac claim at the unreachable bound until the guest pro
 | Worktree | `~/worktrees/<repo>/<unit>/<short-name>` | `target` links to the worktree output. |
 | Worktree output | `/build/<repo>/<unit>/<short-name>` | The folder holds intermediate and final output. |
 | Numbered copy | `/build/<repo>/<unit>/<number>` | The copy holds the fixed source and a real `target` folder. |
+| Fixed repository folder | `~/build/<repo>/<machine>` | The folder holds the source and a real `target` folder. |
 | Main output | `/build/<repo>/main` | Local main checkouts link `target` here. The Hana guest creates no main checkout `target` link. |
 | CI | `/build/<repo>/ci/<number>` | Each number has a runner folder that also holds the runner's home. |
 
@@ -27,6 +78,7 @@ The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the
 
 The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
 Each numbered copy uses its own real `target` directory.
+Each `r*` test run folder lives in `test-runs` in the checkout's build output, for example `/build/claude/main/test-runs` for `~/.claude` on natedev; a checkout without a model output uses `$TMPDIR/test-runs` (see `merge-gate-and-test-speed.md`).
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
 
@@ -251,6 +303,8 @@ If that checkout's `objects/info/alternates` or `commondir` file is a symbolic l
 If that checkout's `objects/pack` folder is a symbolic link into a numbered copy, the claim can admit that copy.
 Removal then breaks the outside checkout.
 Only a hand-made link of a Git metadata file or folder makes these cases. No Git command makes them.
+
+Known limit: the build root lookup opens the root to read it (`build_folders._build_root_path`). A build root without read access is refused, also at mirror receive.
 
 Automatic owner cleanup for these temporary folders takes the exclusive claim lock without waiting.
 Cleanup keeps the folder and lease record if a reader holds the lock or the borrower check cannot confirm that the folder is unused.

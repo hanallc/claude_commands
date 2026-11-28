@@ -390,16 +390,17 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
         else:
             contents = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)),
+        return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, (FileNotFoundError, NotADirectoryError))),
                           repository_allowed, stamp)
     return ConfigRead(file, source, _read_settings(contents, source), repository_allowed, stamp)
 
 
 def read_or_repository(stem: str) -> ConfigRead:
     """Use the repository file when the fixture has no copy."""
-    if "CONF_DIR" in os.environ and not path(stem).exists():
+    result = read(stem)
+    if "CONF_DIR" in os.environ and isinstance(result.settings, _UnreadableFile) and result.settings.missing:
         return read(_repository_path(stem))
-    return read(stem)
+    return result
 
 
 def directory() -> Path:

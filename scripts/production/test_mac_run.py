@@ -25,7 +25,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, mac_queue_run
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -77,6 +77,10 @@ if [[ $command == ssh && $remote == *smoke-work* ]]; then
     print -r -- "$lease" > "$state/lease-command"
     inner=("${(@Q)${(z)lease}}")
     worker_index=${inner[(Ie)smoke-work]}
+    folder_index=${inner[(Ie)smoke-folder]}
+    if (( folder_index )) && [[ -n ${inner[$((folder_index + 5))]} ]]; then
+        export MAC_RUN_REMOTE_UPLOAD=1
+    fi
     remote=${inner[$((worker_index + 1))]}
     set -- "${@[1,-2]}" "$remote"
     placed_run=1
@@ -141,12 +145,25 @@ if [[ $remote == *' smoke-status '* ]]; then
     exit $?
 fi
 
+if [[ $remote == *' smoke-recover '* ]]; then
+    print -r -- "${remote##* }" > "$state/recovered-episode"
+    exit 0
+fi
 if (( placed_run )); then
     MAC_PLACEMENT=${words[1]#MAC_PLACEMENT=} exec "$MAC_RUN_PYTHON" -c '
 import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ["MAC_RUN_STUB_STATE"])
 os.setsid()
+episode = os.environ["MAC_PLACEMENT"].split("/")[0]
+print("mac_smoke_register=" + episode, flush=True)
+if sys.stdin.read(1) != "+":
+    sys.exit(1)
+if os.environ.get("MAC_RUN_REMOTE_UPLOAD"):
+    (state / "upload-ready").touch()
+    print("mac_smoke_upload=" + episode, flush=True)
+    if sys.stdin.read(1) != chr(10):
+        sys.exit(1)
 print("HEAD=" + os.environ["MAC_RUN_SHA"], flush=True)
 if os.environ.get("MAC_RUN_CHECKOUT_CLEANUP"):
     os.chdir(os.environ["MAC_RUN_CHECKOUT"])
@@ -169,7 +186,8 @@ else:
     (state / "input-closed").touch()
     status_file = Path(os.environ["SCRATCH_ROOT"]) / f"mac-smoke-{episode}" / "status"
     status_file.parent.mkdir(parents=True)
-    status_file.write_text("0" + chr(10))
+    retained = os.environ.get("MAC_RUN_RETAINED_FOLDER") == "1"
+    status_file.write_text(("4" + chr(10) + "retained" if retained else "0") + chr(10))
 '
 fi
 if [[ $remote == *'rev-parse --verify HEAD'* ]]; then
@@ -705,7 +723,7 @@ class MacRunTests(unittest.TestCase):
                     and any(action in event["args"][-1] for action in ("fetch ", "checkout ", "cargo "))]
         self.assertTrue(all(event["claimed"] for event in changing))
 
-    def test_commit_on_the_mac_source_uses_the_numbered_copy_without_a_bundle(self) -> None:
+    def test_commit_on_the_mac_source_uses_the_fixed_folder_without_a_bundle(self) -> None:
         result = self.mac_run(extra={
             "MAC_RUN_SOURCE_COMMIT": SHA,
         })
@@ -723,10 +741,10 @@ class MacRunTests(unittest.TestCase):
         self.assertFalse(any("fetch" in command for command in remote_commands), events)
         words = shlex.split((self.stub_state / "lease-command").read_text())
         lease = words[words.index("smoke-copy") + 1:]
-        self.assertEqual(Path(lease[1]).name, "copies.py")
-        self.assertEqual(lease[2], "run")
-        self.assertEqual(lease[lease.index("--commit") + 1], SHA)
-        self.assertEqual(lease[lease.index("--repo") + 1], "$HOME/rust/hana")
+        self.assertEqual(Path(lease[1]).name, "mac_queue_run.py")
+        self.assertEqual(lease[2:6], ["smoke-folder", "$HOME/rust/hana", "verify", SHA])
+        self.assertEqual((lease[7], lease[9]), ("", "--"))
+        self.assertRegex(lease[8], r"^/tmp/mac_run_hana\.[0-9a-f]{32}\.command$")
         self.assertTrue(any(
             "cargo build -q -p hana" in command for command in remote_commands
         ), events)
@@ -751,13 +769,60 @@ class MacRunTests(unittest.TestCase):
         copy = next(event for event in events if event["command"] == "scp")
         destination = copy["args"][-1].split(":", 1)[1]
         command = (self.stub_state / "lease-command").read_text()
-        arguments = shlex.split(command.splitlines()[0])
-        fetched = arguments[arguments.index("--") + 1]
-        lease = shlex.split(command)
-        self.assertEqual(lease[lease.index("--commit") + 1], SHA)
-        self.assertEqual(destination, remote_bundle)
-        self.assertEqual(fetched, remote_bundle)
+        words = shlex.split(command)
+        folder = words.index("smoke-folder")
+        commit, fetched, ref, launch, separator = words[folder + 3:folder + 8]
+        self.assertEqual((commit, separator), (SHA, "--"))
+        episode = ref.removeprefix("refs/mac-run/")
+        self.assertRegex(episode, r"^[0-9a-f]{32}$")
+        self.assertEqual(launch, f"/tmp/mac_run_hana.{episode}.command")
+        self.assertTrue((self.stub_state / "upload-ready").exists())
+        stream = next(event for event in events if event["command"] == "ssh" and "cargo build" in event["args"][-1])
+        self.assertLess(events.index(stream), events.index(copy))
+        self.assertEqual(destination, f"{remote_bundle}.{episode}/{Path(remote_bundle).name}")
         self.assertEqual(destination, fetched)
+
+    def test_delayed_smoke_upload_cannot_replace_the_next_runs_bundle(self) -> None:
+        base = self.root / "remote.bundle"
+        self.write_production_config(mac_run_bundle=str(base))
+        saved: list[Path] = []
+        for _ in range(2):
+            result = self.mac_run()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            words = shlex.split((self.stub_state / "lease-command").read_text())
+            saved.append(Path(words[words.index("smoke-folder") + 4]))
+        first, second = (Path(event["args"][-1].split(":", 1)[1])
+                         for event in self.events() if event["command"] == "scp")
+        self.assertEqual(saved, [first, second])
+        self.assertEqual(first.parent.parent, self.root)
+        self.assertEqual(second.parent.parent, self.root)
+        first.parent.mkdir()
+        second.parent.mkdir()
+        _ = first.write_text("old upload")
+        _ = second.write_text("new upload")
+
+        mac_queue_run.clear_smoke_bundle(first, first.parent.suffix.removeprefix("."))
+
+        with self.assertRaises(FileNotFoundError):
+            _ = first.write_text("delayed upload")
+        self.assertEqual(second.read_text(), "new upload")
+        mac_queue_run.clear_smoke_bundle(second, second.parent.suffix.removeprefix("."))
+        self.assertEqual(list(self.root.glob("remote.bundle.*")), [])
+
+    def test_smoke_retains_the_run_record_until_folder_recovery(self) -> None:
+        failed = self.mac_run(extra={"MAC_RUN_RETAINED_FOLDER": "1"})
+
+        self.assertEqual(failed.returncode, 4, failed.stdout + failed.stderr)
+        saved, = (self.home / mac_queue_run.RUNS).glob("*/run.json")
+        episode = saved.parent.name
+        self.assert_claim_released()
+
+        recovered = self.mac_run()
+
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertEqual((self.stub_state / "recovered-episode").read_text().strip(), episode)
+        self.assertFalse(saved.exists())
+        self.assert_claim_released()
 
     def test_bundle_uses_fixture_temp_directory(self) -> None:
         result = self.mac_run()
@@ -797,7 +862,7 @@ class MacRunTests(unittest.TestCase):
                 self.assertEqual(self.events(), [])
                 self.assert_claim_released()
 
-    def test_numbered_copy_launch_keeps_purpose_and_owner(self) -> None:
+    def test_fixed_folder_launch_keeps_purpose_and_owner(self) -> None:
         purpose = "camera's $(touch PURPOSE_INJECTION); frame & light"
         for explicit_owner in (False, True):
             with self.subTest(explicit_owner=explicit_owner):
@@ -813,8 +878,7 @@ class MacRunTests(unittest.TestCase):
                 command = (self.stub_state / "lease-command").read_text()
                 words = shlex.split(command)
                 lease = words[words.index("smoke-copy") + 1:]
-                self.assertEqual(lease[2], "run")
-                self.assertEqual(lease[lease.index("--owner") + 1], "verify")
+                self.assertEqual(lease[2:5], ["smoke-folder", "$HOME/rust/hana", "verify"])
                 launch = next(event["input"] for event in remote if event["input"])
                 line = next(line for line in launch.splitlines() if line.startswith("HANA_TEST_PURPOSE="))
                 words = shlex.split(line)
@@ -878,6 +942,9 @@ fi
         remote = next(event["args"][-1] for event in self.events() if event["input"])
         launch_work = remote.partition("open -a Terminal")[0]
         self.assertNotEqual(launch_work, remote)
+        open_line = next(line for line in remote.splitlines() if line.startswith("open -a Terminal "))
+        launch = Path(shlex.split(open_line)[-1])
+        self.assertEqual(launch.parent, self.root)
         self.write_executable(self.bin_directory / "cargo", "exit 0\n")
         self.write_executable(self.bin_directory / "perl", 'print started > "$HANA_STARTED"\n')
         started = self.root / "hana-started"
@@ -901,6 +968,33 @@ fi
         self.assertFalse(started.exists(), resumed.stdout + resumed.stderr)
         self.assertFalse(launch.exists())
         self.assertFalse(keep.exists())
+
+    def test_delayed_terminal_open_cannot_run_the_next_launcher(self) -> None:
+        self.write_production_config(mac_run_launch=str(self.root / "Hana launch.command"))
+        launchers: list[Path] = []
+        for _ in range(2):
+            self.clear_events()
+            result = self.mac_run(extra={"MAC_RUN_SOURCE_COMMIT": SHA})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            work = next(event["args"][-1] for event in self.events() if event["input"])
+            open_line = next(line for line in work.splitlines() if line.startswith("open -a Terminal "))
+            launch = Path(shlex.split(open_line)[-1])
+            self.assertEqual(launch.parent, self.root)
+            self.assertRegex(launch.name, r"^Hana launch\.[0-9a-f]{32}\.command$")
+            words = shlex.split((self.stub_state / "lease-command").read_text())
+            self.assertEqual(words[words.index("smoke-folder") + 6], str(launch))
+            cleanup = shlex.split(words[-1])
+            self.assertEqual(cleanup[-1], str(launch))
+            launchers.append(launch)
+        old, new = launchers
+        started = self.root / "started"
+        _ = new.write_text(f"touch {shlex.quote(str(started))}\n")
+
+        delayed = subprocess.run(["zsh", str(old)], cwd=self.root, env=self.environment,
+                                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertNotEqual(delayed.returncode, 0, delayed.stdout + delayed.stderr)
+        self.assertFalse(started.exists())
 
     def test_hup_keeps_the_numbered_copy_when_stop_checkout_fails(self) -> None:
         script = self.install_checkout_cleanup('print "hana-instances: stop failed"\nexit 1\n')

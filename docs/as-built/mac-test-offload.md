@@ -991,7 +991,9 @@ The sweep takes a repository's mirror leases for one removal group at a time.
 It skips a repository with a busy lease.
 It reads local and natedev claims again under the lease before each removal.
 The source copy, remote steps, artifact reads, fix reads, and post-fetch cleanup take the shared repository lease.
-The per-run trim converts the same lease to exclusive before removing output.
+The per-run trim accepts a registered legacy mirror or the configured fixed checkout for the local Mac.
+It converts the lease for that checkout to exclusive before removing output.
+Both forms use the same repository budget.
 The trim keeps the output if another process holds the shared lease.
 The trim restores the shared lease before the caller measures the remaining output.
 Mirror removal and recovery of an interrupted removal also require the exclusive lease.

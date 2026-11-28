@@ -139,11 +139,14 @@ def _copy_commit(repository: Path, source: Path, commit: str) -> Generator[None]
         _ = _git(repository, "update-ref", "-d", reference)
 
 
-def _rescue(path: Path, output: Sequence[str] = ()) -> None:
+_COPY_OUTPUT = ("target", build_folders.COPY_USE_STAMP)
+
+
+def _rescue(path: Path, output: Sequence[str] = (), *, reserved: Sequence[str] = _COPY_OUTPUT) -> None:
     """Save the source work, but not target, the use stamp or the `output` folders."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
-    generated = [path / "target", path / build_folders.COPY_USE_STAMP, *(path / folder for folder in output)]
+    generated = [path / name for name in (*reserved, *output)]
     try:
         _ = git_rescue.rescue(path, name, generated=generated,
                              pass_fds=build_folders.held_build_folder_descriptors())
@@ -163,6 +166,53 @@ def _rescue(path: Path, output: Sequence[str] = ()) -> None:
             _ = saved_index.replace(index)
             raise
         saved_index.unlink()
+
+
+class UntrackedCopyDirectories(ValueError):
+    """Keep a copy that contains untracked directories."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"{path}: untracked folders")
+
+
+def _prepare_copy_contents(path: Path, git_directory: Path, descriptor: int,
+                           before_rescue: Callable[[], None], *, reserved: Sequence[str] = _COPY_OUTPUT) -> None:
+    index = git_directory / "index"
+    index.with_name("index.lock").unlink(missing_ok=True)
+    if not os.path.lexists(index):
+        _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
+    scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=/target/",
+            *(f"--exclude=/{name}" for name in reserved if name not in _COPY_OUTPUT),
+            *(f"--exclude={folder}/" for folder in _TOOL_OUTPUT_FOLDERS))
+    rescued = False
+    try:
+        untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
+    except CopyGitFailure as error:
+        if isinstance(error.__cause__, subprocess.TimeoutExpired):
+            raise
+        _rescue(path, reserved=reserved)
+        rescued = True
+        untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
+    if any(name.endswith("/") for name in untracked.split("\0")):
+        raise UntrackedCopyDirectories(path)
+    before_rescue()
+    if not rescued:
+        output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
+        _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")], reserved=reserved)
+    _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
+
+
+def prepare_fixed_checkout(source: Path, path: Path, revision: str, *, reserved: Sequence[str],
+                           registration: build_folders.FixedCheckoutRegistration = build_folders.FixedCheckoutRegistration.MAC_LINUX
+                           ) -> None:
+    """Prove the checkout source and rescue files before replacing them."""
+    descriptor = build_folders.build_folder_lock_fd(path)
+    if _git(source, "ls-tree", revision, "--", *reserved, pass_fds=(descriptor,)):
+        raise ValueError(f"{revision}: the commit tracks a reserved build path")
+    with build_folders.fixed_build_checkout_preparation(source, path, revision, registration=registration) as checkout:
+        _prepare_copy_contents(path, checkout.git_dir, descriptor, lambda: None, reserved=reserved)
+        _ = _git(path, "checkout", "--force", "--detach", revision, pass_fds=(descriptor,))
+        _ = _git(path, "clean", "-ff", *(f"--exclude=/{name}" for name in reserved), pass_fds=(descriptor,))
 
 
 def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> None:
@@ -282,33 +332,19 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 if not isinstance(record, build_folders.NumberedCopySource):
                     continue
                 build_folders.mark_folder_use(path)
-                index = record.git_directory / "index"
-                index.with_name("index.lock").unlink(missing_ok=True)
-                if not os.path.lexists(index):
-                    _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=/target/",
-                        *(f"--exclude={folder}/" for folder in _TOOL_OUTPUT_FOLDERS))
-                rescued = False
+                target = path / "target"
+
+                def prepare_output() -> None:
+                    unit_claim.close()
+                    if target.is_symlink():
+                        target.unlink()
+                    _exclude_copy_target(path, descriptor)
+
                 try:
-                    untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
-                except CopyGitFailure as error:
-                    if isinstance(error.__cause__, subprocess.TimeoutExpired):
-                        raise
-                    _rescue(path)
-                    rescued = True
-                    untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
-                if any(name.endswith("/") for name in untracked.split("\0")):
+                    _prepare_copy_contents(path, record.git_directory, descriptor, prepare_output)
+                except UntrackedCopyDirectories:
                     print(f"kept for a manual removal list: {path} (build_copies, untracked folders)", file=sys.stderr)
                     continue
-                unit_claim.close()
-                target = path / "target"
-                if target.is_symlink():
-                    target.unlink()
-                _exclude_copy_target(path, descriptor)
-                if not rescued:
-                    output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
-                    _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")])
-                _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
                 _ = _git(path, "checkout", "--force", "--detach", revision)
                 _ = _git(path, "clean", "-ffx", "--exclude=/target",
                          f"--exclude=/{build_folders.COPY_USE_STAMP}")
@@ -467,7 +503,8 @@ def _check_unused_folder(path: Path, root: Path, *, numbered: bool, snapshot: Bo
         if not build_folders.may_remove_build_path(path) or not build_folders.may_remove_folder_tree(*roots):
             raise BuildFolderInUse(f"{path}: the folder or a mount is protected")
         inspect = _busy_mark_check(path, copy, probes)
-        child = build_folders.hold_child_leases(path, probes, wait=False, check_owners=True,
+        rules = build_folders.FixedFolderRemovalRules.read()
+        child = build_folders.hold_child_leases(path, probes, rules=rules, wait=False, check_owners=True,
                                                review_temporary=not numbered, inspect=inspect)
         if isinstance(child, build_folders.RemovalLockHeld):
             raise BuildFolderInUse(f"{child.lock}: a lease lock or owner is active")

@@ -66,8 +66,9 @@ class FolderFormTests(unittest.TestCase):
 
     def write_config(self, *, alias: str = "claude", machine_root: str = "disk") -> None:
         _ = self.config.write_text(
-            "roots.workspace=~/worktrees\nroots.build=~/build\n"
+            "roots.workspace=~/worktrees\nroots.build=~/build\nroots.session=~/session\nroots.session.natedev=~/session\n"
             + f"roots.build.natedev=~/{machine_root}\nrepo_word.claude_commands={alias}\n"
+            + "forms.build.natedev=per-unit\nforms.build.mac=per-repository\n"
             + "# whole: 1..\nfolders.unused_days=2\n# range: 0..60\nlocks.probe_wait_seconds=0.25\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n",
             encoding="utf-8",
@@ -104,7 +105,7 @@ class FolderFormTests(unittest.TestCase):
 
     def test_repo_word_refuses_missing_or_invalid_names(self) -> None:
         self.init_repository()
-        with self.assertRaises(folders.InvalidFolderForm):
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "Git could not read the origin URL: .*origin"):
             _ = folders.repo_word(self.root)
         self.set_origin("https://example.invalid/")
         with self.assertRaises(folders.InvalidFolderForm):
@@ -119,6 +120,18 @@ class FolderFormTests(unittest.TestCase):
                 [], 0, stdout="git@example.invalid:team/widget.git\n")) as git:
             self.assertEqual(folders.repo_word(self.root), "widget")
         self.assertEqual(git.call_args.kwargs["timeout"], 10)
+
+    def test_repo_word_reports_git_timeout_and_invalid_timeout_setting(self) -> None:
+        timeout = subprocess.TimeoutExpired("git", 10, stderr=b"waiting for Git config\n")
+        with (mock.patch.object(subprocess, "run", side_effect=timeout),
+              self.assertRaisesRegex(folders.InvalidFolderForm,
+                                     "Git timed out after 10 s while reading the origin URL: waiting for Git config")):
+            _ = folders.repo_word(self.root)
+        with (mock.patch.object(folders, "repository_git_timeout", side_effect=ValueError("invalid git_timeout_seconds")),
+              mock.patch.object(subprocess, "run") as git,
+              self.assertRaisesRegex(folders.InvalidFolderForm, "Git timeout setting.*invalid git_timeout_seconds")):
+            _ = folders.repo_word(self.root)
+        git.assert_not_called()
 
     def test_held_copy_reports_kernel_identity_and_missing_or_partial_lease(self) -> None:
         from scripts.lib import build_copies, process_start
@@ -823,6 +836,152 @@ class FolderFormTests(unittest.TestCase):
         self.write_config(machine_root="new-disk")
         self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "new-disk/hana/demo")
         self.assertIsInstance(folders.parse_form(self.root / "disk/hana/demo/try-2"), folders.OutsideFolderLayout)
+
+    def test_build_folder_form_reads_the_named_machine(self) -> None:
+        self.assertIsInstance(folders.build_folder_form("natedev"), folders.PerUnitBuildFolders)
+        self.assertEqual(folders.build_folder_form("mac"), folders.FixedRepositoryBuildFolders("mac"))
+
+    def test_fixed_repository_allocator_refuses_an_unknown_form(self) -> None:
+        _ = self.config.write_text(self.config.read_text().replace("per-repository", "pooled"), encoding="utf-8")
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "forms.build.mac.*pooled"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted an unknown form.")
+        self.assertFalse((self.root / "disk").exists())
+
+    def test_fixed_repository_allocator_refuses_a_missing_machine(self) -> None:
+        _ = self.config.write_text(self.config.read_text().replace("forms.build.mac=per-repository\n", ""),
+                                   encoding="utf-8")
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "forms.build.mac.*missing"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted a missing machine.")
+        self.assertFalse((self.root / "disk").exists())
+
+    def test_generic_allocator_refuses_a_raw_fixed_repository_spec(self) -> None:
+        _ = self.config.write_text(self.config.read_text().replace("per-repository", "pooled"), encoding="utf-8")
+        spec = folders.BuildFolderSpec(kind="fixed-repository", parent=self.root / "disk",
+                                       repository="hana", machine="mac", suffix_length=0)
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "configured build folder form"):
+            _ = folders.create_build_folder(spec)
+        self.assertFalse(spec.parent.exists())
+
+    def test_fixed_repository_allocator_refuses_an_unlinked_lock(self) -> None:
+        with mock.patch.object(build_folder_lock, "lock_current", return_value=False) as current:
+            with self.assertRaisesRegex(BlockingIOError, "lock changed"):
+                with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                    self.fail("The allocator accepted a stale descriptor.")
+        current.assert_called_once()
+        self.assertFalse((self.root / "disk/hana/mac").exists())
+
+    def test_fixed_repository_allocator_holds_and_reuses_the_mac_folder(self) -> None:
+        with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo") as path:
+                self.assertEqual(path, self.root / "build/hana/mac")
+                self.assertTrue(path.is_dir())
+                self.assertEqual(build_folder_lock.probe(path, path.parent, lambda: build_folder_lock.NO_WAIT), "held")
+                fields = folders.folder_lease_fields(path)
+                self.assertEqual((fields["machine"], fields["repository"], fields["unit"]), ("mac", "hana", "demo"))
+                with self.assertRaises(BlockingIOError):
+                    with folders.fixed_repository_build_folder("hana", machine="mac", unit="verify"):
+                        self.fail("A second unit acquired the held folder.")
+                _ = (path / "proof").write_text("saved", encoding="utf-8")
+            self.assertEqual(folders.build_folder_state(path), "free")
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="verify") as reused:
+                self.assertEqual(reused, path)
+                self.assertEqual((reused / "proof").read_text(encoding="utf-8"), "saved")
+                self.assertEqual(folders.folder_lease_fields(reused)["unit"], "verify")
+
+    def test_fixed_build_root_refuses_a_checkout_ancestor(self) -> None:
+        checkout = self.root / "checkout"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        self.write_config(machine_root="checkout/build")
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Git checkout"):
+            _ = folders.build_root(form=folders.FixedRepositoryBuildFolders("mac"))
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Git checkout"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted a build root inside a checkout.")
+        with (mock.patch.object(folders, "build_root", return_value=checkout / "build"),
+              self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Git checkout")):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted an unchecked build root.")
+        self.assertFalse((checkout / "build").exists())
+
+    def test_fixed_build_root_refuses_a_cargo_output_ancestor(self) -> None:
+        output = self.root / "cargo-output"
+        output.mkdir()
+        self.write_config(machine_root="cargo-output/build")
+        with (mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": str(output)}),
+              self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Cargo target directory")):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted a build root inside a Cargo target directory.")
+        self.assertFalse((output / "build").exists())
+
+    def test_f1_placement_refuses_a_git_checkout_at_the_fixed_path(self) -> None:
+        checkout = folders.build_root() / "hana/mac"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        with self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "inside a Git checkout"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted an unrelated Git checkout")
+        self.assertFalse(folders.lease_path(checkout).exists())
+        self.assertTrue((checkout / ".git/HEAD").is_file())
+
+    def test_f7_placement_uses_the_volume_case_rule(self) -> None:
+        root = folders.build_root()
+        root.mkdir()
+        with self.config.open("a") as output:
+            _ = output.write(f"roots.copies={root.with_name(root.name.upper()) / 'copies'}\n")
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=0),
+              self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "contains a scratch root")):
+            _ = folders.build_root(form=folders.FixedRepositoryBuildFolders("mac"))
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=1)):
+            self.assertEqual(folders.build_root(form=folders.FixedRepositoryBuildFolders("mac")), root)
+
+    def test_f7_cargo_target_name_uses_the_volume_case_rule(self) -> None:
+        self.write_config(machine_root="TARGET/build")
+        form = folders.FixedRepositoryBuildFolders("mac")
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=0),
+              self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "inside a Cargo target directory")):
+            _ = folders.build_root(form=form)
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=1)):
+            self.assertEqual(folders.build_root(form=form), self.root / "TARGET/build")
+
+    def test_placement_refuses_overlap_with_each_configured_root(self) -> None:
+        root = folders.build_root()
+        initial = self.config.read_text()
+        for key in ("scratch", "session", "copies", "workspace", "temporary", "gate"):
+            for location in (root.parent, root / key):
+                with self.subTest(key=key, location=location):
+                    values = [line for line in initial.splitlines() if not line.startswith(f"roots.{key}")]
+                    _ = self.config.write_text("\n".join([*values, f"roots.{key}={location}", ""]))
+                    with (mock.patch.dict(os.environ, {"SESSION_TEMP_ROOT": ""}),
+                          self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "scratch root")):
+                        _ = folders.build_root(form=folders.FixedRepositoryBuildFolders("mac"))
+
+    def test_rows_198_199_temporary_sweep_keeps_former_fixed_folders(self) -> None:
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                former = self.root / f"former-{staged}"
+                with mock.patch.object(folders, "build_root", return_value=former):
+                    with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo") as fixed:
+                        _ = (fixed / "proof").write_text("fixed output")
+                sweep_root = self.root / f"sweep-{staged}"
+                sweep_root.mkdir()
+                name = ".removing-123-0123456789abcdef" if staged else "output"
+                outer = sweep_root / name
+                _ = former.rename(outer)
+                with build_folder_lock.folder_parent(outer, sweep_root, create=False) as parent:
+                    descriptor = build_folder_lock.open_lock(outer, parent, create=True)
+                    try:
+                        build_folder_lock.mark_lock(descriptor)
+                    finally:
+                        os.close(descriptor)
+
+                folders.sweep_temporary_build_folders(sweep_root, wait=False)
+
+                self.assertEqual((outer / fixed.relative_to(former) / "proof").read_text(), "fixed output")
 
     def test_mac_uses_the_common_build_root(self) -> None:
         with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
@@ -1673,8 +1832,8 @@ def mkdir_step(name, mode=0o777, *, dir_fd=None):
         interrupt()
         return result
     return mkdir(name, mode, dir_fd=dir_fd)
-def lease_step(*args):
-    lease(*args)
+def lease_step(*args, **kwargs):
+    lease(*args, **kwargs)
     interrupt()
 def fstat_step(fd):
     inode = fstat(fd)
@@ -2918,7 +3077,7 @@ os._exit(0)
                 parent.mkdir(exist_ok=True)
                 child = parent / ("sync" if nested else "late-child")
                 request = folders.StableOwnerFolder(child.name, folders.ExplicitBuildParent(parent))
-                scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+                scan = cast(Callable[..., object], folders.hold_child_leases_at)
 
                 def allocate_after_scan(path: Path, *args: object, **kwargs: object) -> object:
                     result = scan(path, *args, **kwargs)
@@ -2927,7 +3086,7 @@ os._exit(0)
                         self.addCleanup(_release_folder, made)
                     return result
 
-                with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan):
+                with mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_after_scan):
                     folders.sweep_temporary_build_folders(self.root, wait=False)
                 self.assertTrue(outer.is_dir())
                 self.assertTrue(child.is_dir())
@@ -2937,7 +3096,7 @@ os._exit(0)
     def test_staging_prevents_allocation_from_a_relative_temporary_parent(self) -> None:
         target = folders.create_build_folder(folders.UniqueBuildFolder("outer-"))
         _release_folder(target)
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
         allocated: list[Path] = []
         attempts: list[Path] = []
 
@@ -2956,7 +3115,7 @@ os._exit(0)
             return result
 
         with (chdir(target), mock.patch.dict(os.environ, {"TMPDIR": "."}),
-              mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan)):
+              mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_after_scan)):
             folders.sweep_temporary_build_folders(self.root, wait=False)
 
         self.assertEqual(len(attempts), 1)
@@ -3001,7 +3160,7 @@ os._exit(0)
         _release_folder(target)
         request = folders.StableOwnerFolder("sibling", folders.ExplicitBuildParent(self.root))
         sibling = self.root / "sibling"
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
 
         def allocate_sibling(path: Path, *args: object, **kwargs: object) -> object:
             result = scan(path, *args, **kwargs)
@@ -3014,7 +3173,7 @@ os._exit(0)
                     self.addCleanup(_release_folder, child)
             return result
 
-        with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_sibling):
+        with mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_sibling):
             folders.sweep_temporary_build_folders(self.root, wait=False)
         self.assertTrue(sibling.is_dir())
         self.assertEqual(folders.build_folder_state(sibling), "held")
@@ -3024,7 +3183,7 @@ os._exit(0)
     def test_a_sweep_keeps_the_hidden_tree_when_the_original_path_is_taken(self) -> None:
         target = folders.create_build_folder(folders.UniqueBuildFolder("occupied-"))
         _release_folder(target)
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
 
         def fill_original_path(path: Path, *args: object, **kwargs: object) -> object:
             if path != target:
@@ -3042,7 +3201,7 @@ os._exit(0)
                 build_folder_lock.mark_lock(lock)
             return result
 
-        with (mock.patch.object(folders, "_hold_child_leases", side_effect=reserve_late_child),
+        with (mock.patch.object(folders, "hold_child_leases_at", side_effect=reserve_late_child),
               mock.patch("sys.stderr", new_callable=io.StringIO) as report):
             folders.sweep_temporary_build_folders(self.root, wait=False)
         hidden_trees = [item for item in self.root.glob(".removing-*") if item.is_dir()]
@@ -3223,7 +3382,7 @@ os._exit(0)
             scratch.STYLE_TARGET_NAME, folders.ExplicitBuildParent(path)))
         _release_folder(target)
         (target / scratch.STYLE_LOCK_NAME).touch()
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
         child = target / "late"
 
         def allocate_after_scan(folder: Path, *args: object, **kwargs: object) -> object:
@@ -3239,7 +3398,7 @@ os._exit(0)
             if not isinstance(locks, sweep.TargetLocksAcquired):
                 self.fail(f"the style lock was held: {locks}")
             self.addCleanup(sweep.release, locks.held)
-        with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan):
+        with mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_after_scan):
             folders.sweep_temporary_build_folders(path, wait=False)
         self.assertTrue(child.is_dir())
         _release_folder(child)

@@ -8092,6 +8092,18 @@ class MacCullTests(SweepCase):
         self.assertTrue(newer.is_file())
         self.assertEqual(marker.read_text(), "keep")
 
+    def test_post_run_trim_refuses_a_checkout_outside_both_roots(self) -> None:
+        tree, payload = cargo_target(self.build_home / "unmanaged", "sample", APP, time.time())
+        checkout = tree.parents[1]
+        (checkout / floor_claims.MIRROR_MARK).touch()
+        with (build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.SHARED,
+                                            root=checkout.parent) as descriptor,
+              mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "0",
+                                           floor_claims.MIRROR_LEASE_FDS: str(descriptor)})):
+            self.assertEqual(sweep.sweep_workspace(str(tree.parent), conf.read("lint"), False, 60,
+                                                   mac_trim=sweep.MacRunTrim.LEASED_MIRROR), 2)
+        self.assertTrue(payload.is_file())
+
 
 class MacFloorTests(SweepCase):
     def policy(self, base: Path, claims: frozenset[str] = NO_MAC_CLAIMS) -> sweep.MacFloor:

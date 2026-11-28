@@ -1294,13 +1294,78 @@ process.stdout.write($("leftover-rows").innerHTML);
         return self.placement_wait_page("/fixture/claude_commands", gate_candidates(guest))
 
     def placement_wait_page(self, folder: str,
-                            candidates: tuple[placement.CandidateEligibility, ...]) -> memory_feed.MemoryPage:
+                            candidates: tuple[placement.CandidateEligibility, ...], *,
+                            selection: placement.GateTargets | None = None,
+                            remote: tuple[str, ...] = ()) -> memory_feed.MemoryPage:
         base = captured_reading()
         waiter = GatePlacementWaiter(8100, "gate-session", "fixture gate", "gate", folder,
             base.explanation.now - 30, admission_records.GIB, admission_records.NeedsMemory(),
-            job=StepJob("gate"), placement_candidates=candidates)
+            job=StepJob("gate"), placement_candidates=candidates, gate_targets=selection, placement_targets=remote)
         with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(base, view=replace(base.view, waiting=(waiter,))))):
             return memory_feed.reading()
+
+    def test_gate_reasons_show_for_caller_defaults_and_remote_waits(self) -> None:
+        local, guest, _scaler = gate_candidates(placement.TemporaryExclusion("busy"))
+        caller = placement.GATE_CALLER_EXCLUSION
+        pinned = placement.GateTargets(("natedev",), (("mac-linux", caller), ("aws", caller)), caller_supplied=True)
+        defaults = placement.GateTargets(("natedev", "mac-linux"), (("aws", "off"),))
+        remote = placement.GateTargets(("mac-linux",), (("natedev", caller), ("aws", caller)), caller_supplied=True)
+        cases = (
+            (pinned, (local,), (), "mac-linux: requested by the caller · aws: requested by the caller"),
+            (defaults, (local, replace(guest, eligibility=placement.AllowedHost())), (), "aws: the target is off"),
+            (remote, (guest,), ("mac-linux",),
+             "natedev: requested by the caller · mac-linux: the target is busy · aws: requested by the caller"),
+            (None, (local,), (),
+             "mac-linux: the queue did not record a reason · aws: the queue did not record a reason"),
+        )
+        for selection, candidates, remote_names, because in cases:
+            with self.subTest(selection=selection):
+                page = self.placement_wait_page("/fixture/claude_commands", candidates,
+                                                selection=selection, remote=remote_names)
+                row, = page["waiters"]
+                self.assertEqual(row.get("because"), because)
+                if remote_names:
+                    self.assertEqual(row.get("targets"), list(remote_names))
+                    self.assertEqual(row["reason"], "waiting for mac-linux")
+                payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                waiting = cast(list[dict[str, object]], payload["waiters"])
+                waiting[0]["head_room"] = {"unavailable": True}
+                tips, _table = self.render_assignment_table(payload)
+                self.assertIn(because, "\n".join(tips["waiters"][0]))
+
+    def test_running_gate_reasons_use_saved_eligibility_and_the_actual_machine(self) -> None:
+        local, guest, scaler = gate_candidates(placement.AllowedHost())
+        aws = replace(scaler, destination=replace(scaler.destination, target="claude-aws"),
+                      eligibility=placement.TemporaryExclusion("daily_limit"))
+        guest = replace(guest, eligibility=placement.TemporaryExclusion("busy"))
+        selection = placement.GateTargets(("natedev", "mac-linux", "claude-aws"), ())
+        base = reservation_reading(project="claude_commands")
+        step = replace(base.view.running[0], step="gate", job=StepJob("test-all"),
+            placement_candidates=(local, guest, aws), gate_targets=selection)
+        entry = replace(base.explanation.running[0], step=step)
+        base = replace(base, view=replace(base.view, running=(step,)),
+            explanation=replace(base.explanation, running=(entry,)))
+        reading = cloud_reading(base)
+        aws_only = placement.GateTargets(("claude-aws",),
+            (("natedev", placement.GATE_CALLER_EXCLUSION), ("mac-linux", "off")), caller_supplied=True)
+        reading = replace(reading, cloud=tuple(replace(row, identity=replace(row.identity, gate_targets=aws_only))
+                                               for row in reading.cloud))
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
+              mock.patch.object(memory_feed, "host_name", return_value="natedev")):
+            page = memory_feed.reading()
+        assert isinstance(step.run, LiveBuildRun)
+        row = next(row for row in page["walk"] if row["pid"] == step.run.pid)
+        self.assertEqual(row.get("because"), "mac-linux: the target is busy · aws: the daily spending limit is reached")
+        cloud_rows = [row for row in (*page["walk"], *page["waiters"]) if row.get("kind") == "cloud"]
+        self.assertEqual(len(cloud_rows), 2)
+        for cloud in cloud_rows:
+            self.assertEqual(cloud.get("because"), "natedev: requested by the caller · mac-linux: the target is off")
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        cells = dict(cast(list[tuple[str, str]],
+            re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(cells[str(row.get("key"))]), [("run", "natedev")])
+        self.assertIn(str(row.get("because")), "\n".join(tips["walk"][page["walk"].index(row)]))
 
     def test_a_fixed_guest_exclusion_is_not_a_target_and_the_route_fit_names_the_targets(self) -> None:
         row, = self.placement_wait_page("/fixture/hana", gate_candidates(placement.FixedExclusion("repo")))["waiters"]

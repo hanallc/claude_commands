@@ -2693,6 +2693,7 @@ try_mac_test() {
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE")
     runner_args+=(--target "$selected_target")
+    if [[ -n "${BUILDLOG_RUN:-}" ]]; then runner_args+=(--run-id "$BUILDLOG_RUN"); fi
     if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         local reserved_target reserved_settings
         IFS=$'\t' read -r reserved_target reserved_settings < "$HOLD_WAIT_DIR/ssh-reservation"
@@ -3469,6 +3470,15 @@ wait_for_claim_recovery() {
 }
 
 take_local_placement() {
+    if [[ "$STEP_ASSIGNED_TARGET" == natedev ]]; then
+        local form_status=0
+        verify_helper "$BUILD_FOLDERS_SCRIPT" require-per-unit "$STEP_ASSIGNED_TARGET" || form_status=$?
+        if (( form_status != 0 )); then
+            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the build folder form was refused" >/dev/null || true
+            return "$form_status"
+        fi
+    fi
     # The grant keeps its reservation while the call takes its unit's cargo token.
     local token_status=0
     TOKEN_WAIT_HOLD_CHECK=build_hold_check_local

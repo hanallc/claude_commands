@@ -198,6 +198,12 @@ def load(path: Path, reverse: bool) -> DeploymentState:
     return DeploymentState(step, owned, float(began), float(total), gate_folders, recovery, direction)
 
 
+def assigned_value(source: ast.Module, name: str) -> ast.expr | None:
+    """Read the value assigned to a top-level name."""
+    return next((node.value for node in source.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)), None)
+
+
 def require_installed_code(tree: Path, direction: Direction) -> None:
     production = tree / "scripts/production"
     land = ast.parse((production / "land_runs.py").read_text())
@@ -205,9 +211,14 @@ def require_installed_code(tree: Path, direction: Direction) -> None:
     gate_path = production / ("merge_gate.py" if reverse else "gate.py")
     _, gate_step = direction.gate_steps()
     expected_folder = f"~/.local/state/{gate_step}"
-    default = next((node.value for node in land.body if isinstance(node, ast.Assign)
-                    and any(isinstance(target, ast.Name) and target.id == "DEFAULT_STATE_DIR"
-                            for target in node.targets)), None)
+    default = assigned_value(land, "DEFAULT_STATE_DIR")
+    if default is None and any(isinstance(node, ast.ImportFrom) and node.module == "scripts.lib.gate_state_paths"
+                               and node.level == 0
+                               and any(item.name == "DEFAULT_GATE_STATE_DIR" and item.asname is None
+                                       for item in node.names) for node in land.body):
+        paths = tree / "scripts/lib/gate_state_paths.py"
+        if paths.is_file():
+            default = assigned_value(ast.parse(paths.read_text()), "DEFAULT_GATE_STATE_DIR")
     if reverse and default is None:
         # The old reader sets the default in state_dir().
         default_matches = any(isinstance(value, ast.Constant) and value.value == expected_folder

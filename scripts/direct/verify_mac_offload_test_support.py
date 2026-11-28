@@ -52,7 +52,27 @@ from scripts.lib.shell_test_support import shell_functions
 VERIFY = Path(__file__).with_name("verify.sh")
 
 
-_REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+_REACHABLE_SSH_STUB = b'''#!/bin/sh
+for command do :; done
+case "$command" in
+    *'mac_queue_run.py hold-offload-folder '*) exec "${0%/*}/fixed-folder-holder" "$command" ;;
+esac
+printf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"
+'''
+
+FIXED_FOLDER_HOLDER = '''
+from pathlib import Path
+import shlex
+import sys
+from unittest.mock import patch
+
+from scripts.agents import remote
+from scripts.mac_test import mac_queue_run
+
+_, _, _, machine, repository, unit, record = shlex.split(sys.argv[1])
+with patch.object(remote, "this_machine", return_value="mac"):
+    sys.exit(mac_queue_run.hold_offload_folder(machine, repository, unit, Path(record)))
+'''
 
 
 def drop_released_mac_claim(reader: service.HostEvidenceReader, claim: placement.ProviderClaimReference) -> None:
@@ -1043,6 +1063,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if "fixture_seed" in type(self).__dict__:
             self.root = self.fixture_root
             self.addCleanup(shutil.rmtree, self.root)
+            self.addCleanup(self.remove_build_root)
             _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
             self.fixture_paths()
             self.environment = self.fixture_environment.copy()
@@ -1180,8 +1201,17 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.cargo_events_path = self.root / "cargo-events.jsonl"
         self.runner = self.root / "runner.py"
 
+    @property
+    def build_root(self) -> Path:
+        return self.root.with_name(f"{self.root.name}-build")
+
+    def remove_build_root(self) -> None:
+        if self.build_root.is_dir():
+            shutil.rmtree(self.build_root)
+
     def build_fixture(self) -> None:
         self.fixture_paths()
+        self.addCleanup(self.remove_build_root)
         self.home.mkdir()
         claude = self.home / ".claude"
         scripts = claude / "scripts"
@@ -1206,6 +1236,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB.decode("utf-8"))
+        self.write_executable(self.bin_directory / "fixed-folder-holder", FIXED_FOLDER_HOLDER)
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -1324,10 +1355,14 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         private = copies_environment(self.root)
         configuration = Path(self.environment["CONF_DIR"])
         settings_source = Path(private["CONF_DIR"]) / "build_folders.conf"
-        settings_lines = [
-            line for line in settings_source.read_text(encoding="utf-8").splitlines()
-            if (key := line.partition("=")[0].strip()) != "patterns.tool" and not key.startswith("patterns.tool.")
-        ]
+        settings_lines: list[str] = []
+        for line in settings_source.read_text(encoding="utf-8").splitlines():
+            key = line.partition("=")[0].strip()
+            if key == "patterns.tool" or key.startswith("patterns.tool."):
+                continue
+            if key == "roots.build" or key.startswith("roots.build."):
+                line = f"{key}={self.build_root}"
+            settings_lines.append(line)
         settings_lines.append("patterns.tool={purpose}{suffix}")
         _ = (configuration / settings_source.name).write_text("\n".join(settings_lines) + "\n", encoding="utf-8")
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})

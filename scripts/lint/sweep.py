@@ -4300,6 +4300,7 @@ class MacFloor:
 
 class MacOutputLocation(Enum):
     MIRROR = "a registered mirror target"
+    FIXED_CHECKOUT = "a fixed Mac checkout target"
     BUILD = "build output outside the source checkout"
     NUMBERED_COPY = "numbered copy output used to determine repository age"
 
@@ -4486,7 +4487,7 @@ def mac_output_locks(outputs: Mapping[MacBuildOutput, MacOutputObservation],
     folders = set(paths)
     build = Path.home().resolve() / "build"
     for output in outputs:
-        if output.location is not MacOutputLocation.MIRROR:
+        if output.location in (MacOutputLocation.BUILD, MacOutputLocation.NUMBERED_COPY):
             folders.update(parent for parent in output.path.parents if parent != build and parent.is_relative_to(build))
     leases: dict[Path, build_folders.FreeFolderRemovalLease] = {}
     with ExitStack() as resources:
@@ -4639,19 +4640,32 @@ def trim_mac_outputs(outputs: Mapping[MacBuildOutput, MacOutputObservation], bud
 
 
 def trim_mac_run(target: Path, budget: int, recent_minutes: float, *, lint_settings: conf.ConfigRead) -> int:
-    """Trim only the registered mirror that the caller still leases."""
+    """Trim output in a registered checkout that the caller still leases."""
+    from scripts.agents import remote
+
     try:
         mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path()
         checkout = target.parent
-        if target.name != "target" or checkout.parent != mirror:
+        if target.name != "target":
             return 2
+        if checkout.parent == mirror:
+            output = MacBuildOutput(target, checkout.name, MacOutputLocation.MIRROR, mirror)
+        else:
+            try:
+                fixed = build_folders.check_fixed_repository_placement(
+                    checkout.parent.name, machine=remote.this_machine())
+            except (ValueError, StopIteration):
+                return 2
+            if checkout != fixed:
+                return 2
+            output = MacBuildOutput(target, checkout.parent.name, MacOutputLocation.FIXED_CHECKOUT,
+                                    checkout.parent.parent)
         if not target.exists():
             return 0
         marker = checkout / floor_claims.MIRROR_MARK
         if not marker.is_file() or marker.is_symlink():
             return 1
-        with build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.UPGRADE):
-            output = MacBuildOutput(target, checkout.name, MacOutputLocation.MIRROR, mirror)
+        with build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.UPGRADE, root=checkout.parent):
             outputs = {output: observe_mac_output(output)}
             with mac_output_locks(outputs) as locks:
                 if isinstance(locks, MacOutputRemoval):

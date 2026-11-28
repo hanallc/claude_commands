@@ -1,6 +1,7 @@
 """Test process identity reads for admission clients."""
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
@@ -247,6 +248,33 @@ class RequestOwnerRowTests(unittest.TestCase):
 
 
 class FolderOwnerTests(unittest.TestCase):
+    def test_active_gate_then_copy_record_then_staff_supplies_the_owner(self) -> None:
+        from scripts.agents.remote import local_machine
+        from scripts.copies import copies
+        from scripts.lib import copy_record, scratch
+
+        tree = Path(FIXTURE_WORKTREE).resolve()
+        member = replace(UNIT, worktree=staff.PresentWorktree(local_machine(), tree))
+        registration = copy_record.Registered("run:fixture", {"owner_unit": "copy_unit"})
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((member,))),
+              patch.object(scratch, "task_of", return_value=registration) as task_of):
+            token = copies.ACTIVE_GATES.set((copies.ActiveGate(tree, tree, "gate_unit"),))
+            try:
+                self.assertEqual(records.folder_owner(tree), "gate_unit")
+                self.assertEqual(copies.recorded_owner(tree), "gate_unit")
+                task_of.assert_not_called()
+            finally:
+                copies.ACTIVE_GATES.reset(token)
+            self.assertEqual(records.folder_owner(tree), "copy_unit")
+            self.assertEqual(copies.recorded_owner(tree), "copy_unit")
+            task_of.return_value = copy_record.NotRegistered()
+            self.assertEqual(records.folder_owner(tree), str(member.id))
+            self.assertEqual(copies.recorded_owner(tree), str(member.id))
+            task_of.return_value = copy_record.Registered("run:fixture", {"owner_unit": "invalid owner"})
+            self.assertEqual(records.folder_owner(tree), "")
+            with self.assertRaisesRegex(copies.CopyError, "owner must match"):
+                _ = copies.recorded_owner(tree)
+
     def test_a_queue_request_reads_the_copy_record_without_recovery_and_source_owner_recovers(self) -> None:
         from scripts.copies import copies
         from scripts.lib import scratch

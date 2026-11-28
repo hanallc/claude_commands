@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Build and run a commit on the Mac in a numbered copy.
+# Build and run a commit in the Mac build folder.
 # Usage: mac_run.sh <repo dir> <sha> [seconds]
 # Exit: 0 passed, 3 Mac unreachable, 4 setup or cleanup failed, 5 wrong tree,
 # 6 build failed, 7 Hana exited early, 8 an example failed, 9 Mac unavailable.
@@ -21,7 +21,7 @@ if [[ $1 == cleanup-copy ]]; then
 fi
 callback_mode=''
 argv_file=''
-if [[ $1 == prepare || $1 == cleanup ]]; then
+if [[ $1 == prepare || $1 == cleanup || $1 == upload ]]; then
   callback_mode=$1
   argv_file=$2
   shift 2
@@ -58,7 +58,18 @@ cleanup_legacy_scratch() {
   fi
   [[ -z $bundle ]] || rm -f -- "$bundle" || return 4
 }
+if [[ $callback_mode == upload ]]; then
+  bundle=$(< "$argv_file.bundle")
+  remote_bundle=$(< "$argv_file.upload")
+  exec scp -q "$bundle" "${MAC_QUEUE_HOST:?}:$remote_bundle"
+fi
 if [[ $callback_mode == cleanup ]]; then
+  if [[ ${MAC_QUEUE_RECOVER_SMOKE:-} == 1 && -f $argv_file.fixed-smoke ]]; then
+    episode=${argv_file:h:t}
+    [[ ${#episode} == 32 && $episode != *[^0-9a-f]* ]] || exit 4
+    ssh -o BatchMode=yes "${MAC_QUEUE_HOST:?}" \
+      'exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/mac_test/mac_queue_run.py" smoke-recover '"$episode" || exit 4
+  fi
   if [[ -e $argv_file.state || -h $argv_file.state ]]; then
     cleanup_legacy_scratch "$argv_file.state"
     exit $?
@@ -96,7 +107,6 @@ remote_bundle=$(conf_value production mac_run_bundle) || exit 2
 example_log_prefix=$(conf_value production mac_run_example_log_prefix) || exit 2
 # Quote each configured path before it enters a remote shell command.
 log_arg=${(q)log}
-launch_arg=${(q)launch}
 status_arg=${(q)status_file}
 source_repo=$(conf_value production mac_run_source) || exit 2
 source_arg=${(q)source_repo}
@@ -108,6 +118,11 @@ if [[ -z $callback_mode ]]; then
     --worktree "$repo" --cwd '' --lifecycle-script "${0:A}" -- "$repo" "$sha" "$hold"
 fi
 host=$MAC_QUEUE_HOST
+episode=${argv_file:h:t}
+[[ ${#episode} == 32 && $episode != *[^0-9a-f]* ]] || exit 4
+launch_extension=${launch:e}
+launch="${launch:r}.$episode${launch_extension:+.$launch_extension}"
+launch_arg=${(q)launch}
 sha=$(git -C "$repo" rev-parse --verify "$sha^{commit}") || exit 2
 copy_owner=$("$lib/py" -c 'import sys; from pathlib import Path; from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' "$lib/../copies/copies.py" "$repo") || exit 4
 
@@ -119,7 +134,8 @@ base=$(ssh -o BatchMode=yes "$host" "git -C $source_arg rev-parse --verify $sha^
 }
 ref=''
 if [[ $base != $sha ]]; then
-  ref=refs/mac-run/tip
+  ref=refs/mac-run/$episode
+  remote_bundle="$remote_bundle.$episode/${remote_bundle:t}"
   bundle=$(mktemp --suffix=.bundle) || exit 4
   print -r -- "$bundle" > "$argv_file.bundle"
   git -C "$repo" update-ref $ref $sha || exit 4
@@ -131,7 +147,7 @@ if [[ $base != $sha ]]; then
   bundle_exit=$?
   git -C "$repo" update-ref -d $ref
   (( bundle_exit == 0 )) || exit 4
-  scp -q "$bundle" "$host:$remote_bundle" || exit 4
+  print -r -- "$remote_bundle" > "$argv_file.upload" || exit 4
 fi
 remote_work=$(cat <<EOF
 checkout=\$PWD
@@ -211,23 +227,19 @@ env = os.environ
 source = env["MAC_RUN_SOURCE"]
 source = "$HOME/" + quote(source[2:]) if source.startswith("~/") else quote(source)
 py = """ "$HOME/.claude/scripts/lib/py" """
-copies = """ "$HOME/.claude/scripts/copies/copies.py" """
 runner = """ "$HOME/.claude/scripts/mac_test/mac_queue_run.py" """
 cleanup = """exec "$HOME/.claude/scripts/production/mac_run.sh" cleanup-copy "$1" """ + quote(env["MAC_RUN_LAUNCH"])
 work = env["MAC_RUN_REMOTE_WORK"]
-prepare = ""
-if ref := env["MAC_RUN_BUNDLE_REF"]:
-    bundle = quote(env["MAC_RUN_BUNDLE"])
-    prepare = (
-        f"git -C {source} fetch -q --no-tags --no-write-fetch-head -- {bundle} {quote(ref)} </dev/null\n"
-        + "fetch_status=$?\n"
-        + f"rm -f -- {bundle}\n"
-        + "(( fetch_status == 0 )) || exit 5\n"
-    )
+owner, commit, bundle, ref = (quote(env[key]) for key in
+    ("MAC_RUN_COPY_OWNER", "MAC_RUN_SHA", "MAC_RUN_BUNDLE", "MAC_RUN_BUNDLE_REF"))
 command = [
     "/bin/zsh", "-c",
-    prepare + f"exec{py}{runner}smoke-copy{py}{copies}run --repo {source} --owner " + quote(env["MAC_RUN_COPY_OWNER"])
-    + " --commit " + env["MAC_RUN_SHA"] + f" --{py}{runner}smoke-work " + quote(work) + " " + quote(cleanup)
+    f"exec{py}{runner}smoke-copy{py}{runner}smoke-folder {source} {owner} {commit} {bundle} {ref} "
+    + quote(env["MAC_RUN_LAUNCH"]) + " "
+    + f"--{py}{runner}smoke-work "
+    + quote(work) + " " + quote(cleanup)
 ]
-Path(sys.argv[1]).write_text(json.dumps(command))
+path = Path(sys.argv[1])
+path.write_text(json.dumps(command))
+path.with_suffix(".json.fixed-smoke").touch()
 ' "$argv_file"

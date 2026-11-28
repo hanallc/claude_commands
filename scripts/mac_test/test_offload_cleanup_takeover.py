@@ -8,6 +8,7 @@ import subprocess
 import unittest
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 from scripts.mac_test import claim_state, offload
+from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -56,7 +57,7 @@ class OffloadCommandTests(SeededCleanupFixture):
                 assigned_options = tuple(self.assignment_options(self.repository, "nextest", settings, ()))
                 if unacknowledged:
                     self.fixture["run_status_reported"] = False
-                    self.sync_fixture()
+                    self.set_leftover_answer("remaining")
                     interrupted = self.process_command(runner_options=assigned_options)
                     self.assertEqual(interrupted.returncode, 75, interrupted.stdout)
                     self.assertTrue(self.claim_file.exists())
@@ -86,11 +87,12 @@ class OffloadCommandTests(SeededCleanupFixture):
                                       pending_identity["attempt"], pending_identity["remote_host"]))
                     self.assertEqual(self.events_for("rsync"), [])
                     self.clear_events()
-                    exact = claim_state.ClaimIdentity(pending_identity["claim_id"], pending_identity["episode"],
-                                                     pending_identity["attempt"])
-                    self.fixture["cleanup_lines"] = ["dispatch_start_settled=" + offload.pending_start_key(exact),
-                                                     "leftovers=0", "rc=0"]
-                    self.sync_fixture()
+                    selectors = self.stub_directory / "selectors"
+                    selectors.mkdir()
+                    for tool in ("pgrep", "lsof", "sleep"):
+                        write_shell(selectors / tool, SELECTOR_STUB)
+                    self.fixture["selector_shell"] = "sh"
+                    self.set_leftover_answer("clean")
                     cleanup_result = self.command("--no-fail-fast", settings=alternate, subprocess_cli=unacknowledged,
                                                   runner_options=assigned_options)
                     self.assertEqual(cleanup_result.returncode, 75, cleanup_result.stdout)
@@ -102,8 +104,18 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assert_wire("passed", "")
                 self.assertFalse(self.claim_file.exists())
                 events = self.events()
-                self.assertEqual([event["command"] for event in events], ["ssh", "ssh", "rsync", "ssh"])
-                cleanup = events[0]
+                cleanup, = self.leftover_events()
+                ssh = self.events_for("ssh")
+                probe, = [
+                    event for event in ssh
+                    if event["args"][-2] == "next-mac" and "\nprobe_status=$?\n" in event["args"][-1]
+                ]
+                self.assertIn("free_gib=$(df", probe["args"][-1])
+                copy, = self.events_for("rsync")
+                run, = [event for event in ssh if "lint nextest" in event["args"][-1]]
+                settlement, = [event for event in ssh if event not in (cleanup, probe, run)]
+                self.assertIn("dispatch_start_settled=", settlement["args"][-1])
+                self.assertEqual(events, [cleanup, probe, copy, run, settlement])
                 self.assertEqual(cleanup["args"][-2], previous_host)
                 self.assertIn("ConnectTimeout=2", cleanup["args"])
                 self.assert_leftover_selectors(cleanup["args"][-1])

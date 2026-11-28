@@ -1242,7 +1242,8 @@ class UnitFolderRename:
         _review_rename_copies(old)
         if not new.is_dir():
             return
-        root = build_folders.build_root()
+        rules = build_folders.FixedFolderRemovalRules.read()
+        root = old.parent.parent
         with (build_folder_lock.folder_parent(old / "output", root, create=False) as old_fd,
               build_folder_lock.folder_parent(new / "output", root, create=False) as new_fd):
             for path in sorted(old.iterdir()):
@@ -1266,7 +1267,10 @@ class UnitFolderRename:
                     raise ValueError(f"{path}: the output lock changed. Rerun when idle")
                 if not build_folders.may_remove_folder_tree(path):
                     raise ValueError(f"{path}: a mount prevents the unit rename")
-                rename_exclusive(old_fd, path.name, new_fd, path.name)
+                with ExitStack() as children:
+                    if build_folders.hold_child_leases(path, children, rules=rules, wait=False) is not None:
+                        raise ValueError(f"{path}: a child build folder prevents the unit rename")
+                    rename_exclusive(old_fd, path.name, new_fd, path.name)
 
     def _renamed_path(self, path: Path) -> Path:
         if path.is_relative_to(self.source):
@@ -1677,8 +1681,8 @@ type RenameGuard = Callable[[Path, MoveJournal], AbstractContextManager[Callable
 
 
 @contextmanager
-def _unguarded_rename(_path: Path, _journal: MoveJournal) -> Generator[Callable[[], None]]:
-    yield lambda: None
+def _check_direct_rename(path: Path) -> Generator[Callable[[], None]]:
+    yield lambda: build_folders.require_no_fixed_build_folders(path)
 
 
 def _source_signature(source: Path) -> dict[Path, tuple[int, int, int]]:
@@ -2452,6 +2456,10 @@ def _migration_build_keep(path: Path, folders: MigrationFolders) -> str:
             pass
         else:
             return "a build unit folder; the build folder model owns it"
+    try:
+        build_folders.require_no_fixed_build_folders(resolved)
+    except (OSError, ValueError) as error:
+        return str(error)
     return ""
 
 
@@ -3192,6 +3200,8 @@ def _hold_worktree_relocation(
             uses = _migration_processes(paths, ignored_fds=frozenset(fds))
             record_process_scan(uses)
             for member, source in current.items():
+                if reason := _migration_build_keep(source, folders):
+                    raise MigrationPlanChanged(reason)
                 if reason := _migration_process_use(source, uses, ignore_stopped_pane_shells=ignore_stopped_pane_shells):
                     if member != path and not reason.startswith("unreadable process "):
                         reason = f"linked worktree {member}: {reason}"
@@ -3203,7 +3213,7 @@ def _hold_worktree_relocation(
 def _direct_move_guard(path: Path, journal: MoveJournal) -> AbstractContextManager[Callable[[], None]]:
     if journal.copy_tag:
         return _hold_worktree_relocation(path, journal, MigrationLocations({}), MigrationFolders.configured())
-    return _unguarded_rename(path, journal)
+    return _check_direct_rename(path)
 
 
 @dataclass

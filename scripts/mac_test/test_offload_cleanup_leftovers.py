@@ -7,14 +7,16 @@ import hashlib
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib import build_folders
 from scripts.mac_test import claim_state, eligibility, offload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
+from scripts.mac_test.offload_test_support import SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
@@ -33,6 +35,12 @@ class RunnerFenceCommandTests(unittest.TestCase):
 
 class OffloadCommandTests(SeededCleanupFixture):
     def test_fence_holder_diagnostic_preserves_the_test_verdict(self) -> None:
+        self.assert_fence_holder_preserves_verdict(42, "failed")
+
+    def test_pending_fence_preserves_a_pass(self) -> None:
+        self.assert_fence_holder_preserves_verdict(0, "passed")
+
+    def assert_fence_holder_preserves_verdict(self, status: int, verdict: str) -> None:
         stream = offload.ProcessController.stream_mac_run
 
         def remote_run(controller: offload.ProcessController, arguments: Sequence[str],
@@ -44,19 +52,24 @@ class OffloadCommandTests(SeededCleanupFixture):
             identity = controller.claim_identity
             assert isinstance(identity, claim_state.ClaimIdentity)
             key = offload.pending_start_key(identity)
-            self.assertIn("dispatch_start_settled=", command.split("exec 8<&-\n", 1)[1])
+            self.assertEqual(command.split("exec 8<&-\n", 1)[1], 'exit "$dispatch_status"')
             self.assertNotIn("fence_holders", command)
-            lines = f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending={key}\n"
+            lines = f"mac_exit={status}\nmac_cleanup=skipped\ndispatch_start_pending={key}\n"
             return stream(controller, ["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines], cleanup_limit)
 
         with mock.patch.object(offload.ProcessController, "stream_mac_run", remote_run), \
              mock.patch.object(offload, "settle_pending_start") as settle:
             result = self.command("--no-fail-fast", direct_placement=True, separate_stderr=True)
-        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+        self.assertIn("the fixed build folder clearance is unconfirmed", result.stderr)
         settle.assert_not_called()
         self.assertEqual(self.leftover_events(), [])
-        self.assert_wire("failed", "")
+        self.assert_wire(verdict, "")
         self.assertEqual(self.remote_claim()["remote_host"], "mac")
+        dispatch = Path(self.environment["HOME"]) / ".local/state/mac-test/dispatch-fences"
+        record, = dispatch.rglob("*.folder")
+        self.assertTrue(record.with_suffix(".lock").is_file())
+        self.assertTrue(build_folders.copy_keep_file(Path(record.read_text().strip())).is_file())
 
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
@@ -244,9 +257,10 @@ class OffloadCommandTests(SeededCleanupFixture):
                     self.assertIn("pgrep", names)
                     if pgrep_status == 1:
                         self.assertIn("lsof", names)
+                    command_pattern, _ = self.fixed_selector_patterns()
                     for call in calls:
                         if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", HANA_COMMAND_PATTERN])
+                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", command_pattern])
                         if call["command"] == "lsof":
                             self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
                     answer = (self.stub_directory / "selector-answer").read_text()

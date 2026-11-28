@@ -22,8 +22,8 @@ from unittest import mock
 from scripts.mac_test import eligibility, offload
 from scripts.lib import conf
 from scripts.lint import sweep
-from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
-from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.mac_test.offload_test_commands import write_shell
+from scripts.mac_test.offload_test_support import OFFLOAD_COMMAND_STUB, OffloadCommandFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -463,7 +463,7 @@ select_leftovers
 
 def install_floor_sweep_stub(fixture: OffloadCommandFixture) -> None:
     """Match the deadline argument in the fixture's SSH command."""
-    write_shell(fixture.bin_directory / "command-stub", COMMAND_STUB.replace(
+    write_shell(fixture.bin_directory / "command-stub", OFFLOAD_COMMAND_STUB.replace(
         "'sweep.py --floor-only --host mac'",
         "'sweep.py --mac-floor-deadline '*' --floor-only --host mac'",
     ))
