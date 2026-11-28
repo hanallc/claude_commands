@@ -17,6 +17,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
+from typing import TYPE_CHECKING, BinaryIO, ClassVar, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -8173,7 +8174,47 @@ class MacCullTests(SweepCase):
         self.assertEqual(marker.read_text(), "keep")
 
 
+FLOOR_FIXTURE_IMPORTS = """
+import fcntl
+import os
+import signal
+import sys
+import termios
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, os.environ["FLOOR_TEST_PACKAGE_ROOT"])
+from scripts.lib import conf
+from scripts.lint import sweep
+from scripts.mac_test import floor_claims
+from scripts.mac_test.mirror_root import MacMirrorRoot
+"""
+
+
 class MacFloorTests(SweepCase):
+    _floor_startup_seconds: ClassVar[float | None] = None
+
+    @classmethod
+    def measure_floor_startup(cls) -> float:
+        if cls._floor_startup_seconds is not None:
+            return cls._floor_startup_seconds
+        guard = LauncherHangGuard("floor fixture startup measure")
+        package_root = str(Path(__file__).resolve().parents[2])
+        env = {**os.environ, "FLOOR_TEST_PACKAGE_ROOT": package_root}
+        samples: list[float] = []
+        with tempfile.TemporaryDirectory() as directory:
+            program = Path(directory) / "sweep_fixture.py"
+            _ = program.write_text(FLOOR_FIXTURE_IMPORTS)
+            for _ in range(3):
+                started = time.monotonic()
+                # Use the supervisor's flags for the first start and the worker's for the second.
+                for flags in ((), ("-u",)):
+                    _ = subprocess.run([sys.executable, *flags, str(program)], env=env,
+                                       check=True, timeout=guard.remaining())
+                samples.append(time.monotonic() - started)
+        cls._floor_startup_seconds = statistics.median(samples)
+        return cls._floor_startup_seconds
+
     def policy(self, base: Path, claims: frozenset[str] = NO_MAC_CLAIMS) -> sweep.MacFloor:
         return sweep.MacFloor((str(base),), floor_claims.ClaimSnapshot(claims), base / "mirror")
 
@@ -8391,25 +8432,12 @@ class MacFloorTests(SweepCase):
         alert.assert_not_called()
 
     def test_mac_sweep_releases_the_floor_lock_when_the_session_ends(self) -> None:
+        startup_seconds = self.measure_floor_startup()
         base = self.output_fixture()
         mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path()
         mirror.mkdir(parents=True)
         program = base / "sweep_fixture.py"
-        _ = program.write_text("""
-import fcntl
-import os
-import signal
-import sys
-import termios
-from pathlib import Path
-from unittest import mock
-
-sys.path.insert(0, os.environ["FLOOR_TEST_PACKAGE_ROOT"])
-from scripts.lib import conf
-from scripts.lint import sweep
-from scripts.mac_test import floor_claims
-from scripts.mac_test.mirror_root import MacMirrorRoot
-
+        _ = program.write_text(FLOOR_FIXTURE_IMPORTS + """
 base = Path(__file__).parent
 mode = os.environ["FLOOR_TEST_MODE"]
 scandir = os.scandir
@@ -8481,10 +8509,12 @@ with (mock.patch.object(sweep, "__file__", __file__),
                 barrier_path = lock if waiting_for_lock else base / "scan.lock"
                 barrier = terminal.enter_context(barrier_path.open("a+"))
                 fcntl.flock(barrier, fcntl.LOCK_EX)
-                client_deadline = time.monotonic() + seconds
+                client_deadline = time.monotonic() + seconds + startup_seconds
                 # The caller sends this time before SSH starts the Mac process.
-                sent_at = time.time() - (seconds if mode == "delayed startup" else 0)
-                mac_deadline = sent_at + seconds / 2
+                sent_at = time.time()
+                if mode == "delayed startup":
+                    sent_at -= seconds + startup_seconds
+                mac_deadline = sent_at + seconds / 2 + startup_seconds
                 with os.fdopen(slave, "rb") as slave_stream:
                     child = subprocess.Popen(
                         [sys.executable, str(program), "--mac-floor-deadline", str(mac_deadline),
