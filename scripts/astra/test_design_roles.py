@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_runtime_id, fixture_unit_location, fixture_session,
+    fixture_member, fixture_runtime_id, fixture_unit_location, fixture_session, fixture_worker,
     showrunner_relationship, unit_membership,
 )
 
@@ -388,7 +388,8 @@ class HeldRolePaneTests(HeldRolePaneCase):
         reply = self.panes.root / "dispatch-review.md"
         result = self.panes.assign([
             "--role", "implement", "--target", "durable-design-role", "--policy", "astra-designer",
-            "--parent", str(self.panes.command_case.fixture.parent.id), "--to", instance.name,
+            "--design-role", design.placement.design_id + "/designer", "--to", instance.name,
+            "--parent", str(fixture_runtime_id("unrelated-parent")),
             "--session-dir", str(self.panes.command_case.run_dir), "--phase", "8",
             "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(reply),
             "--cwd", str(self.panes.root),
@@ -722,8 +723,11 @@ class DurableRolesTests(HeldRolePaneCase):
             _ = self.open_designer()
         path, = design_roles.state_root().glob("*/design.json")
         saved = design_roles.read_design(path.parent.name)
-        self.assertEqual(self.instance(saved, "designer").lifecycle,
-                         design_roles.RoleNotOpened("pane-start", "not_started"))
+        instance = self.instance(saved, "designer")
+        self.assertEqual(instance.lifecycle, design_roles.RoleNotOpened("pane-start", "not_started"))
+        parent = self.panes.command_case.fixture.parent.id
+        self.assertEqual(instance.parent, parent)
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=parent), [])
         opened = self.open_designer()
         self.assertIsInstance(self.instance(opened, "designer").lifecycle, design_roles.RoleOpen)
         self.assertEqual(len(world.launches), 1)
@@ -745,13 +749,18 @@ class DurableRolesTests(HeldRolePaneCase):
         with redirect_stderr(io.StringIO()) as errors:
             saved = self.open_designer()
         self.assertIn("creation outcome unknown", errors.getvalue())
-        self.assertEqual(self.instance(saved, "designer").lifecycle,
-                         design_roles.RoleNotOpened("pane-start", "outcome_unknown"))
         parent = staff.by_path("demo/design")
         assert parent is not None
-        row = worker_admission.find_worker(staff.snapshot(), parent.id, self.instance(saved, "designer").name)
+        instance = self.instance(saved, "designer")
+        row = worker_admission.find_worker(staff.snapshot(), parent.id, instance.name)
         assert row is not None
-        recovered = design_roles.recover(saved.placement.design_id + "/designer")
+        self.assertEqual(instance.parent, parent.id)
+        self.assertEqual(instance.lifecycle, design_roles.RoleWorkerPublished(row.id))
+        owner = staff.snapshot().parent_of(parent)
+        assert owner is not None
+        other = fixture_member("unit", name="other-holder", parent=owner.id)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
+            recovered = design_roles.recover(saved.placement.design_id + "/designer")
         self.assertEqual(self.instance(recovered, "designer").lifecycle, design_roles.RoleOpen(row.id))
         self.assertEqual(self.open_designer(), recovered)
         self.assertEqual(len(world.launches), 1)
@@ -770,8 +779,22 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(design_roles.read_design(saved.placement.design_id), saved)
         self.assertEqual(self.instance(saved, "designer").lifecycle,
                          design_roles.RoleNotOpened("pane-start", "outcome_unknown"))
+        parent = self.panes.command_case.fixture.parent.id
+        self.assertEqual(self.instance(saved, "designer").parent, parent)
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=parent), [])
         self.assertEqual(self.panes.commands, [])
         self.assertEqual(world.launches, [])
+
+    def test_interrupted_worker_publication_retains_the_admitted_id(self) -> None:
+        with stop_once(staff, "ensure_worker"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        path, = design_roles.state_root().glob("*/design.json")
+        instance = self.instance(design_roles.read_design(path.parent.name), "designer")
+        parent = self.panes.command_case.fixture.parent.id
+        row, = staff.snapshot().find(kind="worker", parent=parent)
+        self.assertEqual(instance.parent, parent)
+        self.assertEqual(instance.lifecycle, design_roles.RoleWorkerPublished(row.id))
+        self.assertEqual(row.design_claim, staff.DesignWorkerClaim(path.parent.name, "designer"))
 
     def test_pane_open_rerun_with_unknown_process_evidence_retains_the_claim(self) -> None:
         world = self.pane_start()
@@ -784,17 +807,19 @@ class DurableRolesTests(HeldRolePaneCase):
         with self.assertRaisesRegex(design_roles.RoleRefused, "process evidence is unavailable; worker is retained"):
             _ = design_roles.recover(saved.placement.design_id + "/designer")
         self.assertEqual(design_roles.read_design(saved.placement.design_id), saved)
-        self.assertEqual(self.instance(saved, "designer").lifecycle,
-                         design_roles.RoleNotOpened("pane-start", "outcome_unknown"))
+        self.assertIsInstance(self.instance(saved, "designer").lifecycle, design_roles.RoleWorkerPublished)
         self.assertEqual(len(world.launches), 1)
         self.assertEqual(sum("--new-worker" in command for command in self.panes.commands), 1)
 
-    def test_pane_end_clears_unknown_creation_before_the_worker_command(self) -> None:
+    def test_pane_end_clears_unknown_creation_without_a_worker(self) -> None:
         world = self.pane_start()
         with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
             _ = self.open_designer()
         path, = design_roles.state_root().glob("*/design.json")
         identifier = path.parent.name + "/designer"
+        saved = self.instance(design_roles.read_design(path.parent.name), "designer")
+        parent = self.panes.command_case.fixture.parent.id
+        decoy = fixture_worker(saved.name, parent)
         with self.assertRaises(design_roles.RoleRefused) as refused:
             _ = design_roles.recover(identifier)
         ended = design_roles.end(identifier)
@@ -803,9 +828,9 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertIn("no recorded worker; replacement refused", str(refused.exception))
         self.assertIn("end", str(refused.exception))
         self.assertFalse((path.parent / "transition.json").exists())
-        self.assertEqual(self.panes.commands, [["end", self.instance(ended, "designer").name,
-                                                "--session-dir", str(self.run_a)]])
+        self.assertEqual(self.panes.commands, [])
         self.assertEqual(world.launches, [])
+        self.assertEqual(staff.by_id(decoy.id), decoy)
 
     def test_end_unknown_creation_refuses_another_roles_creation_claim(self) -> None:
         with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
@@ -837,12 +862,36 @@ class DurableRolesTests(HeldRolePaneCase):
                 _ = design_roles.end(path.parent.name + "/designer")
         self.assertEqual(design_roles.read_design(path.parent.name), saved)
         self.assertIsNotNone(staff.by_id(row.id))
-        ended = design_roles.end(path.parent.name + "/designer")
+        owner = staff.snapshot().parent_of(parent)
+        assert owner is not None
+        other = fixture_member("unit", name="other-holder", parent=owner.id)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
+            ended = design_roles.end(path.parent.name + "/designer")
         self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded(row.id))
         self.assertEqual(design_roles.end(path.parent.name + "/designer"), ended)
         self.assertIsNone(staff.by_id(row.id))
         self.assertFalse((path.parent / "transition.json").exists())
         self.assertEqual(len(world.launches), 1)
+
+    def test_legacy_design_saves_the_bound_run_owner_once(self) -> None:
+        design = self.open_designer()
+        design_id = design.placement.design_id
+        path = design_roles.design_directory(design_id) / "design.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        entry = next(item for item in cast(list[dict[str, object]], fields["roles"]) if item["role"] == "designer")
+        parent_id = entry.pop("parent")
+        write_text_atomic(path, json.dumps(fields))
+        parent = self.panes.command_case.fixture.parent
+        owner = staff.snapshot().parent_of(parent)
+        assert owner is not None
+        other = fixture_member("unit", name="other-holder", parent=owner.id)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
+            recovered = design_roles.recover(design_id + "/designer")
+        self.assertEqual(self.instance(recovered, "designer").parent, parent_id)
+        state = self.run_a / "progress_history_state.json"
+        saved = cast(dict[str, object], json.loads(state.read_text()))
+        write_text_atomic(state, json.dumps({**saved, "owner_staff_id": other.id}))
+        self.assertEqual(self.instance(design_roles.read_design(design_id), "designer").parent, parent_id)
 
     def test_pane_rebind_rerun_before_transition_clear_finishes_publication(self) -> None:
         world = self.pane_start()
@@ -1014,16 +1063,17 @@ class DurableRolesTests(HeldRolePaneCase):
                 self.assertEqual(str(refusal.exception), f"{self.run_a}: run owner is unavailable")
                 self.assertEqual(self.launches, [])
 
-    def test_staff_refusal_retains_the_creation_claim_and_launches_no_astra_role(self) -> None:
+    def test_staff_refusal_leaves_the_role_unclaimed(self) -> None:
         caller = self.panes.command_case.fixture.worker("caller")
         with patch.dict(os.environ, {"CODEX_THREAD_ID": str(caller.current_session)}):
             with self.assertRaisesRegex(design_roles.RoleRefused,
                                         "staff: caller: not opened: caller is not a unit or showrunner"):
                 _ = self.open_designer()
         self.assertEqual(self.launches, [])
-        self.assertTrue(all(isinstance(role.lifecycle, design_roles.RoleNotOpened) and role.lifecycle.claim == "pane-start"
-                            for path in design_roles.state_root().glob("*/design.json")
-                            for role in design_roles.read_design(path.parent.name).roles if role.role == "designer"))
+        path, = design_roles.state_root().glob("*/design.json")
+        instance = self.instance(design_roles.read_design(path.parent.name), "designer")
+        self.assertEqual(instance.lifecycle, design_roles.RoleNotOpened())
+        self.assertIsInstance(instance.parent, design_roles.RoleParentUnrecorded)
 
 
     def test_design_ownership_read_names_damaged_state_instead_of_decoding_it_as_empty(self) -> None:

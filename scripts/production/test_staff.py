@@ -2002,6 +2002,31 @@ class StaffTests(StaffCommandTestCase):
         _ = staff.retire(worker.id)
         self.assertIsNone(staff.by_id(worker.id))
 
+    def test_ensure_worker_commits_the_design_claim_with_the_row(self) -> None:
+        runner = fixture_member("showrunner", name="designs")
+        claim = staff.DesignWorkerClaim("9a01e67d-6c33-4637-8fa8-2e760dfd9445", "designer")
+        worker_id = staff.native_id(fixture_runtime_id("published-design-worker"))
+        original = self.staff_file.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("staff publish interrupted")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "staff publish interrupted"):
+                _ = staff.ensure_worker(worker_id, "design-worker", runner.id, design_claim=claim)
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        self.assertIsNone(staff.by_id(worker_id))
+        result = self.cli("ensure-worker", worker_id, "--name", "design-worker", "--parent", runner.id,
+                          "--design-role", str(claim), "--json", "--row-write")
+        worker = staff.StaffRow.from_json(cast(object, json.loads(result.stdout)))
+        self.assertEqual((worker.id, worker.design_claim), (worker_id, claim))
+        self.assertEqual(staff.by_id(worker_id), worker)
+        self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
+        with (mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote_row", return_value=worker) as remote_row):
+            self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
+        remote_row.assert_called_once_with(["ensure-worker", worker_id, "--name", worker.name,
+                                            "--parent", runner.id, "--design-role", str(claim)])
+        with self.assertRaisesRegex(staff.StaffRefused, "the design role already has a worker"):
+            another = staff.native_id(fixture_runtime_id("another-worker"))
+            _ = staff.ensure_worker(another, "other-worker", runner.id, design_claim=claim)
+
     def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
         runner, unit, ordinary = self.tree()
         designer = fixture_worker("sdlc-handler-astra-designer", runner.id)

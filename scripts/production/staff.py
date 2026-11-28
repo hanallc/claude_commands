@@ -467,6 +467,32 @@ class NoTopItem:
 
 
 @dataclass(frozen=True)
+class DesignWorkerClaim:
+    design_id: str
+    role: Literal["designer", "reviewer"]
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        design_id, _, role = value.partition("/")
+        if role not in ("designer", "reviewer"):
+            raise StaffRefused("invalid design worker role")
+        _ = native_id(design_id)
+        return cls(design_id, role)
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.design_id}/{self.role}"
+
+
+@dataclass(frozen=True)
+class NoDesignWorkerClaim:
+    """The worker row has no held design role."""
+
+
+NO_DESIGN_WORKER_CLAIM = NoDesignWorkerClaim()
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -487,6 +513,7 @@ class StaffRow:
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
     top_item: TopItem | NoTopItem = field(default_factory=NoTopItem, kw_only=True)
     resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
+    design_claim: DesignWorkerClaim | NoDesignWorkerClaim = field(default=NO_DESIGN_WORKER_CLAIM, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -526,6 +553,8 @@ class StaffRow:
             value["retired_producer"] = self.retirement.profile
         if isinstance(self.top_item, TopItem):
             value["top_item"] = self.top_item.number
+        if isinstance(self.design_claim, DesignWorkerClaim):
+            value["design_claim"] = str(self.design_claim)
         return value
 
     @classmethod
@@ -562,6 +591,16 @@ class StaffRow:
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
         known_fields.update(("retired_producer", "top_item", "resume_pending"))
+        design_claim: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM
+        if "design_claim" in fields:
+            raw_claim = fields["design_claim"]
+            if kind != "worker" or not isinstance(raw_claim, str):
+                raise StaffUnreadable("invalid design worker claim")
+            try:
+                design_claim = DesignWorkerClaim.parse(raw_claim)
+            except StaffRefused as error:
+                raise StaffUnreadable("invalid design worker claim") from error
+            known_fields.add("design_claim")
         retirement: RetiredProducer | Active = Active()
         if "retired_producer" in fields:
             profile = fields["retired_producer"]
@@ -596,6 +635,7 @@ class StaffRow:
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    resume_pending=ResumePending.from_json(fields["resume_pending"])
                    if "resume_pending" in fields else NoPendingResume(),
+                   design_claim=design_claim,
                    unknown_fields=_unknown_fields(fields, known_fields))
 
 
@@ -2147,12 +2187,32 @@ def create_session(name: str, identity: str, folder: SessionLaunchFolder, home: 
     return _transaction(edit)
 
 
-def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
-    """Publish worker membership before dispatch."""
+def ensure_worker(identity: StaffId, name: str, parent: StaffId, *,
+                  design_claim: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM) -> StaffRow:
+    """Publish worker membership and its design claim in one staff commit."""
     identity = native_id(identity)
     if not is_owner():
-        return _remote_row(["ensure-worker", identity, "--name", name, "--parent", parent])
-    return _transaction(lambda rows: _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity))
+        command = ["ensure-worker", identity, "--name", name, "--parent", parent]
+        if isinstance(design_claim, DesignWorkerClaim):
+            command.extend(("--design-role", str(design_claim)))
+        return _remote_row(command)
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        if isinstance(design_claim, NoDesignWorkerClaim):
+            return _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity)
+        claimed = next((row for row in rows if row.design_claim == design_claim), None)
+        if claimed is not None:
+            if claimed.current_session == identity and claimed.reports_to(parent):
+                return claimed
+            raise StaffRefused(f"{design_claim}: the design role already has a worker")
+        if any(row.kind == "worker" and row.name == name and row.reports_to(parent) for row in rows):
+            raise StaffRefused(f"{name}: the worker slot already belongs to another claim")
+        row = _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity)
+        published = replace(row, design_claim=design_claim)
+        rows[rows.index(row)] = published
+        return published
+
+    return _transaction(edit)
 
 
 def set_worker_role(identity: StaffId, role: KnownWorkerRole) -> StaffRow:
@@ -2905,6 +2965,7 @@ class _MoveCommand(Protocol):
 
 class _Arguments:
     creation_action: str = ""
+    design_role: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM
     marker: str = ""
     profile: str = ""
     number: str = ""
@@ -3000,6 +3061,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = worker_parser.add_argument("target")
     _ = worker_parser.add_argument("--name", required=True)
     _ = worker_parser.add_argument("--parent", required=True)
+    _ = worker_parser.add_argument("--design-role", type=DesignWorkerClaim.parse, default=NO_DESIGN_WORKER_CLAIM)
     _ = worker_parser.add_argument("--json", action="store_true")
     _ = worker_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     session_parser = verbs.add_parser("update-current-session", help=argparse.SUPPRESS)
@@ -3129,7 +3191,8 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
                               SessionLaunchFolder(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
-        return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
+        return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent),
+                             design_claim=arguments.design_role)
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
     if arguments.verb == "set-producer-retirement":
