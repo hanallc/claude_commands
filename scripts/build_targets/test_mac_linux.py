@@ -37,7 +37,7 @@ from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import machine_facts, store, treekey
 from scripts.copies import copies
-from scripts.lib import atomic_file, conf, process_group, process_start, scratch
+from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
