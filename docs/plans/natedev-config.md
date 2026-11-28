@@ -898,23 +898,14 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Acceptance gate:** no conflict marker; basedpyright clean on the five files; the tests of the resolved code pass by class; `fixture_conf_keys.py` reports 0 missing; the queued `gate.py --affected` run is green; `behavior_check.py run` with main's checker on the tip.
 
-### Phase 29 — A host value too large for the reader is unusable  · status: todo
+### Phase 29 — A host value too large for the reader is unusable  · status: done
 
-**Depends on:** Phase 28
+#### As-built
 
-#### Work Order
+- `conf.file_byte_count` refuses a whole value above `sys.maxsize` with the normal `conf.Unusable` error that names the key. `worker._worker_history_events` reads `worker.history_bytes` with `value(key, conf.file_byte_count)`. Checkpoint 9dfd334771.
+- `conf.whole` is unchanged: `test_the_list.py` reads `series_run_limit=sys.maxsize + 1`, and `test_repeat_rule.py` passes it directly.
+- Showrunner ruling 11-28 03:42 EST (nate 11-24): a `<key>.<host>` row keeps its own, wider limit line.
 
-**Goal:** A config value the reader cannot hold gives the normal unusable-value error that names the key, not an `OverflowError`.
+**Files:** `scripts/lib/conf.py`, `scripts/production/worker.py`, `scripts/lib/test_conf.py` (`test_file_byte_count_rejects_an_oversized_host_value`)
 
-**Spec:**
-1. Showrunner ruling 11-28 03:42 EST, from nate 11-24 ("didn't we create machine onl values to not honor the normal limits"): a `<key>.<host>` row keeps a limit wider than the shared row. Do not make a wider host row unusable.
-2. Fix only the crash. The phase 13 adversary probe wrote `worker.history_bytes.<host>` with `# whole: 1..` and the value 2^63; the read raised `OverflowError`. That read now raises the normal unusable-value error, and the message names the key.
-3. One test for the read.
-
-**Files:** `scripts/lib/conf.py` (or the reader that raised), its test module.
-
-**Workers:** 1 writer + 1 tester. `impl`: the reader. `test`: the read test.
-
-**Constraints from prior phases:** No code default and no new refusal (Phase 21).
-
-**Acceptance gate:** the new test fails before the fix and passes after; basedpyright clean; the queued `gate.py --affected` run is green.
+**Binds later work:** A key whose value goes to a file seek or read uses `conf.file_byte_count`.
