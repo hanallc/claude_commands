@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 from functools import cache
 from importlib import import_module
+import math
 import os
 from pathlib import Path
 import select
@@ -196,6 +197,42 @@ def guest_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], boo
         if reconcile is not None and holds_slot():
             reconcile(episode, attempt)
     return placement.DispatchPathSettled() if isinstance(result, placement.Settled) else placement.DispatchPathPending(result.reason)
+
+
+@dataclass(frozen=True)
+class GuestNoStartSettled(placement.DispatchPathSettled):
+    """The journal proves that this guest claim never started."""
+
+
+def _guest_no_start_proven(claim: placement.ProviderClaimReference) -> bool:
+    """Distinguish no start from a finished run in the guest settlement journal."""
+    attempt = execution_identity.attempt_key(claim.episode, claim.attempt)
+    no_start = False
+    try:
+        with target_config.mac_linux_end_proof_journal().open("rb") as journal:
+            for line in journal:
+                if not line.endswith(b"\n"):
+                    continue
+                try:
+                    value = cast(object, json.loads(line))
+                    if not isinstance(value, dict):
+                        continue
+                    row = cast(dict[str, object], value)
+                    written_at = row.get("written_at")
+                    if (row.get("attempt") != attempt or row.get("claim") != claim.claim_id
+                            or not isinstance(row.get("detail"), str)
+                            or not isinstance(written_at, (int, float)) or isinstance(written_at, bool)
+                            or not math.isfinite(written_at)):
+                        continue
+                except (ValueError, OverflowError, RecursionError):
+                    continue
+                if row.get("result") == "proven":
+                    return False
+                if row.get("result") == "not started":
+                    no_start = True
+    except FileNotFoundError:
+        return False
+    return no_start
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -1427,10 +1464,10 @@ class HostEvidenceWorker:
 
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Keep the attempt until the worker confirms settlement."""
-        return self.dispatch_settled_at(probe) is None
+        return self.dispatch_settlement(probe) is None
 
-    def dispatch_settled_at(self, probe: DispatchEvidenceProbe) -> float | None:
-        """Request a reading and return the time of exact settlement."""
+    def dispatch_settlement(self, probe: DispatchEvidenceProbe) -> DispatchEvidence | None:
+        """Request a reading and return the exact settlement evidence."""
         assignment = probe.saved.assignment
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         with self.lock:
@@ -1440,19 +1477,20 @@ class HostEvidenceWorker:
                 _ = self.dispatch_observations.pop(attempt, None)
                 self.due[probe.key] = float('-inf')
                 self.requested.set()
-            return self._settlement_time(probe.saved, attempt)
+            return self._settled_dispatch(probe.saved, attempt)
 
     def observed_settlement_time(self, saved: records.SavedPlacementAssignment, attempt: str) -> float | None:
         with self.lock:
-            return self._settlement_time(saved, attempt)
+            observed = self._settled_dispatch(saved, attempt)
+            return None if observed is None else observed.observed_at
 
-    def _settlement_time(self, saved: records.SavedPlacementAssignment, attempt: str) -> float | None:
+    def _settled_dispatch(self, saved: records.SavedPlacementAssignment, attempt: str) -> DispatchEvidence | None:
         observed = self.dispatch_observations.get(attempt)
         if (observed is not None and observed.saved == saved
                 and isinstance(observed.result, placement.DispatchPathSettled)
                 and (is_mac_linux_guest(saved.assignment.destination)
                      or time.monotonic() - observed.observed_monotonic <= self.interval)):
-            return observed.observed_at
+            return observed
         return None
 
     def recovered_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
@@ -1590,7 +1628,7 @@ class HostEvidenceWorker:
             for attempt, probe, observed in dispatches_read:
                 if (self.dispatch_probes.get(attempt) is probe
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
-                             or self._settlement_time(probe.saved, attempt) is None)):
+                             or self._settled_dispatch(probe.saved, attempt) is None)):
                     self.dispatch_observations[attempt] = observed
             if refresh_generation == self.refresh_generation:
                 self.due[key] = time.monotonic() + self.interval
@@ -5283,7 +5321,8 @@ done
         return self.assignments.get(execution_identity.attempt_key(episode, attempt),
             status_wire.UnknownPlacementStatus(episode, attempt))
 
-    def _awaits_mac_report(self, saved: records.SavedPlacementAssignment, *, guest_end_proven: bool = False) -> bool:
+    def _awaits_mac_report(self, saved: records.SavedPlacementAssignment, *,
+                           settlement: DispatchEvidence | None = None) -> bool:
         """Keep consumed Mac attempts open while their coordinator can report."""
         assignment = saved.assignment
         report = saved.terminal_report
@@ -5291,10 +5330,9 @@ done
         if isinstance(report, placement.TerminalAttemptReport):
             if report.outcome != GUEST_SETTLEMENT_REQUESTED:
                 return False
-            if guest_end_proven and saved.guest_settlement_requested_by_coordinator:
-                return False
-            # A resubmit can settle a guest attempt with no recorded start.
-            if guest_end_proven and not _guest_start_observed(saved):
+            # An inferred request needs proof of no start before a retry.
+            if settlement is not None and (saved.guest_settlement_requested_by_coordinator
+                                           or isinstance(settlement.result, GuestNoStartSettled)):
                 return False
         return (isinstance(saved.permission, placement.PermissionConsumed)
                 and (assignment.destination.provider == "mac" or is_mac_linux_guest(assignment.destination))
@@ -6805,6 +6843,10 @@ done
         assignment = saved.assignment
         episode = assignment.episode
         attempt_key = execution_identity.attempt_key(episode, assignment.attempt)
+        previous = saved.terminal_report
+        resubmitted = (isinstance(previous, placement.TerminalAttemptReport)
+                       and previous.outcome == GUEST_SETTLEMENT_REQUESTED
+                       and not saved.guest_settlement_requested_by_coordinator)
 
         def holds_slot() -> bool:
             active = self.assignments.get(attempt_key)
@@ -6817,21 +6859,29 @@ done
                 identity.host == self.host
                 and not owner_may_be_live(self.proc.owner_start(identity.pid), identity.start_time)
                 for identity in (holder, assignment.owner))
-            return guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
+            result = guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
                 holds_slot=holds_slot,
                 legacy_holder_ended=legacy_holder_ended)
+            if (resubmitted and isinstance(result, placement.DispatchPathSettled) and not _guest_start_observed(saved)
+                    and isinstance(saved.provider, placement.ProviderClaimReference)
+                    and _guest_no_start_proven(saved.provider)):
+                return GuestNoStartSettled()
+            return result
 
         probe = self._dispatch_settlement_probe(saved, read_dispatch)
-        proved_at = None if probe is None else probe[0].dispatch_settled_at(probe[1])
-        settled_at = self._guest_settlement_ready_at(saved, proved_at)
-        if settled_at is None:
+        settlement = None if probe is None else probe[0].dispatch_settlement(probe[1])
+        if (settlement is None
+                or (settled_at := self._guest_settlement_ready_at(saved, settlement.observed_at)) is None):
             self.assignments[attempt_key] = self._expire_guest_replacement(saved)
             return
-        if self._awaits_mac_report(saved, guest_end_proven=True):
+        if self._awaits_mac_report(saved, settlement=settlement):
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
-        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
+        # A resubmit without no-start proof cannot retry if the coordinator ends.
+        may_have_started = _guest_start_observed(saved) or (
+            resubmitted and not isinstance(settlement.result, GuestNoStartSettled))
+        if may_have_started and (isinstance(report, placement.NoTerminalReport)
                 or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             report = placement.TerminalAttemptReport(
                 placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),

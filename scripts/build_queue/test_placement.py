@@ -266,9 +266,14 @@ def consume_guest_permission(fixture: PlacementFixture, assignment: placement.Pl
 
 
 def write_guest_no_start_proof(fixture: PlacementFixture, claim: placement.ProviderClaimReference) -> None:
+    write_guest_proof(fixture, claim, result="not started", detail="The guest confirmed no start")
+
+
+def write_guest_proof(fixture: PlacementFixture, claim: placement.ProviderClaimReference, *,
+                      result: str, detail: str) -> None:
     journal = mac_linux_end_proof_journal()
     row = {"attempt": execution_identity.attempt_key(claim.episode, claim.attempt), "claim": claim.claim_id,
-           "result": "not started", "detail": "The guest confirmed no start", "written_at": fixture.clock.now()}
+           "result": result, "detail": detail, "written_at": fixture.clock.now()}
     journal.parent.mkdir(parents=True, exist_ok=True)
     with journal.open("a") as stream:
         _ = stream.write(json.dumps(row) + "\n")
@@ -5380,6 +5385,49 @@ class LostMacPlacementTests(unittest.TestCase):
             saved = fixture.server.assignments[attempt]
             self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
             assert isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+            self.assertEqual(saved.terminal_report.outcome, outcome)
+
+    def test_guest_end_proof_after_resubmit_keeps_the_attempt_open_for_a_verdict(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            key = publish_candidate(fixture, request).key
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            authorized, = consume_guest_permission(fixture, assignment, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            fixture.end_owner(holder)
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            pending = fixture.server.assignments[attempt].terminal_report
+            assert isinstance(pending, placement.TerminalAttemptReport), pending
+            self.assertEqual(pending.outcome, service.GUEST_SETTLEMENT_REQUESTED)
+            write_guest_proof(fixture, authorized.claim, result="proven", detail="The guest confirmed the run ended")
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), attempt)
+            self.assertEqual(fixture.server.assignments[attempt].terminal_report, pending)
+
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[attempt].terminal_report, pending)
+            outcome = placement.AttemptCompleted(1)
+            verdict = wire.ExecutionReport("late-verdict", assignment, authorized.claim,
+                execution_identity.ExecutionEvidenceUnavailable("the guest start report is missing", fixture.clock.now()),
+                outcome, placement.DispatchPathSettled())
+            accepted, = fixture.server.handle_request(verdict)
+            assert isinstance(accepted, wire.DispatchStatus), accepted
+            self.assertEqual(accepted.reason, "")
+            _ = fixture.run_pass()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport), saved
             self.assertEqual(saved.terminal_report.outcome, outcome)
 
     def test_guest_loss_can_follow_an_expired_unproven_settlement_request(self) -> None:
