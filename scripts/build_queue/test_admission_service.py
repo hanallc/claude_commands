@@ -802,6 +802,40 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertNotIn(older.episode, fixture.server.reservations)
             spending.assert_not_called()
 
+    def test_the_scaler_waits_while_the_older_request_needs_a_guest_reading(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, aws_gate_request, local_candidate, mac_linux_candidate,
+            mac_linux_fixture, placement_request, read_aws_gate_evidence,
+        )
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            request = aws_gate_request(fixture)
+            registry = fixture.root / "build_targets.conf"
+            scaler_settings = registry.read_text(encoding="utf-8").split("\n", 1)[1]
+            _ = mac_linux_fixture(fixture)
+            settings = registry.read_text(encoding="utf-8").replace(
+                "targets=mac-linux,natedev\n", "targets=mac-linux,natedev,claude-aws\n", 1)
+            _ = registry.write_text(settings + scaler_settings, encoding="utf-8")
+            evidence = read_aws_gate_evidence(fixture, request)
+            self.assertIsInstance(evidence.eligibility, placement.AllowedHost)
+            fixture.free(12 * GIB)
+            guest, local = mac_linux_candidate(), local_candidate(fixture)
+            older = placement_request(fixture, since=fixture.clock.now() - 1)
+            older = replace(older, constraints=replace(older.constraints, candidates=(guest, local)))
+            initial, = fixture.connect(older).replies()
+            assert isinstance(initial, wire.PlacementWait), initial
+            self.assertEqual(initial.eligibility[0], placement.CandidateEligibility(
+                guest.destination, placement.EvidenceNeeded("not read")))
+
+            request = replace(request, route=older.route, constraints=replace(request.constraints,
+                candidates=(local, *request.constraints.candidates)))
+            with mock.patch.object(fixture.server, "_aws_gate_spending", return_value=placement.AllowedHost()) as spending:
+                reply, = fixture.connect(request).replies()
+            self.assertIsInstance(reply, wire.PlacementWait)
+            spending.assert_not_called()
+            self.assertFalse(fixture.server.current_assignments)
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, request.owner.pid])
+
     def test_waiting_for_the_guest_preserves_an_earlier_mac_hold(self) -> None:
         from scripts.build_queue.test_placement import (
             ManualEvidenceWorker, PlacementFixture, mac_linux_candidate, mac_linux_fixture,
