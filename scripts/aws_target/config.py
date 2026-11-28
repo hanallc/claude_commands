@@ -6,7 +6,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeVar, cast
 from collections.abc import Callable
-import os
 import json
 from zoneinfo import ZoneInfo
 
@@ -76,8 +75,7 @@ def gate_deployment(path: Path, home: str) -> dict[str, object]:
 
 def account_settings_path() -> Path:
     """Use the installed account settings regardless of the checkout's CONF_DIR."""
-    override = os.environ.get('AWS_TARGET_CONFIG')
-    return Path(override).expanduser() if override else Path.home() / '.claude/config/aws_target.conf'
+    return Path.home() / '.claude/config/aws_target.conf'
 
 
 @dataclass(frozen=True)

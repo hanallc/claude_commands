@@ -2912,7 +2912,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         key = "model.gpt-6.2-sol.natedev"
         models = config / "models.conf"
         _ = models.write_text("[codex.agents]\ngpt-6.2-sol.natedev=high\n")
-        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}),
+        with (patch.dict(os.environ, {"CONF_DIR": str(models.parent)}),
               patch.object(subprocess, "run") as run):
             self.assertEqual(accounts_page.save_color(key, "#123456"),
                              accounts_page.Refused(".natedev is a host override, not a model color."))

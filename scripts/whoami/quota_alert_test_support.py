@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import session_send
@@ -38,7 +39,7 @@ from scripts.whoami import account
 from scripts.whoami import usage_store
 from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
-from scripts.accounts import accounts, moves, next_moves, role_map
+from scripts.accounts import accounts, moves, next_moves, role_map, worker_names
 from scripts.production import showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
@@ -142,9 +143,7 @@ def fixture_configuration(root: Path) -> dict[str, str]:
 def select_fixture_registry(test: unittest.TestCase, root: Path) -> Path:
     """Select the fixture registry for both Python and shell readers."""
     _ = cast(object, test.enterContext(mock.patch.dict(os.environ, fixture_configuration(root))))
-    registry = root / "models.conf"
-    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
-    return registry
+    return conf.path("models")
 
 
 class QuotaReminderFixture(unittest.TestCase):
@@ -171,7 +170,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
-        registry = select_fixture_registry(self, self.root)
+        _ = select_fixture_registry(self, self.root)
         environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -181,9 +180,8 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
-        config = self.root / "showrunners.conf"
-        for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
-                            ("tell_user", self.tell_user), ("REGISTRY", registry)):
+        for name, value in (("STATE", self.root / "state.json"), ("relay", self.relay),
+                            ("tell_user", self.tell_user)):
             patcher = mock.patch.object(quota_alert, name, value)
             _ = patcher.start()
             self.addCleanup(patcher.stop)
@@ -204,22 +202,22 @@ class QuotaReminderFixture(unittest.TestCase):
 
     def prepare_files(self) -> None:
         """Write the immutable starting account and registry documents."""
-        (self.root / ".claude/config").mkdir(parents=True)
-        _ = (self.root / ".claude/config/accounts.json").write_text(
-            json.dumps({"workers": "codex1"}))
+        state = worker_names.migrated_accounts_state(self.root)
+        state.file.parent.mkdir(parents=True)
+        _ = state.file.write_text(json.dumps({"workers": "codex1"}))
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
         codex_home = self.root / ".codex"
         codex_home.mkdir()
         claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
         _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (self.root / "showrunners.conf").write_text(("""# range: 0..
+        _ = (self.root / "config/showrunners.conf").write_text(("""# range: 0..
 threshold_percent=1
 # range: 0..
 stall_minutes=5
 faults_to=natedev
 always=natedev
 """))
-        _ = write_registry((self.root / "models.conf"), base_text=REGISTRY)
+        _ = write_registry(self.root / "config/models.conf", base_text=REGISTRY)
         (self.root / "catalog synced").touch()
 
     @staticmethod
@@ -444,7 +442,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
-        config = self.root / "showrunners.conf"
+        config = conf.path("showrunners")
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
 # range: 0..
@@ -453,8 +451,6 @@ faults_to=director
 always=director
 """))
         _ = write_registry(registry, base_text=REGISTRY)
-        _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
-        _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))
         _ = self.enterContext(mock.patch.object(quota_alert, "STATE", self.root / "alerts.json"))
         _ = self.enterContext(mock.patch.object(os, "uname", return_value=os.uname_result(
             ("Linux", "natedev", "fixture", "fixture", "x86_64"))))

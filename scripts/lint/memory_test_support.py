@@ -473,7 +473,8 @@ def config_environment(root: Path, *, values: FixtureConfigValues = FixtureConfi
                 _ = shutil.copyfile(_template(name), destination)
             else:
                 _ = copy_config_file_fixture(_template(name), destination)
-    return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
+    # An empty pin clears the caller's pin when this overlay updates an environment.
+    return {"CONF_DIR": str(folder), "MODELS_CONFIG_FILE": ""}
 
 
 def memory_gate_shell_environment() -> dict[str, str]:

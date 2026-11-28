@@ -75,7 +75,7 @@ class MacRunTests(unittest.TestCase):
         _ = copies_config.write_text("# range: 5e-324..\ngit_timeout_seconds=5\n")
         _ = (self.root / "build_folders.conf").write_text("# whole: 1..\nnames.repository_key_length=8\n")
         self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(self.root), "COPIES_CONFIG": str(copies_config),
+            "CONF_DIR": str(self.root),
             "USER_ZONE": "UTC",
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         }))

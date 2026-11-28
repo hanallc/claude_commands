@@ -56,6 +56,10 @@ GATE_TEST_SETTINGS = """# range: 1..
 gate_time_limit_factor=100
 # whole: 0..
 memory_stop_reruns=1
+# whole: 0..
+rerun.max_failed_modules=8
+# whole: 3..4096
+nightly.type_line_bytes=512
 """
 # The fixture has no Mac placement. The client refuses it without contacting the queue.
 MAC_GATE_TEST_SETTINGS = (
@@ -343,8 +347,7 @@ class MergeGateFixture(unittest.TestCase):
     def setUpClass(cls) -> None:
         configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
         environment = fixture_git_environment(configuration)
-        for key in ("BASH_ENV", "STAFF_CONFIG"):
-            _ = environment.pop(key, None)
+        _ = environment.pop("BASH_ENV", None)
         environment.update(cls.fixture_configuration(configuration))
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
         tmpfs = build_folders.tmpfs_temporary_parent()

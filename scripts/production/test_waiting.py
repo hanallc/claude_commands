@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.production import add_unit
 from scripts.production import merge_checkpoint
@@ -210,14 +211,14 @@ class WaitingTests(unittest.TestCase):
         # Each unit has a herdr session marked as that unit, with a Claude running under the unit's id
         # as its name. Tests that call the tool in this process read the same stand-ins.
         (self.root / "sessions").mkdir()
-        self.write(self.root / "showrunners.json", json.dumps({
-            "threshold_percent": 2, "stall_minutes": 5, "faults_to": "natedev",
-            "always": []}))
+        configuration = copies_environment(self.root)
+        _ = write_config_fixture(Path(configuration["CONF_DIR"]) / "showrunners.conf",
+                                 "threshold_percent=2\nstall_minutes=5\nfaults_to=natedev\nalways=\n")
         self.write(self.root / "herdr-responses.json", json.dumps({
             "default": CommandResponse(stdout="", code=1),
         }))
         self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root), "HOME": str(home),
+            **configuration, "HOME": str(home),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CODEX_HOME": str(home / "codex-fixture"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -225,8 +226,7 @@ class WaitingTests(unittest.TestCase):
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
-            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json")}))
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
             labeled_host(unit, f"w{index}:p1", unit, production_name="showrunner-example")

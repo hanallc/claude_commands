@@ -13,6 +13,7 @@ import math
 import os
 import select
 import shlex
+import shutil
 import signal
 import socket
 import sqlite3
@@ -895,8 +896,13 @@ class StopResumeTests(unittest.TestCase):
                     receipts = {path.name: path.read_text() for path in (world.case.root / "panes").glob(".producer-admission-*")}
                     with patch.dict(os.environ):
                         _ = os.environ.pop("MODELS_LAUNCH_CONFIGURATION", None)
-                        os.environ["MODELS_CONFIG_FILE"] = str(world.case.root / "absent-models.conf")
-                        failed = stop_resume.resume("dwight")
+                        registry = Path(os.environ["CONF_DIR"]) / "models.conf"
+                        saved = registry.read_bytes()
+                        registry.unlink()
+                        try:
+                            failed = stop_resume.resume("dwight")
+                        finally:
+                            _ = registry.write_bytes(saved)
                     self.assertIsInstance(failed, stop_resume.ResumeFailed, failed)
                     self.assertEqual(staff.initial_snapshot().rows, ())
                     self.assertEqual({path.name: path.read_text() for path in (world.case.root / "panes").glob(".producer-admission-*")}, receipts)
@@ -2414,7 +2420,9 @@ class StopResumeTests(unittest.TestCase):
             with self.subTest(target=target, registry=registry), patch.dict(os.environ):
                 if registry == "absent":
                     _ = os.environ.pop("MODELS_LAUNCH_CONFIGURATION", None)
-                    os.environ["MODELS_CONFIG_FILE"] = str(self.root / "absent-models.conf")
+                    folder = self.root / "config-without-models"
+                    _ = shutil.copytree(Path(os.environ["CONF_DIR"]), folder, ignore=shutil.ignore_patterns("models.conf"))
+                    os.environ["CONF_DIR"] = str(folder)
                 self.assertEqual(stop_resume.resume(target, to="claude4"), stop_resume.ClaudeUp(
                     identity, "w1:p2", "claude4"))
         self.start.assert_not_called()
@@ -2858,7 +2866,7 @@ class StopResumeTests(unittest.TestCase):
             "TEST-account-home": "claude:opus:max", "row-name": "claude:opus:max",
             "own-codex": "codex:gpt-test:high"}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(configuration / "models.conf")})))
+            "CONF_DIR": str(configuration)})))
         _ = self.enterContext(redirect_stderr(io.StringIO()))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
         def resolved_program(tool: str, *, environment: Mapping[str, str]) -> str:

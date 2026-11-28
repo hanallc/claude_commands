@@ -59,7 +59,6 @@ class GateSuitesFixture(MergeGateFixture):
     @override
     def bind_fixture(self, root: Path) -> None:
         super().bind_fixture(root)
-        self.environment["LINT_CONFIG_FILE"] = str(root / "lint.conf")
         self.environment["GATE_PYTHON"] = sys.executable
         self.environment["GATE_TEST_WAIT"] = str(self.bin / "wait-for-state.py")
 

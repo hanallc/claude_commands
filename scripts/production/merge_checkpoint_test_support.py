@@ -356,8 +356,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
         home = self.root / "home"
-        private = copies_environment(root, repository="origin")
-        _ = shutil.copyfile(Path(private["CONF_DIR"]) / "build_folders.conf", root / "build_folders.conf")
+        private = copies_environment(root, repository="origin", configuration=self.root)
         self.env = {**fixture_git_environment(root.parent), **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "GIT_CONFIG_SYSTEM": os.devnull,
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),

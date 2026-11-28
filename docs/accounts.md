@@ -421,7 +421,10 @@ claude3
 A logout in a unit director's session stops every unit on that account.
 After login, use Hana console, Accounts to check that every directory matches its label.
 
-Historical `default`, `~/.claude` or `~/.codex` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover and matching the tool. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
+Historical `default`, `~/.claude` or `~/.codex` records use their own login or a dated cutover entry in `~/.local/state/accounts/accounts.json`.
+A cutover applies to earlier records for the same tool on that machine.
+These records stay unresolved until they have evidence from the same period.
+A resolved resume uses the numbered account's folder.
 
 ## Move a session
 
@@ -465,7 +468,13 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py placement -
 
 Claude accounts have room until they have an unresolved provider refusal for the work's model family. A model family refusal (for example Fable) blocks only work of that family; work of an unknown family treats it as a block. The producers use their family from `[producers]` in `config/models.conf`; unit directors and showrunners use `[production.claude]`. Without an account move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with an account move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 
-natedev holds the one role map for both machines: Claude groups in `~/.local/state/accounts/groups.json`, workers in `~/.claude/config/accounts.json`, and changes in `~/.local/state/accounts/roles.jsonl`. All readers and writers use `read_role_map()` / `write_role_map(change)`. On the Mac, writes run through `ssh natedev` and preserve the reason, cause and move id; failed writes refuse without changing local selections. Reads fetch the map once per command and save `~/.local/state/accounts/role_map_cache.json`. When natedev is unreachable, a cached map prints `role map from <time in the user's zone>; natedev unreachable`; without a usable cache the command refuses. No machine selects a substitute account.
+natedev holds the role map for both machines.
+Under `~/.local/state/accounts/`, `groups.json` holds Claude groups, `accounts.json` holds worker selection, and `roles.jsonl` records changes.
+On the Mac, `write_role_map(change)` sends writes to natedev through SSH with the reason, cause, and move ID.
+A refused write leaves the local selections in place.
+On the Mac, `read_role_map()` fetches the map once per command and saves it in `~/.local/state/accounts/role_map_cache.json`.
+When natedev is unreachable, the command uses the saved map and reports its time in the user's zone.
+The command refuses when it has no usable saved map.
 
 `groups.json` stores explicitly selected group accounts. A manual group move, a refusal move or an account move entry writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
 

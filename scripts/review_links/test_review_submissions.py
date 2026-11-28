@@ -123,6 +123,7 @@ class ReviewSubmissionTests(unittest.TestCase):
             "REVIEW_LINKS_ROOT": str(self.root / "review")})))
         conf.path("machines").parent.mkdir(parents=True, exist_ok=True)
         _ = write_config_fixture(conf.path("machines"))
+        _ = write_config_fixture(conf.path("production"))
         _ = write_config_fixture(conf.path("review_links"))
         _ = write_config_fixture(conf.path("user_zone"))
 

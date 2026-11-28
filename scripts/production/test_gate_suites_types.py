@@ -144,10 +144,14 @@ class MergeGateTypesTests(GateSuitesFixture):
             fast_line = "scripts/fast.py:1:1 - error: third"
             unknown_line = "scripts/unknown.py:1:1 - error: fourth"
             limit = gate.NIGHTLY_TYPE_DIAGNOSTIC_LINES
-            byte_limit = gate.NIGHTLY_TYPE_LINE_BYTES
+            byte_limit = 512
+            gate_config = Path(self.environment["CONF_DIR"]) / "gate.conf"
             long_line = f"{source}:1:1 - error: " + "漢" * byte_limit
-            for case in ("assigned", "unknown", "test red", "long report", "wide files", "notice failure", "recorded producer"):
+            for case in ("assigned", "unknown", "test red", "long report", "wide files", "notice failure",
+                         "unusable display limit", "recorded producer"):
                 with self.subTest(case=case):
+                    display_limit = 2 if case == "unusable display limit" else byte_limit
+                    _ = write_config_fixture(gate_config, f"nightly.type_line_bytes={display_limit}\n")
                     self.environment["GATE_STATE_DIR"] = str(self.root / case)
                     expected_author = receipt_author
                     if case == "recorded producer":
@@ -181,6 +185,19 @@ class MergeGateTypesTests(GateSuitesFixture):
                     self.assertEqual(second.args[0], f"session:{fast_author.current_session}")
                     first_text = cast(str, first.args[2])
                     second_text = cast(str, second.args[2])
+                    notice_text = cast(str, notice.call_args.args[2])
+                    if case == "unusable display limit":
+                        for text in (first_text, second_text, notice_text):
+                            self.assertIn("nightly.type_line_bytes='2'", text)
+                            self.assertNotIn(receipt_lines[0], text)
+                        path, = (Path(self.environment["GATE_STATE_DIR"]) / "nightly-red").glob("*.json")
+                        saved = gate.read_nightly_red(path)
+                        self.assertIsInstance(saved.assignment, gate.NightlyFixAssigned)
+                        assert isinstance(saved.assignment, gate.NightlyFixAssigned)
+                        self.assertEqual(saved.assignment.unit, receipt_author.id)
+                        self.assertIn(receipt_lines[0], saved.failures)
+                        push.assert_called_once()
+                        continue
                     shown = first_text.splitlines()[1:-1]
                     recheck = first_text.splitlines()[-1]
                     expected = routed_lines[:limit]
@@ -204,7 +221,6 @@ class MergeGateTypesTests(GateSuitesFixture):
                         fast_line, "Run `basedpyright scripts/fast.py` to see every diagnostic in these files."])
                     self.assertIn("Fix it in your next phase.", first_text)
                     notice.assert_called_once()
-                    notice_text = cast(str, notice.call_args.args[2])
                     heading = f"Sent to {expected_author.name}:"
                     self.assertIn(heading + "\n" + "\n".join(receipt_lines), notice_text)
                     if case == "long report":

@@ -23,7 +23,7 @@ class FixtureModelDefaultsTests(unittest.TestCase):
     def test_only_unchanged_baseline_results_are_reused(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             registry = write_registry(Path(root) / "models.conf")
-            with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
+            with patch.dict(os.environ, {"CONF_DIR": str(registry.parent)}):
                 resolve = MagicMock(return_value=("gpt-test", "high"))
                 defaults = FixtureModelDefaults(resolve)
                 configuration = models_registry.launch_configuration({
@@ -45,7 +45,7 @@ class FixtureModelDefaultsTests(unittest.TestCase):
             **os.environ, models_registry.OPERATION_ENVIRONMENT[0]: ""})
         args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
         self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
-        with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-codex-registry"}):
+        with patch.dict(os.environ, {"CONF_DIR": "/tmp/custom-codex-registry"}):
             self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
             self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         with patch.object(subprocess, "run"):

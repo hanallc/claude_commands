@@ -514,7 +514,7 @@ class ListPageTests(unittest.TestCase):
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
-        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = write_config_fixture(config / "production.conf", "# whole: 20..\nquestion_title_max_chars=100\n")
         _ = (config / "statusline.conf").write_text(
             "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
             + "role.producer=#90fe42\nrole.worker=#ff0404\n")
@@ -3384,6 +3384,7 @@ document.body.append(result);
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)
         _ = write_config_fixture(config / "console.conf", f"page.list.owner={MORTY.id}\n")
+        _ = write_config_fixture(config / "statusline.conf", f"rebuild.cache={self.root / 'rebuild-cache'}\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
         environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}

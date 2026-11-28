@@ -11,18 +11,20 @@ export HOME="$TEST_DIR/home"
 mkdir -p "$HOME"
 export CLAUDE_CONFIG_DIR="$TEST_DIR/claude-config"
 
-MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
+export CONF_DIR="$TEST_DIR"
+unset MODELS_CONFIG_FILE
 MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
-export MODELS_CONFIG_FILE MODELS_CONFIG_PUBLISH CODEX_CONFIG_FILE
+export MODELS_CONFIG_PUBLISH CODEX_CONFIG_FILE
 export CODEX_MODELS_CACHE_FILE CODEX_CATALOG_SYNC_STATE_FILE
 
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
 write_fixture() {
-    cp "$1" "$MODELS_CONFIG_FILE"
+    mkdir -p "$CONF_DIR"
+    cp "$1" "$CONF_DIR/models.conf"
 }
 
 write_test_registry "$TEST_DIR/base.conf" --replace-provided-sections --replace-section claude.families \
@@ -121,9 +123,9 @@ assert_registry_matches() {
 }
 
 test_resolve_reads_registry_once() (
-    MODELS_CONFIG_FILE="$TEST_DIR/read-once.conf"
+    CONF_DIR="$TEST_DIR/read-once"
     write_fixture "$TEST_DIR/base.conf"
-    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    registry_read_probe "$TEST_DIR" "$CONF_DIR/models.conf"
     for task in alpha.work alpha.claude_task; do
         : > "$TEST_REGISTRY_READS"
         agents_resolve "$task" || fail "read-count task did not resolve: $task"
@@ -142,12 +144,12 @@ test_resolve_reads_registry_once() (
 )
 
 test_inherited_editor_writes_without_catalog_sync() (
-    export MODELS_CONFIG_FILE="$TEST_DIR/inherited-editor.conf"
+    CONF_DIR="$TEST_DIR/inherited-editor"
     export MODELS_LAUNCH_CONFIGURATION="" MODELS_CONFIG_TIER_ONLY=0
     export CODEX_CONFIG_FILE="$TEST_DIR/editor-codex.toml"
     export CODEX_MODELS_CACHE_FILE="$TEST_DIR/editor-models.json"
     export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/editor-last-success"
-    write_test_registry "$MODELS_CONFIG_FILE"
+    write_test_registry "$CONF_DIR/models.conf"
     printf '%s\n' 'model = "gpt-test"' > "$CODEX_CONFIG_FILE"
     printf '%s\n' '{"models":[{"slug":"gpt-test","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]}]}' > "$CODEX_MODELS_CACHE_FILE"
     touch -t 200001010000 "$CODEX_CATALOG_SYNC_STATE_FILE"
@@ -158,22 +160,22 @@ import os, sys
 from pathlib import Path
 with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.models_registry import RegistryEditBase
-path = Path(os.environ["MODELS_CONFIG_FILE"])
+path = Path(os.environ["CONF_DIR"]) / "models.conf"
 print(RegistryEditBase(path, path.read_text(), ()).environment({})["MODELS_REGISTRY_EDIT_BASE"])
 PYTHON
     )"
-    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    registry_read_probe "$TEST_DIR" "$CONF_DIR/models.conf"
     bash "$SCRIPT_DIR/default_models.sh" direct.impl gpt-test:medium > "$TEST_DIR/editor-output" \
         || fail "the inherited editor write failed"
     # The local save reads under the lock and returns the text it saved.
     [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 1 ]] \
         || fail "the inherited editor must read the registry once for the local save: $(cat "$TEST_REGISTRY_READS")"
-    grep -q '^impl=gpt-test:medium$' "$MODELS_CONFIG_FILE" \
+    grep -q '^impl=gpt-test:medium$' "$CONF_DIR/models.conf" \
         || fail "the inherited editor did not publish its row"
 )
 
 test_registry_edit_refreshes_readers() (
-    MODELS_CONFIG_FILE="$TEST_DIR/edit-refresh.conf"
+    CONF_DIR="$TEST_DIR/edit-refresh"
     write_fixture "$TEST_DIR/base.conf"
     agents_resolve alpha.work
     [[ "$AGENT_EFFORT" == high ]] || fail "edit fixture did not start at high effort"
@@ -190,17 +192,18 @@ test_registry_edit_refreshes_readers() (
 )
 
 test_changed_registry_file_refreshes_readers() (
-    MODELS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
+    CONF_DIR="$TEST_DIR/first-registry"
     write_fixture "$TEST_DIR/base.conf"
+    mkdir -p "$TEST_DIR/second-registry"
     sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$TEST_DIR/base.conf" \
-        > "$TEST_DIR/second-registry.conf"
+        > "$TEST_DIR/second-registry/models.conf"
     agents_resolve alpha.work
     [[ "$AGENT_EFFORT" == high ]] || fail "first registry did not resolve high effort"
-    MODELS_CONFIG_FILE="$TEST_DIR/second-registry.conf"
+    CONF_DIR="$TEST_DIR/second-registry"
     agents_resolve alpha.work
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == medium ]] \
         || fail "same-shell resolve kept values from the previous registry file"
-    MODELS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
+    CONF_DIR="$TEST_DIR/first-registry"
     agents_resolve alpha.work
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == high ]] \
         || fail "switching back to the first registry kept the second file's values"
@@ -208,11 +211,11 @@ test_changed_registry_file_refreshes_readers() (
 )
 
 test_spaced_keys_and_shell_quoting() (
-    MODELS_CONFIG_FILE="$TEST_DIR/spaced registry.conf"
-    write_test_registry "$MODELS_CONFIG_FILE" assignments/direct=codex
-    sed 's/^direct=codex$/  direct = codex   # chosen family/' "$MODELS_CONFIG_FILE" > "$TEST_DIR/spaced.conf"
-    mv "$TEST_DIR/spaced.conf" "$MODELS_CONFIG_FILE"
-    cat >> "$MODELS_CONFIG_FILE" <<'EOF'
+    CONF_DIR="$TEST_DIR/spaced registry"
+    write_test_registry "$CONF_DIR/models.conf" assignments/direct=codex
+    sed 's/^direct=codex$/  direct = codex   # chosen family/' "$CONF_DIR/models.conf" > "$TEST_DIR/spaced.conf"
+    mv "$TEST_DIR/spaced.conf" "$CONF_DIR/models.conf"
+    cat >> "$CONF_DIR/models.conf" <<'EOF'
 
 [empty]
 [quoted]
@@ -227,16 +230,16 @@ EOF
 )
 
 test_editor_uses_matching_text_and_values_after_a_concurrent_edit() (
-    MODELS_CONFIG_FILE="$TEST_DIR/editor-base.conf"
+    CONF_DIR="$TEST_DIR/editor-base"
     write_fixture "$TEST_DIR/base.conf"
-    cp "$MODELS_CONFIG_FILE" "$TEST_DIR/editor-before.conf"
-    sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$MODELS_CONFIG_FILE" > "$TEST_DIR/editor-peer.conf"
-    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    cp "$CONF_DIR/models.conf" "$TEST_DIR/editor-before.conf"
+    sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$CONF_DIR/models.conf" > "$TEST_DIR/editor-peer.conf"
+    registry_read_probe "$TEST_DIR" "$CONF_DIR/models.conf"
     parser="$(declare -f _models_registry_parse)"
     eval "${parser/_models_registry_parse /test_original_registry_parse }"
     _models_registry_parse() {
         test_original_registry_parse "$@"
-        cp "$TEST_DIR/editor-peer.conf" "$MODELS_CONFIG_FILE"
+        cp "$TEST_DIR/editor-peer.conf" "$CONF_DIR/models.conf"
     }
     validate_editor_base() {
         models_registry_text > "$TEST_DIR/editor-source.conf"
@@ -247,18 +250,18 @@ test_editor_uses_matching_text_and_values_after_a_concurrent_edit() (
     }
     models_registry_edit validate_editor_base
     [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 1 ]] || fail "editor read more than one base"
-    cmp "$TEST_DIR/editor-peer.conf" "$MODELS_CONFIG_FILE" || fail "editor replaced the concurrent edit"
+    cmp "$TEST_DIR/editor-peer.conf" "$CONF_DIR/models.conf" || fail "editor replaced the concurrent edit"
 )
 
 test_model_families() (
     # Keep these fixtures separate from the legacy mutation cases below. A
     # generated family row may lag the cache until the next catalog sync.
-    MODELS_CONFIG_FILE="$TEST_DIR/families.conf"
+    CONF_DIR="$TEST_DIR/families"
     # /default_models sources the resolver in a child; keep the freshness gate closed
     # so these effort-less cache fixtures exercise resolution alone.
     MODELS_CONFIG_TIER_ONLY=1
     export MODELS_CONFIG_TIER_ONLY
-    write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
+    write_test_registry "$CONF_DIR/models.conf" --replace-provided-sections \
         assignments/launch=codex \
         assignments/launch.claude=claude \
         launch.codex/work=sol:xhigh \
@@ -369,7 +372,7 @@ EOF
                 null-minimum) minimum=null; TEST_CLAUDE_VERSION=1.0.0 ;;
                 absent-minimum) minimum=null; TEST_CLAUDE_VERSION=1.0.0 ;;
             esac
-            write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
+            write_test_registry "$CONF_DIR/models.conf" --replace-provided-sections \
                 assignments/launch=claude \
                 "launch.claude/work=$word:high" \
                 "claude.agents/$word=low,medium,high,max" \
@@ -417,11 +420,11 @@ EOF
 test_model_families
 
 test_family_repairs() (
-    MODELS_CONFIG_FILE="$TEST_DIR/family-repairs.conf"
+    CONF_DIR="$TEST_DIR/family-repairs"
     CODEX_MODELS_CACHE_FILE="$TEST_DIR/family-repairs.json"
     MODELS_CONFIG_TIER_ONLY=1
     export MODELS_CONFIG_TIER_ONLY
-    write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
+    write_test_registry "$CONF_DIR/models.conf" --replace-provided-sections \
         assignments/direct=codex \
         assignments/probe=codex \
         assignments/dormant=claude \
@@ -920,7 +923,7 @@ assert_registry_matches "$before" || fail "a rejected tier changed the registry"
 # default_models.sh routes a tier word at each level and says whether it runs.
 admin_first_line() {
     local output
-    output="$(MODELS_CONFIG_FILE="$MODELS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+    output="$(CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
         CODEX_MODELS_CACHE_FILE="$CODEX_MODELS_CACHE_FILE" \
         CODEX_CATALOG_SYNC_STATE_FILE="$CODEX_CATALOG_SYNC_STATE_FILE" \
         bash "$SCRIPT_DIR/default_models.sh" "$@")"
@@ -978,7 +981,7 @@ write_test_registry "$TEST_DIR/production.conf" --replace-provided-sections \
     claude.agents/sonnet=low,medium,high,xhigh
 
 admin() {
-    MODELS_CONFIG_FILE="$MODELS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+    CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
         CODEX_MODELS_CACHE_FILE="$CODEX_MODELS_CACHE_FILE" \
         CODEX_CATALOG_SYNC_STATE_FILE="$CODEX_CATALOG_SYNC_STATE_FILE" \
         bash "$SCRIPT_DIR/default_models.sh" "$@"

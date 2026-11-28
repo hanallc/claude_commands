@@ -59,7 +59,7 @@ locks.probe_wait_seconds=0.25
 # range: 0.001..1
 locks.probe_retry_seconds=0.005
 """)
-        environment = {**fixture_git_environment(self.root), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(self.root)}
+        environment = {**fixture_git_environment(self.root), "CONF_DIR": str(self.root)}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         self.repo = self.root / "repo"
         self.repo.mkdir()

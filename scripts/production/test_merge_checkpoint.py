@@ -45,8 +45,7 @@ def setUpModule() -> None:
     state = Path(tempfile.mkdtemp(prefix="checkpoint-zone-fixture-")).resolve()
     unittest.addModuleCleanup(shutil.rmtree, state)
     environment = fixture_git_environment(state)
-    for key in ("BASH_ENV", "STAFF_CONFIG"):
-        _ = environment.pop(key, None)
+    _ = environment.pop("BASH_ENV", None)
     environment["ZONE_STATE"] = str(state)
     unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     configure_test_environment()
@@ -197,9 +196,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
-        config = self.root / "staff.conf"
+        config = Path(self.env["CONF_DIR"]) / "staff.conf"
         _ = copy_config_file_fixture(checkout / "config/staff.conf", config)
-        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
+        self.env["WORKTREES_STATE_DIR"] = str(records)
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
         workspace = self.root / "workspace"

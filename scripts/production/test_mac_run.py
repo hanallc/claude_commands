@@ -349,7 +349,6 @@ class MacRunTests(unittest.TestCase):
             **fixture_zsh_environment(),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
-            "COPIES_CONFIG": str(copies_config),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),

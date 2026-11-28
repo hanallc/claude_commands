@@ -1800,6 +1800,7 @@ class CountsRowTests(ConfiguredShellTests):
         statusline = fixture_colors(self.configuration / "statusline.conf")
         _ = write_config_fixture(statusline, "# whole: 1..\ncounts.retry_seconds=7\n"
                                  + fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+        _ = write_config_fixture(self.configuration / "production.conf")
         _ = write_config_fixture(self.configuration / "user_zone.conf", f"zone={USER_ZONE.key}\n")
         environment = {"CONF_DIR": str(self.configuration), "USER_ZONE": USER_ZONE.key}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))

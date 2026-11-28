@@ -26,10 +26,11 @@ class RegistryOverrideTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.path = root / "models.conf"
         self.enterContext(patch.dict(os.environ, {
-            "HOME": str(root), "MODELS_CONFIG_FILE": str(self.path),
+            "HOME": str(root), "CONF_DIR": str(self.path.parent),
             "MODELS_LAUNCH_CONFIGURATION": "", "MODELS_REGISTRY_EDIT_BASE": "",
             "MODELS_CONFIG_TIER_ONLY": "1",
         }))
+        _ = os.environ.pop("MODELS_CONFIG_FILE", None)
 
     def test_shell_assignments_preserve_parsed_values_without_executing_them(self) -> None:
         text = "[roles]\nrunner = quoted ' value $(exit 9) # comment\nbare\n[empty]\n"
@@ -72,11 +73,11 @@ class RegistryOverrideTests(unittest.TestCase):
         log = root / "sync-log"
         receipt = root / "sync-environment.json"
         sync_environment = self._catalog_sync_environment("#!" + sys.executable + "\n" + '\n'.join([
-            "import json, os", "from pathlib import Path",
-            "path = Path(os.environ['MODELS_CONFIG_FILE'])",
+            "import json, os, sys", "from pathlib import Path",
+            "path = Path(sys.argv[2])",
             f"with Path({str(log)!r}).open('a') as output: output.write(str(path) + '\\n')",
             f"Path({str(receipt)!r}).write_text(json.dumps({{key: os.environ[key] for key in "
-            + "('HOME', 'MODELS_CONFIG_FILE', 'MODELS_CONFIG_TIER_ONLY', 'CODEX_CONFIG_FILE', "
+            + "('HOME', 'CONF_DIR', 'MODELS_CONFIG_TIER_ONLY', 'CODEX_CONFIG_FILE', "
             + "'CODEX_MODELS_CACHE_FILE', 'CODEX_CATALOG_SYNC_STATE_FILE')}))",
             "path.write_text(path.read_text().replace('source=before', 'source=synced'))",
             "Path(os.environ['CODEX_CATALOG_SYNC_STATE_FILE']).touch()",
@@ -128,17 +129,17 @@ class RegistryOverrideTests(unittest.TestCase):
                 os.utime(path, (20, 20) if key == "CODEX_CATALOG_SYNC_STATE_FILE" else (30, 30))
             _ = log.write_text("")
             with self._catalog_sync_scope({**sync_environment, "MODELS_CONFIG_TIER_ONLY": "1"}):
-                environment = {**os.environ, "HOME": str(call_home), "MODELS_CONFIG_FILE": str(selected),
+                environment = {**os.environ, "HOME": str(call_home), "CONF_DIR": str(selected.parent),
                                "MODELS_CONFIG_TIER_ONLY": "0",
                                **{key: str(path) for key, path in call_paths.items()}}
-                configuration = models_registry.launch_configuration(environment, registry=selected)
+                configuration = models_registry.launch_configuration(environment)
             self.assertEqual(log.read_text().splitlines(), [str(selected)])
             self.assertEqual(configuration.path, selected)
             self.assertEqual(configuration.text, original.replace("before", "synced"))
             self.assertEqual(next(row.value for row in configuration.rows if row.key == "source"), "synced")
             self.assertEqual(receipt.read_text(), json.dumps({
                 key: environment[key] for key in (
-                    "HOME", "MODELS_CONFIG_FILE", "MODELS_CONFIG_TIER_ONLY", "CODEX_CONFIG_FILE",
+                    "HOME", "CONF_DIR", "MODELS_CONFIG_TIER_ONLY", "CODEX_CONFIG_FILE",
                     "CODEX_MODELS_CACHE_FILE", "CODEX_CATALOG_SYNC_STATE_FILE")}))
 
     def test_failed_catalog_sync_warns_and_returns_the_current_configuration(self) -> None:
@@ -154,9 +155,16 @@ class RegistryOverrideTests(unittest.TestCase):
             self.assertEqual(configuration.path, self.path)
             self.assertEqual(configuration.text, original)
 
+    def test_shell_operations_use_conf_dir_and_explicit_paths_take_precedence(self) -> None:
+        self.assert_shell_registry_selection('export CONF_DIR="$2"', self.path, self.path.parent)
+
     def test_shell_operations_use_unexported_registry_paths_and_explicit_paths_take_precedence(self) -> None:
-        selected = fixture.write_registry(self.path, {"assignments": {"direct": "claude"}})
-        _ = fixture.write_registry(self.path.parent / ".claude/config/models.conf", {"assignments": {"direct": "codex"}})
+        selected = self.path.with_name("worker registry.conf")
+        _ = fixture.write_registry(self.path, {"assignments": {"direct": "codex"}})
+        self.assert_shell_registry_selection('MODELS_CONFIG_FILE="$2"', selected, selected)
+
+    def assert_shell_registry_selection(self, selector: str, selected: Path, argument: Path) -> None:
+        _ = fixture.write_registry(selected, {"assignments": {"direct": "claude"}})
         other = fixture.write_registry(self.path.parent / "other.conf", {"assignments": {"direct": "codex"}})
         source = Path(models_registry.__file__).parents[1] / "agents/models_config.sh"
         for operation, expected in (("models_launch_configuration; emit", selected),
@@ -164,11 +172,11 @@ class RegistryOverrideTests(unittest.TestCase):
                                     ('_models_registry_parse --registry "$3"; emit', other),
                                     ('_models_registry_parse --registry="$3"; emit', other)):
             with self.subTest(operation=operation):
-                result = subprocess.run(["bash", "-c", 'source "$1"; export -n MODELS_CONFIG_FILE; '
-                    + 'MODELS_CONFIG_FILE="$2"; emit() { printf "%s\\n" "$MODELS_CONFIG_FILE"; '
+                result = subprocess.run(["bash", "-c", 'source "$1"; ' + selector + '; '
+                    + 'emit() { printf "%s\\n" "$MODELS_REGISTRY_PATH"; '
                     + '_models_table_section_values assignments; }; ' + operation,
-                    "fixture", str(source), str(selected), str(other)],
-                    env={**os.environ, "MODELS_CONFIG_FILE": str(other)},
+                    "fixture", str(source), str(argument), str(other)],
+                    env=os.environ,
                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines()[0], str(expected))
@@ -180,11 +188,12 @@ class RegistryOverrideTests(unittest.TestCase):
         self.assertIn('design_roles=codex\n', text)
 
     def test_path_resolution_uses_the_default_or_the_current_override(self) -> None:
-        default = self.path.parent / "default registry.conf"
-        for configured, expected in (("", default), (str(self.path), self.path),
-                                     (str(self.path.parent / "later.conf"), self.path.parent / "later.conf")):
-            with self.subTest(configured=configured), patch.object(models_registry, "DEFAULT_PATH", default), \
-                    patch.dict(os.environ, {"MODELS_CONFIG_FILE": configured}):
+        home = self.path.parent / "live home"
+        default = home / ".claude/config/models.conf"
+        later = self.path.parent / "later config"
+        for configured, expected in (("", default), (str(self.path.parent), self.path),
+                                     (str(later), later / "models.conf")):
+            with self.subTest(configured=configured), patch.dict(os.environ, {"HOME": str(home), "CONF_DIR": configured}):
                 self.assertEqual(models_registry.registry_path(), expected)
 
     def test_shell_cli_resolves_its_path_without_reading_stdin(self) -> None:
@@ -195,13 +204,13 @@ class RegistryOverrideTests(unittest.TestCase):
                 selected.parent.mkdir(parents=True, exist_ok=True)
                 _ = selected.write_text(text)
                 environment = {**os.environ, "HOME": str(self.path.parent),
-                               "MODELS_CONFIG_FILE": str(selected) if override else ""}
+                               "CONF_DIR": str(selected.parent) if override else ""}
                 result = subprocess.run(
                     ["python3", str(Path(models_registry.__file__)), "shell"], input="not a registry\n",
                     env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 shell = subprocess.run(["bash", "-c", result.stdout +
-                                        'printf "%s\\0" "$MODELS_CONFIG_FILE" "$MODELS_REGISTRY_BASE" '
+                                        'printf "%s\\0" "$MODELS_REGISTRY_PATH" "$MODELS_REGISTRY_BASE" '
                                         + '"${_models_table_sections[@]}" "${_models_table_keys[@]}" '
                                         + '"${_models_table_values[@]}"'],
                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)

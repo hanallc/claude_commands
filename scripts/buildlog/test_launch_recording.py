@@ -18,7 +18,7 @@ from types import FrameType
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target.ledger_test_support import install_cost_settings, write_gate_config
+from scripts.aws_target.ledger_test_support import account_fixture_path, install_cost_settings, write_gate_config
 from scripts.buildlog import index
 from scripts.buildlog import launches
 from scripts.buildlog import record
@@ -65,13 +65,12 @@ class LaunchRecordingTests(unittest.TestCase):
             ["git", "init", "--quiet", "--initial-branch=main", str(self.worktree)],
             check=True, capture_output=True,
         )
-        aws_settings = base / 'config/aws_target.conf'
-        install_cost_settings(aws_settings)
+        install_cost_settings(account_fixture_path(base))
         write_gate_config(base / 'config/cloud_gate.conf')
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(base / "config"),
-            "AWS_TARGET_CONFIG": str(aws_settings),
+            "HOME": str(base),
             "BUILD_TARGETS_STATE_DIR": str(base / "targets"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),

@@ -44,6 +44,7 @@ from scripts.astra.design_role_test_support import designer_fixture
 from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import unit_labels
 
 SCRIPTS = Path(__file__).parents[1]
@@ -154,13 +155,8 @@ class RosterTests(unittest.TestCase):
         transport_config.mkdir()
         write_text_atomic(transport_config / "direct.conf", "# Worker settings.\n")
         write_machine_config(transport_config)
-        config = self.root / "showrunners.json"
-        _ = config.write_text(json.dumps({
-            "threshold_percent": 2,
-            "stall_minutes": 5,
-            "faults_to": "runner",
-            "always": [],
-        }), encoding="utf-8")
+        _ = write_config_fixture(transport_config / "showrunners.conf",
+                                 "threshold_percent=2\nstall_minutes=5\nfaults_to=runner\nalways=\n")
         self.environment = {
             **os.environ,
             "HOME": str(self.home),
@@ -174,7 +170,6 @@ class RosterTests(unittest.TestCase):
             "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "NOTIFIER_STATE_DIR": str(self.notifier),
-            "SHOWRUNNERS_CONFIG": str(config),
             "CONF_DIR": str(transport_config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -194,7 +189,6 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(environment_patch)
         _ = self.enterContext(mock.patch.object(unit_runs, "run_roots", return_value=(self.runs,)))
         _ = self.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
-        _ = self.enterContext(mock.patch.object(showrunners, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier))
         _ = self.enterContext(mock.patch.object(
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),

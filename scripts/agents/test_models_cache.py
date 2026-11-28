@@ -108,7 +108,7 @@ class ModelsCacheTests(unittest.TestCase):
             "codex.agents": {"gpt-6.1-sol": "high"},
             "codex.families": {"sol": "gpt-6.1-sol"},
         })
-        return {**os.environ, "MODELS_CONFIG_FILE": str(registry),
+        return {**os.environ, "CONF_DIR": str(registry.parent),
                        "MODELS_CONFIG_TIER_ONLY": "1", "MODELS_CONFIG_PUBLISH": "0",
                 "CODEX_MODELS_CACHE_FILE": str(self.cache)}
 

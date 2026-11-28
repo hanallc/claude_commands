@@ -29,6 +29,7 @@ from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
@@ -108,6 +109,7 @@ class RegistrationFixture(unittest.TestCase):
         cls.command_snapshot = cls.fixture_root.with_name("command")
         builder = cls()
         try:
+            cls.fixture_root.mkdir()
             builder.bind_fixture(cls.fixture_root)
             builder.build_fixture()
             if cls.needs_command_copy:
@@ -131,13 +133,13 @@ class RegistrationFixture(unittest.TestCase):
         self.home = self.root / "home"
         self.checkout = self.root / "checkout"
         self.state = self.root / "state"
-        self.config = self.root / "showrunners.json"
+        self.config = self.root / "registration-config/showrunners.conf"
         self.doc = self.checkout / "docs/plans/registration-notes.md"
         bin_dir = self.root / "bin"
         self.env = {**fixture_git_environment(root.parent), "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles",
                     "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
-                    "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
+                    "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "CONF_DIR": str(self.config.parent),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
@@ -145,7 +147,8 @@ class RegistrationFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.state / "staff/staff.json", self.env))
 
     def build_fixture(self) -> None:
-        self.root.mkdir()
+        _ = config_environment(self.config.parent)
+        self.config.unlink()
         self.home.mkdir()
         self.checkout.mkdir()
         self.state.mkdir()

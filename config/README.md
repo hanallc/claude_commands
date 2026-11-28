@@ -389,7 +389,7 @@ Cloud gates use `~/.claude/config/aws_target.conf` for the account money check, 
 The route passes this path to the installed worker through `--settings`.
 The worker uses this path for billing reads and ledger reservations.
 The ledger guard also accepts this explicit path.
-`AWS_TARGET_CONFIG` supplies an explicit account config path for fixtures.
+Tests set `HOME` to a private folder and place the account file at `.claude/config/aws_target.conf`.
 Tests can also pass their own file through `--settings` or the `GateWorker` constructor.
 Reports use the same account config path for money calculations.
 The older builder's SSH eligibility guard retains its target settings.
@@ -597,7 +597,7 @@ Block and claim settings use the same units as `mac_test.conf`.
 
 Configured SSH targets use `~/.local/state/build-targets/<target>/` for claims, locks, blocks and retry records.
 The Mac retains `~/.local/state/mac-test/` and its existing fixture overrides.
-Checkout tests use a temporary `HOME` for other targets and `BUILD_TARGETS_CONFIG` for their settings paths.
+Checkout tests set a temporary `HOME` for other targets and put `build_targets.conf` under `CONF_DIR`.
 `mac_test.py <command> --target <name>` selects a configured SSH target.
 Explicit target status reads local records without probes or cleanup.
 
@@ -804,6 +804,11 @@ List of crate names to exclude from `cargo fmt` checks. Used when running format
 ## mcp.json
 
 MCP server definitions for reference when setting up Claude Code on a new machine. Copy these entries into `~/.claude.json` under the `mcpServers` key.
+
+## orphans.conf
+
+`corpus.max_file_bytes` sets the largest file that `/orphans` reads for references.
+The command reads this setting at the start of each scan.
 
 ## orphans_expected.json
 

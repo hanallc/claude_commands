@@ -23,11 +23,12 @@ from pathlib import Path
 from typing import override, cast, final
 from unittest.mock import patch
 
-from scripts.accounts import role_map
+from scripts.accounts import role_map, worker_names
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib import models_registry
+from scripts.lint.memory_test_support import config_environment
 from scripts.message import process_table
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, showrunners
@@ -45,7 +46,8 @@ def fixture_write_metadata(home: Path) -> dict[Path, tuple[int, int]]:
     """
     paths = [root / "auth.json" for root in home.glob(".codex*") if root.is_dir()]
     # note_file.notes_dir's production default, anchored to passwd home rather than HOME.
-    paths.extend((home / ".claude/config/accounts.json", home / "rust/hanadocs/agents/codex9.md"))
+    paths.extend((worker_names.legacy_accounts_state(home).file, worker_names.migrated_accounts_state(home).file,
+                  home / "rust/hanadocs/agents/codex9.md"))
     metadata: dict[Path, tuple[int, int]] = {}
     for path in paths:
         try:
@@ -73,11 +75,13 @@ def refuse_real_home(path: Path, source: str) -> None:
 
 
 def assert_fixture_environment() -> None:
-    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "CONF_DIR"):
         value = os.environ.get(name)
         if not value:
             raise AssertionError(f"{name} is unset; Codex fixture requires setUpModule")
         refuse_real_home(Path(value), name)
+    if registry := os.environ.get("MODELS_CONFIG_FILE"):
+        refuse_real_home(Path(registry), "MODELS_CONFIG_FILE")
 
 
 @dataclasses.dataclass
@@ -209,10 +213,13 @@ def fixture_no_sleep(_seconds: float) -> None:
     raise AssertionError("fixture must not sleep")
 
 
-def set_environment(name: str, value: str) -> Callable[[], None]:
-    """Set one environment variable and return the call that puts it back."""
+def set_environment(name: str, value: str | None) -> Callable[[], None]:
+    """Set or remove one environment variable and return its cleanup."""
     previous = os.environ.get(name)
-    os.environ[name] = value
+    if value is None:
+        _ = os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
     def restore() -> None:
         if previous is None:
@@ -227,9 +234,9 @@ def select_fixture_workers(home: Path, *, notes: Path) -> None:
     """Give fake-server tests an explicit selection backed by a synthetic sign-in."""
     default = home / ".codex"
     auth = default / "auth.json"
-    config = home / ".claude/config/accounts.json"
+    config = worker_names.migrated_accounts_state(home).file
     for source, path in (("fixture home", home), ("fixture sign-in", auth),
-                         ("fixture note", notes / "codex9.md"), ("fixture account config", config)):
+                         ("fixture note", notes / "codex9.md"), ("fixture account state", config)):
         refuse_real_home(path, source)
     default.mkdir(exist_ok=True)
     login = "codex-fixture@example.invalid"
@@ -272,7 +279,10 @@ def setUpModule() -> None:
     private_staff = Path(home.name) / "staff.json"
     _ = private_staff.write_text(json.dumps({"schema": 2, "rows": []}))
     unittest.addModuleCleanup(set_environment("STAFF_FILE", str(private_staff)))
-    unittest.addModuleCleanup(set_environment("STAFF_CONFIG", str(Path(__file__).resolve().parents[2] / "config/staff.conf")))
+    configuration = Path(home.name) / "config"
+    _ = config_environment(configuration)
+    unittest.addModuleCleanup(set_environment("CONF_DIR", str(configuration)))
+    unittest.addModuleCleanup(set_environment("MODELS_CONFIG_FILE", None))
     unittest.addModuleCleanup(set_environment("XDG_STATE_HOME", str(Path(home.name) / "state")))
     # Account-change notices resolve the user zone through discovery, whose paths
     # were cached at import before HOME changed. Isolate both it and child processes.
@@ -291,7 +301,6 @@ def setUpModule() -> None:
     unittest.addModuleCleanup(set_environment("MODELS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
     tier_files = {
-        "MODELS_CONFIG_FILE": str(Path(home.name) / "models.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
         "CODEX_MODELS_CACHE_FILE": str(Path(home.name) / "models_cache.json"),
@@ -299,7 +308,7 @@ def setUpModule() -> None:
     }
     for path in tier_files.values():
         _ = Path(path).write_text("", encoding="utf-8")
-    _ = write_registry(Path(tier_files["MODELS_CONFIG_FILE"]))
+    _ = write_registry(configuration / "models.conf")
     for path in tier_files.values():
         os.utime(path, (1, 1))
     os.utime(tier_files["CODEX_CATALOG_SYNC_STATE_FILE"], (2, 2))
@@ -591,10 +600,10 @@ class FixtureModelDefaults:
     def __init__(self, resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]]) -> None:
         self.resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]] = resolve
         self.environment: dict[str, str] = self.resolver_environment()
+        paths = (models_registry.registry_path(), *(Path(os.environ[key]) for key in
+                 ("CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE", "CODEX_CATALOG_SYNC_STATE_FILE")))
         self.files: dict[Path, tuple[int, bytes]] = {
-            Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
-            for key in ("MODELS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
-                        "CODEX_CATALOG_SYNC_STATE_FILE")
+            path: (path.stat().st_mtime_ns, path.read_bytes()) for path in paths
         }
         self.run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
         self.defaults: dict[tuple[str, ...], tuple[str, str]] = {}
@@ -602,7 +611,7 @@ class FixtureModelDefaults:
     @staticmethod
     def resolver_environment() -> dict[str, str]:
         return {key: value for key, value in os.environ.items()
-                if (key.startswith(("AGENTS_", "MODELS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
+                if (key.startswith(("AGENTS_", "MODELS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS", "CONF_DIR"))
                 and key not in ("CODEX_HOME",)}
 
     def unchanged(self) -> bool:

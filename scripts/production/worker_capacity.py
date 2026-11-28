@@ -35,8 +35,6 @@ from scripts.production import broadcast, session_staff, showrunners, staff, wor
 from scripts.whoami import quota_state
 
 SENDER = "worker-capacity"
-# A loaded machine can pass the stop deadline between SIGTERM and SIGKILL (seen 2026-11-13).
-STOP_ATTEMPTS = 2
 # A dispatch holds the worker lock while it submits; the stop waits this long for it.
 LOCK_WAIT_SECONDS = 60
 USAGE = "usage: worker_capacity.py stop"
@@ -123,7 +121,11 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         except recorder_state.OldRecorderState as error:
             return WorkerNotStopped(row.name, str(error))
         process: Literal["stopped", "absent"] = "absent"
-        for _ in range(STOP_ATTEMPTS):
+        try:
+            stop_attempts = conf.read("shutdown").whole("worker.stop_attempts") if isinstance(state, worker_panes.OpenWorker) else 0
+        except conf.Unusable as error:
+            return WorkerNotStopped(row.name, str(error))
+        for _ in range(stop_attempts):
             if not isinstance(state, worker_panes.OpenWorker):
                 break
             if isinstance(sweep, StopSweep) and not sweep.active():
@@ -271,7 +273,7 @@ def stop() -> int:
         text = "\n".join(["Codex worker stop is incomplete. A Codex worker that still runs can spend credits.", *faults])
         for line in text.splitlines():
             print(line, file=sys.stderr, flush=True)
-        recipient = showrunners.load_settings_from(showrunners.CONFIG)["faults_to"]
+        recipient = showrunners.load_settings()["faults_to"]
         if sweep.active():
             delivered = _send(recipient, text) and delivered
     if not sweep.active():

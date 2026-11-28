@@ -41,7 +41,7 @@ from scripts.direct.pass_record import dispatch_delivery as dispatch_delivery, h
 from scripts.direct.pass_record import require_ordinary_review_run as require_ordinary_review_run
 from scripts.direct.pass_record import worker_artifact as worker_artifact
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.lib import file_lock, git_files, unit_runs
+from scripts.lib import conf, file_lock, git_files, unit_runs
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -3194,10 +3194,6 @@ SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
 # so the alignment follows a column that moves. The two scope labels and the
 # phase tally read as words and stay left.
 RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ETA high"})
-# How much of a worker's last board line the note under the table carries. The
-# board caps a post far higher than a terminal line can hold, and a wrapped
-# narration costs the reader the three-line scan the note exists to give.
-BOARD_NOTE_CHARS = 72
 # assign.py prefixes its final `done` and `blocked` board lines with this text.
 LAUNCHER_PREFIX = "launcher:"
 # What a worker's own narration says when it is alive but not working: held up on
@@ -3804,8 +3800,12 @@ def _board_phrase(said: BoardActivity) -> str:
     message = re.sub(r"^\s*role=\S+\s*", "", message).strip()
     body = message if said["kind"] == "status" else f"{said['kind']}: {message}"
     body = body.strip() or said["kind"]
-    if len(body) > BOARD_NOTE_CHARS:
-        body = body[: BOARD_NOTE_CHARS - 1].rstrip() + "\u2026"
+    try:
+        note_chars = conf.read("direct").whole("board.max_note_chars")
+    except conf.Unusable:
+        return said["kind"]
+    if len(body) > note_chars:
+        body = body[: note_chars - 1].rstrip() + "\u2026"
     return body
 
 
@@ -4714,10 +4714,7 @@ def _eta_band_cells(
     Each cell carries its own distance from the ETA, so the swing reads off the
     row without subtracting two clock times by hand.
 
-    Neither end is allowed past double or half the reported progress, whatever
-    the spread says. A measured error wider than the percentage itself would
-    otherwise push the pessimistic end down to 1% and quote an arrival ninety-nine
-    times the elapsed clock — a number no reader can use and none should trust.
+    The configured rate factor limits each end of the range.
     """
     band = plan_history.eta_band_seconds(percent, elapsed, spread)
     if isinstance(band, plan_history.EtaProjectionUnavailable):

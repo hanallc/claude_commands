@@ -76,7 +76,6 @@ class UnitTransferFixture(StaffTestCase):
             (showrunners, "SEND", self.root / "fake_send.py"),
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
-            (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
         ):
             _ = self.enterContext(mock.patch.object(module, name, value))
 
@@ -98,7 +97,6 @@ class UnitTransferFixture(StaffTestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state/showrunner"),
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
-            "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
             "TRANSFER_MESSAGE_LOG": str(self.root / "messages.jsonl"),
             "STAFF_FILE": str(self.root / "staff.json"),

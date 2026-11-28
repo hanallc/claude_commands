@@ -461,7 +461,7 @@ class AdmissionFixture(ExitStack):
                 "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
                 "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
                 "BUILDLOG_DIR": str(logs),
-                "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+                "BUILDLOG_PROC": str(self.proc.path),
                 "BUILDLOG_RUN": "",
                 "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
                 "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
@@ -1342,7 +1342,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     if not records.owner_given(environment):
         # A child process with no owner says the fixture started it, so the queue never refuses it.
         environment["CLAUDE_SESSION_NAME"] = FIXTURE_OWNER
-    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())

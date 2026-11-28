@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib import conf
 from scripts.lib import live_settings, models_registry
 from scripts.lib.test_models_registry import write_registry
 
@@ -88,7 +89,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.pushed, [])
 
     def test_refusal_push_says_when_nothing_was_on_codex(self) -> None:
-        registry = quota_alert.REGISTRY
+        registry = conf.path("models")
         _ = write_registry(registry, {"assignments": {"direct": "claude", "design_roles": "claude"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)

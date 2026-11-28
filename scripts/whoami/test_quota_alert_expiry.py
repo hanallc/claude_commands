@@ -12,6 +12,7 @@ from io import StringIO
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.accounts import accounts, next_moves, role_map
 from scripts.lib import conf
 from scripts.notify import push_texts, pushover, review, silence
@@ -37,7 +38,7 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "USER_ZONE": "America/New_York", "NOTIFY_STATE_DIR": str(self.root / "notify"),
         })))
-        with quota_alert.CONFIG.open("a", encoding="utf-8") as config:
+        with conf.path("showrunners").open("a", encoding="utf-8") as config:
             _ = config.write("# whole: 1..168\nclaude_expiry.alert_hours=12\n"
                              + "# whole: 1..168\nclaude_expiry.repeat_hours=2\n")
 
@@ -174,7 +175,7 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
                 self.assertEqual(self.expiry_accounts(), ["claude2"])
 
     def test_lead_and_repeat_hours_come_from_config(self) -> None:
-        config = quota_alert.CONFIG
+        config = conf.path("showrunners")
         text = config.read_text(encoding="utf-8")
         _ = config.write_text(text.replace("alert_hours=12", "alert_hours=8").replace("repeat_hours=2", "repeat_hours=1"),
                               encoding="utf-8")
@@ -322,7 +323,7 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
         self.assertEqual((self.noted[0].title, self.noted[0].body), ("claude2 runs out Sun 11-22 05:05 EST", ""))
 
     def test_each_host_override_needs_a_whole_number_limit(self) -> None:
-        config = quota_alert.CONFIG
+        config = conf.path("showrunners")
         valid = config.read_text(encoding="utf-8")
         for key in ("claude_expiry.alert_hours", "claude_expiry.repeat_hours"):
             with self.subTest(key=key), redirect_stderr(StringIO()):

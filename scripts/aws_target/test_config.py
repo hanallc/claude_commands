@@ -2,12 +2,26 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from unittest import TestCase
+from unittest import TestCase, mock
 import tempfile
 
-from scripts.aws_target.config import gate_deployment, gate_regions
+from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
+
+
+class AccountSettingsPathTests(TestCase):
+    def test_uses_installed_file_with_conflicting_conf_dir(self) -> None:
+        # ConfigFormTests.test_repository_form rejects reads of the removed override.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'home'
+            with mock.patch.dict(os.environ, {
+                'HOME': str(home),
+                'CONF_DIR': str(root / 'checkout' / 'config'),
+            }):
+                self.assertEqual(account_settings_path(), home / '.claude/config/aws_target.conf')
 
 
 class GateRegionTests(TestCase):

@@ -230,7 +230,7 @@ class TuneTests(PublicationTestCase):
         _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(peer))
         key, value = "model.gpt-6.2-sol", "#304050"
         override = f"{key}.mac=#506070\n"
-        with mock.patch.dict(os.environ, {**repo.env, "MODELS_CONFIG_FILE": str(models)}, clear=True):
+        with mock.patch.dict(os.environ, {**repo.env, "CONF_DIR": str(models.parent)}, clear=True):
             saved = live_settings.stage_save(live_settings.WaitingChange(
                 "statusline", key, value, "tune(statusline): save model color"))
             assert isinstance(saved, live_settings.StagedSave)
@@ -256,8 +256,7 @@ class TuneTests(PublicationTestCase):
         _ = models.write_text("[codex.agents]\ngpt-6.2-sol=high\ngpt-6.2-sol.preview=high\n")
         colors = config / "statusline.conf"
         keys = ("model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
-        with mock.patch.dict(os.environ, {**repo.env, "CONF_DIR": str(config),
-                                         "MODELS_CONFIG_FILE": str(models)}, clear=True):
+        with mock.patch.dict(os.environ, {**repo.env, "CONF_DIR": str(config)}, clear=True):
             for order in (keys, keys[::-1]):
                 with self.subTest(order=order):
                     _ = colors.write_text("")
@@ -299,7 +298,7 @@ class TuneTests(PublicationTestCase):
         pending_key, pending_value = "model.gpt-6.2-astra", "#506070"
         mac_catalog = mac / "config/models.conf"
         _ = mac_catalog.write_text("[codex.agents]\ngpt-6.2-sol=high\ngpt-6.2-astra=high\n")
-        mac_env = {**repo.env, "CONF_DIR": str(mac_catalog.parent), "MODELS_CONFIG_FILE": str(mac_catalog),
+        mac_env = {**repo.env, "CONF_DIR": str(mac_catalog.parent),
                    "XDG_STATE_HOME": str(mac / "state")}
         with mock.patch.dict(os.environ, mac_env, clear=True):
             self.assertEqual(live_settings.main(["statusline", key, value]), 0)

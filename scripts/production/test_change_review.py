@@ -97,7 +97,7 @@ def setUpModule() -> None:
     home.mkdir()
     environment = staff.child_environment(fixture_git_environment(folder))
     for key in ("BASH_ENV", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CODEX_HOME",
-                "CODEX_SESSION_ID", "CODEX_THREAD_ID", "STAFF_CONFIG", "UNIT_RUN_DIR"):
+                "CODEX_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR"):
         _ = environment.pop(key, None)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **environment,

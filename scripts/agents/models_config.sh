@@ -49,7 +49,7 @@ models_registry_text() {
 
 models_launch_configuration() {
     _models_registry_parse --launch || return 1
-    export MODELS_LAUNCH_CONFIGURATION MODELS_CONFIG_FILE
+    export MODELS_LAUNCH_CONFIGURATION MODELS_CONFIG_FILE="$MODELS_REGISTRY_PATH"
 }
 
 models_registry_edit() {
@@ -64,7 +64,7 @@ models_registry_edit() {
 _models_registry_scope() {
     local mode="$1"
     shift
-    local _models_table_file MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_BASE MODELS_CONFIG_FILE="${MODELS_CONFIG_FILE:-}"
+    local _models_table_file MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_BASE MODELS_REGISTRY_PATH
     local -a _models_table_sections=() _models_table_keys=() _models_table_values=()
     _models_registry_parse "$mode" || return 1
     "$@"
@@ -77,7 +77,7 @@ models_registry_store() {
     local extra=()
     [[ "${3:-}" != additive-catalog ]] || extra+=(--additive-catalog)
     assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" store \
-        --registry "$MODELS_CONFIG_FILE" --after "$registry" \
+        --registry "$MODELS_REGISTRY_PATH" --after "$registry" \
         --before <(printf '%s' "$MODELS_REGISTRY_BASE") --description "$description" \
         "${extra[@]}")" || result=$?
     rm -f "$registry"
@@ -103,7 +103,7 @@ models_config_trim() {
 
 # Nested readers share their caller's operation table.
 _models_registry_read() {
-    if [[ -n "${_models_table_file:-}" && "$_models_table_file" == "${MODELS_CONFIG_FILE:-}" ]]; then
+    if [[ -n "${_models_table_file:-}" && "$_models_table_file" == "${MODELS_REGISTRY_PATH:-}" ]]; then
         "$@"
         return $?
     fi
@@ -119,13 +119,13 @@ _models_registry_parse() {
             case "$argument" in --registry|--registry=*) registry=(); break ;; esac
         done
     fi
-    assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" shell "${registry[@]}" "$@")" || return 1
+    assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" shell ${registry[@]+"${registry[@]}"} "$@")" || return 1
     _models_table_load "$assignments"
 }
 
 _models_table_load() {
     eval "$1"
-    _models_table_file="$MODELS_CONFIG_FILE"
+    _models_table_file="$MODELS_REGISTRY_PATH"
 }
 
 _models_config_has_section() {
@@ -409,13 +409,13 @@ _agents_validate_pair_from_table() {
     if ! _models_registry_has_key "$family.agents" "$model"; then
         allowed_agents="$(_agents_section_keys_inline "$family.agents")"
         echo "ERROR: [$context] agent '$model' is not allowed for family '$family'." >&2
-        echo "       Allowed agents in $MODELS_CONFIG_FILE [$family.agents]: $allowed_agents" >&2
+        echo "       Allowed agents in $MODELS_REGISTRY_PATH [$family.agents]: $allowed_agents" >&2
         return 1
     fi
     allowed_efforts="$(_models_registry_get "$family.agents" "$model")"
     if [[ -n "$effort" ]] && ! _agents_effort_allowed "$allowed_efforts" "$effort"; then
         echo "ERROR: [$context] effort '$effort' is not allowed for agent '$model'." >&2
-        echo "       Allowed efforts in $MODELS_CONFIG_FILE [$family.agents] $model: $allowed_efforts" >&2
+        echo "       Allowed efforts in $MODELS_REGISTRY_PATH [$family.agents] $model: $allowed_efforts" >&2
         return 1
     fi
 
@@ -453,7 +453,7 @@ _agents_resolve_from_table() {
     if [[ -z "$family" ]]; then
         configured="$(_agents_section_keys_inline assignments)"
         echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
-        echo "       Configured assignments in $MODELS_CONFIG_FILE: $configured" >&2
+        echo "       Configured assignments in $MODELS_REGISTRY_PATH: $configured" >&2
         return 1
     fi
     _agents_resolve_in_family "$task" "$family"
@@ -472,7 +472,7 @@ _agents_resolve_in_family_from_table() {
     section="$function.$family"
     if ! _models_config_has_section "$section"; then
         allowed_families="$(_agents_function_families_inline "$function")"
-        echo "ERROR: [$task] missing set section [$section] in $MODELS_CONFIG_FILE." >&2
+        echo "ERROR: [$task] missing set section [$section] in $MODELS_REGISTRY_PATH." >&2
         echo "       Allowed families with a configured set: $allowed_families" >&2
         return 1
     fi
@@ -696,7 +696,7 @@ _agents_list_assignments_from_table() {
     done < <(_models_config_section_values assignments)
     if [[ -n "$filter" && "$matched" -eq 0 ]]; then
         echo "ERROR: no [assignments] entry for '$filter'." >&2
-        echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        echo "       Configured assignments in $MODELS_REGISTRY_PATH: $(_agents_section_keys_inline assignments)" >&2
         return 1
     fi
 }
@@ -714,7 +714,7 @@ _agents_list_function_from_table() {
     active="$(_models_registry_get assignments "$function")"
     if [[ -z "$active" ]]; then
         echo "ERROR: no [assignments] entry for '$function'." >&2
-        echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        echo "       Configured assignments in $MODELS_REGISTRY_PATH: $(_agents_section_keys_inline assignments)" >&2
         return 1
     fi
     for family in codex claude; do
@@ -789,7 +789,7 @@ _agents_set_assignment() {
         fi
     done < <(_models_config_section_values "$section")
 
-    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    tmp_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
     if ! awk -v fn="$function" -v fam="$family" '
         /^\[assignments\]/ { in_section = 1; print; next }
         /^\[/ { in_section = 0; print; next }
@@ -802,7 +802,7 @@ _agents_set_assignment() {
         END { if (!found) exit 2 }
     ' <(models_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
-        echo "ERROR: no [assignments] entry for '$function'; $MODELS_CONFIG_FILE was not changed." >&2
+        echo "ERROR: no [assignments] entry for '$function'; $MODELS_REGISTRY_PATH was not changed." >&2
         return 1
     fi
     models_registry_store "$tmp_file" "set $function assignment to $family" || return $?
@@ -819,7 +819,7 @@ _agents_set_all_assignments() {
 
     if [[ -z "$family" ]] || ! _models_config_has_section "$family.agents"; then
         echo "ERROR: unknown family '$family'." >&2
-        echo "       Configured families in $MODELS_CONFIG_FILE: $(_agents_families_inline)" >&2
+        echo "       Configured families in $MODELS_REGISTRY_PATH: $(_agents_families_inline)" >&2
         return 1
     fi
     while IFS= read -r line; do
@@ -859,7 +859,7 @@ _agents_set_all_assignments() {
         done < <(_models_config_section_values "$section")
     done < <(_models_config_section_values assignments)
 
-    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    tmp_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
     if ! awk -v fam="$family" \
         -v kept=" $AGENT_KEPT_FUNCTIONS " '
         /^\[/ {
@@ -889,7 +889,7 @@ _agents_set_all_assignments() {
         END { if (!found) exit 2 }
     ' <(models_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
-        echo "ERROR: [assignments] has no entries; $MODELS_CONFIG_FILE was not changed." >&2
+        echo "ERROR: [assignments] has no entries; $MODELS_REGISTRY_PATH was not changed." >&2
         return 1
     fi
     models_registry_store "$tmp_file" "set all assignments to $family" || return $?
@@ -912,13 +912,13 @@ _agents_set_model() {
     family="$(_agents_agent_families_inline "$agent")"
     if [[ -z "$family" ]]; then
         echo "ERROR: unknown agent '$agent'." >&2
-        echo "       Allowed agents in $MODELS_CONFIG_FILE [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
-        echo "       Allowed agents in $MODELS_CONFIG_FILE [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
+        echo "       Allowed agents in $MODELS_REGISTRY_PATH [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
+        echo "       Allowed agents in $MODELS_REGISTRY_PATH [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
         return 1
     fi
     if [[ "$family" == *,* ]]; then
         echo "ERROR: agent '$agent' is listed by more than one family ($family)." >&2
-        echo "       Remove the duplicate in $MODELS_CONFIG_FILE so an agent names exactly one family." >&2
+        echo "       Remove the duplicate in $MODELS_REGISTRY_PATH so an agent names exactly one family." >&2
         return 1
     fi
 
@@ -966,11 +966,11 @@ _agents_set_model() {
     done < <(_models_config_section_values assignments)
     if [[ -n "$only" && "$matched" -eq 0 ]]; then
         echo "ERROR: no [assignments] entry for '$only'." >&2
-        echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        echo "       Configured assignments in $MODELS_REGISTRY_PATH: $(_agents_section_keys_inline assignments)" >&2
         return 1
     fi
 
-    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    tmp_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
     if ! NEW_AGENT="$agent" awk -v fam="$family" -v only="$only" \
         -v secs="$sections " \
         -v kept=" $AGENT_KEPT_FUNCTIONS " '
@@ -1010,7 +1010,7 @@ _agents_set_model() {
         { print }
     ' <(models_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
-        echo "ERROR: rewrite failed; $MODELS_CONFIG_FILE was not changed." >&2
+        echo "ERROR: rewrite failed; $MODELS_REGISTRY_PATH was not changed." >&2
         return 1
     fi
     models_registry_store "$tmp_file" "set ${only:-all functions} model to $agent" || return $?
@@ -1036,20 +1036,20 @@ _agents_set_row() {
     if [[ -z "$active" ]]; then
         configured="$(_agents_section_keys_inline assignments)"
         echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
-        echo "       Configured assignments in $MODELS_CONFIG_FILE: $configured" >&2
+        echo "       Configured assignments in $MODELS_REGISTRY_PATH: $configured" >&2
         return 1
     fi
 
     families="$(_agents_agent_families_inline "${pair%%:*}")"
     if [[ -z "$families" ]]; then
         echo "ERROR: [$task] unknown agent '${pair%%:*}'." >&2
-        echo "       Allowed agents in $MODELS_CONFIG_FILE [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
-        echo "       Allowed agents in $MODELS_CONFIG_FILE [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
+        echo "       Allowed agents in $MODELS_REGISTRY_PATH [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
+        echo "       Allowed agents in $MODELS_REGISTRY_PATH [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
         return 1
     fi
     if [[ "$families" == *,* ]]; then
         echo "ERROR: [$task] agent '${pair%%:*}' is listed by more than one family ($families)." >&2
-        echo "       Remove the duplicate in $MODELS_CONFIG_FILE so an agent names exactly one family." >&2
+        echo "       Remove the duplicate in $MODELS_REGISTRY_PATH so an agent names exactly one family." >&2
         return 1
     fi
     family="$families"
@@ -1073,7 +1073,7 @@ _agents_set_row() {
     fi
     _agents_validate_pair "$task" "$family" "$pair" || return 1
 
-    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    tmp_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
     if ! NEW_PAIR="$pair" awk -v sec="$section" -v row="$subtask" '
         /^\[/ {
             in_section = ($0 == "[" sec "]")
@@ -1098,7 +1098,7 @@ _agents_set_row() {
         END { if (!found) exit 2 }
     ' <(models_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
-        echo "ERROR: no [$section] row '$subtask'; $MODELS_CONFIG_FILE was not changed." >&2
+        echo "ERROR: no [$section] row '$subtask'; $MODELS_REGISTRY_PATH was not changed." >&2
         return 1
     fi
     models_registry_store "$tmp_file" "set $task to $pair" || return $?
@@ -1157,7 +1157,7 @@ _agents_set_service_tier() {
         fi
         if [[ -z "$(_models_registry_get assignments "$function")" ]]; then
             echo "ERROR: no [assignments] entry for '$function'." >&2
-            echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+            echo "       Configured assignments in $MODELS_REGISTRY_PATH: $(_agents_section_keys_inline assignments)" >&2
             return 1
         fi
         if ! _models_config_has_section "$function.codex"; then
@@ -1172,7 +1172,7 @@ _agents_set_service_tier() {
         fns=" $function"
     fi
 
-    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    tmp_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
     if ! TIER_FNS="$fns" TIER_ROW="$subtask" TIER_VALUE="$value" awk '
         function key_of(line,    hash, equals, key) {
             hash = index(line, "#")
@@ -1255,7 +1255,7 @@ _agents_set_service_tier() {
         END { printf "%s", tail }
     ' <(models_registry_text) <(models_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
-        echo "ERROR: rewrite failed; $MODELS_CONFIG_FILE was not changed." >&2
+        echo "ERROR: rewrite failed; $MODELS_REGISTRY_PATH was not changed." >&2
         return 1
     fi
     models_registry_store "$tmp_file" "set ${scope:-all functions} service tier to $tier" || return $?

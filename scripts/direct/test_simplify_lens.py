@@ -91,11 +91,11 @@ class DailySimplifyTests(NixFixture):
         with patch.dict(os.environ, self.env):
             write_claude_account("claude1", "unit@example.invalid", 100,
                                  datetime.now(timezone.utc) + timedelta(days=30))
-        registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
-        self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
-                         "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
         self.env.update(private_copy_config(self.root).environment)
         settings = Path(self.env["CONF_DIR"])
+        registry = write_registry(settings / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
+        self.env.update({"MODELS_CONFIG_PUBLISH": "0",
+                         "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
         _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
         _ = write_config_fixture(settings / "direct.conf", "simplify_lens=on\nsimplify_first_run_before=2026-11-05T22:50:00-05:00\n")
         startup = self.root / "startup"

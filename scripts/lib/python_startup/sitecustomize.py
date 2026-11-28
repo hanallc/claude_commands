@@ -533,6 +533,8 @@ def within_test_limit() -> bool:
 
 
 def _begin_direct_test() -> None:
+    # Clear the inherited registry pin so tests can select their own configuration.
+    _ = os.environ.pop("MODELS_CONFIG_FILE", None)
     sys.dont_write_bytecode = True
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if within_test_limit():

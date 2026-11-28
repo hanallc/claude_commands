@@ -610,6 +610,14 @@ def _whole(value: str) -> int:
     return int(value)
 
 
+def file_byte_count(value: str) -> int:
+    """Check a whole number against the platform limit for a file read."""
+    result = _whole(value)
+    if result > sys.maxsize:
+        raise ValueError(f"exceeds the file byte count limit of {sys.maxsize}")
+    return result
+
+
 def positive_whole(value: str) -> int:
     result = _whole(value)
     if result <= 0:

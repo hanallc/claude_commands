@@ -282,7 +282,7 @@ class StatusBoardTests(unittest.TestCase):
 
     def test_model_aliases_use_the_catalog_and_missing_evidence_stays_unknown(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        registry = root / "models.conf"
+        registry = Path(os.environ["CONF_DIR"]) / "models.conf"
         _ = registry.write_text("[claude.families]\nopus=opus\n[codex.families]\nastra=gpt-6.2-astra\n")
         catalog = root / "cache/model-catalog"
         catalog.mkdir(parents=True)
@@ -299,7 +299,6 @@ class StatusBoardTests(unittest.TestCase):
             ("codex", "short-unknown", "high", accounts.SessionModelUnknown()),
         ):
             with (self.subTest(family=family, model=model, effort=effort),
-                  patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}),
                   patch.object(accounts, "_model_process_options", return_value=accounts.SessionModelOptions(model, effort))):
                 thread = UUID(int=(int(NOW.timestamp() * 1000) << 80) | (7 << 76) | (2 << 62))
                 result = (read.claude(root, "fixture", pid=1) if family == "claude"

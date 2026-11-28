@@ -710,6 +710,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(deliver.call_count, 2)
 
     def test_restore_lists_finished_results_newest_first(self) -> None:
+        _ = write_config_fixture(self.fixture.root / "conf/production.conf", "worker.history_bytes=256\n")
         for launcher in ("explicit", "assign"):
             with self.subTest(launcher=launcher):
                 opened = self.opened()
@@ -738,7 +739,7 @@ class WorkerCommandTests(unittest.TestCase):
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
                 phase = cast(list[dict[str, object]], state["open_phases"])[0]
                 with (self.run_dir / "history.jsonl").open("a") as history:
-                    _ = history.write(json.dumps({"padding": "x" * worker.WORKER_HISTORY_BYTES}) + "\n")
+                    _ = history.write(json.dumps({"padding": "x" * 256}) + "\n")
                 for placement in ("current", "parallel", "closed", "reopened"):
                     state["open_phases"] = {
                         "current": [phase],

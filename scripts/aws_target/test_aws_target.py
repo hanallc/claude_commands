@@ -89,6 +89,7 @@ class HanaGpuSnapshotTests(CostFixture):
 class BuildlogAwsSnapshotTests(AwsSettingsFixture):
     def test_buildlog_snapshot_accepts_auth_failure_and_reports_local_write_error(self) -> None:
         self.configure_gate('spot_candidate_regions=us-east-1')
+        checkout_settings = self.root / 'aws_target.conf'
         auth_failure = ('aws: [ERROR]: An error occurred (AuthFailure) '
                         + 'when calling the DescribeSpotPriceHistory operation: fixture')
 
@@ -116,8 +117,8 @@ class BuildlogAwsSnapshotTests(AwsSettingsFixture):
                 failure, = aws_target.snapshot_failures(aws_target.read_snapshot(directory))
                 self.assertEqual(failure.error, 'AwsUnavailable')
                 self.assertIn('AuthFailure', failure.reason)
-                hours.assert_called_once_with(self.settings, directory)
-                placement.assert_called_once_with(self.settings, directory)
+                hours.assert_called_once_with(checkout_settings, directory)
+                placement.assert_called_once_with(checkout_settings, directory)
 
 
 class SpotPlacementTests(CostFixture):

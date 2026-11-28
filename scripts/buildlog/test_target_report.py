@@ -40,7 +40,7 @@ class TargetReportTests(unittest.TestCase):
         _ = (self.root.parent / "mac.conf").write_text("host=fake-mac\nci_repo=\n")
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "USER_ZONE": "UTC", "BUILD_TARGETS_CONFIG": str(self.registry),
+            "USER_ZONE": "UTC",
             "CONF_DIR": str(self.root.parent),
         })))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))

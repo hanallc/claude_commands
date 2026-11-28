@@ -363,8 +363,9 @@ class LintInputIdentityTests(VerifyLintCacheFixture):
         verify, invoke = self.private_scripts()
         _ = self.enable_cache()
         cargo = lint_support.CARGO_STUB.replace('if arguments[:1] == ["clippy"]:', '''if arguments[:1] == ["clippy"]:
-    for name in ("TEST_PRIVATE_VERIFY", "TEST_PRIVATE_INVOKE", "LINT_CONFIG_FILE"):
-        with Path(os.environ[name]).open("a") as script:
+    for path in (Path(os.environ["TEST_PRIVATE_VERIFY"]), Path(os.environ["TEST_PRIVATE_INVOKE"]),
+                 Path(os.environ["CONF_DIR"]) / "lint.conf"):
+        with path.open("a") as script:
             script.write("\\n# changed while clippy ran\\n")
 if arguments[:1] == ["clippy"]:''')
         self.write_executable(self.root / "bin" / "cargo", cargo)
@@ -440,7 +441,7 @@ BUILD_HELPER_ROOT=$HOME/.claude/scripts
 tree_key --with-tree-content
 ''')
             result = subprocess.run(["bash", "-e", str(script)], cwd=root, text=True, capture_output=True,
-                                    env={**verify_test_environment(), "HOME": str(root), "LINT_CONFIG_FILE": str(config)},
+                                    env={**verify_test_environment(), "HOME": str(root), "CONF_DIR": str(config.parent)},
                                     timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         words = result.stdout.split("\0")[:-1]

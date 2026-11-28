@@ -150,7 +150,6 @@ class _FolderHistory:
 
 _history_cache: OrderedDict[Path, _FolderHistory] = OrderedDict()
 _history_lock = Lock()
-_HISTORY_LIMIT = 128
 _INCLUDE_SECTION = re.compile(r"^\[\s*include(?:if)?(?=[.\s\]])", re.IGNORECASE)
 _INCLUDE_PATH = re.compile(r"^path\s*=\s*(.*)$", re.IGNORECASE)
 _HISTORY_OVERRIDES = ("GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_SHALLOW_FILE",
@@ -289,20 +288,27 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
     if os.environ.get("GIT_DIR"):
         yield from _read_folder_history(doc) or ()
         return
+    try:
+        history_limit = conf.read("production").whole("record_store.history_cache_entries")
+    except conf.Unusable:
+        history_limit = None
     resolved = doc.resolve()
     query = doc.absolute()
     environment = tuple(sorted((key, value) for key, value in os.environ.items()
                                if key.startswith("GIT_") or key in ("HOME", "PATH", "XDG_CONFIG_HOME")))
-    with _history_lock:
-        cached = _history_cache.get(resolved)
-        if cached is not None:
-            _history_cache.move_to_end(resolved)
-    if cached is not None and cached.query == query and cached.environment == environment:
-        if sources is not None:
-            sources.extend(cached.stamps)
-        if _stamps_match(cached.stamps):
-            yield from cached.folders
-            return
+    if history_limit is not None:
+        with _history_lock:
+            cached = _history_cache.get(resolved)
+            if cached is not None:
+                _history_cache.move_to_end(resolved)
+            while len(_history_cache) > history_limit:
+                _ = _history_cache.popitem(last=False)
+        if cached is not None and cached.query == query and cached.environment == environment:
+            if sources is not None:
+                sources.extend(cached.stamps)
+            if _stamps_match(cached.stamps):
+                yield from cached.folders
+                return
 
     root = next((folder for folder in resolved.parents
                  if (folder / ".git").exists() or (folder / "HEAD").is_file() and (folder / "objects").is_dir()), None)
@@ -321,11 +327,11 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
     folders = _read_folder_history(doc)
     if folders is None:
         return
-    if stamps and _stamps_match(stamps):
+    if history_limit is not None and stamps and _stamps_match(stamps):
         with _history_lock:
             _history_cache[resolved] = _FolderHistory(query, environment, stamps, folders)
             _history_cache.move_to_end(resolved)
-            if len(_history_cache) > _HISTORY_LIMIT:
+            if len(_history_cache) > history_limit:
                 _ = _history_cache.popitem(last=False)
     yield from folders
 

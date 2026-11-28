@@ -217,7 +217,7 @@ esac
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader), **config_environment(self.root),
+            **config_environment(self.root),
             "UNIT_SESSION_DIR": str(self.root / "session"),
         }
 

@@ -31,6 +31,7 @@ from scripts.lib import build_folders, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.lint import style_review
+from scripts.lint.memory_test_support import write_config_fixture
 
 setUpModule = codex_fixture.setUpModule
 
@@ -146,7 +147,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
 
     def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
         _ = self.enterContext(patch.object(remote, "local_machine", new=local_machine))
-        write_text_atomic(Path(os.environ["LINT_CONFIG_FILE"]), "style_review=on\n")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "lint.conf", "style_review=on\n")
         project = self.panes.root / "project"
         project.mkdir()
         _ = subprocess.run(["git", "init", "-q", str(project)], check=True, capture_output=True)

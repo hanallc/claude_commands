@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_models_registry import write_registry
 
 import json
@@ -185,14 +186,14 @@ class AddStyleTests(unittest.TestCase):
         self.doc = self.repo / "docs" / f"sample-style-production{LIVE_DOCUMENT_SUFFIX}"
         _ = shutil.copytree(self.repository_seed, self.repo)
         config = home / ".claude/config"
-        config.mkdir(parents=True)
-        _ = (config / "build_folders.conf").write_text(
-            f"roots.workspace={home / 'worktrees'}\nroots.build={self.root / 'build'}\n"
+        configuration = config_environment(config)
+        build = self.root / "build"
+        _ = write_config_fixture(config / "build_folders.conf",
+            f"roots.workspace={home / 'worktrees'}\nroots.build={build}\nroots.build.natedev={build}\n"
             + "# one of: report, enforce\nfolders.check=report\n"
             + "# range: 0.001..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
-        copies_config = config / "copies.conf"
-        _ = copies_config.write_text("# range: 0.001..\ngit_timeout_seconds=10\n")
+        _ = write_config_fixture(config / "copies.conf", "# range: 0.001..\ngit_timeout_seconds=10\n")
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
         for family in add_style.FAMILIES:
@@ -206,7 +207,7 @@ class AddStyleTests(unittest.TestCase):
             **fixture_git_environment(self.root),
             "GIT_CONFIG_SYSTEM": os.devnull,
             "HOME": str(home),
-            "COPIES_CONFIG": str(copies_config),
+            **configuration,
             "WORKTREES_STATE_DIR": str(self.root / "worktree-records"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "ledger"),
@@ -794,14 +795,14 @@ class AddStyleTests(unittest.TestCase):
             plan=add_unit.PlanGiven(plan), port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=1.0,
         )
         before = self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()
-        agent_config = self.root / "models.conf"
+        agent_config = Path(os.environ["CONF_DIR"]) / "models.conf"
         _ = write_registry(agent_config, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh'}})
         catalog_sync = self.root / "catalog-synced"
         catalog_sync.touch()
 
         with (
             mock.patch.dict(os.environ, {
-                "MODELS_CONFIG_FILE": str(agent_config), "CODEX_CATALOG_SYNC_STATE_FILE": str(catalog_sync),
+                "CODEX_CATALOG_SYNC_STATE_FILE": str(catalog_sync),
                 "CODEX_CONFIG_FILE": str(self.root / "codex.toml"), "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             }),
             mock.patch.object(herdr, "claude_trust", return_value=herdr.Trusted(

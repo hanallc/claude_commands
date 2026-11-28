@@ -16,6 +16,7 @@ from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
 from typing import ClassVar, cast
 
+from scripts.accounts import worker_names
 from scripts.direct import assign_claude_test_support as support
 from scripts.lib.test_models_registry import RegistryReadProbe
 from scripts.lib import models_registry, process_group, process_start, unit_runs
@@ -29,9 +30,9 @@ from scripts.production.cli_fixture import process_boundary
 
 def configure_pane_account(home: Path, notes: Path) -> None:
     """Give the child command a signed-in private worker account."""
-    configuration = home / ".claude/config"
-    configuration.mkdir(parents=True, exist_ok=True)
-    _ = (configuration / "accounts.json").write_text(json.dumps({"workers": "codex1"}))
+    state = worker_names.migrated_accounts_state(home)
+    state.file.parent.mkdir(parents=True, exist_ok=True)
+    _ = state.file.write_text(json.dumps({"workers": "codex1"}))
     notes.mkdir(parents=True, exist_ok=True)
     _ = (notes / "codex1.md").write_text("---\nlogin: worker@example.invalid\n---\n")
     account = home / ".codex"
@@ -213,7 +214,7 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
         session = self.start_phase("custom-models-path")
         environment = self.launch_environment(session)
         custom = self.root / "custom-models.conf"
-        _ = custom.write_text(Path(environment.pop("MODELS_CONFIG_FILE")).read_text())
+        _ = custom.write_text((Path(environment["CONF_DIR"]) / "models.conf").read_text())
         configuration = models_registry.launch_configuration({
             "MODELS_LAUNCH_CONFIGURATION": json.dumps([str(custom), custom.read_text()]),
         })
@@ -272,7 +273,7 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_phase("registry-snapshot")
         environment = self.environment()
-        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        probe = RegistryReadProbe(self.root, (Path(environment["CONF_DIR"]) / "models.conf"))
         result = self.run_assignment(self.assign_command(session), probe.environment(environment))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(probe.reads()), 1, probe.reads())
@@ -427,7 +428,7 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
 
     def test_model_resolution_failure_preserves_the_previous_pass(self) -> None:
         session = self.start_phase("resolve-failed")
-        registry = self.root / ".claude/config/models.conf"
+        registry = self.root / "models.conf"
         _ = registry.write_text("invalid configuration\n")
         before = (session / "progress_history_state.json").read_bytes()
         result = self.checked_launch(session)

@@ -50,7 +50,7 @@ class LiveRootsGuardTests(unittest.TestCase):
             protected = private_copy_config(guarded)
             private = private_copy_config(root)
             for fixture in (protected, private):
-                _ = write_config_fixture(Path(fixture.environment["COPIES_CONFIG"]),
+                _ = write_config_fixture(Path(fixture.environment["CONF_DIR"]) / "copies.conf",
                                          "git_timeout_seconds=30\nguard_timeout_seconds=30\n")
             guarded_temporary = guarded / "temporary"
             guarded_temporary.mkdir()

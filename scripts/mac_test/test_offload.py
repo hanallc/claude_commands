@@ -26,7 +26,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
 from scripts.lint import prebuild
-from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment,
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS,
                                               write_config_fixture,
                                               write_config_fault, commit_config_fixture)
 
@@ -603,9 +603,8 @@ class OffloadSettingsTests(unittest.TestCase):
             + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n")
         _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\nunreachable_wait_seconds=45\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **config_environment(self.root),
-            **copies_environment(self.root),
-            "MAC_TEST_CONFIG": str(self.settings), "CONF_DIR": str(Path(self.settings).parent),
+            **copies_environment(self.root, configuration=self.settings.parent),
+            "MAC_TEST_CONFIG": str(self.settings),
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
@@ -1420,11 +1419,10 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.sync_config()
         linux_settings = self.root / "linux.conf"
         _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
-        registry = self.root / "build_targets.conf"
+        registry = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
             + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n"
             + UNREACHABLE_WAIT_FIXTURE)
-        self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
         request_placement = admission_client.request_placement
 
         def submit(request: wire.PlacementRequest

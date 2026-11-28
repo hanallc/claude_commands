@@ -197,11 +197,11 @@ class LocalReviewTests(unittest.TestCase):
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
         _ = self.enterContext(mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
-        registry = write_registry(self.root / "models.conf")
+        _ = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf")
 
         def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
                     check: bool, timeout: float = 60, input: str | None = None) -> subprocess.CompletedProcess[str]:
-            if argv[0] != "bash" or env.get("MODELS_CONFIG_FILE") != str(registry):
+            if argv[0] != "bash" or env.get("CONF_DIR") != environment["CONF_DIR"]:
                 raise AssertionError(f"unexpected process: {argv}")
             return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout,
                                     input=input)
@@ -216,7 +216,7 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
         binary.chmod(0o700)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "MODELS_CONFIG_PUBLISH": "0",
             "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
         })))
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
@@ -2326,7 +2326,7 @@ class LocalReviewTests(unittest.TestCase):
             self.assertNotIn("\nno action\n", command[-1])
 
     def test_unresolved_registry_uses_opus_medium(self) -> None:
-        registry = write_registry(self.root / "models.conf")
+        _ = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf")
         caller = claude_catalog_environment(self.root / "caller-review", {"opus": "claude-opus-caller-fixture"})
         binary = self.root / "bin/claude"
         _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
@@ -2335,7 +2335,6 @@ class LocalReviewTests(unittest.TestCase):
         for target in ("opus", "claude-opus-fixture"):
             with self.subTest(target=target), mock.patch.dict(os.environ, {
                 **caller,
-                "MODELS_CONFIG_FILE": str(registry),
                 "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
             }):
                 if target != "opus":

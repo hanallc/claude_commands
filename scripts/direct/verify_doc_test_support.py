@@ -192,7 +192,7 @@ class VerifyDocFixture(unittest.TestCase):
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_SKIP_SWEEP": "1",
-            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
+            **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         private = private_copy_config(self.root)
@@ -201,8 +201,8 @@ class VerifyDocFixture(unittest.TestCase):
             line, _ = conf.editable_line(private.settings, key)
             copy_settings[line] = f"{key}={value}\n"
         _ = private.settings.write_text("".join(copy_settings))
-        _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
+        _ = write_config_fixture(configuration / "copies.conf", "git_timeout_seconds=600\n")
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
         self.environment.update({key: value for key, value in private.environment.items() if key != "CONF_DIR"})
         with mock.patch.dict(os.environ, self.environment, clear=True):

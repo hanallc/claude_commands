@@ -237,9 +237,15 @@ class MapReadRefused:
     reason: str
 
 
+@dataclass(frozen=True)
+class NoLocalAccountsState:
+    """The command has no cached read of the local account file."""
+
+
 @dataclass
 class CommandRoleMap:
     value: RoleMap | MapNotRead | MapReadRefused
+    local_state: worker_names.AccountsState | NoLocalAccountsState = NoLocalAccountsState()
 
 
 @dataclass(frozen=True)
@@ -471,7 +477,7 @@ def _local_role_map() -> RoleMap:
     except FileNotFoundError:
         groups = StoredGroupSelections()
     try:
-        values = worker_names.configuration(_object(worker_names.accounts_config_file()))
+        values = worker_names.configuration(worker_names.read_accounts_document())
     except FileNotFoundError:
         values = {}
     workers = values.get("workers", "")
@@ -505,12 +511,18 @@ def _cached_role_map() -> tuple[RoleMap, datetime]:
 
 def read_role_map(*, fresh: bool = False) -> RoleMap:
     scope = MapNotRead() if fresh else _command_map.get()
-    if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap):
-        return scope.value
-    if isinstance(scope, CommandRoleMap) and isinstance(scope.value, MapReadRefused):
-        raise RoleMapUnavailable(scope.value.reason)
+    local_state: worker_names.AccountsState | NoLocalAccountsState = NoLocalAccountsState()
     try:
+        if isinstance(scope, CommandRoleMap):
+            if not isinstance(scope.local_state, NoLocalAccountsState) and scope.local_state != worker_names.accounts_state():
+                scope.value = MapNotRead()
+            if isinstance(scope.value, RoleMap):
+                return scope.value
+            if isinstance(scope.value, MapReadRefused):
+                raise RoleMapUnavailable(scope.value.reason)
         if is_role_map_host():
+            if isinstance(scope, CommandRoleMap):
+                local_state = worker_names.accounts_state()
             result = _local_role_map()
         elif not fresh and isinstance(_role_map_source.get(), StoredRoleMap):
             result, stamp = _cached_role_map()
@@ -529,12 +541,16 @@ def read_role_map(*, fresh: bool = False) -> RoleMap:
                 saved_map = CachedRoleMap(at=datetime.now(timezone.utc).isoformat(),
                     map=_map_document(result))
                 _atomic_write(role_map_cache_file(), json.dumps(saved_map) + "\n")
+    except RoleMapUnavailable:
+        raise
     except (OSError, ValueError, KeyError) as error:
         reason = f"accounts: cannot read role map from {ROLE_MAP_HOST}; no usable map"
         if isinstance(scope, CommandRoleMap):
+            scope.local_state = local_state
             scope.value = MapReadRefused(reason)
         raise RoleMapUnavailable(reason) from error
     if isinstance(scope, CommandRoleMap):
+        scope.local_state = local_state
         scope.value = result
     return result
 
@@ -707,12 +723,12 @@ def write_role_map(
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             raise RoleMapWriteRefused(f"accounts: {ROLE_MAP_HOST} refused {change.role} → {change.label}") from error
     else:
-        path = worker_names.accounts_config_file() if change.role == "workers" else groups_file()
         history = groups_file().with_name("roles.jsonl")
         try:
-            with _groups_lock(), worker_names.roles_lock():
+            with _groups_lock(), worker_names.roles_lock() as state:
+                path = state.file if change.role == "workers" else groups_file()
                 try:
-                    previous = path.read_text(encoding="utf-8") if path.exists() else ""
+                    previous = path.read_text(encoding="utf-8") if path.exists() else None
                     values = _object(path) if previous else {}
                     _recover_locked_role_history(history)
                     size = history.stat().st_size if history.exists() else -1
@@ -733,7 +749,7 @@ def write_role_map(
                             fcntl.flock(output.fileno(), fcntl.LOCK_EX)
                             append_journal_line(output.fileno(), json.dumps(row, sort_keys=True), valid_row=lambda _row: True)
                     except OSError:
-                        if previous:
+                        if previous is not None:
                             _atomic_write(path, previous)
                         else:
                             path.unlink(missing_ok=True)
@@ -764,8 +780,8 @@ def _write_workers_claude_route(change: WorkersClaudeRouteChange) -> None:
         if not is_role_map_host():
             _ = ssh_role_map(("role-map-write", json.dumps(_change_document(change), sort_keys=True)))
         else:
-            with _groups_lock(), worker_names.roles_lock():
-                path = worker_names.accounts_config_file()
+            with _groups_lock(), worker_names.roles_lock() as state:
+                path = state.file
                 values = worker_names.configuration(_object(path)) if path.exists() else {}
                 if isinstance(change.account, NamedWorkersClaudeAccount):
                     values["workers_claude"] = {"label": change.account.label, "until": change.account.until.isoformat()}

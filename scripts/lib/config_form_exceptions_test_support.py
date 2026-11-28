@@ -69,7 +69,6 @@ class InternalLiteral:
     reason: str
 
 
-_FILE_VARIABLE_PHASE = RemoveInPhase("Per-file config environment variables to CONF_DIR")
 _TOML_PHASE = RemoveInPhase("TOML tunables to .conf")
 _SECTION_PHASE = RemoveInPhase("Remove section lines")
 _CLI_PHASE = RemoveInPhase("config/cli.conf")
@@ -96,8 +95,8 @@ READER_EXCEPTIONS: tuple[ReaderException, ...] = (
         ExceptionLifetime.PERMANENT,
     ),
     ReaderException(
-        "scripts/direct/pass_record.py", ("direct.conf", "models.conf"),
-        "Hash the exact bytes of config/models.conf and config/direct.conf.",
+        "scripts/direct/pass_record.py", ("direct.conf",),
+        "Hash the exact bytes of config/direct.conf.",
         ExceptionLifetime.PERMANENT,
     ),
     ReaderException(
@@ -156,20 +155,14 @@ READER_EXCEPTIONS: tuple[ReaderException, ...] = (
 )
 
 VARIABLE_EXCEPTIONS: tuple[VariableException, ...] = (
-    VariableException("MODELS_CONFIG_FILE", "Select config/models.conf.", _FILE_VARIABLE_PHASE),
-    VariableException("COPIES_CONFIG", "Select config/copies.conf.", _FILE_VARIABLE_PHASE),
-    VariableException("STAFF_CONFIG", "Select config/staff.conf.", _FILE_VARIABLE_PHASE),
-    VariableException("AWS_TARGET_CONFIG", "Select config/aws_target.conf.", _FILE_VARIABLE_PHASE),
-    VariableException("BUILD_TARGETS_CONFIG", "Select config/build_targets.conf.", _FILE_VARIABLE_PHASE),
-    VariableException("LINT_CONFIG_FILE", "Select config/lint.conf.", _FILE_VARIABLE_PHASE),
-    VariableException("SHOWRUNNERS_CONFIG", "Select config/showrunners.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("MODELS_CONFIG_FILE", "Keep the exact registry path in a newly launched Claude worker.",
+                      ExceptionLifetime.PERMANENT),
     VariableException("HERDR_UPKEEP_CONFIG", "Select config/herdr_upkeep.toml.", _TOML_PHASE),
     VariableException("AGENT_NOTES_JOB_CONFIG", "Select config/agent_notes.toml.", _TOML_PHASE),
     VariableException("DESIGN_ROLES_CONFIG", "Select config/design_roles.conf.", _SECTION_PHASE),
     VariableException("CODEX_CONFIG_FILE", "not a config file", ExceptionLifetime.PERMANENT),
 )
 
-_PRODUCTION_BATCH = RemoveInPhase("Production and direct literals to config")
 
 LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...] = (
     InternalLiteral(
@@ -191,10 +184,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/agents/detached_runs.py", "LIVE_RUN_LIMIT_REACHED",
         "The detached runner returns this status when it reaches the live run limit.",
-    ),
-    TunableLiteral(
-        "scripts/agents/inventory.py", "_LAST_STEP_BYTES", "262_144",
-        "production", "inventory.last_step_scan_bytes", "# whole: 1..", _PRODUCTION_BATCH,
     ),
     InternalLiteral(
         "scripts/agents/pane_record.py", "ANCESTOR_LIMIT",
@@ -268,14 +257,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/buildlog/repository.py", "LINT_COPY_ALLOCATION_BYTES",
         "Set the fixed size of a lint copy allocation id.",
     ),
-    TunableLiteral(
-        "scripts/direct/plan_history.py", "RATE_FACTOR_LIMIT", "2.0",
-        "direct", "plan_history.max_rate_factor", "# range: 1..", _PRODUCTION_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/direct/progress_history.py", "BOARD_NOTE_CHARS", "72",
-        "direct", "board.max_note_chars", "# whole: 1..", _PRODUCTION_BATCH,
-    ),
     InternalLiteral(
         "scripts/hooks/context_usage.py", "ANCESTOR_LIMIT",
         "Limit the search for the nearest Claude process to six processes.",
@@ -308,21 +289,9 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/notify/pushover.py", "MESSAGE_MAX",
         "The Pushover Message API sets the message character limit.",
     ),
-    TunableLiteral(
-        "scripts/orphans/orphans.py", "MAXIMUM_CORPUS_FILE_BYTES", "2_000_000",
-        "orphans", "corpus.max_file_bytes", "# whole: 1..", _PRODUCTION_BATCH,
-    ),
     ExternalLiteral(
         "scripts/prioritize/strip_generated.py", "PACKET_DATA_LIMIT",
         "Git pkt-line sets the payload limit after the four-byte header.",
-    ),
-    TunableLiteral(
-        "scripts/production/gate.py", "RERUN_LIMIT", "8",
-        "gate", "rerun.max_failed_modules", "# whole: 1..", _PRODUCTION_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/production/gate.py", "NIGHTLY_TYPE_LINE_BYTES", "512",
-        "gate", "nightly.type_line_bytes", "# whole: 3..", _PRODUCTION_BATCH,
     ),
     TunableLiteral(
         "scripts/production/hand_made_limit.py", "TAIL_BYTES", "64 * 1024",
@@ -331,18 +300,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/production/hand_made_route.py", "CHUNK_BYTES",
         "Copy command output in fixed chunks.",
-    ),
-    TunableLiteral(
-        "scripts/production/record_store.py", "_HISTORY_LIMIT", "128",
-        "production", "record_store.history_cache_entries", "# whole: 1..", _PRODUCTION_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/production/worker.py", "WORKER_HISTORY_BYTES", "64 * 1024",
-        "production", "worker.history_bytes", "# whole: 1..", _PRODUCTION_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/production/worker_capacity.py", "STOP_ATTEMPTS", "2",
-        "shutdown", "worker.stop_attempts", "# whole: 1..", _PRODUCTION_BATCH,
     ),
     InternalLiteral(
         "scripts/review_links/new_item_dialog.py", "MAX_REQUEST_ID_LENGTH",

@@ -785,7 +785,7 @@ class MixedRestartTests(ShutdownTestCase):
             "CLAUDE_CONFIG_DIR": str(root / ".claude2"), "CODEX_HOME": str(root / ".codex1"),
             "ROSTER_RUN_ROOT": str(root / "runs"), "UNIT_RUN_DIR": str(root / "runs/pane"),
             "CONF_DIR": str(root / "conf"), "SHUTDOWN_PROOF_WORKSPACE": "w1",
-            "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
+            "MODELS_CONFIG_PUBLISH": "0",
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, fixture.enter_context(patch.dict(os.environ, environment)))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
@@ -1311,7 +1311,6 @@ class RestartTests(RestartTestCase):
             "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
             "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
             "TEST-brain": "codex:gpt-test:high", "owner": "claude:opus:max"}})
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(configuration / "models.conf")})))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / ".claude2"
         config.mkdir()
@@ -5731,7 +5730,7 @@ class RetainedSplitRestartTests(RestartTestCase):
             _ = write_config_fixture(config / source.name)
         write_text_atomic(config / "models.conf", registry_text())
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
-            "MODELS_CONFIG_FILE": str(config / "models.conf"), "MODELS_CONFIG_PUBLISH": "0",
+            "MODELS_CONFIG_PUBLISH": "0",
             "SHUTDOWN_STATE_DIR": str(root / "shutdown"), "XDG_STATE_HOME": str(root / "state"),
             "UNIT_RUN_DIR": str(root / "run"), "ROSTER_RUN_ROOT": str(root)})))
         showrunner = fixture_member("showrunner", name="showrunner")

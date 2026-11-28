@@ -88,7 +88,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.restore_fixture(("hooks",))
                 self.configure_gate("merge_gate_governor_gib=4")
                 _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
-                                         f"memory_stop_reruns={reruns}")
+                                         f"memory_stop_reruns={reruns}\nrerun.max_failed_modules=0\n")
                 self.record_module_peaks({"hooks/test_first.py": 48.0})
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
@@ -252,17 +252,35 @@ class MergeGateRerunsTests(GateSuitesFixture):
                            "existing": "gate already runs in builds.slice"}[reason]
                 self.assertIn("Module scope skipped: " + message, output.getvalue())
 
-    @gate_suites(*FIXTURE_FOLDERS[:gate.RERUN_LIMIT])
+    @gate_suites(*FIXTURE_FOLDERS)
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:
-        failed_suites = self.suites[:gate.RERUN_LIMIT]
-        for suite in failed_suites:
+        for suite in self.suites:
             self.write(self.state / ("red-" + suite), "red")
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"{gate.RERUN_LIMIT + 1} modules failed; this is a real breakage, not load", result.stdout)
+        self.assertIn("9 modules failed; this is a real breakage, not load", result.stdout)
         self.assertNotIn("Rerun alone:", result.stdout)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), self.module_count)
+
+    def test_an_unusable_rerun_limit_stops_the_gate_before_any_module(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "rerun.max_failed_modules=-1\n")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(gate, "start_gate_job") as start,
+              self.assertRaisesRegex(GateRefused, r"rerun\.max_failed_modules='-1'")):
+            _ = gate.run_suites(self.checkout)
+        start.assert_not_called()
+
+    def test_an_unusable_rerun_limit_stops_a_full_whole_machine_gate(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "rerun.max_failed_modules=-1\n")
+        machine = gate.WholeMachine(rerun_failed_modules=False)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(gate, "start_gate_job", side_effect=AssertionError("The gate started a module.")) as start,
+              self.assertRaisesRegex(GateRefused, r"rerun\.max_failed_modules='-1'")):
+            _ = gate.run_suites(self.checkout, full=True, machine=machine, selected=gate.ALL_MODULES)
+        start.assert_not_called()
 
     def test_red_gate_restores_tracked_debris_before_rollback(self) -> None:
         self.write(self.state / "modify-tracked", "modify")

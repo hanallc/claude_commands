@@ -69,7 +69,7 @@ def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str
     _ = copies.write_text("# range: 0.001..\ngit_timeout_seconds=30\n")
     templates = root / "git-templates"
     templates.mkdir()
-    return {"HOME": str(root), "TMPDIR": str(root), "CONF_DIR": str(configuration), "COPIES_CONFIG": str(copies),
+    return {"HOME": str(root), "TMPDIR": str(root), "CONF_DIR": str(configuration),
             "WORKTREES_STATE_DIR": str(root / "worktree-records"), "GIT_TEMPLATE_DIR": str(templates)}
 
 

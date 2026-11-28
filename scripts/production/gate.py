@@ -133,14 +133,12 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 # behind it. The slowest measured module took 387 s at load 152 (direct/test_verify_mac_offload.py,
 # 2026-10-18); the limit is about 4.6 times that.
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
-RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
 # basedpyright resolves bpy with these Blender stubs.
 # Later versions report diagnostics in bake_textures.py.
 TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
-NIGHTLY_TYPE_LINE_BYTES = 512
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
@@ -1897,13 +1895,15 @@ def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float
     needs_shared_slots = shared and not under_parent
     if under_parent:
         max_running_jobs = 1
+    try:
+        settings = conf.read("gate")
+        rerun_limit = settings.whole("rerun.max_failed_modules")
+        memory_stop_reruns = settings.whole("memory_stop_reruns") if shared else 0
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
     if shared:
         recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
-    try:
-        memory_stop_reruns = conf.read("gate").whole("memory_stop_reruns") if shared else 0
-    except conf.Unusable as error:
-        raise GateRefused(str(error)) from error
     if isinstance(machine, WholeMachine):
         max_running_jobs = os.cpu_count() or 1
     if named:
@@ -2287,7 +2287,7 @@ def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float
                     failed = [] if rerunning else [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
-                    if len(failed) > RERUN_LIMIT:
+                    if len(failed) > rerun_limit:
                         print(f"{len(failed)} modules failed; this is a real breakage, not load; no ordinary reruns", flush=True)
                         failed = []
                     memory_failed = [result for result in results if can_retry_memory_stop(result)]
@@ -3344,24 +3344,24 @@ class NightlyUnitDiagnostic:
     path: Path
 
 
-def _nightly_diagnostic_line(line: str) -> str:
+def _nightly_diagnostic_line(line: str, limit: int) -> str:
     encoded = line.encode()
-    if len(encoded) <= NIGHTLY_TYPE_LINE_BYTES:
+    if len(encoded) <= limit:
         return line
-    return encoded[:NIGHTLY_TYPE_LINE_BYTES - 3].decode(errors="ignore") + "..."
+    return encoded[:limit - 3].decode(errors="ignore") + "..."
 
 
-def _nightly_type_recheck(diagnostics: Sequence[NightlyUnitDiagnostic]) -> str:
+def _nightly_type_recheck(diagnostics: Sequence[NightlyUnitDiagnostic], limit: int) -> str:
     files = sorted({item.path.as_posix() for item in diagnostics})
     arguments = shlex.join("./" + path if path.startswith("-") else path for path in files)
-    listed = _nightly_diagnostic_line(arguments)
+    listed = _nightly_diagnostic_line(arguments, limit)
     if listed != arguments:
         return f"Files include {listed} Run `basedpyright scripts` to see every diagnostic."
     return f"Run `basedpyright {listed}` to see every diagnostic in these files."
 
 
-def _nightly_diagnostic_excerpt(lines: Sequence[str]) -> str:
-    shown = "\n".join(_nightly_diagnostic_line(line) for line in lines[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+def _nightly_diagnostic_excerpt(lines: Sequence[str], limit: int) -> str:
+    shown = "\n".join(_nightly_diagnostic_line(line, limit) for line in lines[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
     omitted = len(lines) - NIGHTLY_TYPE_DIAGNOSTIC_LINES
     return f"{shown}\n{omitted} other diagnostic lines omitted." if omitted > 0 else shown
 
@@ -3402,12 +3402,17 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
     details: list[str] = []
     for author, items in by_unit.values():
         lines = [item.text for item in items]
-        diagnostics_text = _nightly_diagnostic_excerpt(lines)
+        try:
+            limit = conf.read("gate").whole("nightly.type_line_bytes")
+        except conf.Unusable as error:
+            diagnostics_text = f"{error}\nRun `basedpyright scripts` to see every diagnostic."
+        else:
+            diagnostics_text = _nightly_diagnostic_excerpt(lines, limit) + "\n" + _nightly_type_recheck(items, limit)
         try:
             notice = showrunners.send_to_address(f"session:{author.current_session}",
                 f"gate-nightly:{result_id}:{author.id}",
                 "The nightly type check is red on your change. Fix it in your next phase.\n"
-                + diagnostics_text + "\n" + _nightly_type_recheck(items),
+                + diagnostics_text,
                 recipient=author.name, sender="gate")
             delivered = not notice.failed
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -3435,17 +3440,23 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                       + " while the full-required marker exists.")
         else:
             detail = "Tests passed. A type failure does not require full test runs."
-        if type_failures:
-            lines = [line for job in type_failures for line in job.output.splitlines()]
-            summaries = type_check_summaries("\n".join(lines))
-            diagnostics = [line for line in lines if line not in summaries]
-            detail += "\nType check failed:\n" + "\n".join(
-                _nightly_diagnostic_line(line) for line in diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
-            detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
-            if summaries:
-                detail += "\n" + summaries[-1]
-        if author_notices:
-            detail += "\n" + _nightly_diagnostic_excerpt(author_notices)
+        if type_failures or author_notices:
+            try:
+                limit = conf.read("gate").whole("nightly.type_line_bytes")
+            except conf.Unusable as error:
+                detail += f"\nType check failed:\n{error}"
+            else:
+                if type_failures:
+                    lines = [line for job in type_failures for line in job.output.splitlines()]
+                    summaries = type_check_summaries("\n".join(lines))
+                    diagnostics = [line for line in lines if line not in summaries]
+                    detail += "\nType check failed:\n" + "\n".join(
+                        _nightly_diagnostic_line(line, limit) for line in diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+                    detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
+                    if summaries:
+                        detail += "\n" + summaries[-1]
+                if author_notices:
+                    detail += "\n" + _nightly_diagnostic_excerpt(author_notices, limit)
         if result_id:
             detail += f"\nAssign the fix, then run gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)

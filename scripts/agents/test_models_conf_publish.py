@@ -36,7 +36,7 @@ DEFAULTS = registry_text({
 
 
 def require_isolated_registry(environment: dict[str, str]) -> None:
-    configured = Path(environment.get("MODELS_CONFIG_FILE", str(LIVE_REGISTRY))).expanduser().resolve()
+    configured = models_registry.registry_path(environment).resolve()
     if configured == LIVE_REGISTRY.resolve() and environment.get("MODELS_CONFIG_PUBLISH") != "0":
         raise AssertionError(f"test refused to publish the live registry: {configured}; set MODELS_CONFIG_PUBLISH=0")
 
@@ -58,13 +58,13 @@ def prepare_catalog(root: Path, environment: dict[str, str]) -> None:
 @final
 class RegistrySafetyTests(unittest.TestCase):
     def test_a_live_registry_target_is_refused_before_a_test_can_spawn_a_writer(self) -> None:
-        environment = {"MODELS_CONFIG_FILE": str(LIVE_REGISTRY), "MODELS_CONFIG_PUBLISH": "1"}
+        environment = {"CONF_DIR": str(LIVE_REGISTRY.parent), "MODELS_CONFIG_PUBLISH": "1"}
         with self.assertRaisesRegex(AssertionError, "test refused to publish the live registry"):
             require_isolated_registry(environment)
         with tempfile.TemporaryDirectory() as directory:
-            link = Path(directory) / "registry-link"
+            link = Path(directory) / "models.conf"
             link.symlink_to(LIVE_REGISTRY)
-            environment["MODELS_CONFIG_FILE"] = str(link)
+            environment["CONF_DIR"] = str(link.parent)
             with self.assertRaisesRegex(AssertionError, "MODELS_CONFIG_PUBLISH=0"):
                 require_isolated_registry(environment)
         environment["MODELS_CONFIG_PUBLISH"] = "0"
@@ -86,7 +86,7 @@ class RegistryFixture(unittest.TestCase):
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
         self.environment = {**os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
-                            "MODELS_CONFIG_FILE": str(self.registry),
+                            "CONF_DIR": str(self.registry.parent),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
                             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
@@ -101,7 +101,7 @@ class RegistryFixture(unittest.TestCase):
     def command(self, *arguments: str, cwd: Path | None = None,
                 input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         require_isolated_registry(self.environment)
-        configured = Path(self.environment["MODELS_CONFIG_FILE"]).resolve()
+        configured = models_registry.registry_path(self.environment).resolve()
         self.assertTrue(configured.is_relative_to(self.root), "registry fixture escaped its temporary folder")
         return subprocess.run(arguments, cwd=cwd or self.command_directory, env=self.environment, text=True,
                               input=input_text, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -166,7 +166,7 @@ read_text = conf_reads.read_text
 def read_then_edit(path, *arguments, **keywords):
     text = read_text(path, *arguments, **keywords)
     path = Path(path)
-    if str(path) == os.environ["MODELS_CONFIG_FILE"] and "note=original" in text:
+    if path == Path(os.environ["CONF_DIR"]) / "models.conf" and "note=original" in text:
         peer = path.with_suffix(".peer")
         peer.write_text(text.replace("note=original", "note=intermediate"))
         peer.replace(path)
@@ -183,8 +183,8 @@ conf_reads.read_text = read_then_edit
                 result = self.bash('''
 eval "$(declare -f models_registry_store | sed '1s/models_registry_store/saved_registry_store/')"
 models_registry_store() {
-    sed 's/note=intermediate/note=latest/' "$MODELS_CONFIG_FILE" > "$MODELS_CONFIG_FILE.peer"
-    mv "$MODELS_CONFIG_FILE.peer" "$MODELS_CONFIG_FILE"
+    sed 's/note=intermediate/note=latest/' "$CONF_DIR/models.conf" > "$CONF_DIR/models.conf.peer"
+    mv "$CONF_DIR/models.conf.peer" "$CONF_DIR/models.conf"
     saved_registry_store "$@"
 }
 ''' + operation)
@@ -974,7 +974,7 @@ os.execv(real, [real, *arguments])
         external = self.root / "external/models.conf"
         external.parent.mkdir()
         _ = write_registry(external, base_text=DEFAULTS)
-        self.environment["MODELS_CONFIG_FILE"] = str(external)
+        self.environment["CONF_DIR"] = str(external.parent)
         before = self.dirty_state()
         result = self.edit()
         self.assertEqual(result.returncode, 0, result.stderr)

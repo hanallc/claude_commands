@@ -14,6 +14,7 @@ export HOME="$TEST_DIR/home"
 mkdir -p "$HOME"
 
 AGENTS="$TEST_DIR/models.conf"
+unset MODELS_CONFIG_FILE
 export MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG="$TEST_DIR/config.toml"
 MODELS_CACHE="$TEST_DIR/models_cache.json"
@@ -45,7 +46,7 @@ fail() {
 
 run_sync() {
     PATH="$FAKE_BIN:$PATH" \
-    MODELS_CONFIG_FILE="$AGENTS" \
+    CONF_DIR="$(dirname "$AGENTS")" \
     CODEX_CONFIG_FILE="$CODEX_CONFIG" \
     CODEX_MODELS_CACHE_FILE="$MODELS_CACHE" \
     CODEX_CATALOG_SYNC_STATE_FILE="${SYNC_STATE_OVERRIDE:-$SYNC_STATE}" \
@@ -63,7 +64,7 @@ effective_registry() {
 
 
 test_model_families() (
-    AGENTS="$TEST_DIR/families.conf"
+    AGENTS="$TEST_DIR/families/models.conf"
     CODEX_CONFIG="$TEST_DIR/families.toml"
     MODELS_CACHE="$TEST_DIR/families.json"
     SYNC_STATE="$TEST_DIR/family-state/last_success"
@@ -176,7 +177,7 @@ EOF
 test_model_families
 
 test_family_repairs() (
-    AGENTS="$TEST_DIR/family-repairs.conf"
+    AGENTS="$TEST_DIR/family-repairs/models.conf"
     CODEX_CONFIG="$TEST_DIR/family-repairs.toml"
     MODELS_CACHE="$TEST_DIR/family-repairs.json"
     SYNC_STATE="$TEST_DIR/family-repairs-state/last_success"

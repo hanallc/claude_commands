@@ -26,7 +26,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         _ = write_config_fixture(config, "mend=on\nfmt=on\nclippy=on\n")
         self.environment.update({
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
-            "LINT_CONFIG_FILE": str(config),
+            "CONF_DIR": str(config.parent),
             "LINT_SKIP_SWEEP": "1",
             "TEST_TAPLO_EVENTS": str(self.root / "taplo-events.jsonl"),
             "TEST_TAPLO_STATUS": "0",

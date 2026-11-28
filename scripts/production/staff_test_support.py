@@ -41,7 +41,7 @@ from scripts.production import staff
 from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
@@ -432,12 +432,15 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
         _ = environment.setdefault(key, str(path.parent / folder))
     # A row removal edits the restart record; a fixture never edits the live one.
     _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
-    environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
-        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
-            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+        configured = environment.get("CONF_DIR") or os.environ.get("CONF_DIR")
+        if configured is None:
+            configured = contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))
+            _ = config_environment(Path(configured))
+        configuration = Path(configured) / "staff.conf"
+        if not configuration.exists():
             _ = write_config_fixture(configuration, "producer_workspace=producers\n")
-            environment["STAFF_CONFIG"] = str(configuration)
+        environment["CONF_DIR"] = configured
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
@@ -449,7 +452,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
             "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
-            "STAFF_CONFIG": environment["STAFF_CONFIG"],
+            "CONF_DIR": environment["CONF_DIR"],
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
@@ -923,7 +926,6 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_OWNER_SOURCE": str(self.root / "natedev-sources"),
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         }, clear=True)))
         _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
@@ -988,14 +990,13 @@ class StaffTestCase(unittest.TestCase):
     def staff_config(self, *, lock_seconds: float = 0.2,
                      remote_seconds: float = 2.0) -> Path:
         """Write private limits that the staff writer reads at each use."""
-        path = self.root / "staff.conf"
-        write_text_atomic(path, "".join(
+        path = Path(os.environ["CONF_DIR"]) / "staff.conf"
+        _ = write_config_fixture(path, "".join(
             f"# range: 5e-324..\n{key}={value}\n" for key, value in (
                 ("operation_lock_seconds", lock_seconds),
                 ("remote_seconds", remote_seconds),
             )
         ))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"STAFF_CONFIG": str(path)})))
         return path
 
     def forget_rows(self, *identities: staff.StaffId) -> None:
@@ -1088,9 +1089,8 @@ class StaffTestCase(unittest.TestCase):
             _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
-        registry = self.source_root / "showrunners.json"
-        self.write_json(registry, {"always": []})
-        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"SHOWRUNNERS_CONFIG": str(registry)})))
+        registry = Path(os.environ["CONF_DIR"]) / "showrunners.conf"
+        _ = write_config_fixture(registry, "always=\n")
         return doc
 
     def row_production(self) -> RowProductionFixture:

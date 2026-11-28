@@ -10,7 +10,8 @@ import signal
 import unittest
 from unittest import mock
 from scripts.lib.process_group import send_process_group
-from scripts.accounts.home_test_support import scratch_accounts_config
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -22,9 +23,7 @@ setUpModule = support.setUpModule
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_a_stopped_switch_leaves_the_registry_alone(self) -> None:
-        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
-        _ = config.write_text(config.read_text().replace(
-            "quota_edit_timeout_seconds=30", f"quota_edit_timeout_seconds={INJECTED_EDIT_TIMEOUT_SECS}"))
+        _ = write_config_fixture(conf.path("accounts"), f"quota_edit_timeout_seconds={INJECTED_EDIT_TIMEOUT_SECS}\n")
         _ = self.alert([self.note("codex1.md", "active", "0")], self.now)
         # A live descendant holds this pipe until the editor's whole group dies.
         # Without killpg it could still reach the real registry editor later.
@@ -78,7 +77,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
             self.assertEqual(ready.read(), b"", "an editor descendant can still change the registry")
         self.assertEqual(self.assignments()["direct"], "codex")
-        self.assertEqual([path.name for path in self.root.glob("models.conf.*")], [])
+        self.assertEqual([path.name for path in conf.directory().glob("models.conf.*")], [])
 
 
 if __name__ == "__main__":

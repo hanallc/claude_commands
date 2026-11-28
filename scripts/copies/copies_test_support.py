@@ -30,16 +30,17 @@ def stop_before_copy(test: unittest.TestCase, copy_root: Path) -> Generator[None
         yield
 
 
-def copies_environment(root: Path, *, repository: str = "fixture") -> dict[str, str]:
+def copies_environment(root: Path, *, repository: str = "fixture",
+                       configuration: Path | None = None) -> dict[str, str]:
     # Keep the keyword for callers that still pass it.
     del repository
-    private = private_copy_config(root)
-    configuration = Path(private.environment["COPIES_CONFIG"])
-    _ = memory_test_support.write_config_fixture(configuration,
+    private = private_copy_config(root, configuration=configuration)
+    copies = Path(private.environment["CONF_DIR"]) / "copies.conf"
+    _ = memory_test_support.write_config_fixture(copies,
         "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
     return {
         **private.environment,
-        "HOME": str(root), "COPIES_CONFIG": str(configuration),
+        "HOME": str(root),
         "SCRATCH_ROOT": str(root / "scratch"), "SCRATCH_COPIES_ROOT": str(root / "copies"),
         "SCRATCH_HOLDS": str(root / "holds.json"),
     }

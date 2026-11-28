@@ -633,10 +633,9 @@ phase table and vault note show: the open phase ends at its latest stated
 promise and later phases are predicted from it. Under a gate with no clear
 time it reads `after G<k>`.
 
-`eta_band_seconds` names both outcomes. `EtaBand` carries the projected
-`remaining`, `earliest`, and `latest` seconds in that order;
-`EtaProjectionUnavailable` says the displayed percentage and elapsed time do
-not support a projection.
+`eta_band_seconds` returns an `EtaBand` or an `EtaProjectionUnavailable`.
+`EtaBand` gives the `remaining`, `earliest`, and `latest` seconds in that order.
+`EtaProjectionUnavailable` marks a projection without usable inputs or a usable rate factor.
 
 `ETA low` and `ETA high` close the row with the two arrivals that same
 percentage still allows, each followed by its own distance from the ETA as
@@ -645,12 +644,12 @@ hand. Both come from re-running the ETA's own projection over a percentage moved
 a plausible distance each way, which makes the band asymmetric on purpose: at
 20% a few points of optimism cost far more hours than the same few points of
 pessimism save, and a symmetric band would hide exactly that. The distance is
-the phase estimate's own measured error when a calibration cleared its sample
-floor, and ten percentage points otherwise. Neither end may stray past double or
-half the reported rate whatever the measured error says — a spread wider than
-the percentage itself would otherwise push the pessimistic end to 1% and quote
-an arrival ninety-nine times the elapsed clock. Both cells are blank wherever
-the ETA is. The project row's low and high shift the chain's finish by the
+the measured error when calibration has enough samples.
+The distance is ten percentage points when calibration has too few samples.
+`direct.conf` sets the cap in `plan_history.max_rate_factor`.
+The shipped factor of 2.0 limits each end to double or half the reported progress.
+Both cells are blank when the projection is unavailable.
+The project row's low and high shift the chain's finish by the
 open phase's own band: its projection's band, else the range of its stated
 promise, else the Phase row's band beside it, so a promise stated with no range
 still gets a low and a high (user, 2026-10-26). A finished plan's low and high

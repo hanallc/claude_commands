@@ -254,16 +254,15 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.trees = self.root / "trees"
         self.trees.mkdir()
         self.state = self.root / "worktrees-state"
-        config = self.root / "staff.conf"
-        _ = config.write_text("# range: 0.001..\noperation_lock_seconds=5\n"
-                              + "# range: 0.001..\nremote_seconds=5\n")
+        config = self.root / "settings/staff.conf"
+        _ = write_config_fixture(config, "operation_lock_seconds=5\nremote_seconds=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
             **config_environment(self.root / "settings"),
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "WORKTREES_STATE_DIR": str(self.state),
-            "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
+            "STAFF_FILE": str(staff_file),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
             **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
@@ -438,8 +437,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies = config / "copies.conf"
-        _ = copies.write_text("# range: 0.001..\ngit_timeout_seconds=5\n")
-        self.environment["COPIES_CONFIG"] = str(copies)
+        _ = write_config_fixture(copies, "git_timeout_seconds=5\n")
 
     def make_layout(self, unit: str, name: str) -> Path:
         source = self.home / "rust/origin"

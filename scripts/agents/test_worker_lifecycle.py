@@ -237,8 +237,9 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE")}
+        variables = ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "CONF_DIR", "MODELS_CONFIG_FILE")
+        for name in variables:
+            environment = dict.fromkeys(variables, str(root / "safe"))
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{fixture_support.__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
@@ -284,7 +285,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
                         fixture_support.select_fixture_workers(real, notes=real / "rust/hanadocs/agents")
                     with self.assertRaises(AssertionError) as changed:
                         fixture_support.assert_real_codex_unchanged()
-                    for name in (".codex/auth.json", ".claude/config/accounts.json",
+                    for name in (".codex/auth.json", ".local/state/accounts/accounts.json",
                                  "rust/hanadocs/agents/codex9.md"):
                         self.assertIn(str(real / name), str(changed.exception))
         # Check an account directory created after import.

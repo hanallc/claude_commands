@@ -62,10 +62,8 @@ class NativeClaudeUnitTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        registry = write_registry(Path.home() / ".claude/config/models.conf")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
-        })))
+        _ = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_PUBLISH": "0"})))
 
     def pending_opening_fixture(self) -> tuple[add_unit.UnitLaunch, add_unit.LabeledSessionFound, Path, str, str]:
         native = fixture_runtime_id("pending-opening-rerun")

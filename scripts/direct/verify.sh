@@ -1051,7 +1051,7 @@ STEP_COPIES_SCRIPT="$VERIFY_START_DIR/../copies/copies.py"
 lint_code_files() {
     LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh"
         "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
+        "${CONF_DIR:-$HOME/.claude/config}/lint.conf")
 }
 
 lint_code_key() {

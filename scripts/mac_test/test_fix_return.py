@@ -45,7 +45,7 @@ exec "$FIX_TEST_RSYNC" "${words[@]}"
 
 def git_environment() -> dict[str, str]:
     environment = {name: value for name, value in os.environ.items()
-                   if not name.startswith("GIT_") and name not in ("BASH_ENV", "STAFF_CONFIG")}
+                   if not name.startswith("GIT_") and name != "BASH_ENV"}
     return {**environment, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 

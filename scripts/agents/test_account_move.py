@@ -34,6 +34,7 @@ from scripts.agents import stop_resume
 from scripts.agents.test_restart import showrunner, top_level, unit
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import write_config_fixture
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300
@@ -47,8 +48,9 @@ class AccountMoveTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(scratch_accounts_config())
-        write_machine_config(Path(os.environ["CONF_DIR"]))
+        config = self.enterContext(scratch_accounts_config())
+        write_machine_config(config)
+        _ = write_config_fixture(config / "staff.conf", "producer_workspace=producers\n")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.root / "notes"
         notes.mkdir()
@@ -237,7 +239,6 @@ class AccountMoveTests(ShutdownTestCase):
         environment = {
             "HOME": str(self.root),
             "STAFF_FILE": os.environ["STAFF_FILE"],
-            "STAFF_CONFIG": os.environ["STAFF_CONFIG"],
             "PATH": os.defpath,
             "CONF_DIR": os.environ["CONF_DIR"],
             "AGENT_NOTES_DIR": str(self.root / "notes"),
@@ -341,7 +342,7 @@ class AccountMoveTests(ShutdownTestCase):
                     row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude3"))
                     self.moves.failures[row.id] = "live process account is unreadable"
                 family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
-                registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
+                _ = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf", {"producers": {row.name: family}})
                 live = [accounts.LiveGroupMember(identity, row.name, "producers", self.root / ".claude1")] if state == "interrupted" else []
                 move = self.moves.move
                 def start(session: str, target: str, *, why: str) -> stop_resume.MoveResult:
@@ -358,7 +359,6 @@ class AccountMoveTests(ShutdownTestCase):
                 with (patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
                       patch.object(self.moves, "move", side_effect=start),
                       patch.object(remote, "other_machine", return_value="mac"),
-                      patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}),
                       patch("scripts.accounts.accounts._read_local_role_sessions",
                             side_effect=producer_roles)):
                     if state in ("interrupted", "early exit after home write"):

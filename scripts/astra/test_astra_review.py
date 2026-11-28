@@ -210,7 +210,7 @@ class AstraReviewTests(StaffTestCase):
                 self.assertEqual(self.world.requests, [])
 
     def test_the_review_runs_astra_read_only_on_the_workers_account_and_is_printed(self) -> None:
-        _ = write_registry(Path(os.environ["MODELS_CONFIG_FILE"]), {
+        _ = write_registry((Path(os.environ["CONF_DIR"]) / "models.conf"), {
             "assignments": {"design_roles": "claude"},
             "design_roles.claude": {"designer": "sonnet:high", "reviewer": "opus:high"},
         })

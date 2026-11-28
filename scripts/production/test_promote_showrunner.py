@@ -26,6 +26,7 @@ from unittest import mock
 from scripts.production import add_showrunner
 from scripts.production import production_doc, promote_showrunner
 from scripts.production import showrunners, worker
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.agents import stop_resume
 from scripts.production import showrunner_tree
 from scripts.production import unit_effort
@@ -256,14 +257,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        configuration = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(configuration / "showrunners.conf", "faults_to=fixture\nalways=\n")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+            "CONF_DIR": str(configuration),
         }, clear=True)))
         for name, path in {
             "NOTIFIER_STATE_DIR": self.root / "notifier",
             "SHOWRUNNER_STATE_DIR": self.root / "showrunner-state",
-            "CONFIG": self.root / "showrunners.json",
         }.items():
             _ = self.enterContext(mock.patch.object(showrunners, name, path))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

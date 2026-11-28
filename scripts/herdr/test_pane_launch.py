@@ -196,7 +196,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                                 if pid == 999 else observed)
                     with (patch.object(staff, "initial_snapshot", return_value=record),
                           patch.object(staff, "local_snapshot", return_value=record),
-                          patch.dict("os.environ", {"MODELS_CONFIG_FILE": str(registry)}),
+                          patch.dict("os.environ", {"CONF_DIR": str(registry.parent)}),
                           patch.object(herdr, "native_process", side_effect=native_process),
                           patch.object(herdr.Herdr, "result", return_value={"process_info": {
                               "shell_pid": 998, "foreground_process_group_id": 999,

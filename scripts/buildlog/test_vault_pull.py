@@ -149,7 +149,7 @@ class VaultPullTests(unittest.TestCase):
             + "sync.connect_timeout_s=10\n"
         )
         self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(settings), "BUILD_TARGETS_CONFIG": str(build_targets),
+            "CONF_DIR": str(settings),
         }))
         point_root_at(self, self.root)
         script = self.folder / "update_registration.py"

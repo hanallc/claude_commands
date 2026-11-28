@@ -21,7 +21,7 @@ from typing import cast, override
 from unittest import mock
 from zipfile import ZipFile, Path as ZipPath
 
-from scripts.aws_target.ledger_test_support import install_cost_settings
+from scripts.aws_target.ledger_test_support import account_fixture_path, install_cost_settings
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
@@ -79,10 +79,9 @@ class ReportSpeedTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
         configuration = temporary / "config"
-        account_settings = configuration / "aws_target.conf"
-        install_cost_settings(account_settings)
+        install_cost_settings(account_fixture_path(temporary))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **mac_natedev_environment(configuration), "AWS_TARGET_CONFIG": str(account_settings),
+            **mac_natedev_environment(configuration), "HOME": str(temporary),
         })))
         write_edited_crate_maximum(configuration, 3)
 

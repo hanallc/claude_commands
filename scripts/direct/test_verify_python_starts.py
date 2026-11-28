@@ -19,6 +19,7 @@ from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.tree_watch_test_support import TreeWatchFixture, write_workspace
 from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
@@ -150,7 +151,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         harness = self.root / "code-key.sh"
         _ = harness.write_text("\n".join(shell_function(VERIFY.read_text(), name) for name in ("hash_stream", "lint_code_files", "lint_code_key")))
         environment = {**self.environment, "HOME": str(home), "BUILD_HELPER_ROOT": str(home / ".claude/scripts"),
-                       "LINT_CONFIG_FILE": str(self.config),
+                       "CONF_DIR": str(self.config.parent),
                        "FIX_RETURN_SCRIPT": str(fix_return), "PY": str(self.root / "python-must-not-start")}
         bash = shutil.which("bash")
         assert bash is not None
@@ -189,7 +190,8 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
             tool = shutil.which(name)
             assert tool is not None
             (tools / name).symlink_to(tool)
-        unreadable = self.root / "unreadable.conf"
+        unreadable = self.root / "unreadable/lint.conf"
+        unreadable.parent.mkdir()
         _ = unreadable.write_text("# no read permission\n")
         unreadable.chmod(0)
         self.addCleanup(unreadable.chmod, 0o600)
@@ -203,9 +205,9 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
             with self.subTest(path=path):
                 environment["PATH"] = path  # The restricted PATH forces the real shasum fallback.
                 self.assertEqual(key(), original)
-                environment["LINT_CONFIG_FILE"] = str(unreadable)
+                environment["CONF_DIR"] = str(unreadable.parent)
                 _ = key(unreadable=True)
-                environment["LINT_CONFIG_FILE"] = str(self.config)
+                environment["CONF_DIR"] = str(self.config.parent)
 
 
 class VerifyOutputRootsTests(unittest.TestCase):
@@ -293,6 +295,7 @@ class PairedTreeKeyTests(TreeWatchFixture):
         session = self.root / "session"
         session.mkdir(exist_ok=True)
         _ = (session / "lint.conf").write_text("# key input\n")
+        _ = write_config_fixture(session / "direct.conf")
         harness = session / "keys.sh"
         _ = harness.write_text('set -euo pipefail\nCMD=$1; shift; ARGS=("$@")\n'
                                + 'GATE_METADATA=$TEST_METADATA\n'
@@ -305,7 +308,7 @@ printf '%s\\n' "$VERDICT_KEY" "$VERDICT_TREE_KEY"
         self.environment.update({
             "PY": sys.executable, "TEST_METADATA": json.dumps(self.metadata),
             "TREE_WATCH_SCRIPT": str(VERIFY.with_name("tree_watch.py")),
-            "CACHE_DIR": str(session / "cache"), "LINT_CONFIG_FILE": str(session / "lint.conf"),
+            "CACHE_DIR": str(session / "cache"), "CONF_DIR": str(session),
             "HOME": str(self.root), "BUILD_HELPER_ROOT": str(self.root / ".claude/scripts"),
             "FILTER_RUN": "0", "HOLD_WAIT_DIR": str(session),
         })

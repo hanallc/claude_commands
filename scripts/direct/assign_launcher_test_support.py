@@ -14,6 +14,7 @@ from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
@@ -194,16 +195,14 @@ def assignment_environment(bytecode_setting: str) -> Generator[None]:
     """Pin settings and use only the fixture's Git configuration."""
     config = Path(os.environ["CONF_DIR"])
     for stem, settings in ASSIGNMENT_SETTINGS.items():
-        _ = (config / f"{stem}.conf").write_text(settings)
+        _ = write_config_fixture(config / f"{stem}.conf", settings)
     cache = Path.home() / ".cache"
     seed_interpreter_cache(cache)
     environment = {
         **fixture_git_environment(config),
         "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache),
         "PYTHONDONTWRITEBYTECODE": bytecode_setting,
-        "STAFF_CONFIG": str(config / "staff.conf"),
-        "COPIES_CONFIG": str(config / "copies.conf"),
-        "LINT_CONFIG_FILE": str(config / "lint.conf"),
+        "CONF_DIR": str(config),
         "USER_ZONE": "America/New_York",
         "PROCESS_TABLE_PS": "sh -c :",
     }
@@ -288,12 +287,12 @@ class AssignLauncherFixture(unittest.TestCase):
         _ = self.paths.write_text("src/worker.py\ntests/test_worker.py\n")
         self.prompt = self.session_dir.parent / "assignment.txt"
         self.write_phase_prompt("7", "Assignment core", "Implement the assigned change.")
-        self.registry = self.native.fixture.root / "conf/models.conf"
+        self.registry = Path(os.environ["CONF_DIR"]) / "models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "UNIT_HISTORY_DIR": str(self.history), 
             "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
-            "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
+            "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
             "PYTHONPATH": str(ROOT / "scripts/lib/python_startup"), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
         })))
         for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE"):
@@ -388,7 +387,7 @@ class AssignLauncherFixture(unittest.TestCase):
 
     def prepare_style_project(self) -> None:
         self.commit_project()
-        _ = Path(os.environ["LINT_CONFIG_FILE"]).write_text("style_review=on\n")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "lint.conf", "style_review=on\n")
 
     def events(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in

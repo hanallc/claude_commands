@@ -10,6 +10,7 @@ import subprocess
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.notify import push_texts, silence
 from scripts.whoami import mac_fallback_token, quota_alert, quota_alert_test_support as support
@@ -22,7 +23,7 @@ class MacTokenAlertTests(support.SeededQuotaReminderFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.root / "notify")})))
-        with quota_alert.CONFIG.open("a", encoding="utf-8") as settings:
+        with conf.path("showrunners").open("a", encoding="utf-8") as settings:
             _ = settings.write("token_expiry.lead_days=30 7\n")
 
     def save_token(self, made: datetime, *, failure: str = "unknown", good: str = "unknown",
@@ -33,7 +34,7 @@ class MacTokenAlertTests(support.SeededQuotaReminderFixture):
             + f"last_good_use: {good}\n---\n", encoding="utf-8")
 
     def set_configured_token_dates(self, dates: str) -> None:
-        config = quota_alert.CONFIG
+        config = conf.path("showrunners")
         lines = config.read_text(encoding="utf-8").splitlines(keepends=True)
         other_settings = "".join(line for line in lines
                                  if not (line.startswith("token_expiry.") and ".ends=" in line))
@@ -346,10 +347,10 @@ class MacTokenAlertTests(support.SeededQuotaReminderFixture):
 
     def test_invalid_expiry_days_do_not_suppress_the_login_alert(self) -> None:
         self.save_token(self.now - timedelta(days=345), failure=self.now.isoformat())
-        default = quota_alert.CONFIG.read_text(encoding="utf-8")
+        default = conf.path("showrunners").read_text(encoding="utf-8")
         for invalid in ("0 7", "366 7", "7 7", "x 7"):
             with self.subTest(value=invalid):
-                _ = quota_alert.CONFIG.write_text(default.replace("30 7", invalid), encoding="utf-8")
+                _ = conf.path("showrunners").write_text(default.replace("30 7", invalid), encoding="utf-8")
                 quota_alert.STATE.unlink(missing_ok=True)
                 self.noted.clear()
                 log = self.alert([], self.now)

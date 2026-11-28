@@ -1880,7 +1880,12 @@ The build queue shows each step by its configured name. `config/build_steps.conf
 
 #### As-built
 
-On a shared machine, a merge gate stops a test module whose own memory sample (resident plus swapped memory of the module and its descendants) goes above `merge_gate_governor_gib` (4 GiB). The stop uses the time-limit path: `killed_for` names the peak and the limit, and `stop_gate_jobs` ends the module. The module runs again alone up to `memory_stop_reruns` times (`config/merge_gate.conf`, 1). These reruns do not count toward `RERUN_LIMIT`, and a further overrun fails the gate. A stopped run records no peak in `module_peak_mib.json`.
+On a shared machine, a merge gate stops a test module if its memory use exceeds `merge_gate_governor_gib` (4 GiB).
+The sample includes resident and swapped memory for the module and its descendants.
+`killed_for` records the peak and the limit. `stop_gate_jobs` ends the module.
+`memory_stop_reruns` in `config/gate.conf` lets the module run again alone once.
+The `rerun.max_failed_modules` setting controls ordinary failures only.
+A further memory overrun fails the gate. A stopped run records no peak in `module_peak_mib.json`.
 
 Each stop sends sdlc one message through `session_send.send_argv`, after the result is known. It names the gate mode, branch and checkpoint, the module, its peak, the limit, and "runs again alone" or "the gate fails". A failed send prints one line and does not change the gate result.
 

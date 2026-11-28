@@ -5,6 +5,7 @@ if [[ "${1:-}" != --fixture-environment ]]; then
     exec env -i PATH="$PATH" bash "$0" --fixture-environment
 fi
 shift
+unset MODELS_CONFIG_FILE
 export MODELS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -55,7 +56,9 @@ run_exec_fixture() (
     agents_exec_main "$@"
 )
 
-export MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
+export CONF_DIR="$TEST_DIR/config"
+mkdir -p "$CONF_DIR"
+cp "$SCRIPT_DIR/../../config/"*.conf "$CONF_DIR/"
 export CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 export CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
@@ -63,7 +66,7 @@ export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
 unset AGENT_EXEC_DRY_RUN AGENT_EXEC_EXTRA_ARGS || true
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
-write_test_registry "$MODELS_CONFIG_FILE" \
+write_test_registry "$CONF_DIR/models.conf" \
     assignments/codex_case=codex \
     assignments/direct.simplify=claude \
     direct.claude/simplify=opus:max \
@@ -362,10 +365,10 @@ assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(rec
 assert_equal "background worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 
 # CLI assignments also come from the registry.
-write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/merge_branch=opus:max
-cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
-write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.merge_branch=claude
-MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" merge_branch < /dev/null > "$TEST_DIR/cli-output"
+write_test_registry "$CONF_DIR/models.conf" --update cli.claude/merge_branch=opus:max
+cp -R "$CONF_DIR" "$TEST_DIR/cli"
+write_test_registry "$TEST_DIR/cli/models.conf" --update assignments/cli.merge_branch=claude
+CONF_DIR="$TEST_DIR/cli" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" merge_branch < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "CLI worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 "$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'

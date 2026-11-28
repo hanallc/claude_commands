@@ -39,7 +39,6 @@ class RemoveRunScratchTests(unittest.TestCase):
         self.fixture_root.mkdir()
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
         environment = {**fixture_git_environment(root), **private_copy_config(root).environment}
-        _ = environment.pop("STAFF_CONFIG", None)
         environment["HOME"] = str(root / "home")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         owner = fixture_member("showrunner", name="demo")

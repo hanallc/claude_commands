@@ -763,6 +763,14 @@ conf_reads.record('disabled')
             self.write(f"# whole: 1..9007199254740993\ntries={value}\n")
             self.assertEqual(conf.read("example").whole("tries"), int(value))
 
+    def test_file_byte_count_rejects_an_oversized_host_value(self) -> None:
+        self.write("# whole: 1..1048576\nworker.history_bytes=65536\n"
+                   + "# whole: 1..\nworker.history_bytes.testhost=9223372036854775808\n")
+        with (mock.patch("socket.gethostname", return_value="testhost.example"),
+              redirect_stderr(io.StringIO()),
+              self.assertRaisesRegex(conf.Unusable, r"worker\.history_bytes(?:\.testhost)?=")):
+            _ = conf.read("example").value("worker.history_bytes", conf.file_byte_count)
+
     def test_whole_limits_accept_open_bounds_and_reject_values_beyond_them(self) -> None:
         for bounds, accepted, refused in (("..-2", "-2", "-1"), ("2..", "2", "1"),
                                           ("..", "-100", "1.5")):

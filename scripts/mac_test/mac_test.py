@@ -1513,7 +1513,7 @@ def start_watcher(paths: StatePaths) -> None:
     environment = [
         f"{name}={value}"
         for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
+        if name.startswith("MAC_TEST_") or name == "CONF_DIR"
     ]
     command = [
         "systemd-run",
@@ -1557,7 +1557,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
     environment = [
         f"{name}={value}"
         for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
+        if name.startswith("MAC_TEST_") or name == "CONF_DIR"
     ]
     command = [
         "systemd-run", "--user", "--collect", "--quiet", "--no-block",

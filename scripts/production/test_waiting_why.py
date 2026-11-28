@@ -15,6 +15,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.nightly_review import candidates
 from scripts.lib import file_lock
 from scripts.production import investigation, proposal_issue, staff, update_registration, waiting_why
@@ -36,6 +37,7 @@ class WaitingWhyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = set_up_fixture(self.addCleanup, test_change_page.ChangePageTests('runTest'))
         self.root = self.fixture.root
+        _ = write_config_fixture(self.fixture.temporary / 'config/production.conf')
         _ = self.enterContext(patch.object(candidates, 'state_root', return_value=self.fixture.temporary / 'candidates'))
         folder = self.fixture.temporary / 'proposals'
         folder.mkdir()

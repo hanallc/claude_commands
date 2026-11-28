@@ -767,7 +767,7 @@ placement_once
 
     def verify_run_environment(self, tools: VerifyMacOffloadFixture) -> dict[str, str]:
         environment = {**tools.environment, **{key: os.environ[key] for key in (
-            "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
+            "CONF_DIR", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
             "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
             "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "LINT_SKIP_SWEEP": "1", "BUILD_TARGETS_POLL_S": "5"}

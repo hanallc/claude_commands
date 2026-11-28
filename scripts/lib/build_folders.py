@@ -800,9 +800,7 @@ def repository_git_timeout() -> float:
     """Keep the copies Git deadline when the maker creates a numbered copy."""
     from scripts.lib import conf
 
-    path = os.environ.get("COPIES_CONFIG")
-    settings = conf.read(Path(path).expanduser()) if path else conf.read_or_repository("copies")
-    return settings.number("git_timeout_seconds")
+    return conf.read_or_repository("copies").number("git_timeout_seconds")
 
 
 def repository_key_for(name: str, identity: str) -> str:

@@ -145,7 +145,7 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                 root = Path(directory)
                 configuration = root / "config"
                 environment = {key: value for key, value in os.environ.items()
-                               if key not in ("PYTHONPATH", "BUILD_TARGETS_CONFIG", "MAC_TEST_CONFIG")}
+                               if key not in ("PYTHONPATH", "MAC_TEST_CONFIG")}
                 environment.update({**config_environment(configuration), "HOME": directory,
                                     "BUILDLOG_DIR": str(root / "buildlog"),
                                     "BUILD_HOLD_DIR": str(root / "holds"),

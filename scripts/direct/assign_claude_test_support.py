@@ -639,7 +639,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     def claude_launch(
         self, session_dir: Path, registry_row: str, *, kind: str = "impl"
     ) -> subprocess.CompletedProcess[str]:
-        registry = self.root / ".claude" / "config" / "models.conf"
+        registry = self.root / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
         environment = self.launch_environment(session_dir)
         return self.run_assignment(self.assign_command(session_dir, kind=kind), environment)

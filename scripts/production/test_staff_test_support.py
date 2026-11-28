@@ -15,9 +15,11 @@ import unittest
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from typing import TextIO, cast, final, override
+from unittest import mock
 
 from scripts.lib import process_group
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production import staff
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -111,7 +113,6 @@ class SharedStaffOwnerTests(unittest.TestCase):
             **config_environment(self.root / "config"),
             "HOME": str(self.root),
             "PATH": os.defpath,
-            "STAFF_CONFIG": str(self.root / "config/staff.conf"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "STAFF_TEST_CHECKOUT": str(CHECKOUT),
             "STAFF_TEST_OWNER_FILE": str(self.root / "staff.json"),
@@ -286,6 +287,22 @@ parent = fixtures.unit_membership("fixture-showrunner", "fixture-unit")
 
 
 class FixtureAccountTests(unittest.TestCase):
+    def test_staff_settings_select_the_fixture_or_the_live_folder(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = root / "fixture"
+        _ = write_config_fixture(configuration / "staff.conf", "remote_seconds=5\n")
+        _ = write_config_fixture(root / ".claude/config/staff.conf", "remote_seconds=7\n")
+        with (mock.patch.dict(os.environ, {"HOME": str(root), "CONF_DIR": str(configuration)}),
+              mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "", "")) as run):
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = staff.authority_snapshot()
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+            del os.environ["CONF_DIR"]
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = staff.authority_snapshot()
+            self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
     def run_fixture(self, body: str, family: str, selection: str = "real") -> None:
         with tempfile.TemporaryDirectory() as temporary:
             environment = {key: value for key, value in os.environ.items()

@@ -3677,7 +3677,6 @@ class WorkerDispatchRecord:
     timestamp: float
 
 
-WORKER_HISTORY_BYTES = 64 * 1024
 type WorkerHistoryTargets = dict[bytes, staff.StaffRow]
 
 
@@ -3686,10 +3685,11 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets, *,
     identity_pattern = re.compile(rb'"worker_id"\s*:\s*"([^"\\]*)"')
     bad_line_reported = False
     try:
+        limit = 0 if complete else conf.read("production").value("worker.history_bytes", conf.file_byte_count)
         with path.open("rb") as history:
-            offset = 0 if complete else max(0, history.seek(0, os.SEEK_END) - WORKER_HISTORY_BYTES)
+            offset = 0 if complete else max(0, history.seek(0, os.SEEK_END) - limit)
             _ = history.seek(offset - 1 if offset else 0)
-            tail = history.read() if complete else history.read(WORKER_HISTORY_BYTES + bool(offset))
+            tail = history.read() if complete else history.read(limit + bool(offset))
         if offset:
             boundary, tail = tail[:1], tail[1:]
             if boundary != b"\n":
@@ -3713,7 +3713,7 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets, *,
                     yield entry
     except FileNotFoundError:
         pass
-    except OSError as error:
+    except (OSError, conf.Unusable) as error:
         print(f"anomaly: {path}: {error}", file=sys.stderr)
 
 
