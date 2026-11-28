@@ -2650,6 +2650,10 @@ class PreviousAnswer(Enum):
     NEXT_REQUEST = "the transcript shows a new request after the pending answer"
 
 
+class QuestionAnsweredByAnother(Enum):
+    RECORDED = "the Codex question was answered by another"
+
+
 @dataclass(frozen=True)
 class CodexQuestionBox:
     call: str
@@ -2671,8 +2675,38 @@ def _answer_digest(text: str) -> str:
     return hashlib.sha256(text.strip().encode()).hexdigest()
 
 
+def _question_answer(output: object, answer_digest: object
+                     ) -> Literal[PreviousAnswer.ACCEPTED, PreviousAnswer.UNCONFIRMED] | QuestionAnsweredByAnother:
+    if not isinstance(output, str):
+        return PreviousAnswer.UNCONFIRMED
+    try:
+        result = cast(object, json.loads(output))
+    except ValueError:
+        return PreviousAnswer.UNCONFIRMED
+    groups = cast(dict[str, object], result).get("answers") if isinstance(result, dict) else None
+    if not isinstance(groups, dict):
+        return PreviousAnswer.UNCONFIRMED
+    answers: list[str] = []
+    notes: list[str] = []
+    for group in cast(dict[str, object], groups).values():
+        values = cast(dict[str, object], group).get("answers") if isinstance(group, dict) else None
+        if not isinstance(values, list):
+            return PreviousAnswer.UNCONFIRMED
+        for value in cast(list[object], values):
+            if not isinstance(value, str):
+                return PreviousAnswer.UNCONFIRMED
+            if value.startswith("user_note: "):
+                notes.append(value.removeprefix("user_note: "))
+            else:
+                answers.append(value)
+    recorded = [text.strip() for text in (notes or answers) if text.strip()]
+    if any(_answer_digest(script_prompt(text)) == answer_digest for text in recorded):
+        return PreviousAnswer.ACCEPTED
+    return QuestionAnsweredByAnother.RECORDED if recorded else PreviousAnswer.UNCONFIRMED
+
+
 def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend
-                    ) -> AnswerRequest | AnswerTranscriptUnavailable:
+                    ) -> AnswerRequest | AnswerTranscriptUnavailable | QuestionAnsweredByAnother:
     saved = worker_lifecycle.read_json_object(path)
     session = str(row.current_session)
     boundary = saved.get("record_number", 0)
@@ -2686,7 +2720,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
     last: dict[str, object] = {}
     open_questions: set[str] = set()
     saved_call = saved.get("question_call")
-    accepted = False
+    previous = PreviousAnswer.UNCONFIRMED
     next_request = False
     records = worker_admission.transcript_records(
         source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
@@ -2708,30 +2742,33 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
             call = payload.get("call_id")
             if isinstance(call, str) and call:
                 if kind == "function_call" and payload.get("name") == "request_user_input":
-                    if number > boundary and accepted and call != saved_call:
+                    if number > boundary and previous is PreviousAnswer.ACCEPTED and call != saved_call:
                         next_request = True
                     open_questions.add(call)
                 elif kind == "function_call_output" and call in open_questions:
                     if number > boundary and call == saved_call:
-                        accepted = True
+                        answer = _question_answer(payload.get("output"), saved.get("answer_digest"))
+                        if isinstance(answer, QuestionAnsweredByAnother):
+                            return answer
+                        previous = answer
                     open_questions.remove(call)
         if not saved or number <= boundary:
             continue
         entry = worker_admission.transcript_entry(fields, set())
-        if entry.startswith("user:\n"):
+        if not saved_call and entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
-            accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
-        elif accepted and (entry.startswith("assistant:\n") or turn_ended):
+            if _answer_digest(script_prompt(body)) == saved.get("answer_digest"):
+                previous = PreviousAnswer.ACCEPTED
+        elif previous is PreviousAnswer.ACCEPTED and (entry.startswith("assistant:\n") or turn_ended):
             next_request = True
     if not number or number < boundary or len(open_questions) > 1:
         return AnswerTranscriptUnavailable.UNAVAILABLE
     question = CodexQuestionBox(next(iter(open_questions))) if open_questions else AnswerPrompt.NORMAL
-    previous = PreviousAnswer.NONE
-    if saved:
-        if next_request and (not isinstance(question, CodexQuestionBox) or question.call != saved_call):
-            previous = PreviousAnswer.NEXT_REQUEST
-        else:
-            previous = PreviousAnswer.ACCEPTED if accepted else PreviousAnswer.UNCONFIRMED
+    if not saved:
+        previous = PreviousAnswer.NONE
+    elif (previous is PreviousAnswer.ACCEPTED and next_request
+          and (not isinstance(question, CodexQuestionBox) or question.call != saved_call)):
+        previous = PreviousAnswer.NEXT_REQUEST
     return AnswerRequest(number, _answer_digest(json.dumps(last, sort_keys=True)), question, previous)
 
 
@@ -2763,23 +2800,27 @@ def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staf
     request = _answer_request(path, row, backend)
     if isinstance(request, AnswerTranscriptUnavailable):
         return _refuse_answer(name, request.value, ExitCode.UNCERTAIN)
-    if request.previous in (PreviousAnswer.UNCONFIRMED, PreviousAnswer.ACCEPTED):
-        return _refuse_answer(name, "an answer is pending for this input request", ExitCode.BUSY)
     if owner is None:
         return _refuse_answer(name, "the owner is unavailable")
+    artifacts = CompletionArtifacts(owner, run)
+    if isinstance(request, QuestionAnsweredByAnother):
+        artifacts.unlink(path)
+        return _refuse_answer(name, request.value)
+    if request.previous in (PreviousAnswer.UNCONFIRMED, PreviousAnswer.ACCEPTED):
+        return _refuse_answer(name, "an answer is pending for this input request", ExitCode.BUSY)
     box = request.input_path
     submitted = text + "\n" + _done_instruction(completion_id) if ask_for_done and isinstance(box, AnswerPrompt) else text
     target = str(row.current_session)
-    pending = PendingAnswer(target, request.record_number, request.request_digest, _answer_digest(script_prompt(submitted)),
+    answer_text = submitted.strip() if isinstance(box, CodexQuestionBox) else submitted
+    pending = PendingAnswer(target, request.record_number, request.request_digest, _answer_digest(script_prompt(answer_text)),
                             box.call if isinstance(box, CodexQuestionBox) else "")
-    artifacts = CompletionArtifacts(owner, run)
     artifacts.write(path, json.dumps(asdict(pending)))
     if isinstance(box, CodexQuestionBox):
         def require_open_question() -> None:
             current = _answer_request(path, row, backend)
             if isinstance(current, AnswerTranscriptUnavailable):
                 raise herdr_types.HerdrFailure("the transcript cannot verify the selected Codex question")
-            if current.input_path != box:
+            if isinstance(current, QuestionAnsweredByAnother) or current.input_path != box:
                 raise herdr_types.HerdrFailure("the selected Codex question is no longer open")
 
         transport = client.answer_question(state.pane, submitted, target=target, require_open=require_open_question)
@@ -2792,6 +2833,9 @@ def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staf
         receipt = _answer_request(path, row, backend)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return _refuse_answer(name, f"answer delivery unknown: {error}", ExitCode.UNCERTAIN)
+    if isinstance(receipt, QuestionAnsweredByAnother):
+        artifacts.unlink(path)
+        return _refuse_answer(name, receipt.value)
     if isinstance(receipt, AnswerRequest) and receipt.previous in (PreviousAnswer.ACCEPTED, PreviousAnswer.NEXT_REQUEST):
         return ExitCode.OK
     reason = transport.reason if isinstance(transport, herdr.AnswerDeliveryUnknown) else "no receipt in the transcript"

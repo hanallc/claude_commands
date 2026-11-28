@@ -1080,6 +1080,7 @@ class UnknownPane:
 class RowPaneScan:
     found: dict[staff.StaffId, list[dict[str, object]]]
     unknown: list[UnknownPane]
+    confirmed_closed: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1209,6 +1210,7 @@ class NoReportedAgentSession:
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
+    name: NotRequired[str]
     agent_status: AgentStatus
     agent_session: ReportedAgentSession | NoReportedAgentSession
 
@@ -2574,7 +2576,7 @@ class Herdr:
                 for identity in sessions:
                     if (row := record.by_current_session(identity)) is not None:
                         found.setdefault(row.id, []).append(pane)
-        return RowPaneScan(found, unknown)
+        return RowPaneScan(found, unknown, frozenset(closed))
 
     @pane_evidence_run()
     def retitle_row(self, row_id: str) -> bool:
@@ -3624,8 +3626,10 @@ class Herdr:
                                     pane_info=self.pane_row(pane), client=self):
                     raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
                 require_open()
-                self._send_keys(pane, key)
-                if index == 0:
+                if index:
+                    self._send_keys(pane, key, before_send=require_open)
+                else:
+                    self._send_keys(pane, key)
                     script_prompts.record(pane, text)
                     require_open()
                     may_have_typed = True
@@ -3640,7 +3644,8 @@ class Herdr:
             return AnswerDidNotSubmit(str(error))
         return AnswerTransportCompleted.SENT
 
-    def _send_keys(self, pane: str, *keys: str) -> None:
+    def _send_keys(self, pane: str, *keys: str, before_send: Callable[[], None] = lambda: None) -> None:
+        before_send()
         _ = self.run("pane", "send-keys", pane, *keys)
 
     def close_pane(self, pane: str, *, target: str) -> bool:
@@ -3670,12 +3675,15 @@ class Herdr:
                 report = json_object(agent["agent_session"], "herdr agent session")
                 if json_text(report.get("kind"), "herdr agent session kind") == "id":
                     session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
-            agents.append({
+            occupant: AgentOccupant = {
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
                 "agent_session": session,
-            })
+            }
+            if isinstance(name := agent.get("name"), str) and name:
+                occupant["name"] = name
+            agents.append(occupant)
         return agents
 
 

@@ -187,6 +187,7 @@ class DispatchAgent:
         self.notices: list[str] = []
         self.notice_senders: list[send.SenderStamp] = []
         self.questions: dict[str, str | herdr_types.HerdrFailure] = {}
+        self.question_calls: dict[str, str] = {}
         self.answers: list[tuple[str, str]] = []
         self.answer_inputs: dict[str, str] = {}
         self.answer_enters: dict[str, int] = {}
@@ -254,9 +255,15 @@ class DispatchAgent:
         self.fixture.world.locations[pane]["agent_status"] = "done"
         self.after_complete(pane)
 
-    def question_record(self, pane: str, call: str, *, answered: bool = False) -> None:
-        payload = ({"type": "function_call_output", "call_id": call, "output": "{}"} if answered else
-                   {"type": "function_call", "call_id": call, "name": "request_user_input", "arguments": "{}"})
+    def question_record(self, pane: str, call: str) -> None:
+        self.question_calls[pane] = call
+        payload = {"type": "function_call", "call_id": call, "name": "request_user_input", "arguments": "{}"}
+        self.append_transcript(pane, json.dumps({"type": "response_item", "payload": payload}) + "\n")
+
+    def question_output(self, pane: str, answers: list[str]) -> None:
+        call = self.question_calls.pop(pane)
+        payload = {"type": "function_call_output", "call_id": call,
+                   "output": json.dumps({"answers": {"question": {"answers": answers}}})}
         self.append_transcript(pane, json.dumps({"type": "response_item", "payload": payload}) + "\n")
 
     def append_transcript(self, pane: str, line: str) -> None:
@@ -282,12 +289,15 @@ class DispatchAgent:
 
         _ = case.enterContext(patch.object(send, "_send", side_effect=notify))
 
-        def accept(pane: str, text: str) -> None:
+        def accept(pane: str, text: str, *, box: bool = False) -> None:
             del self.questions[pane]
             _ = self.answer_inputs.pop(pane, None)
             _ = self.answer_enters.pop(pane, None)
             self.answers.append((pane, text))
-            self.append(pane, "user", text)
+            if box and pane in self.question_calls:
+                self.question_output(pane, [f"user_note: {text.strip()}"])
+            else:
+                self.append(pane, "user", text)
             self.error = ""
             self.fixture.world.locations[pane]["agent_status"] = "working"
 
@@ -313,7 +323,7 @@ class DispatchAgent:
                 elif key == "enter":
                     self.answer_enters[pane] += 1
                     if self.answer_enters[pane] == 2:
-                        accept(pane, self.answer_inputs[pane])
+                        accept(pane, self.answer_inputs[pane], box=True)
             return result
 
         _ = case.enterContext(patch.object(self.fixture.world, "run", side_effect=command))
@@ -4242,7 +4252,6 @@ class WorkerCommandTests(unittest.TestCase):
         for index, reported in enumerate((True, False), start=1):
             with self.subTest(reported=reported):
                 if index == 2:
-                    self.agent.question_record(opened.pane, "question-1", answered=True)
                     self.agent.append(opened.pane, "assistant", "Which output format must I use?")
                 self.agent.question_record(opened.pane, f"question-{index}")
                 self.agent.questions[opened.pane] = "Which output format must I use?"
@@ -4736,7 +4745,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_answer_prompts_a_blocked_codex_worker_without_an_open_call(self) -> None:
         opened = self.answerable_worker()
         self.agent.question_record(opened.pane, "closed")
-        self.agent.question_record(opened.pane, "closed", answered=True)
+        self.agent.question_output(opened.pane, ["user_note: Use Markdown."])
         with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as box:
             self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
         box.assert_not_called()
@@ -4775,16 +4784,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_answer_allows_a_new_box_after_the_transcript_accepts_the_first_answer(self) -> None:
         opened = self.answerable_worker()
         self.agent.question_record(opened.pane, "format")
-        append = self.agent.append
-
-        def record_tool_answer(pane: str, role: str, text: str) -> None:
-            if pane == opened.pane and role == "user":
-                self.agent.question_record(pane, "format", answered=True)
-            else:
-                append(pane, role, text)
-
-        with patch.object(self.agent, "append", side_effect=record_tool_answer):
-            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
         self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
         self.assertEqual(self.command("answer", "impl", "--text", "Use Markdown.")[0], worker.ExitCode.BUSY)
         self.agent.question_record(opened.pane, "indent")
@@ -4833,7 +4833,7 @@ class WorkerCommandTests(unittest.TestCase):
         composer = world.composer
 
         def close_question(pane: str) -> herdr.ComposerInput | herdr.NoComposer:
-            self.agent.question_record(pane, "format", answered=True)
+            self.agent.question_output(pane, ["user_note: Use Markdown."])
             return composer(pane)
 
         with patch.object(world, "composer", side_effect=close_question) as target_check:
@@ -4845,6 +4845,75 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.answers, [])
         self.assertFalse(any(command[:2] in (("pane", "send-keys"), ("pane", "send-text"))
                              for command in world.commands))
+
+    def test_answer_sends_no_enter_if_the_question_closes_after_the_open_check(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "format")
+        world = self.fixture.world
+        send_keys = world._send_keys  # pyright: ignore[reportPrivateUsage]
+        closed = False
+
+        def close_before_send(pane: str, *keys: str, **checks: Callable[[], None]) -> None:
+            nonlocal closed
+            if keys == ("enter",) and not closed:
+                closed = True
+                self.agent.append_transcript(pane, '{"type":"event_msg","payload":{"type":"turn_aborted"}}\n')
+            send_keys(pane, *keys, **checks)
+
+        with patch.object(world, "_send_keys", side_effect=close_before_send):
+            code, output, error = self.command("answer", "impl", "--text", "Use JSON.")
+        self.assertTrue(closed)
+        self.assertEqual((code, output), (worker.ExitCode.UNCERTAIN, ""))
+        self.assertIn("delivery unknown: the selected Codex question is no longer open", error)
+        self.assertIn(("pane", "send-text", opened.pane, "Use JSON."), world.commands)
+        self.assertNotIn(("pane", "send-keys", opened.pane, "enter"), world.commands)
+        self.assertEqual(len(list(self.run_dir.glob(".*.pending-answer.json"))), 1)
+
+    def test_answer_reports_a_different_answer_to_the_same_call_and_clears_the_record(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "format")
+        world = self.fixture.world
+        send_keys = world._send_keys  # pyright: ignore[reportPrivateUsage]
+
+        def replace_answer(pane: str, *keys: str, **checks: Callable[[], None]) -> None:
+            if keys == ("enter",) and self.agent.answer_enters[pane] == 0:
+                self.agent.question_output(pane, ["Use JSON.", "user_note: Use Markdown."])
+            send_keys(pane, *keys, **checks)
+
+        with patch.object(world, "_send_keys", side_effect=replace_answer):
+            code, output, error = self.command("answer", "impl", "--text", "Use JSON.")
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("answered by another", error)
+        self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+        self.assertNotIn(("pane", "send-keys", opened.pane, "enter"), world.commands)
+        _ = self.agent.answer_inputs.pop(opened.pane)
+        self.agent.question_record(opened.pane, "indent")
+        self.assertEqual(self.command("answer", "impl", "--text", "Use two spaces."), (0, "done\n", ""))
+
+    def test_answer_checks_a_late_call_output_before_sending_again(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "format")
+        world = self.fixture.world
+        send_keys = world._send_keys  # pyright: ignore[reportPrivateUsage]
+
+        def omit_enter(pane: str, *keys: str, **checks: Callable[[], None]) -> None:
+            if keys != ("enter",):
+                send_keys(pane, *keys, **checks)
+
+        answer = ("answer", "impl", "--text", "Use JSON.")
+        with patch.object(world, "_send_keys", side_effect=omit_enter):
+            self.assertEqual(self.command(*answer)[0], worker.ExitCode.UNCERTAIN)
+        self.agent.append(opened.pane, "user", "Use JSON.")
+        self.assertEqual(self.command(*answer)[0], worker.ExitCode.BUSY)
+        self.agent.question_output(opened.pane, ["user_note: Use Markdown."])
+        with (patch.object(world, "answer_question", wraps=world.answer_question) as box,
+              patch.object(world, "answer_prompt", wraps=world.answer_prompt) as prompt):
+            code, output, error = self.command(*answer)
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("answered by another", error)
+        self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+        box.assert_not_called()
+        prompt.assert_not_called()
 
     def test_answer_uses_a_prompt_after_the_transcript_ends_turns_with_open_calls(self) -> None:
         opened = self.answerable_worker()
