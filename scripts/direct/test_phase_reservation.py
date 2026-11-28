@@ -1273,12 +1273,43 @@ import json, os, sys
 with open(os.environ["REPAIR_BERTH_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
 if sys.argv[1] == "check":
+    if "--reservation" in sys.argv:
+        reservation = sys.argv[sys.argv.index("--reservation") + 1]
+        assert reservation == "r2"
+        session = os.environ["CARGO_BERTH_SESSION_ID"]
+        mapping_path = os.environ["REPAIR_SESSION_MAP"]
+        mapping = json.load(open(mapping_path))
+        if "REPAIR_SKIP_MAPPING" not in os.environ:
+            mapping["identities"][session] = {"reservation_id": reservation, "coordination_run_id": "c1"}
+            with open(mapping_path + ".tmp", "w") as mapping_file:
+                json.dump(mapping, mapping_file)
+            os.replace(mapping_path + ".tmp", mapping_path)
+        publication = {"status": "published"}
+        message = ""
+        if "REPAIR_MAPPING_SYNC_FAILURE" in os.environ:
+            message = "The harness session mapping could not be published: fixture mapping sync failure."
+            publication = {"status": "unavailable", "diagnostic": "fixture mapping sync failure"}
+        print(json.dumps({"status": "clear", "message": message, "payload": {"data": {"acquisition": {
+            "kind": "already_held", "reservation_id": reservation, "coordination_run_id": "c1",
+            "phase_start_head": os.environ["REPAIR_TARGET_HEAD"],
+            "session_mapping_publication": publication}}}}))
+        sys.exit(0)
     print(json.dumps({"status": "clear", "payload": {"data": {"acquisition": {
         "reservation_id": "r2", "coordination_run_id": "c2",
         "phase_start_head": os.environ["REPAIR_CLAIM_HEAD"]}}}}))
     sys.exit(0)
+if sys.argv[1:] == ["board", "--json"]:
+    print(open(os.environ["REPAIR_BOARD"]).read())
+    sys.exit(0)
 assert sys.argv[1:3] == ["board", "--reservation"]
 statuses = json.load(open(os.environ["REPAIR_BOARD"]))
+if statuses.get("status") == "board_ready":
+    rows = statuses["payload"]["data"]["targets"][0]["reservations"]
+    row = next(row for row in rows if row["reservation_id"] == sys.argv[3])
+    print(json.dumps({"payload": {"data": {"reservation_id": row["reservation_id"],
+        "lifecycle": {"status": row["lifecycle"]["stage"]},
+        "race_extent": {"status": "editing", "scopes": row["scopes"]}}}}))
+    sys.exit(0)
 print(json.dumps({"payload": {"data": {"lifecycle": {"status": statuses.get(sys.argv[3], "released")}}}}))
 '''
 REPAIR_BOARD_POST = r'''#!__PYTHON__
@@ -1380,6 +1411,16 @@ class PhaseRepairTests(unittest.TestCase):
     def repair(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return self.run_verb("repair", *arguments)
 
+    def named_repair_in_process(self) -> subprocess.CompletedProcess[str]:
+        arguments = ["repair", "--session-dir", str(self.session), "--phase", "34h",
+                     "--repo", str(self.repo), "--to", "r2"]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            status = phase_reservation.main(arguments)
+        return subprocess.CompletedProcess(arguments, status, stdout.getvalue(), stderr.getvalue())
+
     def run_verb(self, verb: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, phase_reservation.__file__, verb, "--session-dir",
                                str(self.session), "--phase", "34h", "--repo", str(self.repo), *arguments],
@@ -1406,6 +1447,278 @@ class PhaseRepairTests(unittest.TestCase):
     def record_files(self) -> list[str]:
         """The phase directory's files apart from the phase lock, which any state read may create."""
         return sorted(path.name for path in self.directory.iterdir() if path.name != phase_reservation.BASELINE_FILE + ".lock")
+
+    def named_repair_board(self, *, status: str = "active", run: str = "c1",
+                           holder: Path | None = None, target_head: str = "a" * 40) -> None:
+        # The partial launcher tree imports this module without the board test helpers.
+        from scripts.lib.test_berth_board import envelope as board_envelope, snapshot as board_snapshot
+
+        _ = phase_reservation.enroll(self.directory, "34h", "board_ready")
+        self.assertTrue(phase_reservation.record_active(
+            self.directory, phase_reservation.Acquisition("r1", "c1", "a" * 40)))
+        _ = (self.directory / phase_reservation.FILES_FILE).write_text("./new.rs\nmodule/\nmodule/nested/file.rs\n")
+        self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
+        self.environment["REPAIR_SESSION_MAP"] = str(ledger / phase_reservation.SESSION_MAP_FILE)
+        self.environment["REPAIR_TARGET_HEAD"] = target_head
+        envelope = board_envelope(populated=False)
+        envelope["status"] = "board_ready"
+        data = cast(dict[str, object], cast(dict[str, object], envelope["payload"])["data"])
+        rows: list[dict[str, object]] = []
+        for reservation, lifecycle, root in (("r1", "active", self.repo), ("r2", status, holder or self.repo)):
+            row = board_snapshot(reservation, lifecycle={"stage": lifecycle})
+            cast(dict[str, object], row["holder"])["worktree_root"] = str(root)
+            row["scopes"] = ([{"kind": "file", "path": "old.rs"}] if reservation == "r1" else
+                             [{"kind": "file", "path": "new.rs"}, {"kind": "tree", "path": "module"}])
+            rows.append(row)
+        data["targets"] = [{"reservations": rows}]
+        _ = (self.root / "board.json").write_text(json.dumps(envelope))
+        journal = ledger / phase_reservation.JOURNAL_FILE
+        _ = journal.write_text("".join(json.dumps({"op": "claim", "reservation_id": reservation,
+                                                  "actor": {"run": owner}}) + "\n"
+                                       for reservation, owner in (("r1", "c1"), ("r2", run))))
+
+    def assert_named_repair_refused(self, reason: str, *, target: str = "r2",
+                                   arguments: tuple[str, ...] = ()) -> None:
+        before = self.record_bytes()
+        result = self.repair("--to", target, *arguments)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn(reason, result.stderr)
+        self.assertEqual(self.record_bytes(), before)
+        self.assertFalse((self.root / "posts.log").exists())
+
+    def test_repair_to_switches_to_an_active_reservation_and_keeps_the_old_row(self) -> None:
+        self.named_repair_board()
+        board = self.root / "board.json"
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
+        before = {path: path.read_bytes() for path in
+                  (board, ledger / phase_reservation.JOURNAL_FILE)}
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = self.state()
+        entry = state.pop(phase_reservation.SWITCH_LOG_ENTRY)
+        self.assertEqual(state, {"kind": "active", "active_phase_reservation": {
+            "reservation_id": "r2", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40,
+            "scopes": [{"kind": "file", "path": "new.rs"}, {"kind": "tree", "path": "module"}]}})
+        lines = (self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines()
+        self.assertEqual(lines, [entry])
+        self.assertIn("old_reservation_id=r1", lines[0])
+        self.assertIn("new_reservation_id=r2", lines[0])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertFalse((self.root / "posts.log").exists())
+        self.assertEqual(self.repair("--to", "r2").returncode, 0)
+        self.assertEqual((self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines(), lines)
+
+    def test_repair_to_makes_no_release_call(self) -> None:
+        self.named_repair_board()
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [cast(list[str], json.loads(line)) for line in
+                 (self.root / "berth.log").read_text().splitlines()]
+        self.assertEqual(calls, [
+            ["board", "--json"], ["board", "--reservation", "r2", "--json"],
+            ["check", "--reservation", "r2", "--path", "file:new.rs", "--json"]])
+
+    def test_repair_to_records_the_targets_start_commit_and_scopes(self) -> None:
+        self.named_repair_board(target_head="b" * 40)
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        active = cast(dict[str, object], self.state()["active_phase_reservation"])
+        self.assertEqual(active["phase_start_head"], "b" * 40)
+        self.assertEqual(active["scopes"], [{"kind": "file", "path": "new.rs"},
+                                            {"kind": "tree", "path": "module"}])
+
+    def test_repair_to_republishes_the_mapping_used_by_the_edit_hook(self) -> None:
+        self.named_repair_board()
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        before = self.state()
+        with mock.patch.dict(os.environ, self.environment):
+            phases = phase_reservation.open_phases(self.session)
+            answer = phase_reservation.check_phase_edit(self.repo, ["new.rs"], DIRECTOR_SESSION, phases[0], phases)
+        self.assertEqual(answer.status, phase_reservation.CLEAR)
+        self.assertEqual(answer.acquisition.reservation_id if answer.acquisition else "", "r2")
+        self.assertEqual(self.state(), before)
+
+    def test_repair_to_refuses_when_the_mapping_does_not_name_the_target(self) -> None:
+        self.named_repair_board()
+        self.environment["REPAIR_SKIP_MAPPING"] = "1"
+        self.assert_named_repair_refused("could not map the phase session")
+        self.environment["REPAIR_MAPPING_SYNC_FAILURE"] = "1"
+        self.assert_named_repair_refused("could not map the phase session")
+
+    def test_repair_to_reports_a_visible_record_after_directory_sync_fails(self) -> None:
+        self.named_repair_board()
+        with mock.patch.object(atomic_file, "sync_folder", side_effect=OSError("fixture sync failure")):
+            failure = self.named_repair_in_process()
+        self.assertEqual(failure.returncode, 1)
+        self.assertIn("record names r2", failure.stderr)
+        self.assertIn("directory sync failed", failure.stderr)
+        self.assertIn("fixture sync failure", failure.stderr)
+        self.assertEqual(cast(dict[str, object], self.state()["active_phase_reservation"])["reservation_id"], "r2")
+        log = self.directory / phase_reservation.REPAIRS_FILE
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
+    def test_repair_to_refuses_the_first_uncovered_phase_path(self) -> None:
+        self.named_repair_board()
+        session = DIRECTOR_SESSION + ".phase-34h"
+        for path in ("unreserved.rs", "modules/file.rs", "new.rs/"):
+            with self.subTest(path=path):
+                _ = (self.directory / phase_reservation.FILES_FILE).write_text(
+                    f"new.rs\nmodule/\n{path}\nother.rs\n")
+                self.assert_named_repair_refused(f"reservation r2 does not cover {path!r}")
+                self.assertEqual(phase_reservation.session_reservation(self.repo, session), ("r1", "c1"))
+
+    def test_repair_to_reports_a_mapped_target_after_replace_fails(self) -> None:
+        self.named_repair_board()
+        record = self.directory / phase_reservation.STATE_FILE
+        before = record.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("fixture replace failure")):
+            failure = self.named_repair_in_process()
+        self.assertEqual(record.read_bytes(), before)
+        session = DIRECTOR_SESSION + ".phase-34h"
+        self.assertEqual(phase_reservation.session_reservation(self.repo, session), ("r2", "c1"))
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("session maps to r2", failure.stderr)
+        self.assertIn("record still names r1", failure.stderr)
+        self.assertIn("fixture replace failure", failure.stderr)
+        command = phase_reservation.repair_command(self.session, "34h", self.repo)
+        self.assertEqual(failure.stderr.splitlines()[-1], command + " --to r2")
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(cast(dict[str, object], self.state()["active_phase_reservation"])["reservation_id"], "r2")
+
+    def test_repair_to_logs_one_switch_after_a_failed_replace(self) -> None:
+        self.named_repair_board()
+        log = self.directory / phase_reservation.REPAIRS_FILE
+        with mock.patch.object(os, "replace", side_effect=OSError("fixture replace failure")):
+            failure = self.named_repair_in_process()
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertFalse(log.exists())
+        for _attempt in range(2):
+            result = self.repair("--to", "r2")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = log.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("old_reservation_id=r1 new_reservation_id=r2", lines[0])
+
+    def test_repair_to_reports_a_visible_mapping_after_mapping_sync_fails(self) -> None:
+        self.named_repair_board()
+        before = self.record_bytes()
+        self.environment["REPAIR_MAPPING_SYNC_FAILURE"] = "1"
+        failure = self.repair("--to", "r2")
+        self.assertEqual(failure.returncode, 1, failure.stdout + failure.stderr)
+        self.assertEqual(self.record_bytes(), before)
+        session = DIRECTOR_SESSION + ".phase-34h"
+        self.assertEqual(phase_reservation.session_reservation(self.repo, session), ("r2", "c1"))
+        self.assertIn("session maps to r2", failure.stderr)
+        self.assertIn("record still names r1", failure.stderr)
+        self.assertIn("fixture mapping sync failure", failure.stderr)
+        command = phase_reservation.repair_command(self.session, "34h", self.repo)
+        self.assertEqual(failure.stderr.splitlines()[-1], command + " --to r2")
+        del self.environment["REPAIR_MAPPING_SYNC_FAILURE"]
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(cast(dict[str, object], self.state()["active_phase_reservation"])["reservation_id"], "r2")
+
+    def test_repair_to_reports_a_visible_mapping_without_berth_confirmation(self) -> None:
+        self.named_repair_board()
+        before = self.record_bytes()
+        session = DIRECTOR_SESSION + ".phase-34h"
+        retry = phase_reservation.repair_command(self.session, "34h", self.repo) + " --to r2"
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        for reply, detail in (("timeout", "cargo-berth check did not answer"),
+                              ("", "cargo-berth printed no JSON envelope"),
+                              ('{"status":"blocked","message":"fixture blocked check"}', "fixture blocked check")):
+            with self.subTest(reply=reply):
+                self.map_sessions({session: "r1"})
+
+                def discard_check_confirmation(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    result = run(command, **options)
+                    if command[:2] != ["cargo-berth", "check"]:
+                        return result
+                    if reply == "timeout":
+                        raise subprocess.TimeoutExpired(command, phase_reservation.CHECK_TIMEOUT_SECONDS)
+                    return subprocess.CompletedProcess(command, 1, reply, "")
+
+                with mock.patch.object(subprocess, "run", side_effect=discard_check_confirmation):
+                    failure = self.named_repair_in_process()
+                self.assertEqual(self.record_bytes(), before)
+                self.assertEqual(phase_reservation.session_reservation(self.repo, session), ("r2", "c1"))
+                self.assertEqual(failure.returncode, 1, failure.stderr)
+                self.assertIn("session maps to r2", failure.stderr)
+                self.assertIn("record still names r1", failure.stderr)
+                self.assertIn(detail, failure.stderr)
+                self.assertEqual(failure.stderr.splitlines()[-1], retry)
+
+        result = self.repair("--to", "r2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(cast(dict[str, object], self.state()["active_phase_reservation"])["reservation_id"], "r2")
+
+    def test_repair_to_refuses_a_missing_or_empty_phase_files_list(self) -> None:
+        self.named_repair_board()
+        files = self.directory / phase_reservation.FILES_FILE
+        files.unlink()
+        session = DIRECTOR_SESSION + ".phase-34h"
+        self.assert_named_repair_refused("phase 34h has no paths in its files list")
+        self.assertEqual(phase_reservation.session_reservation(self.repo, session), ("r1", "c1"))
+        _ = files.write_text("\n  \n")
+        self.assert_named_repair_refused("phase 34h has no paths in its files list")
+        self.assertEqual(phase_reservation.session_reservation(self.repo, session), ("r1", "c1"))
+
+    def test_repair_to_retries_a_failed_log_write_without_duplicates(self) -> None:
+        self.named_repair_board()
+        log = self.directory / phase_reservation.REPAIRS_FILE
+        log.mkdir()
+        failure = self.repair("--to", "r2")
+        self.assertEqual(failure.returncode, 1, failure.stdout + failure.stderr)
+        self.assertIn("record names r2", failure.stderr)
+        self.assertEqual(cast(dict[str, object], self.state()["active_phase_reservation"])["reservation_id"], "r2")
+        log.rmdir()
+        for _attempt in range(2):
+            result = self.repair("--to", "r2")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = log.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("old_reservation_id=r1 new_reservation_id=r2", lines[0])
+
+    def test_repair_to_refuses_an_inactive_or_absent_reservation(self) -> None:
+        self.named_repair_board(status="outstanding")
+        self.assert_named_repair_refused("reservation 'r2' is not active")
+        self.assert_named_repair_refused("reservation 'r3' is not active", target="r3")
+
+    def test_repair_to_refuses_a_reservation_for_another_run(self) -> None:
+        self.named_repair_board(run="c2")
+        self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r2"})
+        self.assert_named_repair_refused("r2 belongs to another coordination run")
+
+    def test_repair_to_refuses_a_reservation_for_another_worktree(self) -> None:
+        other = make_fixture_worktree(self.main, "reservation", "p2")
+        self.named_repair_board(holder=other)
+        self.assert_named_repair_refused("r2 belongs to another worktree")
+        self.assert_named_repair_refused("--repo does not name the phase worktree", arguments=("--repo", str(other)))
+
+    def test_repair_to_refuses_unreadable_board_facts(self) -> None:
+        self.named_repair_board()
+        _ = (self.root / "board.json").write_text("not JSON")
+        self.assert_named_repair_refused("reservation board is unreadable")
+
+    def test_repair_to_refuses_when_the_board_cannot_prove_the_run(self) -> None:
+        self.named_repair_board()
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
+        (ledger / "journal.ndjson").unlink()
+        self.assert_named_repair_refused("reservation board is unreadable")
+
+    def test_repair_to_preserves_pending_release(self) -> None:
+        self.named_repair_board()
+        phase_reservation.committed(self.directory, "b" * 40)
+        self.assert_named_repair_refused("checkpoint release confirmation is pending")
 
     def test_a_lost_record_is_restored_from_the_live_phase_mapping_and_logged(self) -> None:
         source = DIRECTOR_SESSION + ".phase-34h"
