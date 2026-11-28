@@ -281,6 +281,40 @@ class MacRouteTests(unittest.TestCase):
                 self.assertEqual(routes.holds("/fixture/second"), "busy with live check")
             self.assertEqual(path.read_bytes(), original)
 
+    def test_retired_mac_claim_leaves_no_kept_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = claim_state.StatePaths(Path(directory))
+            saved = claim_state.CleanupOnlyMacRepository("hana-key", "hana", "hana.json", "hana",
+                                                         fence_generation="a" * 32)
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "kept", "episode": "e", "attempt": "a", "submitting_session": "s",
+                "pid": 4243, "proc_start": "old-start", "what": "dead check", "worktree": "/fixture",
+                "since": SINCE.isoformat(), "remote_host": "fixture-mac",
+                "mac_repository": saved.record(), "repo_name": saved.mirror_name, "repo_key": saved.key,
+                "mac_watch_origin": {"machine_id": "11111111-2222-3333-4444-555555555555",
+                                     "mirror_root": ".local/state/mac-test/mirror"}}
+            path = paths.claims / saved.claim_file
+            path.parent.mkdir()
+            _ = path.write_text(json.dumps(record) + "\n")
+            pending = claim_state.claim_pending_start(paths, path, record)
+            pending.parent.mkdir(parents=True)
+            pending.touch()
+            with (mock.patch.object(mac_test, "state_paths", return_value=paths),
+                  mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.NoFailedProbe()),
+                  mock.patch.object(eligibility, "read_backoff", return_value=eligibility.NO_BACKOFF)):
+                before = targets.ssh_target_snapshot(MAC)
+                self.assertEqual(before.states, (targets.Free((targets.KeptClaim("dead check", "hana", SINCE),)),))
+                identity = claim_state.claim_identity(record)
+                owner = claim_state.ClaimProcessOwner(4243, "old-start")
+                self.assertTrue(claim_state.save_lost_mac_fence(paths, identity, owner))
+                self.assertEqual(targets.ssh_target_snapshot(MAC), before)
+                self.assertTrue(claim_state.retire_lost_mac_claim(paths, identity, owner))
+                after = targets.ssh_target_snapshot(MAC)
+            self.assertEqual(after.states, (targets.Free(),))
+            self.assertEqual(after.claims, ())
+            self.assertEqual(len(claim_state.read_lost_mac_fences(paths)), 1)
+
     def test_target_status_omits_kept_work_without_removing_the_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = claim_state.StatePaths(Path(directory))

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 from pathlib import Path
 import time
 from typing import Literal, NewType, cast
@@ -212,6 +213,46 @@ def server_alive_options(unreachable_wait_s: int) -> tuple[str, ...]:
     """The SSH keepalive options: a session with no answer ends after the unreachable wait, on each route."""
     count = math.ceil(unreachable_wait_s / SERVER_ALIVE_INTERVAL_SECONDS)
     return ("-o", f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}", "-o", f"ServerAliveCountMax={count}")
+
+
+@dataclass(frozen=True)
+class MacOutageWindow:
+    """The first missed answer and the local deadline for the same outage."""
+
+    outage_since: float
+    deadline: float
+
+
+def mac_outage_window(seconds: int, at: float, now: float, *, keepalive_expired: bool = False) -> MacOutageWindow:
+    """Use the unanswered SSH keepalives as elapsed time in the outage wait."""
+    elapsed = (math.ceil(seconds / SERVER_ALIVE_INTERVAL_SECONDS) * SERVER_ALIVE_INTERVAL_SECONDS
+               if keepalive_expired else 0)
+    return MacOutageWindow(at - elapsed, now + seconds - elapsed)
+
+
+def ssh_keepalive_expired(line: str) -> bool:
+    return re.fullmatch(r"Timeout, server .+ not responding[.]?", line) is not None
+
+
+def ssh_local_error(line: str) -> bool:
+    """Recognize SSH errors that do not prove a missed answer."""
+    return re.search(
+        r"(?:^|: )(?:[Bb]ad configuration option|[Bb]ad owner or permissions|"
+        + r"[Cc]an't open user config file|[Cc]ould not resolve hostname|[Pp]ermission denied)\b"
+        + r"|^Host key verification failed\.", line) is not None
+
+
+def ssh_transport_failed(line: str) -> bool:
+    """Recognize transport diagnostics from the SSH client."""
+    return ssh_keepalive_expired(line) or re.fullmatch(
+        r"(?:ssh: connect to host \S+ port [0-9]+: |"
+        + r"(?:client_loop: send disconnect|kex_exchange_identification(?:: (?:read|write))?|"
+        + r"banner exchange: Connection to \S+ port [0-9]+): )"
+        + r"(?:Connection (?:closed by remote host|reset by peer|timed out|refused)|"
+        + r"Broken pipe|Operation timed out|No route to host|Network is unreachable)"
+        + r"|Connection (?:to \S+ closed by remote host|closed by (?:remote host|\S+ port [0-9]+)|"
+        + r"reset by \S+ port [0-9]+|timed out during banner exchange)\.?"
+        + r"|Read from remote host \S+: Connection reset by peer", line) is not None
 
 
 def config_path() -> Path:

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from contextlib import chdir, contextmanager, redirect_stdout, redirect_stderr
 from collections.abc import Callable, Generator, Mapping
 import io
 import json
@@ -928,7 +928,7 @@ finally:
         self.assertEqual(arguments[:5], ["--user", "--collect", "--quiet", "--no-block", "--unit"])
         self.assertTrue(arguments[5].startswith("mac-test-claim-watch-"))
         self.assertEqual(arguments[-3:], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT.resolve()), "watch-claim"])
-        self.assertIn(f"MAC_TEST_STATE_DIR={self.state_directory}", arguments)
+        self.assertIn(f"--setenv=MAC_TEST_STATE_DIR={self.state_directory}", arguments)
         self.assertIn(f"MAC_TEST_CONFIG={self.config_path}", arguments)
 
     def test_claim_records_worker_owning_session_and_omits_unknown_holder(self) -> None:
@@ -3256,6 +3256,210 @@ fi
         else:
             send.assert_not_called()
 
+    def test_retired_lost_claim_keeps_its_fence_until_the_mac_answers(self) -> None:
+        from scripts.mac_test import eligibility, offload
+
+        path, remote = self.saved_mirror_claim()
+        claim, = claim_state.read_claims(self.paths)
+        identity = claim_state.claim_identity(claim.record)
+        pending = claim_state.claim_pending_start(self.paths, path, claim.record)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        owner = claim_state.ClaimProcessOwner(os.getpid(), "owner-start")
+        self.assertFalse(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+        self.assertTrue(claim_state.save_lost_mac_fence(self.paths, identity, owner))
+        self.assertTrue(path.exists())
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+            self.assertTrue(mac_test.run_is_kept(claim.record))
+            self.assertTrue(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+        self.assertFalse(path.exists())
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+        saved, = claim_state.read_lost_mac_fences(self.paths)
+        self.assertEqual(saved.record, claim.record)
+        self.assertTrue(pending.exists())
+        with mock.patch.object(mac_test, "start_claim_watcher"):
+            self.assertEqual(mac_test.free_now(self.paths, eligibility.DEFAULT_MAC_SETTINGS,
+                                              self.root, mac_scope=claim.scope), "busy")
+
+        ended = offload.LeftoversEnded()
+        answer = f"dispatch_mac_id={self.machine_id}\nleftovers=0\nrc=0\n"
+        answer += f"dispatch_start_settled={claim_state.pending_start_key(identity)}\n"
+        with (mock.patch.object(offload, "mac_cleanup_lease"),
+              mock.patch.object(offload, "read_leftovers", side_effect=(
+                  offload.LeftoverObservation(offload.LeftoverCheckFailed("fixture unreachable"), ""),
+                  offload.LeftoverObservation(ended, answer))) as observe,
+              mock.patch.object(eligibility, "read_connection_settings")):
+            self.assertTrue(mac_test.watch_lost_mac_fences(self.paths, (saved,)))
+            self.assertTrue(saved.path.exists())
+            self.assertTrue(pending.exists())
+            self.assertFalse(mac_test.watch_lost_mac_fences(self.paths, (saved,)))
+        self.assertEqual(observe.call_count, 2)
+        relative = str(remote.relative_to(self.root).with_suffix(""))
+        self.assertIn(relative.encode().hex(), cast(str, observe.call_args.args[2]))
+        self.assertEqual(claim_state.read_lost_mac_fences(self.paths), ())
+        self.assertFalse(pending.exists())
+
+    def interrupt_retirement(self) -> tuple[claim_state.HeldClaim, claim_state.HeldClaim]:
+        path, _ = self.saved_mirror_claim()
+        claim, = claim_state.read_claims(self.paths)
+        pending = claim_state.claim_pending_start(self.paths, path, claim.record)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        owner = claim_state.ClaimProcessOwner(os.getpid(), "owner-start")
+        identity = claim_state.claim_identity(claim.record)
+        self.assertTrue(claim_state.save_lost_mac_fence(self.paths, identity, owner))
+        unlink = Path.unlink
+
+        def interrupt(original: Path, *, missing_ok: bool = False) -> None:
+            if original == path:
+                raise OSError("fixture owner exited before unlink")
+            unlink(original, missing_ok=missing_ok)
+
+        with (mock.patch.object(Path, "unlink", autospec=True, side_effect=interrupt),
+              self.assertRaisesRegex(OSError, "fixture owner exited before unlink")):
+            _ = claim_state.retire_lost_mac_claim(self.paths, identity, owner)
+        saved, = claim_state.read_lost_mac_fences(self.paths)
+        return claim, saved
+
+    def test_next_claim_lock_completes_an_interrupted_retirement(self) -> None:
+        claim, saved = self.interrupt_retirement()
+        path = claim.path
+        pending = claim_state.claim_pending_start(self.paths, path, claim.record)
+        self.try_interrupted_claim(claim)
+        self.assertTrue(path.exists())
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+            self.try_interrupted_claim(claim)
+        self.assertFalse(path.exists())
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+        self.assertEqual(claim_state.read_lost_mac_fences(self.paths), (saved,))
+        self.assertTrue(pending.exists())
+
+    def try_interrupted_claim(self, claim: claim_state.HeldClaim) -> None:
+        args = mac_test.CliArguments()
+        args.pid, args.worktree = os.getpid(), str(self.root)
+        with mock.patch.object(mac_test, "start_claim_watcher"), claim_state.locked(self.paths.lock):
+            self.assertIsInstance(mac_test.claim_once(args, self.paths, claim.scope,
+                session=claim_state.submitting_session(claim_state.CALLING_SESSION)), mac_test.ClaimBusy)
+
+    def test_retirement_recovery_keeps_updated_transfers(self) -> None:
+        claim, saved = self.interrupt_retirement()
+        transfers = [{"operation": "ssh_cleanup", "sent_bytes": 20, "received_bytes": 5, "complete": True}]
+        with claim_state.locked(self.paths.lock):
+            mac_test.write_json(claim.path, {**claim.record, "transfers": transfers})
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+            self.try_interrupted_claim(claim)
+        recovered, = claim_state.read_lost_mac_fences(self.paths)
+        self.assertEqual(recovered.path, saved.path)
+        self.assertEqual(recovered.record.get("transfers"), transfers)
+        self.assertFalse(claim.path.exists())
+
+    def test_floor_query_leaves_interrupted_retirement_for_a_writer(self) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import floor_claims
+
+        claim, saved = self.interrupt_retirement()
+        output = io.StringIO()
+        with (mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(mac_test, "state_paths", return_value=self.paths),
+              mock.patch.object(copies, "held_remote_mirrors", return_value=()), redirect_stdout(output)):
+            self.assertEqual(floor_claims.serve(), 0)
+        self.assertEqual(cast(object, json.loads(output.getvalue())), {"repositories": ["hana"], "mirrors": []})
+        self.assertEqual(claim_state.read_claims(self.paths), (claim,))
+        self.assertEqual(claim_state.read_lost_mac_fences(self.paths), (saved,))
+        with (mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(mac_test, "print_switch_without_block"), redirect_stdout(io.StringIO())):
+            self.assertEqual(mac_test.command_status(self.paths, mac_test.read_config()), 0)
+        self.assertEqual(claim_state.read_claims(self.paths), (claim,))
+        self.assertEqual(claim_state.read_lost_mac_fences(self.paths), (saved,))
+
+    def test_saved_fence_starts_the_watcher_when_it_blocks_admission(self) -> None:
+        from scripts.mac_test import eligibility
+
+        path, _ = self.saved_mirror_claim()
+        claim, = claim_state.read_claims(self.paths)
+        pending = claim_state.claim_pending_start(self.paths, path, claim.record)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        owner = claim_state.ClaimProcessOwner(os.getpid(), "owner-start")
+        identity = claim_state.claim_identity(claim.record)
+        self.assertTrue(claim_state.save_lost_mac_fence(self.paths, identity, owner))
+        self.assertTrue(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+
+        args = mac_test.CliArguments()
+        args.pid, args.worktree = os.getpid(), str(self.root)
+        saved = claim_state.saved_mac_repository(claim.record)
+        assert isinstance(saved, claim_state.MacMirrorIdentity)
+        with mock.patch.object(mac_test, "start_claim_watcher") as start:
+            self.assertEqual(mac_test.free_now(self.paths, eligibility.DEFAULT_MAC_SETTINGS,
+                                              self.root, mac_scope=claim.scope), "busy")
+            start.assert_not_called()
+            self.assertEqual(mac_test.free_now(self.paths, eligibility.DEFAULT_MAC_SETTINGS, self.root,
+                                              mac_scope=claim.scope, recover_mac_backoff=True), "busy")
+            with claim_state.locked(self.paths.lock):
+                result = mac_test.claim_once(args, self.paths, claim.scope,
+                                             session=claim_state.submitting_session(claim_state.CALLING_SESSION),
+                                             mac_repository=saved)
+            self.assertEqual(result, mac_test.ClaimBusy(claim.record))
+        self.assertEqual(start.call_args_list, [mock.call(self.paths), mock.call(self.paths)])
+
+    def test_floor_reader_protects_a_retired_mirror_until_reconciliation(self) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import eligibility, floor_claims, offload
+
+        path, _ = self.saved_mirror_claim()
+        claim, = claim_state.read_claims(self.paths)
+        identity = claim_state.claim_identity(claim.record)
+        pending = claim_state.claim_pending_start(self.paths, path, claim.record)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        owner = claim_state.ClaimProcessOwner(os.getpid(), "owner-start")
+        self.assertTrue(claim_state.save_lost_mac_fence(self.paths, identity, owner))
+        self.assertTrue(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+
+        def fences_under_lock(paths: claim_state.StatePaths) -> tuple[claim_state.HeldClaim, ...]:
+            with self.assertRaises(BlockingIOError):
+                with claim_state.locked(paths.lock, wait=False):
+                    self.fail("The floor reader released the claim lock before reading fences")
+            return claim_state.read_lost_mac_fences(paths)
+
+        def reply() -> object:
+            output = io.StringIO()
+            with (mock.patch.object(mac_test, "state_paths", return_value=self.paths),
+                  mock.patch.object(mac_test, "read_lost_mac_fences", side_effect=fences_under_lock),
+                  mock.patch.object(copies, "held_remote_mirrors", return_value=()), redirect_stdout(output)):
+                self.assertEqual(floor_claims.serve(), 0)
+            return cast(object, json.loads(output.getvalue()))
+
+        self.assertEqual(reply(), {"repositories": ["hana"], "mirrors": []})
+        observed = (f"dispatch_mac_id={self.machine_id}\nleftovers=0\nrc=0\n"
+                    + f"dispatch_start_settled={claim_state.pending_start_key(identity)}\n")
+        with (mock.patch.object(offload, "mac_cleanup_lease"),
+              mock.patch.object(eligibility, "read_connection_settings"),
+              mock.patch.object(offload, "read_leftovers",
+                                return_value=offload.LeftoverObservation(offload.LeftoversEnded(), observed))):
+            self.assertFalse(mac_test.claim_watch_pass(self.paths, mac_test.read_config()))
+        self.assertEqual(reply(), {"repositories": [], "mirrors": []})
+
+    def test_lost_report_cannot_retire_a_claim_with_a_new_owner(self) -> None:
+        path, _ = self.saved_mirror_claim()
+        claim, = claim_state.read_claims(self.paths)
+        pending = claim_state.claim_pending_start(self.paths, path, claim.record)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        owner = claim_state.ClaimProcessOwner(os.getpid(), "owner-start")
+        identity = claim_state.claim_identity(claim.record)
+        self.assertTrue(claim_state.save_lost_mac_fence(self.paths, identity, owner))
+        saved, = claim_state.read_lost_mac_fences(self.paths)
+        assert "remote_host" in claim.record
+        replacement = claim_state.HeldClaim(claim.scope, path, {**claim.record, "proc_start": "new-start"})
+        mac_test.write_json(path, replacement.record)
+        self.assertFalse(claim_state.save_lost_mac_fence(self.paths, identity, owner))
+        self.assertFalse(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+        self.assertEqual(claim_state.read_claims(self.paths), (replacement,))
+        self.assertEqual(claim_state.read_lost_mac_fences(self.paths), (saved,))
+        self.assertTrue(pending.exists())
+
     def test_kept_mirror_claim_releases_while_another_repository_runs(self) -> None:
         path, fence = self.saved_mirror_claim()
         fence.parent.mkdir(parents=True)
@@ -4193,6 +4397,55 @@ fi
                 mac_test.start_claim_watcher(self.paths)
             run.assert_not_called()
             fcntl.flock(claim_lock.fileno(), fcntl.LOCK_UN)
+
+    def test_claim_watcher_forwards_configured_guest_state_root(self) -> None:
+        state_root = self.root / "target state"
+        with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(state_root)}),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
+            mac_test.start_claim_watcher(self.paths)
+        run.assert_called_once()
+        arguments = cast(list[str], run.call_args.args[0])
+        self.assertIn(f"--setenv=BUILD_TARGETS_STATE_DIR={state_root}", arguments)
+        self.assertEqual(arguments[-1], "watch-claim")
+
+    def test_both_watchers_pass_the_absolute_mac_state_directory(self) -> None:
+        cwd = self.root.resolve()
+        relative = self.paths.directory.name
+        for start in (mac_test.start_watcher, mac_test.start_claim_watcher):
+            with (self.subTest(watcher=start.__name__), chdir(cwd),
+                  mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": relative}),
+                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
+                start(self.paths)
+                run.assert_called_once()
+                arguments = cast(list[str], run.call_args.args[0])
+                delimiter = arguments.index("--")
+                self.assertIn(f"--setenv=MAC_TEST_STATE_DIR={cwd / relative}", arguments[:delimiter])
+                self.assertFalse(any(word.startswith("MAC_TEST_STATE_DIR=") for word in arguments[delimiter:]))
+
+    def test_claim_watcher_passes_a_literal_guest_state_root_through_setenv(self) -> None:
+        root = self.root / "target-${STATE_SUFFIX}"
+        with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root), "STATE_SUFFIX": "expanded"}),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
+            mac_test.start_claim_watcher(self.paths)
+        run.assert_called_once()
+        arguments = cast(list[str], run.call_args.args[0])
+        delimiter = arguments.index("--")
+        self.assertIn(f"--setenv=BUILD_TARGETS_STATE_DIR={root}", arguments[:delimiter])
+        self.assertFalse(any(word.startswith("BUILD_TARGETS_STATE_DIR=") for word in arguments[delimiter:]))
+
+    def test_watchers_leave_unset_state_root_overrides_unset(self) -> None:
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop("MAC_TEST_STATE_DIR", None)
+            _ = os.environ.pop("BUILD_TARGETS_STATE_DIR", None)
+            for start in (mac_test.start_watcher, mac_test.start_claim_watcher):
+                with (self.subTest(watcher=start.__name__),
+                      mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
+                    start(self.paths)
+                    run.assert_called_once()
+                    arguments = cast(list[str], run.call_args.args[0])
+                    roots = [word for word in arguments if word.removeprefix("--setenv=").startswith(
+                        ("MAC_TEST_STATE_DIR=", "BUILD_TARGETS_STATE_DIR="))]
+                    self.assertEqual(roots, [])
 
     def test_activity_check_requires_readable_success_and_uses_one_bounded_ssh(self) -> None:
         config = mac_test.read_config()

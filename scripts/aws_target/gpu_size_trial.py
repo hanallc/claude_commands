@@ -33,7 +33,7 @@ from scripts.aws_target import cloud_gate, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import AwsExecutor, aws_error_code, execute_command
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus, spot_quota
 from scripts.aws_target.config import SpendingSettings, gate_deployment, read_settings
-from scripts.build_targets.target_config import ssh_target_state_directory
+from scripts.build_targets import target_config
 from scripts.lib import conf
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
@@ -1172,7 +1172,7 @@ def confirm_assigned_gpu_service(trial: str) -> None:
     from scripts.lib import process_start
     from scripts.mac_test import claim_state
 
-    paths = claim_state.StatePaths(ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
+    paths = claim_state.StatePaths(target_config.ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
     with claim_state.locked(paths.lock):
         for held in claim_state.read_claims(paths):
             record = held.record
@@ -1189,7 +1189,7 @@ def confirm_assigned_gpu_service(trial: str) -> None:
 def assigned_gpu_cleanup_pending(trial: str) -> bool:
     from scripts.mac_test import claim_state
 
-    paths = claim_state.StatePaths(ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
+    paths = claim_state.StatePaths(target_config.ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
     with claim_state.locked(paths.lock):
         return any(held.record['claim_id'] == trial and held.record.get('cleanup_pending')
                    for held in claim_state.read_claims(paths))
@@ -1205,7 +1205,7 @@ def assigned_gpu_cleanup_confirmed(trial: str) -> bool:
     except (OSError, ValueError):
         pass
 
-    directory = ssh_target_state_directory('aws')
+    directory = target_config.ssh_target_state_directory('aws')
     try:
         with (directory / 'gpu-size-trial/controller.lock').open('rb') as lock:
             # The worker holds this lock across regional retries.
@@ -1236,7 +1236,7 @@ def start_service(folder: Path, directory: Path, settings_path: Path,
             arguments.append('--assigned')
         command = cloud_gate.service_command('scripts.aws_target.gpu_size_trial', arguments, gpu_service_name(trial))
         if assigned and 'BUILD_TARGETS_STATE_DIR' in os.environ:
-            command.insert(1, '--setenv=BUILD_TARGETS_STATE_DIR=' + os.environ['BUILD_TARGETS_STATE_DIR'])
+            command.insert(1, f'--setenv=BUILD_TARGETS_STATE_DIR={target_config.build_targets_state_root()}')
         if isinstance(nextest_request(manifest), HanaGpuNextestRequest):
             command = ['--working-directory=' + str(ROOT) if arg.startswith('--working-directory=') else arg
                        for arg in command]
@@ -2135,7 +2135,7 @@ def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
                 launch.before_service()
             return subprocess.run(command, stdout=sys.stderr).returncode
 
-        directory = ssh_target_state_directory('aws')
+        directory = target_config.ssh_target_state_directory('aws')
         settings = conf.path('aws_target')
         if isinstance(launch, AssignedHanaGpuLaunch):
             status = start_service(folder, directory, settings, service, assigned=True)

@@ -37,6 +37,7 @@ class ClaimReader(Protocol):
     def state_paths(self) -> ClaimState: ...
     def locked(self, path: Path) -> AbstractContextManager[None]: ...
     def read_claims(self, paths: ClaimState) -> Sequence[HeldMacClaim]: ...
+    def read_lost_mac_fences(self, paths: ClaimState) -> Sequence[HeldMacClaim]: ...
 
 
 MIRROR_MARK = ".mac-test-mirror"
@@ -226,7 +227,7 @@ def serve() -> int:
             import_module("scripts.copies.copies").held_remote_mirrors)
         mirrors = [{"host": held.identity.host, "path": held.identity.path, "session": held.session}
                    for held in held_remote_mirrors()]
-        for claim in mac_test.read_claims(paths):
+        for claim in (*mac_test.read_claims(paths), *mac_test.read_lost_mac_fences(paths)):
             record = claim.record
             # A kept remote job can outlive its owner. Unreadable local liveness also keeps it.
             live = "remote_host" in record

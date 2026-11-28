@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
-from contextlib import redirect_stdout
+from contextlib import chdir, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast, override
@@ -175,6 +175,17 @@ class IsolatedTargetTest(unittest.TestCase):
 
 
 class ConfigurationTests(IsolatedTargetTest):
+    def test_relative_state_roots_use_the_working_directory(self) -> None:
+        cwd = self.root.resolve()
+        with chdir(cwd), mock.patch.dict(os.environ, {
+            "BUILD_TARGETS_STATE_DIR": "target-state",
+            "MAC_TEST_STATE_DIR": "mac-state",
+        }):
+            self.assertEqual(target_config.build_targets_state_root(), cwd / "target-state")
+            self.assertEqual(target_config.ssh_target_state_directory("mac"), cwd / "mac-state")
+            self.assertEqual(target_config.mac_linux_end_proof_journal(),
+                             cwd / "target-state/mac-linux/end-proofs.jsonl")
+
     def test_removed_builder_cannot_register_by_name_or_settings(self) -> None:
         registry = self.root / 'removed-target.conf'
         for name, filename in (('aws', 'custom.conf'), ('builder', 'aws_target.conf')):

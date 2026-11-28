@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from io import BytesIO, StringIO
 import base64
@@ -2387,7 +2387,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertNotIn('signal.signal', guest)
         self.assertIn('publish(run)', guest)
 
-    def test_cancel_stops_the_assigned_unit_and_terminates_the_box(self) -> None:
+    def prepare_assigned_trial(self) -> str:
         claim = self.folder.name
         self.fake.manifest['trial'] = claim
         self.fake.manifest['tree'] = 'b' * 40
@@ -2397,6 +2397,27 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
             trial.mapping(self.fake.manifest['sha256']).items() if name not in
             ('hana-tests.tar.zst', 'gpu_trial_wrapper.py', 'inventory.json')}
         trial.write_json(self.folder / 'manifest.json', self.fake.manifest)
+        return claim
+
+    def test_assigned_gpu_service_passes_an_absolute_state_root(self) -> None:
+        _ = self.prepare_assigned_trial()
+        cwd = self.root.resolve()
+        execute = mock.Mock(return_value=0)
+        with chdir(cwd), mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': 'target-state'}):
+            self.assertEqual(trial.start_service(self.folder, self.state, self.settings, execute, assigned=True), 0)
+        execute.assert_called_once()
+        command = cast(list[str], execute.call_args.args[0])
+        self.assertIn('--setenv=BUILD_TARGETS_STATE_DIR=' + str(cwd / 'target-state'), command)
+        execute.reset_mock()
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop('BUILD_TARGETS_STATE_DIR', None)
+            self.assertEqual(trial.start_service(self.folder, self.state, self.settings, execute, assigned=True), 0)
+        execute.assert_called_once()
+        command = cast(list[str], execute.call_args.args[0])
+        self.assertEqual([arg for arg in command if arg.startswith('--setenv=BUILD_TARGETS_STATE_DIR=')], [])
+
+    def test_cancel_stops_the_assigned_unit_and_terminates_the_box(self) -> None:
+        claim = self.prepare_assigned_trial()
         commands: list[Sequence[str]] = []
 
         def launch(command: Sequence[str]) -> int:

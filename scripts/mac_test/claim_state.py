@@ -11,6 +11,8 @@ from enum import StrEnum
 import fcntl
 from hashlib import sha256
 import json
+import math
+import os
 from pathlib import Path
 import re
 from subprocess import SubprocessError
@@ -27,7 +29,7 @@ from scripts.direct.runner_result import (
 )
 from scripts.lib import process_start as process_identity
 from scripts.lib import conf
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.mac_test.mirror_root import MacMirrorRoot
 
 if TYPE_CHECKING:
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 
 
 SubmittingSession = OwningSession | NoOwningSession
+MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 
 CiSwitch = Literal[
@@ -195,6 +198,17 @@ class ClaimIdentity:
     claim_id: str
     episode: str
     attempt: str
+
+
+@dataclass(frozen=True)
+class ClaimProcessOwner:
+    """The process identity that owns one claim."""
+
+    pid: int
+    proc_start: str
+
+    def matches(self, record: ClaimOwnerRecord) -> bool:
+        return (record["pid"], record["proc_start"]) == (self.pid, self.proc_start)
 
 
 @dataclass(frozen=True)
@@ -591,6 +605,10 @@ class HeldClaim:
     path: Path
     record: RunRecord
 
+    @property
+    def claim_file_name(self) -> str:
+        return self.path.name
+
     def matches_mac_assignment_scope(self, scope: ClaimScope) -> bool:
         """Match the scope from an assignment with the same claim identity."""
         if self.scope == scope:
@@ -768,6 +786,7 @@ class StatePaths:
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
         self.retired_reservations: Path = directory / "retired-reservations"
+        self.lost_mac_fences: Path = directory / "lost-mac-fences"
         self.wait_locations: Path = directory / "wait-locations"
         self.block: Path = directory / "block.json"
 
@@ -1292,6 +1311,321 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             scope = WHOLE_MAC if path == paths.run else RepositoryScope(unquote(legacy_linux_claim_name(path)[0]))
         held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
+
+
+def lost_mac_fence_path(paths: StatePaths, identity: ClaimIdentity, original: str) -> Path:
+    return paths.lost_mac_fences / pending_start_key(identity) / original
+
+
+def _has_lost_mac_fence_identity(record: RunRecord, saved: MacMirrorIdentity) -> bool:
+    if "remote_host" in record:
+        return ("mac_watch_origin" in record and "replaced_reservation" not in record
+                and bool(saved.fence_generation))
+    return record["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX) and "wait_released" not in record
+
+
+@dataclass(frozen=True)
+class GuestEndRecordIdentity:
+    """The queue attempt and claim named in the guest end journal."""
+
+    attempt_key: str
+    claim_id: str
+
+
+@dataclass(frozen=True)
+class GuestEndRecordWrite:
+    """Save the end record for the named queue attempt and claim."""
+
+    identity: GuestEndRecordIdentity
+    write: Callable[[], None]
+
+
+class NativeFenceEndRecord(StrEnum):
+    """A native fence has no guest end record."""
+
+    NOT_REQUIRED = "not required"
+
+
+class LegacyGuestEndRecord(StrEnum):
+    """An old pending fence stores only its local claim identity."""
+
+    CLAIM_ONLY = "claim only"
+
+
+GUEST_END_PENDING_SUFFIX = ".guest-end-pending"
+# The guest keeps arm records for placed attempts after the deadline.
+PLACED_GUEST_ATTEMPT_PREFIX = "gate-"
+FULL_BUNDLE_RETRY_SUFFIX = "-full"
+
+
+def placed_guest_attempt(key: str) -> str:
+    """Map a queue attempt key to the guest attempt name."""
+    return PLACED_GUEST_ATTEMPT_PREFIX + sha256(key.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class PendingGuestFence(HeldClaim):
+    """Protect a guest claim while its end record is pending."""
+
+    end_record: GuestEndRecordIdentity | LegacyGuestEndRecord
+
+    @property
+    @override
+    def claim_file_name(self) -> str:
+        return self.path.with_suffix(".json").name
+
+
+def _read_lost_mac_fence(paths: StatePaths, path: Path) -> HeldClaim | NoRun:
+    pending = path.with_suffix(GUEST_END_PENDING_SUFFIX)
+    end_record: GuestEndRecordIdentity | LegacyGuestEndRecord | NativeFenceEndRecord
+    try:
+        try:
+            contents = pending.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            record = read_run(path)
+            end_record = NativeFenceEndRecord.NOT_REQUIRED
+        else:
+            if not contents:
+                record = read_run(path)
+                end_record = LegacyGuestEndRecord.CLAIM_ONLY
+            else:
+                decoded = cast(object, json.loads(contents))
+                if not isinstance(decoded, dict):
+                    raise StateReadError(f"{pending} does not contain a JSON object")
+                values = cast(dict[str, object], decoded)
+                end_record = GuestEndRecordIdentity(required_string(values, "guest_end_attempt", pending),
+                                                   required_string(values, "guest_end_claim", pending))
+                if not end_record.attempt_key or not end_record.claim_id:
+                    raise StateReadError(f"{pending} has an invalid guest end identity")
+                record = decode_run(values, path)
+        if isinstance(record, NoRun):
+            return record
+        saved = saved_mac_repository(record)
+        if (not isinstance(saved, MacMirrorIdentity) or not _has_lost_mac_fence_identity(record, saved)
+                or path != lost_mac_fence_path(paths, claim_identity(record), saved.claim_file)):
+            raise StateReadError(f"{path} has an invalid lost Mac fence")
+        scope = RepositoryScope(saved.mirror_name, saved.key)
+        if end_record is NativeFenceEndRecord.NOT_REQUIRED:
+            return HeldClaim(scope, path, record)
+        if "remote_host" in record:
+            raise StateReadError(f"{pending} is not a guest fence")
+        return PendingGuestFence(scope, pending, record, end_record)
+    except (OSError, ValueError, RecursionError) as error:
+        raise ClaimStateUnreadable(path, error) from error
+
+
+def read_lost_mac_fences(paths: StatePaths) -> tuple[HeldClaim, ...]:
+    """Read published fences and pending guest fences."""
+    if paths.platform != "macos":
+        return ()
+    try:
+        folders = sorted(paths.lost_mac_fences.iterdir())
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ClaimStateUnreadable(paths.lost_mac_fences, error) from error
+    fences: list[HeldClaim] = []
+    for folder in folders:
+        if not re.fullmatch(r"[0-9a-f]{64}", folder.name):
+            continue
+        try:
+            files = sorted({path.with_suffix(".json") for path in folder.iterdir()
+                            if path.suffix in (".json", GUEST_END_PENDING_SUFFIX)})
+        except OSError as error:
+            raise ClaimStateUnreadable(folder, error) from error
+        for path in files:
+            fence = _read_lost_mac_fence(paths, path)
+            if isinstance(fence, HeldClaim):
+                fences.append(fence)
+    return tuple(fences)
+
+
+def save_lost_mac_fence(paths: StatePaths, identity: ClaimIdentity, owner: ClaimProcessOwner, *,
+                        record_guest_end: GuestEndRecordWrite | NativeFenceEndRecord
+                        = NativeFenceEndRecord.NOT_REQUIRED) -> bool:
+    """Save a fence for the exact lost claim under state.lock."""
+    if paths.platform != "macos":
+        return False
+    with locked(paths.lock):
+        matches = tuple(claim for claim in read_claims(paths) if claim_identity(claim.record) == identity)
+        if len(matches) != 1:
+            return False
+        claim, = matches
+        record = claim.record
+        saved = saved_mac_repository(record)
+        if (not owner.matches(record) or not isinstance(saved, MacMirrorIdentity)
+                or not _has_lost_mac_fence_identity(record, saved) or claim.path != paths.claims / saved.claim_file
+                or ("remote_host" in record and not claim_pending_start(paths, claim.path, record).exists())):
+            return False
+        if ("remote_host" in record) != (record_guest_end is NativeFenceEndRecord.NOT_REQUIRED):
+            return False
+        path = lost_mac_fence_path(paths, identity, claim.path.name)
+        if isinstance(record_guest_end, GuestEndRecordWrite):
+            pending = path.with_suffix(GUEST_END_PENDING_SUFFIX)
+            end = record_guest_end.identity
+            staged = {**record, "guest_end_attempt": end.attempt_key, "guest_end_claim": end.claim_id}
+            _write_lost_mac_fence(paths, pending, staged)
+            record_guest_end.write()
+            os.replace(pending, path)
+            sync_folder(path.parent)
+        else:
+            _write_lost_mac_fence(paths, path, record)
+        return True
+
+
+def _write_lost_mac_fence(paths: StatePaths, fence: Path, record: RunRecord | dict[str, object]) -> None:
+    fence.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(fence, json.dumps(record) + "\n")
+    sync_folder(fence.parent)
+    sync_folder(paths.lost_mac_fences)
+    sync_folder(paths.directory)
+
+
+def has_saved_lost_mac_fence(paths: StatePaths, path: Path, record: RunRecord) -> bool:
+    """Check if the active claim has an exact saved fence."""
+    if paths.platform != "macos" or path.parent != paths.claims:
+        return False
+    fence = _read_lost_mac_fence(paths, lost_mac_fence_path(paths, claim_identity(record), path.name))
+    return isinstance(fence, HeldClaim) and same_lost_mac_fence(record, fence.record)
+
+
+def retire_lost_mac_claim(paths: StatePaths, identity: ClaimIdentity, owner: ClaimProcessOwner) -> bool:
+    """Retire the exact saved claim after the queue accepts the lost attempt."""
+    with locked(paths.lock):
+        matches = tuple(fence for fence in read_lost_mac_fences(paths)
+                        if claim_identity(fence.record) == identity and owner.matches(fence.record))
+        if len(matches) != 1:
+            return False
+        fence, = matches
+        if isinstance(fence, PendingGuestFence):
+            return False
+        original = paths.claims / fence.path.name
+        record = read_run(original)
+        if isinstance(record, NoRun) or not same_lost_mac_fence(record, fence.record):
+            return False
+        _finish_lost_mac_retirement(paths, fence, original, record)
+        return True
+
+
+def _finish_lost_mac_retirement(paths: StatePaths, fence: HeldClaim, original: Path, record: RunRecord) -> None:
+    _write_lost_mac_fence(paths, fence.path, record)
+    original.unlink()
+    sync_folder(original.parent)
+    if "remote_host" not in record:
+        # The guest journal keeps the end proof after the claim retires.
+        fence.path.unlink()
+        sync_folder(fence.path.parent)
+
+
+def _durable_guest_end(fence: PendingGuestFence) -> bool:
+    end = fence.end_record
+    local_claim = fence.record
+    claim_since = datetime.fromisoformat(local_claim["since"]).timestamp()
+    path = target_config.mac_linux_end_proof_journal()
+    direct: set[GuestEndRecordIdentity] = set()
+    launches: set[GuestEndRecordIdentity] = set()
+    retries: dict[GuestEndRecordIdentity, int] = {}
+    proofs: dict[GuestEndRecordIdentity, int] = {}
+    try:
+        with path.open("rb") as journal:
+            fcntl.flock(journal.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            for position, line in enumerate(journal, start=1):
+                if not line.endswith(b"\n"):
+                    continue
+                try:
+                    row = cast(object, json.loads(line))
+                    if not isinstance(row, dict):
+                        continue
+                    fields = cast(dict[str, object], row)
+                    attempt, claim, when = fields.get("attempt"), fields.get("claim"), fields.get("written_at")
+                    if (not isinstance(claim, str) or not claim or not isinstance(attempt, str) or not attempt
+                            or not isinstance(fields.get("detail"), str) or isinstance(when, bool)
+                            or not isinstance(when, (int, float)) or not math.isfinite(when)):
+                        continue
+                except (ValueError, OverflowError, RecursionError):
+                    continue
+                kind = fields.get("result")
+                identity = GuestEndRecordIdentity(attempt, claim)
+                if kind in ("proven", "not started"):
+                    if identity == end or (end is LegacyGuestEndRecord.CLAIM_ONLY
+                                            and (claim == local_claim["claim_id"] or identity in retries)):
+                        proofs[identity] = position
+                elif end is LegacyGuestEndRecord.CLAIM_ONLY:
+                    if claim == local_claim["claim_id"] and kind in ("awaiting arm", "unproven"):
+                        direct.add(identity)
+                    elif kind == "awaiting arm" and when <= claim_since:
+                        holder = fields.get("holder")
+                        if isinstance(holder, dict):
+                            owner = cast(dict[str, object], holder)
+                            pid = owner.get("pid")
+                            if type(pid) is int and pid == local_claim["pid"] and owner.get("start") == local_claim["proc_start"]:
+                                launches.add(identity)
+                    elif kind == "unproven" and when >= claim_since and identity in launches:
+                        armed = fields.get("armed")
+                        if isinstance(armed, dict) and cast(dict[str, object], armed).get("attempt") == (
+                                placed_guest_attempt(attempt) + FULL_BUNDLE_RETRY_SUFFIX):
+                            retries[identity] = position
+            if isinstance(end, GuestEndRecordIdentity):
+                matches = end in proofs
+            else:
+                candidates = direct | retries.keys()
+                # A proof before the retry record can describe the first run.
+                matches = len(candidates) == 1 and all(
+                    proofs.get(candidate, 0) > retries.get(candidate, 0) for candidate in candidates)
+            if not matches:
+                return False
+            # Sync the proof before recovery uses it to remove the claim.
+            os.fsync(journal.fileno())
+            sync_folder(path.parent)
+            sync_folder(path.parent.parent)
+    except OSError:
+        return False
+    return True
+
+
+def _recover_pending_guest_fence(fence: PendingGuestFence, original: Path, record: RunState) -> None:
+    if not isinstance(record, NoRun) and same_lost_mac_fence(record, fence.record):
+        if not claim_owner_ended(record) or not _durable_guest_end(fence):
+            return
+        original.unlink()
+        sync_folder(original.parent)
+    elif not _durable_guest_end(fence):
+        return
+    published = fence.path.with_suffix(".json")
+    saved = read_run(published)
+    if not isinstance(saved, NoRun) and same_lost_mac_fence(saved, fence.record):
+        published.unlink()
+    fence.path.unlink()
+    sync_folder(fence.path.parent)
+
+
+def recover_lost_mac_retirement(paths: StatePaths) -> None:
+    """Complete a saved retirement for an ended owner under state.lock."""
+    for fence in read_lost_mac_fences(paths):
+        original = paths.claims / fence.claim_file_name
+        try:
+            record = read_run(original)
+            if isinstance(fence, PendingGuestFence):
+                _recover_pending_guest_fence(fence, original, record)
+                continue
+            if isinstance(record, NoRun) or not same_lost_mac_fence(record, fence.record):
+                if "remote_host" not in fence.record:
+                    fence.path.unlink()
+                    sync_folder(fence.path.parent)
+            elif claim_owner_ended(record):
+                _finish_lost_mac_retirement(paths, fence, original, record)
+        except OSError as error:
+            raise ClaimStateUnreadable(original, error) from error
+
+
+def same_lost_mac_fence(current: RunRecord, saved: RunRecord) -> bool:
+    """Compare the owner and remote fence of the same retirement."""
+    return ("replaced_reservation" not in current and "wait_released" not in current
+            and claim_identity(current) == claim_identity(saved)
+            and ClaimProcessOwner(saved["pid"], saved["proc_start"]).matches(current)
+            and current.get("remote_host") == saved.get("remote_host")
+            and current.get("mac_watch_origin") == saved.get("mac_watch_origin")
+            and current.get("mac_repository") == saved.get("mac_repository"))
 
 
 @contextmanager

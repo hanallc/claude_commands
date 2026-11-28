@@ -12,7 +12,7 @@ from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from functools import partial
 from importlib import import_module
 import fcntl
@@ -220,6 +220,13 @@ class LostMacRun:
 
     seconds: float
     detail: str = 'runner sent no final status'
+
+
+@dataclass(frozen=True)
+class MacRunOutage(LostMacRun):
+    """The Mac connection ended and the run gave no verdict before the outage deadline."""
+
+    outage_since: float = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -637,6 +644,11 @@ for path in base.parent.glob("*.lock"):
             path.unlink(missing_ok=True)
     except FileNotFoundError:
         continue
+for suffix in (".verdict", ".verdict.new"):
+    for path in base.parent.glob("*" + suffix):
+        old_base = path.with_name(path.name.removesuffix(suffix))
+        if old_base != base and not old_base.with_suffix(".lock").exists():
+            path.unlink(missing_ok=True)
 '''
     return shlex.join(["python3", "-c", program, encoded])
 
@@ -759,7 +771,47 @@ if not matches:
             + shlex.join(["python3", "-c", program, encoded, key]) + " || exit 75\n")
 
 
-def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
+MAC_VERDICT_REPORTER = r'''import pathlib, sys
+
+home = pathlib.Path.home()
+relative, key, status = sys.argv[1:4]
+if status == "nextest":
+    sys.path.insert(0, str(home / ".claude"))
+    from scripts.mac_test import nextest_log
+    limits = nextest_log.NextestOutputLimits(int(sys.argv[4]), int(sys.argv[5]))
+    exit_status = nextest_log.run_logged(sys.argv[6:], limits, sys.stdout.buffer)
+    status = "setup" if exit_status is None else str(exit_status)
+verdict = "mac_nextest_setup=failed" if status == "setup" else "mac_exit=" + status
+line = "dispatch_mac_verdict=" + key + " " + verdict + "\n"
+path = (home / relative).with_suffix(".verdict")
+try:
+    staged = path.with_suffix(".verdict.new")
+    staged.write_text(line, encoding="ascii")
+    staged.replace(path)
+except OSError:
+    pass
+print(line + verdict, flush=True)
+'''
+
+
+@dataclass(frozen=True)
+class NativeMacVerdictChannel:
+    """The trusted verdict marker and saved verdict for one Mac attempt."""
+
+    fence: Path
+    key: str
+
+    @property
+    def prefix(self) -> str:
+        return f"dispatch_mac_verdict={self.key} "
+
+    def reporter(self) -> str:
+        return ('"$HOME/.claude/scripts/lib/py" -B '
+                + shlex.join(["-c", MAC_VERDICT_REPORTER, str(self.fence), self.key]))
+
+
+def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *,
+                         scope_key: str = "run") -> str:
     """Remove the prepared identity after the existing remote command ends."""
     descriptors = floor_claims.MIRROR_LEASE_FDS
     return (start_fence_command(identity, target, scope_key=scope_key)
@@ -1092,6 +1144,77 @@ class MissingMacStatus:
 
 
 @dataclass(frozen=True)
+class MalformedMacVerdict(MissingMacStatus):
+    """The exact attempt key had an invalid verdict payload."""
+
+    detail: str = "runner sent a malformed final status"
+
+
+@dataclass(frozen=True)
+class MacSshLocalError(MissingMacStatus):
+    """A local SSH error prevented the runner from sending a verdict."""
+
+
+def parse_mac_verdict(marker: str) -> ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus:
+    if marker == MAC_NEXTTEST_SETUP_FAILURE:
+        return MacNextestSetupFailed()
+    if match := re.fullmatch(r"mac_exit=([0-9]+)", marker):
+        digits = match.group(1).lstrip("0") or "0"
+        if len(digits) <= 3 and int(digits) <= 255:
+            return ReportedMacStatus(int(digits))
+    return MISSING_MAC_STATUS
+
+
+def keyed_mac_verdict(line: str, channel: NativeMacVerdictChannel
+                     ) -> ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus:
+    key = channel.prefix.removesuffix(" ")
+    if not line.startswith(key):
+        return MISSING_MAC_STATUS
+    suffix = line[len(key):]
+    if suffix and not suffix[0].isspace():
+        return MISSING_MAC_STATUS
+    if suffix.startswith(" ") and suffix.endswith("\n"):
+        result = parse_mac_verdict(suffix[1:-1])
+        if not isinstance(result, MissingMacStatus):
+            return result
+    return MalformedMacVerdict()
+
+
+@dataclass(frozen=True)
+class MacSshDisconnected:
+    """SSH failed before the remote command sent a verdict."""
+
+    observed_at: float
+    observed_monotonic: float
+    keepalive_expired: bool
+
+
+class MacFenceState(StrEnum):
+    RUNNING = "running"
+    PREPARED = "prepared"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class MacAttemptAnswered:
+    """The original Mac answered for the exact start fence."""
+
+    fence: MacFenceState
+    verdict: ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
+
+
+class MacReconnectNoAnswer:
+    """The reconnect check received no remote reply."""
+
+
+@dataclass(frozen=True)
+class MacReconnectUnconfirmed:
+    """The reconnect check cannot prove the original attempt state."""
+
+    detail: str = "remote startup has no acknowledgement"
+
+
+@dataclass(frozen=True)
 class MirrorBusyRefusal:
     """A receiver or runner could not acquire the mirror."""
 
@@ -1123,7 +1246,7 @@ class CleanupOnly:
 
 
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
-                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal)
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal | MacSshDisconnected)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -1191,30 +1314,46 @@ class CliArguments(argparse.Namespace):
         self.fetch: str | None = None
 
 
-def bounded_output_lines(output: BinaryIO | TextIO, remaining: Callable[[], float | None]) -> Generator[bytes]:
+class RunStream(StrEnum):
+    RUNNER = "runner"
+    SSH = "ssh"
+
+
+def bounded_output_lines(output: BinaryIO | TextIO, remaining: Callable[[], float | None],
+                         ssh_errors: BinaryIO | TextIO | None) -> Generator[tuple[RunStream, bytes]]:
     """Read complete lines without letting a partial line block the cleanup deadline."""
-    descriptor = output.fileno()
-    partial_line = bytearray()
-    with selectors.DefaultSelector() as reader:
-        _ = reader.register(descriptor, selectors.EVENT_READ)
-        while True:
+    streams = {output.fileno(): RunStream.RUNNER}
+    if ssh_errors is not None:
+        streams[ssh_errors.fileno()] = RunStream.SSH
+    partial = {fd: bytearray() for fd in streams}
+    with selectors.PollSelector() as reader:
+        for fd in streams:
+            _ = reader.register(fd, selectors.EVENT_READ)
+        while reader.get_map():
             timeout = remaining()
-            if (timeout is not None and timeout <= 0) or not reader.select(timeout):
+            if timeout is not None and timeout <= 0:
                 raise TimeoutError
-            chunk = os.read(descriptor, 65536)
-            if not chunk:
-                if partial_line:
-                    yield bytes(partial_line)
-                return
-            *lines, tail = chunk.split(b"\n")
-            if not lines:
-                partial_line.extend(tail)
-                continue
-            partial_line.extend(lines[0])
-            yield bytes(partial_line) + b"\n"
-            for line in lines[1:]:
-                yield line + b"\n"
-            partial_line = bytearray(tail)
+            ready = reader.select(timeout)
+            if not ready:
+                raise TimeoutError
+            for key, _events in ready:
+                fd = key.fd
+                chunk = os.read(fd, 65536)
+                tail = partial[fd]
+                if not chunk:
+                    if tail:
+                        yield streams[fd], bytes(tail)
+                    _ = reader.unregister(fd)
+                    continue
+                *lines, last = chunk.split(b"\n")
+                if not lines:
+                    tail.extend(last)
+                    continue
+                tail.extend(lines[0])
+                yield streams[fd], bytes(tail) + b"\n"
+                for line in lines[1:]:
+                    yield streams[fd], line + b"\n"
+                partial[fd] = bytearray(last)
 
 
 class ProcessController:
@@ -1235,6 +1374,8 @@ class ProcessController:
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
         self.mac_repository: claim_state.SavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY
+        self.mac_machine_id: str = ""
+        self.native_verdict: NativeMacVerdictChannel | None = None
 
     def stop(self) -> None:
         active = self.active
@@ -1437,15 +1578,17 @@ class ProcessController:
             return None if deadline == math.inf else max(0.0, deadline - time.monotonic())
 
         self.pending = PendingStartOperation()
+        uses_ssh = arguments[0] == "ssh"
         try:
             process = subprocess.Popen(
                 arguments,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE if uses_ssh else subprocess.STDOUT,
             )
-        except OSError:
+        except OSError as error:
             self.pending = SettledDispatchOperations()
-            return MISSING_MAC_STATUS
+            return (MacSshLocalError(f"could not start the runner: {error}")
+                    if self.native_verdict is not None else MISSING_MAC_STATUS)
         self.attempt_evidence.execution = execution_identity.ExecutionEvidenceUnavailable(
             "the remote start has no final observation", time.time())
         raw_output = process.stdout
@@ -1464,10 +1607,16 @@ class ProcessController:
         received_bytes = 0
         finished_output = False
         exit_status = 0
+        disconnect: MacSshDisconnected | None = None
+        ssh_local_error = ""
+        malformed_verdict = False
+        channel = self.native_verdict
         try:
-            lines = (output if isinstance(cleanup_limit, NoCommandTimeLimit)
-                     else bounded_output_lines(output, remaining))
-            for raw_line in lines:
+            ssh_errors = cast(BinaryIO | TextIO | None, process.stderr) if uses_ssh else None
+            lines = (bounded_output_lines(output, remaining, ssh_errors)
+                     if uses_ssh or not isinstance(cleanup_limit, NoCommandTimeLimit)
+                     else ((RunStream.RUNNER, line) for line in output))
+            for origin, raw_line in lines:
                 if isinstance(raw_line, bytes):
                     received_bytes += len(raw_line)
                     line = raw_line.decode("utf-8", errors="replace")
@@ -1476,6 +1625,14 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                if origin is RunStream.SSH:
+                    if disconnect is None and eligibility.ssh_transport_failed(marker):
+                        disconnect = MacSshDisconnected(
+                            time.time(), time.monotonic(), eligibility.ssh_keepalive_expired(marker))
+                    if not ssh_local_error and eligibility.ssh_local_error(marker):
+                        ssh_local_error = marker
+                    print(line, end="", flush=True)
+                    continue
                 identity = self.claim_identity
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
@@ -1499,23 +1656,26 @@ class ProcessController:
                     print(line, end="", flush=True)
                     continue
                 if marker == "linux_startup=unresolved":
-                    status = UnresolvedSlotStartup()
-                    held_status_line = ""
-                    cleanup = CleanupUnconfirmed()
+                    if self.native_verdict is None or not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
+                        status = UnresolvedSlotStartup()
+                        held_status_line = ""
+                        cleanup = CleanupUnconfirmed()
                     continue
-                status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
-                if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
+                if channel is not None and line == held_status_line:
+                    continue
+                verdict = (parse_mac_verdict(marker) if channel is None else keyed_mac_verdict(line, channel))
+                invalid_legacy_status = (channel is None and isinstance(verdict, MissingMacStatus)
+                                         and re.fullmatch(r"mac_exit=[0-9]+", marker) is not None)
+                if (isinstance(verdict, MalformedMacVerdict)
+                        or channel is None and marker.startswith("mac_exit=") and isinstance(verdict, MissingMacStatus)):
+                    malformed_verdict = True
+                if not isinstance(verdict, MissingMacStatus) or invalid_legacy_status:
                     if held_status_line:
                         print(held_status_line, end="", flush=True)
-                    if status_match is None:
-                        status = MacNextestSetupFailed()
-                    else:
-                        status_digits = status_match.group(1).lstrip("0") or "0"
-                        mac_status = int(status_digits) if len(status_digits) <= 3 else 256
-                        status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    status = verdict
                     if isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
                         self.pending = AcknowledgedStartOperation()
-                        held_status_line = line
+                        held_status_line = line if channel is None else line.removeprefix(channel.prefix)
                         if isinstance(cleanup_limit, CleanupAfterVerdict) and deadline == math.inf:
                             deadline = time.monotonic() + cleanup_limit.seconds
                     else:
@@ -1532,8 +1692,9 @@ class ProcessController:
                 if held_status_line:
                     print(held_status_line, end="", flush=True)
                     held_status_line = ""
-                status = MISSING_MAC_STATUS
-                cleanup = CleanupUnconfirmed()
+                if channel is None or not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
+                    status = MISSING_MAC_STATUS
+                    cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
             timeout = remaining()
             exit_status = process.wait() if timeout is None else process.wait(timeout=timeout)
@@ -1556,22 +1717,31 @@ class ProcessController:
             if (mirror_refused or mismatch or startup_refused) and not isinstance(status, ReportedMacStatus):
                 self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
             output.close()
-            if arguments[0] == "ssh":
+            if uses_ssh and process.stderr is not None:
+                process.stderr.close()
+            if uses_ssh:
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if isinstance(cleanup, CleanupStreamTimedOut) and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
-            return MissingMacStatus(cleanup.detail(), cleanup)
-        if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
-            return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
         if isinstance(status, MacNextestSetupFailed):
             return MacNextestSetupFailed(cleanup)
+        if channel is not None and malformed_verdict:
+            return MalformedMacVerdict()
+        if channel is not None and ssh_local_error:
+            return MacSshLocalError(ssh_local_error)
+        if isinstance(cleanup, CleanupStreamTimedOut):
+            return MissingMacStatus(cleanup.detail(), cleanup)
+        if mismatch:
+            return ToolVersionMismatch(mismatch)
         if isinstance(mirror_refusal, MirrorBusyRefusal):
             return mirror_refusal
         if isinstance(status, UnresolvedSlotStartup):
             return status
+        if (exit_status == 255 and disconnect is not None
+                and not (malformed_verdict or ssh_local_error)):
+            return disconnect
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
 
@@ -1719,6 +1889,8 @@ def write_result(
             count = str(evidence.unresolved_count) if isinstance(evidence.unresolved_count, int) else "unavailable"
             details = (f"slot={evidence.slot}\ncompletion={evidence.completion}\ncleanup={evidence.cleanup}\n"
                        + f"unresolved_count={count}\nevidence_at={evidence.evidence_at}\n")
+        if isinstance(result, MacRunOutage):
+            details += f"outage=MAC_STATUS_MISSING\noutage_since={result.outage_since}\n"
         if isinstance(result, (PassedOnMac, PassedOnTarget)) and result.build_target_directory:
             details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
@@ -1918,6 +2090,19 @@ def release_claim(
         pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
         return ClaimReleaseConfirmed()
     return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
+
+
+def save_lost_native_fence(controller: ProcessController, target: str) -> bool:
+    """Save the remote fence before returning the lost verdict."""
+    identity = controller.claim_identity
+    if not isinstance(identity, claim_state.ClaimIdentity):
+        return False
+    pid = os.getpid()
+    start = process_identity.process_start(pid)
+    if not isinstance(start, process_identity.Started):
+        return False
+    owner = claim_state.ClaimProcessOwner(pid, start.start)
+    return claim_state.save_lost_mac_fence(claim_state.state_paths(target), identity, owner)
 
 
 def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
@@ -2151,6 +2336,7 @@ def save_mac_watch_origin(controller: ProcessController, host: str, root: MacMir
     replies = [line.removeprefix("dispatch_mac_id=") for line in output.splitlines()
                if line.startswith("dispatch_mac_id=")]
     machine_id = claim_state.mac_machine_id(replies[0]) if len(replies) == 1 else None
+    controller.mac_machine_id = machine_id or ""
     origin: claim_state.MacWatchOrigin | None = (
         {"mirror_root": root.relative, "machine_id": machine_id} if machine_id is not None else None)
     paths = claim_state.state_paths(controller.claim_target)
@@ -2655,7 +2841,7 @@ def remote_test_command(
     request: OffloadRequest,
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
-    *, history_key: str = store.UNKNOWN_IDENTITY,
+    *, history_key: str = store.UNKNOWN_IDENTITY, native_verdict: NativeMacVerdictChannel | None = None,
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
@@ -2701,12 +2887,18 @@ def remote_test_command(
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
     capture = ""
-    report_status = "; echo mac_exit=$?"
     if request.verb == "nextest":
         limits = nextest_log.output_limits(config.settings)
-        capture = nextest_log.capture_function(limits) + " && "
-        # The writer reports the child status. A failed launch takes the setup path.
-        report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
+        if native_verdict is None:
+            capture = nextest_log.capture_function(limits) + " && "
+            report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
+        else:
+            reporter = native_verdict.reporter()
+            capture = (f'run_nextest_logged() {{ {reporter} nextest '
+                       + f'{limits.tail_bytes} {limits.summary_bytes} "$@"; }} && ')
+            report_status = f" || {reporter} setup"
+    else:
+        report_status = "; echo mac_exit=$?" if native_verdict is None else f'; {native_verdict.reporter()} "$?"'
     runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
@@ -3097,6 +3289,93 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     return StartUnsettled("the original remote start has not settled", observed.result)
 
 
+MAC_RECONNECT_PROGRAM = MAC_MACHINE_ID_PROGRAM + '''import fcntl, pathlib, sys
+
+base = pathlib.Path.home() / sys.argv[1]
+machine_id = mac_machine_id(float(sys.argv[3]))
+print("dispatch_mac_id=" + machine_id, flush=True)
+if machine_id != sys.argv[2]:
+    sys.exit(0)
+try:
+    with base.with_suffix(".lock").open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            state = "running"
+        else:
+            state = "prepared"
+except FileNotFoundError:
+    state = "missing"
+print("dispatch_reconnect=" + base.name + " " + state, flush=True)
+try:
+    with base.with_suffix(".verdict").open("rb") as verdict:
+        sys.stdout.buffer.write(verdict.read(128))
+except FileNotFoundError:
+    pass
+'''
+
+
+def reconnect_mac_attempt(controller: ProcessController, config: OffloadConfig, target: str, deadline: float
+                          ) -> MacAttemptAnswered | MacReconnectNoAnswer | MacReconnectUnconfirmed:
+    """Observe the original attempt without changing its remote fence."""
+    identity = controller.claim_identity
+    if not isinstance(identity, claim_state.ClaimIdentity) or not controller.mac_machine_id:
+        return MacReconnectUnconfirmed()
+    timeout = min(config.probe_timeout_s, deadline - time.monotonic())
+    if timeout <= 0:
+        return MacReconnectNoAnswer()
+    relative = start_fence_relative(identity, target, scope_key=controller.claim_scope_key)
+    command = shlex.join(["python3", "-c", MAC_RECONNECT_PROGRAM, str(relative),
+                         controller.mac_machine_id, str(timeout)])
+    try:
+        reply = subprocess.run([*ssh_prefix(config), command], stdin=subprocess.DEVNULL,
+                               capture_output=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout if isinstance(error.stdout, bytes) else b""
+        errors = error.stderr if isinstance(error.stderr, bytes) else b""
+        transport_failed = True
+    except OSError as error:
+        return MacReconnectUnconfirmed(f"could not start the reconnect check: {error}")
+    else:
+        output = reply.stdout
+        errors = reply.stderr
+        transport_failed = (reply.returncode == 255
+                            and any(map(eligibility.ssh_transport_failed, errors.decode(errors="replace").splitlines())))
+
+    local_error = next(filter(eligibility.ssh_local_error, errors.decode(errors="replace").splitlines()), "")
+    if not output:
+        if local_error:
+            return MacReconnectUnconfirmed(local_error)
+        return MacReconnectNoAnswer() if transport_failed else MacReconnectUnconfirmed()
+    machine, _, rest = output.decode(errors="replace").partition("\n")
+    fence, _, status = rest.partition("\n")
+    prefix = f"dispatch_reconnect={relative.name} "
+    if machine != f"dispatch_mac_id={controller.mac_machine_id}" or not fence.startswith(prefix):
+        return MacReconnectUnconfirmed()
+    try:
+        fence_state = MacFenceState(fence.removeprefix(prefix))
+    except ValueError:
+        return MacReconnectUnconfirmed()
+    channel = NativeMacVerdictChannel(relative, pending_start_key(identity))
+    verdict = keyed_mac_verdict(status, channel)
+    if local_error and verdict == MISSING_MAC_STATUS:
+        return MacReconnectUnconfirmed(local_error)
+    return MacAttemptAnswered(fence_state, verdict)
+
+
+def wait_for_mac_reconnect(controller: ProcessController, config: OffloadConfig, target: str,
+                           outage: eligibility.MacOutageWindow
+                           ) -> MacAttemptAnswered | MacReconnectNoAnswer | MacReconnectUnconfirmed:
+    while time.monotonic() < outage.deadline:
+        reply = reconnect_mac_attempt(controller, config, target, outage.deadline)
+        if not isinstance(reply, MacReconnectNoAnswer):
+            return reply
+        remaining = outage.deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(remaining, eligibility.SERVER_ALIVE_INTERVAL_SECONDS))
+    return MacReconnectNoAnswer()
+
+
 def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) -> None:
     label = request.target or "Mac"
     if isinstance(result, LeftoversRemain):
@@ -3175,6 +3454,7 @@ def claim_for_run(
     controller.claim_scope_key = "run"
     controller.mac_repository = claim_state.NO_SAVED_MAC_REPOSITORY
     controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
+    controller.mac_machine_id = ""
     controller.expected_claim = claim_state.NO_CLAIM_IDENTITY
     if isinstance(request.admission, MacClaimFromWait) and not retire_wait:
         controller.expected_claim = request.admission.identity
@@ -3240,6 +3520,7 @@ def claimed_run(
 
     release_allowed = True
     sync_after_release = False
+    recovered_pending = False
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     evidence.cleanup = "unconfirmed"
@@ -3301,10 +3582,16 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        identity = controller.claim_identity
+        native_verdict = (NativeMacVerdictChannel(
+            start_fence_relative(identity, request.target, scope_key=controller.claim_scope_key),
+            pending_start_key(identity)) if not linux and isinstance(identity, claim_state.ClaimIdentity) else None)
+        controller.native_verdict = native_verdict
         try:
             history_key = evidence.repository_key
             step_command = remote_test_command(config, request, repository, copied.tree_key,
-                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY)
+                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY,
+                native_verdict=native_verdict)
         except ValueError as error:
             evidence.execution = execution_identity.ExecutionNotStarted()
             return DeclinedMacRun("state", elapsed_seconds(started), str(error))
@@ -3373,10 +3660,33 @@ def claimed_run(
             command = after_mac_floor_group(mirror.path, command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
-        arguments = [*ssh_prefix(config), command]
+        arguments = [*ssh_prefix(config), f"(\n{command}\n) 2>&1"]
         remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
                          if routed_mac_command else controller.stream_mac_run(arguments))
-        if isinstance(remote_status, MissingMacStatus) and isinstance(remote_status.cleanup, CleanupStreamTimedOut):
+        if isinstance(remote_status, MacSshDisconnected) and not linux:
+            outage = eligibility.mac_outage_window(config.unreachable_wait_s, remote_status.observed_at,
+                                                   remote_status.observed_monotonic,
+                                                   keepalive_expired=remote_status.keepalive_expired)
+            answer = wait_for_mac_reconnect(controller, config, request.target, outage)
+            if isinstance(answer, MacReconnectNoAnswer):
+                detail = "could not save the lost Mac fence"
+                try:
+                    if save_lost_native_fence(controller, request.target):
+                        return MacRunOutage(elapsed_seconds(started), outage_since=outage.outage_since)
+                except (OSError, ValueError) as error:
+                    detail += f": {error}"
+                return MacCleanupUnconfirmed(elapsed_seconds(started), detail)
+            if isinstance(answer, MacReconnectUnconfirmed):
+                return LostMacRun(elapsed_seconds(started), answer.detail)
+            remote_status = answer.verdict
+            recovered_pending = answer.fence is not MacFenceState.MISSING
+            if answer.fence is MacFenceState.RUNNING and remote_status == MISSING_MAC_STATUS:
+                return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
+            if not recovered_pending and isinstance(identity, claim_state.ClaimIdentity):
+                controller.pending = SettledDispatchOperations()
+                pending_start_path(request.target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
+        if (isinstance(remote_status, (MalformedMacVerdict, MacSshLocalError))
+                or isinstance(remote_status, MissingMacStatus) and isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
             return MacCleanupUnconfirmed(elapsed_seconds(started), remote_status.detail)
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
@@ -3411,12 +3721,16 @@ def claimed_run(
         setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
                         or (linux and remote_status.status == os.EX_TEMPFAIL))
         fetched = (fetch_folder(controller, config, request, repository)
-                   if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
-        if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
+                   if not recovered_pending and not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
+        if (not recovered_pending and not linux and isinstance(remote_status, ReportedMacStatus)
+                and isinstance(request.fetch, FetchFolder)
                 and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
+            verdict = f"mac_exit={remote_status.status}"
+            report = [native_verdict.prefix + verdict, verdict] if native_verdict is not None else [verdict]
+            status_command = shlex.join(["printf", "%s\\n", *report])
             cleanup_command = copies.remote_use_command(
-                mirror, f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))
-            arguments = [*ssh_prefix(config), after_mac_floor_group(mirror.path, cleanup_command)]
+                mirror, status_command + "; " + remote_cleanup_command(config, request, repository))
+            arguments = [*ssh_prefix(config), f"(\n{after_mac_floor_group(mirror.path, cleanup_command)}\n) 2>&1"]
             cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
                        if routed_mac_command else controller.stream_mac_run(arguments))
             remote_status = replace(remote_status, cleanup=(
@@ -3425,7 +3739,9 @@ def claimed_run(
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
                        free_floor_gib=config.free_floor_gib)
-        if isinstance(remote_status.cleanup, CleanupUnconfirmed):
+        if recovered_pending:
+            release_allowed = False
+        elif isinstance(remote_status.cleanup, CleanupUnconfirmed):
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
@@ -3443,7 +3759,7 @@ def claimed_run(
             return declined("state", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)
-                     if request.verb == "mend-fix" else FIX_NOT_RUN)
+                     if not recovered_pending and request.verb == "mend-fix" else FIX_NOT_RUN)
             return PassedOnMac(seconds, fetched, remote_status.build_target_directory, fixed)
         if remote_status.status == 4 and request.verb == "nextest":
             return NoTestMatchedOnMac(seconds, fetched)

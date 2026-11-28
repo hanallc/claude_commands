@@ -46,7 +46,8 @@ class OffloadCommandTests(SeededCleanupFixture):
             key = offload.pending_start_key(identity)
             self.assertIn("dispatch_start_settled=", command.split("exec 8<&-\n", 1)[1])
             self.assertNotIn("fence_holders", command)
-            lines = f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending={key}\n"
+            lines = (f"dispatch_mac_verdict={key} mac_exit=42\nmac_exit=42\n"
+                     f"mac_cleanup=skipped\ndispatch_start_pending={key}\n")
             return stream(controller, ["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines], cleanup_limit)
 
         with mock.patch.object(offload.ProcessController, "stream_mac_run", remote_run), \
