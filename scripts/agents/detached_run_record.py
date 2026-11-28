@@ -59,8 +59,12 @@ class RunRecord(StopFields):
     ended_pass_result_released: NotRequired[Literal[True]]
     worker_result_receipt: NotRequired[object]
     blocked_notice_accepted: NotRequired[Literal[True]]
+    pane_submit_failure_counted: NotRequired[Literal[True]]
     push_retries: NotRequired[int]
+    push_alert_delivery: NotRequired[str]
     push_alert_attempted: NotRequired[Literal[True]]
+    push_alert_missing_director_reported: NotRequired[Literal[True]]
+    push_alert_reported_causes: NotRequired[list[str]]
     # Set when the run ended without its supervisor: "supervisor gone".
     completion_pending: NotRequired[bool]
     ended: NotRequired[str]
@@ -88,11 +92,15 @@ def is_detached_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
             return (bool(run_id) and not isinstance(raw["started_at"], bool)
                     and not isinstance(raw["pid"], bool)
                     and all(isinstance(arg, str) for arg in cast(list[object], raw["command"]))
+                    and ("push_alert_reported_causes" not in raw or (
+                        isinstance(causes := raw["push_alert_reported_causes"], list)
+                        and all(isinstance(cause, str) for cause in cast(list[object], causes))))
                     and all(key not in raw or type(raw[key]) is int
                             for key in ("command_pid", "command_group", "exit_code", "push_retries"))
                     and all(key not in raw or isinstance(raw[key], str)
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
-                                        "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id"))
+                                        "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id",
+                                        "push_alert_delivery"))
                     and ("hold_stop_requests" not in raw or _is_hold_stop_requests(raw["hold_stop_requests"]))
                     and ("pending_hold_stop_requests" not in raw or (
                         raw.get("stop_pass_requested") is True and "command_slice" in raw
@@ -102,7 +110,8 @@ def is_detached_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
-                                        "blocked_notice_accepted", "push_alert_attempted",
+                                        "blocked_notice_accepted", "push_alert_attempted", "pane_submit_failure_counted",
+                                        "push_alert_missing_director_reported",
                                         "slice_cleanup_pending", "slice_leftovers",
                                         "completion_after_slice_cleanup", "ended_pass_result_released"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)

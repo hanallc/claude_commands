@@ -496,6 +496,32 @@ class RefuseUnappliedPriority(Enum):
 
 
 @dataclass(frozen=True)
+class DesignWorkerClaim:
+    design_id: str
+    role: Literal["designer", "reviewer"]
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        design_id, _, role = value.partition("/")
+        if role not in ("designer", "reviewer"):
+            raise StaffRefused("invalid design worker role")
+        _ = native_id(design_id)
+        return cls(design_id, role)
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.design_id}/{self.role}"
+
+
+@dataclass(frozen=True)
+class NoDesignWorkerClaim:
+    """The worker row has no held design role."""
+
+
+NO_DESIGN_WORKER_CLAIM = NoDesignWorkerClaim()
+
+
+@dataclass(frozen=True)
 class ProducerClone:
     source: StaffId
 
@@ -526,6 +552,7 @@ class StaffRow:
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
     top_item: TopItem | NoTopItem = field(default_factory=NoTopItem, kw_only=True)
     resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
+    design_claim: DesignWorkerClaim | NoDesignWorkerClaim = field(default=NO_DESIGN_WORKER_CLAIM, kw_only=True)
     clone_of: ProducerClone | NotAClone = field(default_factory=NotAClone, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
@@ -566,6 +593,8 @@ class StaffRow:
             value["retired_producer"] = self.retirement.profile
         if isinstance(self.top_item, TopItem):
             value["top_item"] = self.top_item.number
+        if isinstance(self.design_claim, DesignWorkerClaim):
+            value["design_claim"] = str(self.design_claim)
         if isinstance(self.clone_of, ProducerClone):
             value["clone_of"] = self.clone_of.source
         return value
@@ -604,6 +633,16 @@ class StaffRow:
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
         known_fields.update(("retired_producer", "top_item", "resume_pending"))
+        design_claim: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM
+        if "design_claim" in fields:
+            raw_claim = fields["design_claim"]
+            if kind != "worker" or not isinstance(raw_claim, str):
+                raise StaffUnreadable("invalid design worker claim")
+            try:
+                design_claim = DesignWorkerClaim.parse(raw_claim)
+            except StaffRefused as error:
+                raise StaffUnreadable("invalid design worker claim") from error
+            known_fields.add("design_claim")
         retirement: RetiredProducer | Active = Active()
         if "retired_producer" in fields:
             profile = fields["retired_producer"]
@@ -645,7 +684,8 @@ class StaffRow:
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    resume_pending=ResumePending.from_json(fields["resume_pending"])
                    if "resume_pending" in fields else NoPendingResume(),
-                   clone_of=clone_of, unknown_fields=_unknown_fields(fields, known_fields))
+                   design_claim=design_claim, clone_of=clone_of,
+                   unknown_fields=_unknown_fields(fields, known_fields))
 
 
 def unit_command(unit: StaffRow | UnitType) -> str:
@@ -754,6 +794,8 @@ class StaffSnapshot:
     retired_producers: tuple[StaffRow, ...] = field(default=(), kw_only=True)
     priority_request_proofs: Mapping[PriorityRequestKey, PriorityRequestOutcome] = field(
         default_factory=dict[PriorityRequestKey, PriorityRequestOutcome], kw_only=True, compare=False, repr=False)
+    design_workers: Mapping[DesignWorkerClaim, StaffId] = field(default_factory=dict[DesignWorkerClaim, StaffId], kw_only=True)
+    sealed_design_starts: frozenset[DesignWorkerClaim] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         retired = tuple(row for row in self.rows if isinstance(row.retirement, RetiredProducer))
@@ -769,7 +811,8 @@ class StaffSnapshot:
 
     def encode(self) -> str:
         return json.dumps({"rows": [row.to_json() for row in self.all_rows], "schema": self.schema,
-                           "pending_retire": list(self.pending_retire), "inputs": list(self.inputs)}, sort_keys=True)
+                           "pending_retire": list(self.pending_retire), "inputs": list(self.inputs),
+                           **_design_worker_fields(self.design_workers, self.sealed_design_starts)}, sort_keys=True)
 
     @classmethod
     def decode(cls, text: str) -> StaffSnapshot:
@@ -1120,10 +1163,9 @@ def _holder_fields() -> dict[str, object]:
 
 
 def _write_slot_holder(lock: IO[bytes]) -> None:
-    holder = _holder_fields()
     with suppress(OSError):
         os.ftruncate(lock.fileno(), 0)
-        _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
+        _ = lock.write((json.dumps(_holder_fields()) + "\n").encode("utf-8"))
 
 
 def _clear_slot_holder(lock: IO[bytes]) -> None:
@@ -1133,8 +1175,7 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
 
 def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
     try:
-        _ = lock.seek(0)
-        line = lock.read(4096).partition(b"\n")[0]
+        line = os.pread(lock.fileno(), 4096, 0).partition(b"\n")[0]
         holder = cast(object, json.loads(line))
     except (OSError, ValueError):
         return None
@@ -1167,7 +1208,7 @@ def _upkeep_pid(holder: tuple[int, str]) -> int | None:
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Literal["no_wait"] = "no_wait") -> None:
+def _acquire_slot(lock: IO[bytes], name: str) -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1177,16 +1218,7 @@ def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Litera
             return
         except BlockingIOError as error:
             holder = _slot_holder(lock)
-            if layout_deadline != "no_wait":
-                from scripts.agents import worker_lifecycle
-
-                try:
-                    worker_lifecycle.acquire_flock(lock, deadline=layout_deadline)
-                except worker_lifecycle.OperationDeadlineExpired:
-                    holder = _slot_holder(lock) or holder
-                else:
-                    return
-            elif seconds is not None:
+            if seconds is not None:
                 if holder is not None:
                     upkeep_pid = _upkeep_pid(holder)
                 if upkeep_pid is not None:
@@ -1239,28 +1271,73 @@ def session_operation(session: str, *, native_key: str, join_recovery: bool = Fa
         yield record
 
 
+class SlotLockWait(Enum):
+    IMMEDIATE = "refuse a held slot"
+
+
+def _wait_for_slot(lock: IO[bytes], path: Path, name: str, deadline: float) -> None:
+    from scripts.agents import worker_lifecycle
+
+    try:
+        # The deadline limits the wait for a held slot.
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    except BlockingIOError:
+        holder = _slot_holder(lock)
+    try:
+        worker_lifecycle.acquire_flock(lock, deadline=deadline)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        holder = _slot_holder(lock) or holder
+        named = f"pid {holder[0]}: {holder[1]}" if holder else _operation_lock_holder(path)
+        raise StaffRefused(f"{name}: timed out waiting for lock ({named})", holder=named) from error
+
+
+@contextmanager
+def _slot_lock(path: Path, name: str, wait: float | SlotLockWait) -> Generator[IO[bytes]]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b", buffering=0) as lock:
+        if wait is SlotLockWait.IMMEDIATE:
+            _acquire_slot(lock, name)
+        else:
+            _wait_for_slot(lock, path, name, wait)
+        _write_slot_holder(lock)
+        try:
+            yield lock
+        finally:
+            _clear_slot_holder(lock)
+
+
 @contextmanager
 def slot_operation(key: str, name: str, *, join: bool = True,
-                   layout_deadline: float | Literal["no_wait"] = "no_wait") -> Generator[None]:
-    """Lock a slot across inherited children. Only the layout slot can wait for any holder."""
+                   deadline: float | SlotLockWait = SlotLockWait.IMMEDIATE) -> Generator[None]:
+    """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
     if join and _joined_operation(path, variable):
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name, layout_deadline=layout_deadline)
+    with _slot_lock(path, name, deadline) as lock:
         previous = os.environ.get(variable)
-        _write_slot_holder(lock)
         try:
             os.environ[variable] = str(lock.fileno())
             yield
         finally:
-            _clear_slot_holder(lock)
             if previous is None:
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@contextmanager
+def reviewer_startup(caller: StaffRow) -> Generator[None]:
+    """Wait for reviewer startup and limit the wait for the caller's row."""
+    from scripts.lib import file_lock
+
+    path = _file().parent / "locks" / f"astra-review-start-{caller.id}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path):
+        deadline = time.monotonic() + _wait_seconds("operation_lock_seconds")
+        with slot_operation(caller.id, f"{caller.name}: caller row", deadline=deadline):
+            yield
 
 
 @dataclass(frozen=True)
@@ -1677,11 +1754,56 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
                                    for key, outcome in cast(dict[object, str], proofs).items()}
     except (StaffRefused, ValueError) as error:
         raise StaffUnreadable("invalid priority request proofs") from error
+    sealed = fields.get("sealed_design_starts", [])
+    if not isinstance(sealed, list):
+        raise StaffUnreadable("invalid sealed design starts")
+    starts = frozenset(_read_design_claim(value) for value in cast(list[object], sealed))
     return StaffSnapshot(tuple(rows),
                          tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
                          tuple(cast(list[str], inputs)), cast(int, fields.get("schema", 2)),
                          all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))),
-                         priority_request_proofs=priority_request_proofs)
+                         priority_request_proofs=priority_request_proofs,
+                         design_workers=_design_workers(fields, rows), sealed_design_starts=starts)
+
+
+def _design_worker_fields(workers: Mapping[DesignWorkerClaim, StaffId],
+                          sealed: frozenset[DesignWorkerClaim]) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    if workers:
+        fields["design_workers"] = {str(claim): identity for claim, identity in workers.items()}
+    if sealed:
+        fields["sealed_design_starts"] = sorted(map(str, sealed))
+    return fields
+
+
+def _read_design_claim(value: object) -> DesignWorkerClaim:
+    if not isinstance(value, str):
+        raise StaffUnreadable("invalid design worker claim")
+    try:
+        return DesignWorkerClaim.parse(value)
+    except StaffRefused as error:
+        raise StaffUnreadable("invalid design worker claim") from error
+
+
+def _design_workers(fields: dict[str, object], rows: Sequence[StaffRow]) -> dict[DesignWorkerClaim, StaffId]:
+    saved = fields.get("design_workers", {})
+    if not isinstance(saved, dict):
+        raise StaffUnreadable("invalid design worker records")
+    workers: dict[DesignWorkerClaim, StaffId] = {}
+    for name, identity in cast(dict[str, object], saved).items():
+        if not isinstance(identity, str) or not _valid_id(identity):
+            raise StaffUnreadable("invalid design worker identity")
+        workers[_read_design_claim(name)] = StaffId(identity)
+    return _retain_design_workers(workers, rows)
+
+
+def _retain_design_workers(saved: Mapping[DesignWorkerClaim, StaffId],
+                           rows: Sequence[StaffRow]) -> dict[DesignWorkerClaim, StaffId]:
+    workers = dict(saved)
+    for row in rows:
+        if isinstance(row.design_claim, DesignWorkerClaim) and workers.setdefault(row.design_claim, row.id) != row.id:
+            raise StaffUnreadable(f"{row.design_claim}: conflicting design worker identities")
+    return workers
 
 
 def _remote(arguments: list[str], *, input_text: str | None = None, machine: str = OWNER_MACHINE) -> object:
@@ -2003,18 +2125,20 @@ def _location_paths(row: StaffRow) -> tuple[Path, ...]:
                  if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree, SessionLaunchFolder)))
 
 
-def _store(rows: list[StaffRow], pending: set[StaffId],
-           priority_request_proofs: Mapping[PriorityRequestKey, PriorityRequestOutcome]) -> None:
+def _store(rows: list[StaffRow], pending: set[StaffId], previous: StaffSnapshot) -> None:
     from scripts.lib import atomic_file
 
     retained = cast(dict[str, object], _decode(_file().read_text(encoding="utf-8"))) if _file().exists() else {}
     unknown = [row for row in cast(list[dict[str, object]], retained.get("rows", [])) if row["kind"] not in _KINDS]
     _validate(rows, unknown)
-    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown}
+    # Keep the design link when a staff transaction removes the worker row.
+    design_workers = _retain_design_workers(previous.design_workers, rows)
+    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown,
+                                   **_design_worker_fields(design_workers, previous.sealed_design_starts)}
     if pending:
         document["pending_retire"] = sorted(pending)
-    if priority_request_proofs:
-        document["priority_request_proofs"] = {key.value: outcome for key, outcome in priority_request_proofs.items()}
+    if previous.priority_request_proofs:
+        document["priority_request_proofs"] = {key.value: outcome for key, outcome in previous.priority_request_proofs.items()}
     atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
     _copy_to_mac()
 
@@ -2062,7 +2186,8 @@ mv -f "$temporary" "$directory/staff.json"
 
 
 def _staff_transaction(edit: Callable[
-        [list[StaffRow], set[StaffId], dict[PriorityRequestKey, PriorityRequestOutcome]], _Result]) -> _Result:
+        [list[StaffRow], set[StaffId], dict[PriorityRequestKey, PriorityRequestOutcome]], _Result], *,
+        seal_design_start: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM) -> _Result:
     from scripts.lib import atomic_file
     from scripts.agents import worker_lifecycle
 
@@ -2078,6 +2203,7 @@ def _staff_transaction(edit: Callable[
             pending = set(original.pending_retire)
             proofs = dict(original.priority_request_proofs)
             result = edit(proposed, pending, proofs)
+            updated = _seal_design_start(original, seal_design_start)
             if path.resolve() == _default_file().resolve():
                 previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
@@ -2090,12 +2216,13 @@ def _staff_transaction(edit: Callable[
                             raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
             if (original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows)
-                    and pending == set(original.pending_retire) and proofs == original.priority_request_proofs):
+                    and pending == set(original.pending_retire) and updated is original
+                    and proofs == original.priority_request_proofs):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
             else:
-                _store(proposed, pending, proofs)
+                _store(proposed, pending, replace(updated, priority_request_proofs=proofs))
             return result
     except worker_lifecycle.OperationDeadlineExpired:
         raise
@@ -2105,8 +2232,9 @@ def _staff_transaction(edit: Callable[
         raise StaffUnreadable(f"cannot write staff record: {error}") from error
 
 
-def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
-    return _staff_transaction(lambda rows, pending, _proofs: edit(rows, pending))
+def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result], *,
+                        seal_design_start: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM) -> _Result:
+    return _staff_transaction(lambda rows, pending, _proofs: edit(rows, pending), seal_design_start=seal_design_start)
 
 
 def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
@@ -2293,12 +2421,51 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
             raise StaffRefused(str(error)) from error
 
 
-def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
-    """Publish worker membership before dispatch."""
+def ensure_worker(identity: StaffId, name: str, parent: StaffId, *,
+                  design_claim: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM) -> StaffRow:
+    """Publish worker membership and its design claim in one staff commit."""
     identity = native_id(identity)
     if not is_owner():
-        return _remote_row(["ensure-worker", identity, "--name", name, "--parent", parent])
-    return _transaction(lambda rows: _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity))
+        command = ["ensure-worker", identity, "--name", name, "--parent", parent]
+        if isinstance(design_claim, DesignWorkerClaim):
+            command.extend(("--design-role", str(design_claim)))
+        return _remote_row(command)
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        if isinstance(design_claim, NoDesignWorkerClaim):
+            return _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity)
+        claimed = next((row for row in rows if row.design_claim == design_claim), None)
+        if claimed is not None:
+            if claimed.current_session == identity and claimed.reports_to(parent):
+                return claimed
+            raise StaffRefused(f"{design_claim}: the design role already has a worker")
+        record = _load(initial=True)
+        if design_claim in record.design_workers:
+            raise StaffRefused(f"{design_claim}: the design worker was already published")
+        if design_claim in record.sealed_design_starts:
+            raise StaffRefused(f"{design_claim}: the design startup has ended")
+        if any(row.kind == "worker" and row.name == name and row.reports_to(parent) for row in rows):
+            raise StaffRefused(f"{name}: the worker slot already belongs to another claim")
+        row = _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity)
+        published = replace(row, design_claim=design_claim)
+        rows[rows.index(row)] = published
+        return published
+
+    return _transaction(edit)
+
+
+def _seal_design_start(record: StaffSnapshot, claim: DesignWorkerClaim | NoDesignWorkerClaim) -> StaffSnapshot:
+    if isinstance(claim, DesignWorkerClaim) and claim not in record.design_workers and claim not in record.sealed_design_starts:
+        return replace(record, sealed_design_starts=record.sealed_design_starts | {claim})
+    return record
+
+
+def seal_design_worker_start(claim: DesignWorkerClaim) -> None:
+    """Prevent late publication if the design has no admitted worker."""
+    if not is_owner():
+        _ = _remote(["seal-design-start", str(claim)])
+        return
+    _record_transaction(lambda rows, pending: None, seal_design_start=claim)
 
 
 def set_worker_role(identity: StaffId, role: KnownWorkerRole) -> StaffRow:
@@ -3080,6 +3247,7 @@ class _MoveCommand(Protocol):
 
 class _Arguments:
     creation_action: str = ""
+    design_role: DesignWorkerClaim | NoDesignWorkerClaim = NO_DESIGN_WORKER_CLAIM
     marker: str = ""
     profile: str = ""
     number: str = ""
@@ -3125,6 +3293,9 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    seal_design_start = verbs.add_parser("seal-design-start", help=argparse.SUPPRESS)
+    _ = seal_design_start.add_argument("target")
+    _ = seal_design_start.add_argument("--json", action="store_true")
     lock_status = verbs.add_parser("worktree-write-lock-status", help=argparse.SUPPRESS)
     _ = lock_status.add_argument("--json", action="store_true")
     for command in ("set-worker-role", "set-home"):
@@ -3181,6 +3352,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = worker_parser.add_argument("target")
     _ = worker_parser.add_argument("--name", required=True)
     _ = worker_parser.add_argument("--parent", required=True)
+    _ = worker_parser.add_argument("--design-role", type=DesignWorkerClaim.parse, default=NO_DESIGN_WORKER_CLAIM)
     _ = worker_parser.add_argument("--json", action="store_true")
     _ = worker_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     session_parser = verbs.add_parser("update-current-session", help=argparse.SUPPRESS)
@@ -3320,7 +3492,8 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
                                      profile=models_registry.parse_producer_profile(arguments.profile))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
-        return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
+        return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent),
+                             design_claim=arguments.design_role)
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
     if arguments.verb == "set-producer-retirement":
@@ -3394,6 +3567,10 @@ def _main(arguments: _Arguments) -> int:
                 raise StaffRefused("enter a producer and a List item number")
             command = ApplyPriorityRequest(StaffId(arguments.producer), TopItem(int(arguments.number)))
         print(json.dumps(settle_priority_request(key, command)))
+        return 0
+    if arguments.verb == "seal-design-start":
+        seal_design_worker_start(DesignWorkerClaim.parse(arguments.target))
+        print("null")
         return 0
     if arguments.verb == "worktree-write-lock-status":
         if not is_owner():
