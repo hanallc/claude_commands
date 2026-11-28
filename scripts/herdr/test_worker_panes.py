@@ -4196,6 +4196,71 @@ class WorkerPaneTests(StaffTestCase):
                               "terminal may be held by editor because its stdin is unavailable")
                     self.assertEqual(send.body_text(options), f"Worker {row.name}: anomaly: {reason}\n{body}")
 
+    def test_unreadable_pane_with_a_launch_record_does_not_hide_sibling_absence(self) -> None:
+        unreadable = self.worker("unreadable")
+        absent = self.worker("absent")
+        self.world.add(unreadable, "w1:p1")
+        self.world.unknown["w1:p1"] = "process permission denied"
+        record = staff.snapshot()
+        found = {state.row.id: state for state in worker_panes.observe(self.parent.id, record)}
+        self.assertEqual(found[unreadable.id], worker_panes.ProcessUnknownWorker(
+            unreadable, "w1:p1", "terminal-w1:p1", "process permission denied"))
+        self.assertEqual(found[absent.id], worker_panes.ClosedWorker(absent))
+
+    def test_failed_process_read_for_a_worker_with_a_custom_label_blocks_restart(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", label="custom label")
+        (pane_launch.record_directory() / "agents.json").unlink()
+        self.world.unknown["w1:p1"] = "process permission denied"
+        record = staff.snapshot()
+        self.assertIsInstance(worker_panes.observe_worker(self.parent.id, row, record), worker_panes.UncertainWorker)
+        self.assertIsInstance(self.start(), worker_panes.UncertainWorker)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)),
+                              worker_panes.UncertainWorker)
+        self.assertEqual((self.world.launches, self.world.closed), ([], []))
+
+    def test_unreadable_pane_label_cannot_identify_an_absent_sibling(self) -> None:
+        unreadable = self.worker("unreadable")
+        absent = self.worker("absent")
+        stopped = self.worker("stopped")
+        self.world.add(unreadable, "w1:p1", label=absent.name)
+        (pane_launch.record_directory() / "agents.json").unlink()
+        self.world.add(stopped, "w1:p2", live=False)
+        self.world.unknown["w1:p1"] = "process permission denied"
+        record = staff.snapshot()
+        for row in (unreadable, absent):
+            with self.subTest(worker=row.name):
+                self.assertIsInstance(self.observation(row), worker_panes.UncertainWorker)
+                self.assertIsInstance(worker_panes.observe_worker(self.parent.id, row, record),
+                                      worker_panes.UncertainWorker)
+        self.assertEqual(self.observation(stopped), worker_panes.StoppedWorker(stopped, "w1:p2", "terminal-w1:p2"))
+
+    def test_renamed_agent_cannot_identify_an_unreadable_pane_as_its_sibling(self) -> None:
+        unreadable = self.worker("unreadable")
+        absent = self.worker("absent")
+        self.world.add(unreadable, "w1:p1", label="custom label")
+        (pane_launch.record_directory() / "agents.json").unlink()
+        self.world.unknown["w1:p1"] = "process permission denied"
+        server_result = self.world.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments == ("agent", "list"):
+                return {"agents": [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
+                                    "name": worker_panes.agent_name(self.parent, absent.name)}]}
+            return server_result(*arguments, deadline=deadline)
+
+        record = staff.snapshot()
+        with patch.object(self.world, "result", side_effect=result):
+            for row in (unreadable, absent):
+                with self.subTest(worker=row.name):
+                    self.assertIsInstance(self.observation(row), worker_panes.UncertainWorker)
+                    self.assertIsInstance(worker_panes.observe_worker(self.parent.id, row, record),
+                                          worker_panes.UncertainWorker)
+            self.world.locations["w1:p1"]["agent_session"] = {"kind": "id", "value": unreadable.current_session}
+            self.assertEqual(self.observation(unreadable), worker_panes.ProcessUnknownWorker(
+                unreadable, "w1:p1", "terminal-w1:p1", "process permission denied"))
+            self.assertEqual(self.observation(absent), worker_panes.ClosedWorker(absent))
+
     def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")
         self.world.add(self.parent, "w1:p9", live=False, label="foreign")
