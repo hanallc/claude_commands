@@ -75,7 +75,7 @@ from scripts.review_links import (
 )
 from scripts.review_links import (
     accounts_page, answer_sources, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
-    placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
+    placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, settings_page, studio_page, test_review_page,
 )
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
 from scripts.feature_log import feature_log
@@ -1209,6 +1209,114 @@ class ReviewLinksServerTests(unittest.TestCase):
         """Return the state of each saved hold file."""
         return [cast(send_hold.HoldFile, json.loads(path.read_text(encoding="utf-8")))["state"]
                 for path in sorted((self.root / send_hold.HOLD_FOLDER).glob("*.json"))]
+
+    def post_undo_time(self, seconds: str, *, token: str) -> tuple[int, str, dict[str, object]]:
+        body = urlencode({"seconds": seconds, "token": token}).encode()
+        return self.held_http("POST", settings_page.PAGE_PATH, body,
+                              headers={"Content-Type": "application/x-www-form-urlencoded"})
+
+    def test_settings_saves_at_once_and_changes_the_send_hold_time(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            status, held, saved = self.post_undo_time("20", token=self.server.new_item_token)
+            self.assertEqual((status, held, saved["seconds"], saved["previous"]), (200, "", 20, 10))
+            config = conf.read("review_links")
+            self.assertEqual(config.whole("undo_seconds"), 10)
+            self.assertEqual(settings_page.undo_seconds(self.root, config), 20)
+            page = self.request(settings_page.PAGE_PATH)
+            self.assertEqual(page.status, 200, page.body)
+            self.assertIn(b'value="20" aria-pressed="true">20 s', page.body)
+            self.assertEqual(self.request("/" + settings_page.SETTINGS_FILE).status, 404)
+            status, held, send = self.held_http("POST", images.PAGE_PATH, b"action=answer",
+                                               headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual((status, held, send["seconds"]), (202, "held", 20))
+            self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{send["hold"]}/undo')[0], 200)
+            self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{saved["hold"]}/undo')[0], 200)
+            self.assertEqual(settings_page.undo_seconds(self.root, config), 10)
+
+    def test_settings_refuses_an_unlisted_time_and_a_bad_token(self) -> None:
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            self.assertEqual(self.post_undo_time("15", token=self.server.new_item_token)[0], 400)
+            self.assertEqual(self.post_undo_time("20", token="wrong")[0], 403)
+            self.assertFalse((self.root / settings_page.SETTINGS_FILE).exists())
+
+    def test_settings_undo_restores_the_previous_choice(self) -> None:
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            token = self.server.new_item_token
+            _, _, first = self.post_undo_time("20", token=token)
+            _, _, second = self.post_undo_time("30", token=token)
+            stale = f'{send_hold.HOLD_PATH}/{first["hold"]}/undo'
+            recent = f'{send_hold.HOLD_PATH}/{second["hold"]}/undo'
+            self.assertEqual(self.held_http("POST", stale)[0], 404)
+            self.assertEqual(self.held_http("POST", recent)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(self.held_http("POST", recent)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 20)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_opens_settings_and_saves_with_undo_in_dark_mode(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=20\n")
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        session = browser.session
+        _ = browser.command("Emulation.setDeviceMetricsOverride",
+                            {"width": 1440, "height": 900, "deviceScaleFactor": 1, "mobile": False}, session)
+        _ = browser.command("Emulation.setEmulatedMedia", {"features": [
+            {"name": "prefers-color-scheme", "value": "dark"}]}, session)
+
+        def evaluate(expression: str) -> None:
+            result = browser.command("Runtime.evaluate", {"expression": expression, "awaitPromise": True}, session)
+            self.assertNotIn("exceptionDetails", result, result)
+
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            browser.navigate(f"http://127.0.0.1:{self.port}/console/")
+            evaluate(r"""
+(async()=>{
+ window.settingsCheck=(ok,message)=>{if(!ok) throw new Error(message);};
+ window.settingsWhen=(root,find)=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(check);
+  const timeout=setTimeout(()=>{observer.disconnect();reject(new Error('Settings did not update.'));},4000);
+  function check(){
+   if(!find()) return;
+   clearTimeout(timeout);observer.disconnect();resolve();
+  }
+  observer.observe(root,{attributes:true,childList:true,subtree:true});check();
+ });
+ const link=document.querySelector('[data-page=settings]');
+ link.click();
+ const frame=document.querySelector('.workspace iframe[data-console-page=settings]');
+ settingsCheck(link.getAttribute('aria-current')==='page' && frame && !frame.hidden,'Settings opens in the main area.');
+ settingsCheck(link.parentElement.firstElementChild.matches('.for-you-slot') && link===link.parentElement.lastElementChild,
+  'Settings is below For you.');
+ if(!frame.contentDocument?.querySelector('#undo-time')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+ window.settingsDocument=frame.contentDocument;
+ const choices=[...settingsDocument.querySelectorAll('#undo-time button')];
+ settingsCheck(innerWidth===1440 && innerHeight===900 && matchMedia('(prefers-color-scheme:dark)').matches,
+  'The browser uses the dark 1440 x 900 view.');
+ settingsCheck(settingsDocument.querySelector('h1').textContent==='Settings' && choices.map(button=>button.textContent).join(',')===
+  '5 s,10 s,20 s,30 s','Settings shows the four approved choices.');
+ choices[1].click();
+ await settingsWhen(document.body,()=>document.querySelector('[data-send-undo] button'));
+ settingsCheck(choices[1].getAttribute('aria-pressed')==='true','The 10 s choice is selected.');
+ const toast=document.querySelector('[data-send-undo]');
+ settingsCheck(toast.querySelector('span').textContent==='Saved.' && toast.querySelector('button').textContent==='Undo',
+  'The shared Saved. message offers Undo.');
+ await settingsWhen(document.body,()=>document.querySelector('.for-you-slot button[data-state=quiet]'));
+})();
+""")
+            if proof := os.environ.get("SETTINGS_PROOF"):
+                picture = cast(dict[str, str], browser.command("Page.captureScreenshot", {"format": "png"}, session))
+                _ = Path(proof).write_bytes(base64.b64decode(picture["data"]))
+            evaluate(r"""
+(async()=>{
+ document.querySelector('[data-send-undo] button').click();
+ await settingsWhen(settingsDocument.body,()=>settingsDocument.querySelector('#undo-time button[aria-pressed=true]').value==='20');
+ settingsCheck(!document.querySelector('[data-send-undo]'),'Undo removes the saved message.');
+})();
+""")
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 20)
 
     def held_new_item(self) -> tuple[test_review_page.ReviewPageTests, staff.StaffRow, bytes]:
         case = self.review_fixture()

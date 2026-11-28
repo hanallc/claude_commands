@@ -45,7 +45,7 @@ from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing, change_review, record_store, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
+from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, settings_page, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
 from scripts.whoami import usage_store
 
@@ -1000,6 +1000,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(200, content, content_security_policy="default-src 'self'; script-src 'unsafe-inline'; "
                                + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             return None
+        if route.path == settings_page.PAGE_PATH:
+            if self.tailscale_refusal() or not self.same_origin():
+                self.send_error(403)
+                return None
+            try:
+                content = settings_page.render(root, conf.read("review_links"), server.new_item_token)
+            except (OSError, ValueError) as error:
+                print(f"review-links settings: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>Settings is not available.</p>", "Settings"))
+            else:
+                self.html_response(200, content, content_security_policy="default-src 'self'; script-src 'unsafe-inline'; "
+                                   + "style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'")
+            return None
         if route.path == "/console/for-you.json":
             extra: dict[str, object] = {}
             if route.query == "view=console":
@@ -1354,7 +1367,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         refusal = self.tailscale_refusal()
         if refusal:
-            if route.path == console_tune.PAGE_PATH or route.path.startswith(send_hold.HOLD_PATH + "/"):
+            if route.path in (console_tune.PAGE_PATH, settings_page.PAGE_PATH) or route.path.startswith(send_hold.HOLD_PATH + "/"):
                 self.json_response(403, {"reason": refusal})
             elif route.path == review_page.NEW_ITEM_PATH:
                 self.json_response(403, {"error": refusal})
@@ -1370,8 +1383,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.json_response(400, {"reason": "The send has no valid request ID."})
                 return
             request_id = request_ids[0] if request_ids else ""
-            seconds = conf.read("review_links").whole("undo_seconds")
-            server = cast(ReviewLinksServer, self.server)
+            seconds = settings_page.undo_seconds(server.store_folder, conf.read("review_links"))
             if seconds or (request_id and server.send_holds.has_hold(request_id)):
                 self.hold_post(route, seconds, request_id)
                 return
@@ -1383,6 +1395,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if route.path == console_tune.PAGE_PATH:
             self.tune_post(route.query)
+            return
+        if route.path == settings_page.PAGE_PATH:
+            self.settings_post(route.query)
             return
         if not self.same_origin():
             self.send_error(403)
@@ -2447,6 +2462,33 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, {**response, "state": "saved"})
 
+    def settings_post(self, query: str) -> None:
+        """Save the selected Undo time from the console form."""
+        if not self.same_origin(required=True):
+            self.json_response(403, {"reason": "Open Settings on this console."})
+            return
+        try:
+            if query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                raise ValueError("Use the Settings form.")
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError("Invalid Settings request size.")
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+            tokens = fields.pop("token", [])
+            if len(tokens) != 1 or not self.valid_request_token(tokens[0]):
+                self.json_response(403, {"reason": "The Settings token expired. Reload Settings."})
+                return
+            if set(fields) != {"seconds"} or len(fields["seconds"]) != 1:
+                raise ValueError("Choose one Undo time.")
+            server = cast(ReviewLinksServer, self.server)
+            saved = settings_page.save(server.store_folder, conf.read("review_links"), fields["seconds"][0])
+        except ValueError as error:
+            self.json_response(400, {"reason": str(error)})
+        except OSError as error:
+            self.browser_failure(503, "The Undo time could not be saved.", error)
+        else:
+            self.json_response(200, dict(saved))
+
     def accounts_post(self) -> None:
         """Apply one Accounts page action."""
         quota_fields = {"quota_account", "quota_level", "quota_reset"}
@@ -2730,7 +2772,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if identity == "list" and "list" not in identities and "studio" in identities:
                     identity = "studio"
                 # Rebuilds has no navigation entry, so its request uses an empty name.
-                if identity and identity not in identities:
+                if identity and identity != "settings" and identity not in identities:
                     raise ValueError("name one console page or none")
                 fresh = console.news(server.root, tuple(pages), identity)
         except ValueError as error:
@@ -2821,6 +2863,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             outcome = server.send_holds.undo(hold_id)
+            if outcome is send_hold.UndoResult.MISSING and server.mode is not ServerMode.LIST_FIXTURE:
+                outcome = settings_page.undo(server.store_folder, hold_id)
         except OSError as error:
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
             self.json_response(503, {"reason": "The undo failed. The send can still leave."})

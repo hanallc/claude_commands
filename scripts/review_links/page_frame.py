@@ -1180,7 +1180,7 @@ function trackHeldRequest(key,id){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver,resumable){
+function showSendUndo(request,seconds,receiver,resumable,saved=false){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1233,6 +1233,7 @@ function showSendUndo(request,seconds,receiver,resumable){
   window.addEventListener('pagehide',close);
   fade.finished.then(()=>{
    if(done) return;
+   if(saved){finish(false);return;}
    done=true;
    button.remove();bar.remove();toast.hidden=true;
    resolve(reportResult);
@@ -1249,6 +1250,9 @@ function showSendUndo(request,seconds,receiver,resumable){
     finish(true);return;
    }
    if(request.closed) return;
+   if(saved){
+    done=true;remove();reject(new Error('The Undo time could not be restored.'));return;
+   }
    if(signal?.aborted){
     done=true;remove();
     reject(new Error('The Undo response timed out. The send can still leave.'));
@@ -1322,6 +1326,11 @@ async function readHeldResult(hold,request,undo,resumable){
  }
 }
 heldFetch.newId=newHoldId;
+heldFetch.showSaved=({hold,seconds})=>{
+ const request={hold,closed:false};
+ const done=showSendUndo(request,seconds,null,true,true);
+ return {done,close(){request.closed=true;request.closeToast();}};
+};
 heldFetch.resume=id=>{
  const request=heldRequests.get(id);
  return readHeldResult(request?.hold ?? id,request,false,true);
