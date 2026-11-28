@@ -5045,8 +5045,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("Detached run: no-pane-pass", self.inputs[0][1])
         self.assertEqual(self.notices, [])
 
-    def create_stopped_run(self, row: staff.StaffRow, dispatch: str) -> Path:
-        record = self.record(row)
+    def create_stopped_run(self, row: staff.StaffRow, dispatch: str, *, run_id: str = "pane-result") -> Path:
+        record = self.record(row, run_id)
         record.update(pid=DEAD_PID, command_group=DEAD_PID, exit_code=143, stop_pass_requested=True,
                       stop_reason="Private stop.", pane_dispatch_id=dispatch)
         path = Path(record["log"]).with_suffix(".json")
@@ -7379,6 +7379,80 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(self.inputs[0][0], pane)
+
+    def prepare_stop_notice(self, row: staff.StaffRow, dispatch: str) -> Path:
+        path = self.create_stopped_run(row, dispatch, run_id=f"{row.name}-stop")
+        write_text_atomic(path, json.dumps({
+            **worker_lifecycle.read_json_object(path), "status": "finished", "completion_pending": True,
+            "delivery": detached_runs.BUSY_WORKER_RESULT,
+        }))
+        route = pass_notices.Route(dispatch, self.fixture.parent.id, row.name)
+        pass_notices.stage_result(self.run_dir, route, "stopped",
+                                  pass_notices.Notice("The pass stopped.", f"codex:{row.current_session}",
+                                                      pass_notices.NoticeKind.RESULT, settled=True),
+                                  legacy=pass_notices.LegacyNoticeStamp("", ""))
+        return path
+
+    def test_done_keeps_stop_result_pending_when_transport_is_busy(self) -> None:
+        row = self.fixture.worker(family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        path = self.prepare_stop_notice(row, dispatch)
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        claim = detached_runs._result_transport_claim  # pyright: ignore[reportPrivateUsage]
+
+        evidence = MagicMock(spec=detached_runs.ResultDoneEvidence)
+        evidence.configure_mock(**{"covers_run.return_value": detached_runs.ResultDoneCoverage.COVERED})
+        with (claim(path) as claimed,
+              patch.object(worker, "read_result_done_evidence", return_value=evidence),
+              self.assertRaises(KeyboardInterrupt)):
+            self.assertTrue(claimed)
+            detached_runs.stage_worker_stop_results(self.run_dir, row, dispatch)
+            _ = detached_runs.acknowledge_worker_completion(self.run_dir, row, passed)
+            raise KeyboardInterrupt
+
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], detached_runs.BUSY_WORKER_RESULT)
+        self.assertIs(saved["completion_pending"], True)
+        detached_runs.stage_worker_stop_results(self.run_dir, row, dispatch)
+        pass_notices.retry(self.run_dir)
+        pass_notices.retry(self.run_dir)
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn(f"Detached run: {path.stem}", self.notices[0][1])
+        self.assertEqual(self.inputs, [])
+
+    def test_retirement_replays_the_saved_stop_notice_without_an_alert(self) -> None:
+        stage = pass_notices.stage_ended_run_result
+        for publish in (False, True):
+            with self.subTest(publish=publish):
+                row = self.fixture.worker(f"stopped-{publish}", family="codex")
+                dispatch, _ = self.begin_pane_pass(row)
+                path = self.prepare_stop_notice(row, dispatch)
+
+                def interrupt_publish(run: Path, route: pass_notices.Route, sender: str, run_id: str,
+                                      message: str, *, publish_notice: bool = publish) -> str:
+                    if publish_notice:
+                        _ = stage(run, route, sender, run_id, message)
+                    raise KeyboardInterrupt
+
+                with (patch.object(pass_notices, "stage_ended_run_result", side_effect=interrupt_publish),
+                      self.assertRaises(KeyboardInterrupt)):
+                    detached_runs.stage_worker_stop_results(self.run_dir, row, dispatch)
+                self.assertIsNotNone(staff.retire(row.id))
+
+                with (patch.object(subprocess, "Popen"), patch.object(
+                        send, "send", return_value=send.Result("sent", "director received the result")) as push):
+                    detached_runs.reap_orphan(path)
+                    push.assert_called_once()
+                    pass_notices.retry(self.run_dir)
+                    detached_runs.reap_orphan(path)
+                push.assert_called_once()
+                options = cast(send.Options, push.call_args.args[0])
+                self.assertEqual(options.key, f"worker-completion:{dispatch}:detached-result:{path.stem}")
+                self.assertIn("exit 143", options.text or "")
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved["stop_result_route"], "director-notice")
+                self.assertIs(saved["completion_pending"], False)
+        self.assertEqual(self.inputs, [])
 
     def test_reap_alerts_when_a_stopped_runs_worker_retires_before_delivery(self) -> None:
         row = self.fixture.worker()
