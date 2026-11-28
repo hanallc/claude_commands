@@ -979,8 +979,8 @@ Paired trials use the same regional launch and cleanup path.
 The home stack owns the artifact bucket and the global gate role and instance profile.
 Each fallback region has a separate gate stack in its default VPC.
 The deployment generates each regional template from the home template.
-The regional template contains network, launch, source storage, and expiry resources.
-The home scaler policies keep the tag, type, Spot, and launch-template restrictions for each region.
+The regional template contains network, launch, scaler policy, and expiry resources.
+The regional scaler policy keeps the home tag, type, Spot, and launch-template restrictions.
 The regional expiry function terminates expired boxes in that region.
 
 The deployment resolves the pinned image by Name and owner or copies it when no matching image exists.
@@ -1021,55 +1021,30 @@ A candidate without the entry point publishes `candidate predates guest entry po
 The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
 
-### Private source bundles
+### Current files for a gate run
 
-Each gate stack owns an encrypted, private source bucket with the existing cost tags.
-The bucket policy requires TLS and limits the scaler to the manifest and bundle keys.
-The gate plan checks the source bucket policy in each proposed region.
-Teardown checks the gate record against the verified deployment.
-It reads the source bucket from each saved stack, including stacks absent from the gate manifest.
-It empties the verified source and request buckets in batches of up to 500 objects before it deletes the stacks.
-If a late write blocks deletion, teardown reads the verified stack again and retries up to three times.
-Private gate uploads and launches hold the shared account stack lock.
-Git preparation and waits for a shared delta receipt occur outside that lock.
-Approved setup uses `git_network_timeout_s` for the Git commands that prepare its first base.
-Teardown holds the exclusive lock and keeps private launches and refreshes disabled until removal ends.
+Gate setup records the pinned Linux tool paths after it verifies their availability in the Nix binary cache.
+A new gate uses the current-files transfer when the deployment has those tool paths.
+Older deployment records and saved launches keep the clone path.
+The repository visibility and `clone_url` stay in place until an AWS gate proof passes.
 
-The deployment captures one `origin/main` commit and publishes a full Git bundle to each source bucket.
-The hourly job checks for a refresh when cloud gates are enabled.
-It refreshes each base after seven days.
-A regional publication verifies the bundle checksum before it advances `base/current.json`.
-A conditional manifest write protects a newer base from a delayed publication.
-A failed regional publication keeps the previous manifest and leaves the other regions available.
+The controller packs the candidate commit and the captured `origin/main` commit with the objects in their trees.
+The pack contains no older commits or objects found only in older trees.
+The scaler uploads the pack once to the home bucket alongside the request and guest program.
+Each launch region receives a signed GET and the expected SHA-256.
+An uncertain launch reuses the saved launch arguments.
+The local pack stays until settlement and is removed after an interrupted submission when no worker can use it.
 
-The controller pins the selected region's base in the saved launch record.
-It uses `BaseOnly` when the base contains all requested commits.
-It downloads and verifies the base if the captured archive lacks the base commit.
-Otherwise, it uploads a delta for the selected base in the same region.
-Paired modules that select the same base share one regional delta.
-Recovery reuses the saved source keys and launch arguments for an uncertain launch.
-The controller checks the suite mode before it creates a gate source archive.
-It removes the archive after a failed or interrupted service start if no worker or launch can use it.
-It keeps the archive while recovery can use it and removes it after settlement.
+The guest checks the SHA-256 before it imports the pack.
+It checks both commit and tree IDs before it starts tests.
+The guest records the captured main as `origin/main` and imports the commits as shallow tips.
+Paired trials include both trial revisions and the captured main in one pack.
+The paired checkouts share the verified Git objects and have separate indexes.
 
-The controller selects bases for 14 days.
-The bucket expires base objects after 15 days and deltas after one day.
-The manifest has no expiry rule.
-The controller requires the attempt deadline to precede delta expiry.
-An unavailable base, a base mismatch, or a failed delta upload prevents the regional variant from launching.
-
-The guest downloads the exact signed objects and verifies their SHA-256 hashes.
-It verifies bundle prerequisites, detached commits, and trees before it runs tests.
-It publishes `GuestSourceRejected` through the boot error link when source verification fails.
-A failed download names the bundle and reports the curl exit code and HTTP status.
-The deployment verifies pinned Linux tool paths in the Nix binary cache.
-The private boot uses those paths and reports `GateToolsUnavailable` if tool preparation fails.
-
-Older deployment records and saved launches keep the public clone path.
-Private paired trials use bundles for both revisions and create no remote trial branches.
-The two checkouts share the verified Git objects and keep separate indexes.
-The cold proof run with GitHub access denied is pending.
-The repository visibility and `clone_url` remain as before.
+The scaler holds the shared account stack lock during package uploads and launches.
+Teardown holds the exclusive lock.
+Teardown verifies the home bucket identity and empties it before it deletes the foundation stack.
+If a late write blocks deletion, teardown verifies the stack and bucket again before it retries.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.
@@ -1184,8 +1159,7 @@ Run one `deploy.py up` at a time. Two runs from different state folders can save
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job refreshes the Spot snapshot, placement scores, and any regional source bases that are due.
-It also checks billed hours.
+The hourly job refreshes the Spot snapshot and placement scores. It also checks billed hours.
 `python3 scripts/aws_target/aws_target.py snapshot` runs the same operations manually.
 `aws_target.py tick` reconciles the Hana lifecycle and refreshes account charges.
 `price_refresh_seconds` limits snapshot attempts to one per configured interval.

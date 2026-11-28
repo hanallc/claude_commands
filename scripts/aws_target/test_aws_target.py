@@ -14,7 +14,7 @@ from typing import override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_target, gate_source, ledger, plan_identity, price_days, run_cost, spot_table
+from scripts.aws_target import aws_target, ledger, plan_identity, price_days, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsUnavailable, aws_error_code
 from scripts.aws_target.ledger_test_support import AwsSettingsFixture, CostFixture
 from scripts.build_targets import target_config
@@ -87,27 +87,6 @@ class HanaGpuSnapshotTests(CostFixture):
 
 
 class BuildlogAwsSnapshotTests(AwsSettingsFixture):
-    def test_hourly_refreshes_private_bases_only_when_cloud_gates_are_enabled(self) -> None:
-        manifest = self.state / 'gate-deployment.json'
-        self.state.mkdir(exist_ok=True)
-        regions = [{'region': 'fixture-region', 'source_bucket': 'fixture-source'}]
-        _ = manifest.write_text(json.dumps({'deployment_id': 'fixture', 'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture'],
-                                           'regions': regions}))
-        api = aws_target.AwsCli('fixture', 'fixture-region', 1,
-                                execute=mock.Mock(side_effect=AssertionError('unexpected AWS command')))
-        with (mock.patch.object(aws_target, 'snapshot', return_value=0),
-              mock.patch.object(aws_target, 'hours_gap_notices', return_value=0),
-              mock.patch.object(aws_target, 'placement_snapshot'),
-              mock.patch.object(aws_target, 'scaler_snapshot_api', return_value=api),
-              mock.patch.object(gate_source, 'refresh_bases', return_value=()) as refresh):
-            self.configure_gate('enabled=off')
-            self.assertEqual(aws_target.hourly(self.settings, self.state), 0)
-            refresh.assert_not_called()
-            self.configure_gate('enabled=on')
-            self.assertEqual(aws_target.hourly(self.settings, self.state), 0)
-            refresh.assert_called_once_with(api, Path(__file__).resolve().parents[2], regions=tuple(regions),
-                git_timeout=conf.read_or_repository('cloud_gate').number('git_network_timeout_s'), write_access=mock.ANY)
-
     def test_buildlog_snapshot_accepts_auth_failure_and_reports_local_write_error(self) -> None:
         self.configure_gate('spot_candidate_regions=us-east-1')
         auth_failure = ('aws: [ERROR]: An error occurred (AuthFailure) '

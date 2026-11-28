@@ -12,7 +12,7 @@ from typing import Literal, cast, final, override
 from unittest import mock
 
 from scripts.aws_target.aws_cli import AwsUnavailable
-from scripts.aws_target import admin_secrets, aws_trial, deploy, gate_source, hana_box, hana_image, hana_placement, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_image, hana_placement, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
@@ -748,9 +748,6 @@ class GatePlanTests(CostFixture):
         _ = conf.path('cloud_gate').write_text(f'''\
 regions={' '.join(self.regions)}
 instance_types=m7a.8xlarge
-packages=git
-# range: 0.01..300
-git_network_timeout_s=60
 credential_file={self.credentials_path}
 hana_gpu_instance_types={GATE_HANA_GPU_TYPE}
 hana_gpu_spot_max_usd_per_hour={json.dumps({GATE_HANA_GPU_TYPE: '0.5'})}
@@ -977,28 +974,17 @@ shared_usd_per_month=1
         elif action == 'ec2:TerminateInstances':
             self.assertEqual(contexts['ec2:ResourceTag/Workload']['ContextKeyValues'], ['cloud-claude-gate'])
         elif action.startswith('s3:'):
+            self.assertEqual(region, GATE_HOME)
             self.assertEqual(contexts['aws:SecureTransport']['ContextKeyType'], 'boolean')
             self.assertEqual(contexts['aws:SecureTransport']['ContextKeyValues'], ['true'])
-            document = ledger.mapping(cast(object, json.loads(ledger.text(request, 'ResourcePolicy'))))
-            bucket = 'arn:aws:s3:::' + gate_source.bucket_name(DEPLOYMENT, region)
-            if resource == bucket or resource.startswith(bucket + '/'):
-                deny, objects, listing = ledger.rows(document, 'Statement')
-                self.assertEqual(deny['Condition'], {'Bool': {'aws:SecureTransport': 'false'}})
-                self.assertEqual(objects['Principal'], {'AWS': GATE_USER})
-                self.assertEqual(objects['Resource'], [bucket + '/' + key for key in (
-                    'base/current.json', 'base/g*', 'delta/*')])
-                if action == 's3:ListBucket':
-                    self.assertEqual(contexts['s3:prefix']['ContextKeyValues'], [gate_source.CURRENT_BASE_KEY])
-                    self.assertEqual(listing['Resource'], bucket)
-            else:
-                self.assertEqual(region, GATE_HOME)
-                self.assertEqual(document, {'Version': '2012-10-17', 'Statement': [{
-                    'Effect': 'Deny', 'Principal': '*', 'Action': 's3:*',
-                    'Resource': ['arn:aws:s3:::' + GATE_BUCKET, f'arn:aws:s3:::{GATE_BUCKET}/*'],
-                    'Condition': {'Bool': {'aws:SecureTransport': 'false'}},
-                }]})
-                if action == 's3:ListBucket':
-                    self.assertEqual(contexts['s3:prefix']['ContextKeyValues'], ['artifacts/gpu-size-trial/setup-probe.json'])
+            document = cast(object, json.loads(ledger.text(request, 'ResourcePolicy')))
+            self.assertEqual(document, {'Version': '2012-10-17', 'Statement': [{
+                'Effect': 'Deny', 'Principal': '*', 'Action': 's3:*',
+                'Resource': ['arn:aws:s3:::' + GATE_BUCKET, f'arn:aws:s3:::{GATE_BUCKET}/*'],
+                'Condition': {'Bool': {'aws:SecureTransport': 'false'}},
+            }]})
+            if action == 's3:ListBucket':
+                self.assertEqual(contexts['s3:prefix']['ContextKeyValues'], ['artifacts/gpu-size-trial/setup-probe.json'])
         decision = 'implicitDeny' if self.failure == action and self.failure_region == region else 'allowed'
         return {'EvaluationResults': [{'EvalActionName': action, 'EvalResourceName': resource, 'EvalDecision': decision}]}
 
@@ -1027,20 +1013,13 @@ shared_usd_per_month=1
         finish = [('iam', 'iam:PassRole'), ('iam', 'ec2:TerminateInstances')]
         s3 = [('iam', action) for action in ('s3:PutObject', 's3:GetObject', 's3:PutObject', 's3:GetObject',
                                            's3:ListBucket', 's3:AbortMultipartUpload')]
-        source = [('iam', 's3:GetObject'), ('iam', 's3:PutObject')] * 3 + [('iam', 's3:ListBucket')]
         count = len((GATE_TRIAL_GPU_TYPE, GATE_HANA_GPU_TYPE))
         for region, calls in (
-            (GATE_HOME, home + change + policies + reads + scores + launch * count + finish + s3 + source),
-            (GATE_REGION, regional + change + scores + launch * count + finish + source),
+            (GATE_HOME, home + change + policies + reads + scores + launch * count + finish + s3),
+            (GATE_REGION, regional + change + scores + launch * count + finish),
         ):
             with self.subTest(region=region):
                 self.assertEqual(self.calls_in(region), calls)
-
-    def test_regional_source_bucket_permission_failure_refuses_the_plan(self) -> None:
-        self.failure, self.failure_region = 's3:PutObject', GATE_REGION
-        status, output = self.run_plan()
-        self.assertEqual(status, 1, output)
-        self.assertIn(f'plan gate: {GATE_REGION}: refused: Gate source scaler s3:PutObject denied.', output)
 
     def test_busy_account_stack_lock_refuses_the_plan_before_aws(self) -> None:
         with account_stack_lock(self.state) as access:
@@ -1185,7 +1164,6 @@ shared_usd_per_month=1
                     stack['StackId'] = self.stack_id(GATE_HOME)
                     outputs = {'GateBucket': GATE_BUCKET, 'GateLaunchTemplate': 'lt-fixture',
                                'GateLaunchVersion': str(images.version), 'GateSecurityGroup': 'sg-fixture',
-                               'GateSourceBucket': gate_source.bucket_name(DEPLOYMENT, GATE_HOME),
                                'GateRoleId': 'fixture-role', 'ScalerUserName': 'fixture-scaler'}
                     stack['Outputs'] = [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]
                     reply.stdout = json.dumps(body)
@@ -1196,9 +1174,6 @@ shared_usd_per_month=1
             with (mock.patch.object(subject.admin, 'get', return_value=credentials), redirect_stdout(StringIO())):
                 if command == 'gate-up':
                     with (mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'),
-                          mock.patch.object(gate_source, 'prepare_tools',
-                                            return_value=('/nix/store/' + 'a' * 32 + '-fixture',)),
-                          mock.patch.object(gate_source, 'refresh_bases', return_value=()),
                           mock.patch.object(deploy, 'gate_subnets', return_value=[{'id': 'subnet-fixture', 'zone': GATE_HOME + 'a'}]),
                           mock.patch.object(subject, '_fill_prices'),
                           mock.patch.object(subject, '_probe_gate_gpu', return_value=True)):

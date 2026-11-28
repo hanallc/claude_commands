@@ -573,7 +573,7 @@ def deployment_parameters(path: Path, settings: DeploymentSettings,
         'NoticeLowPercent': str(settings.notice_low), 'NoticeHighPercent': str(settings.notice_high),
         'StopPercent': str(settings.stop_percent), 'CostTagKey': spending.cost_explorer_tag_key,
         'CostTagValue': spending.cost_explorer_tag_value, 'ScalerUserName': settings.scaler_user_name,
-        'DeploymentId': deployment_id, 'GateSourceBaseDays': str(gate_source.BASE_RETENTION_DAYS),
+        'DeploymentId': deployment_id,
     }
 
 
@@ -2183,8 +2183,7 @@ class Deployment:
         if (self.directory / 'gate-deployment.json').exists():
             template = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
             values.extend({'ParameterKey': key, 'UsePreviousValue': True}
-                          for key in ledger.mapping(template['Parameters'])
-                          if (key.startswith('Gate') or key == 'EnableGates') and key not in parameters)
+                          for key in ledger.mapping(template['Parameters']) if key.startswith('Gate') or key == 'EnableGates')
         name = 'update-' + uuid4().hex
         started = self.clock()
         change: dict[str, object] = {}
@@ -2600,8 +2599,7 @@ class Deployment:
         return {**parameters, 'GateImage': network.image, 'VpcId': network.vpc,
             'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
             'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
-            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': profile,
-            'ScalerUserName': settings.scaler_user_name}
+            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': profile}
 
     def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
                             parameters: dict[str, str], network: RegionalNetwork,
@@ -2651,8 +2649,7 @@ class Deployment:
             stack = ledger.rows(target.call('describe-stacks', '--stack-name', name, service='cloudformation'), 'Stacks')[0]
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')}
         result: dict[str, object] = {'region': region, 'image': network.image, 'subnets': network.subnets, 'template': outputs['GateLaunchTemplate'],
-                'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'], 'stack': name,
-                'source_bucket': outputs['GateSourceBucket']}
+                'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'], 'stack': name}
         if not unchanged:
             entry = regional_stack_digest(digest, stack)
             if entry:
@@ -2970,12 +2967,8 @@ class Deployment:
         else:
             for region, launch in pending_probes.items():
                 try:
-                    is_home = region == settings.region
-                    target = api.in_region(region)
-                    plan.probe_gate_scaler(target, principal, exclusions, documents, shared, launch, home=is_home)
-                    policy = plan.gate_source_policy(region, template if is_home else regional_template,
-                                                     deployment, settings.scaler_user_name)
-                    plan.probe_gate_source(target, principal, exclusions, documents, deployment, policy)
+                    plan.probe_gate_scaler(api.in_region(region), principal, exclusions, documents, shared, launch,
+                                           home=region == settings.region)
                 except plan_run.PLAN_ERRORS as error:
                     failures[region] = plan_run.safe_reason(error)
 
@@ -3037,7 +3030,7 @@ class Deployment:
             deployment_id = ledger.text(saved, 'deployment_id')
             home: dict[str, object] = {'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
                 'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
-                'security_group': outputs['GateSecurityGroup'], 'source_bucket': outputs['GateSourceBucket']}
+                'security_group': outputs['GateSecurityGroup']}
             manifest: dict[str, object] = {
                 'deployment_id': deployment_id, 'revision': revision, 'source_tool_paths': list(tools),
                 'instance_types': values.words('instance_types'),
@@ -3054,17 +3047,11 @@ class Deployment:
                     regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network, digests))
                     manifest['regions'] = regional
                     cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
-            source_api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
-            source_failures = gate_source.refresh_bases(source_api, Path(__file__).resolve().parents[2],
-                regions=regional, clock=self.clock, force=True, git_timeout=values.number('git_network_timeout_s'))
-            for failure in source_failures:
-                print(f'cloud-gate: {failure}', file=sys.stderr, flush=True)
             print('cloud-gate: deployed')
             self._fill_prices()
             scaler_arn = f"arn:{partition}:iam::{account}:user/{outputs['ScalerUserName']}"
-            probed = self._probe_gate_gpu(settings, values, manifest, gpu_caps, admin_api=api,
-                                          scaler_arn=scaler_arn, partition=partition, account_id=account)
-            return probed and not source_failures
+            return self._probe_gate_gpu(settings, values, manifest, gpu_caps, admin_api=api,
+                                        scaler_arn=scaler_arn, partition=partition, account_id=account)
 
     def _gate_scaler_api(self, settings: DeploymentSettings, timeout: float) -> AwsCli:
         # Use the GPU worker's profile and credential file without inherited admin credentials.
@@ -3300,7 +3287,6 @@ def gate_parameters(settings: DeploymentSettings, values: conf.ConfigRead, parti
         'GateRootGiB': str(values.whole('root_gib')),
         'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
         'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
-        'GateSourceBaseDays': str(gate_source.BASE_RETENTION_DAYS),
         'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
         'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
         'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
@@ -3323,7 +3309,7 @@ def region_gate_template() -> dict[str, object]:
     """Reuse the home gate bodies without regional copies of global resources."""
     source = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
     # No scaler policy: the scaler user may hold 10 managed policies, and the budget block needs one of them.
-    names = ('GateSourceBucket', 'GateSourceBucketPolicy', 'GateSecurityGroup', 'GateLaunchTemplate', 'GateExpiryRole',
+    names = ('GateSecurityGroup', 'GateLaunchTemplate', 'GateExpiryRole',
              'GateExpiryFunction', 'GateExpiryLog', 'GateExpirySchedule', 'GateExpiryPermission')
     resources = ledger.mapping(source['Resources'])
     def rewrite(value: object) -> object:
@@ -3345,7 +3331,7 @@ def region_gate_template() -> dict[str, object]:
         return value
     regional = {name: rewrite(resources[name]) for name in names}
     outputs = {key: rewrite(value) for key, value in ledger.mapping(source['Outputs']).items()
-               if key in ('GateLaunchTemplate', 'GateLaunchVersion', 'GateSecurityGroup', 'GateSourceBucket')}
+               if key in ('GateLaunchTemplate', 'GateLaunchVersion', 'GateSecurityGroup')}
     parameters = ledger.mapping(source['Parameters'])
     used = referenced_names([regional, outputs, ledger.mapping(source['Conditions'])['GateEveryMinute']])
     definitions: dict[str, object] = {key: parameters[key] for key in parameters if key in used}

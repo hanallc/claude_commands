@@ -2597,7 +2597,6 @@ sys.exit(7)
         commands: list[list[str]] = []
         outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
                    'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role',
-                   'GateSourceBucket': 'fixture-source-home',
                    'GateProfileArn': 'fixture-profile', 'ScalerUserName': 'fixture-scaler'}
         faults = probe_faults or {}
         fault_attempts: dict[str, int] = {}
@@ -2618,8 +2617,7 @@ sys.exit(7)
                 if not regional_stack.get('StackStatus'):
                     return subprocess.CompletedProcess(args, 255, '', 'An error occurred (ValidationError): Stack does not exist')
                 regional_outputs = {'GateLaunchTemplate': 'fixture-' + region, 'GateSecurityGroup': 'fixture-group',
-                                    'GateLaunchVersion': regional_stack.get('launch_version', '1'),
-                                    'GateSourceBucket': 'fixture-source-' + region}
+                                    'GateLaunchVersion': regional_stack.get('launch_version', '1')}
                 reply = {'Stacks': [{**regional_stack, 'Outputs': [
                     {'OutputKey': key, 'OutputValue': value} for key, value in regional_outputs.items()]}]}
             elif regional_stacks is not None and region in regional_stacks and operation == 'deploy':
@@ -2682,7 +2680,6 @@ sys.exit(7)
         _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
         _ = self.enterContext(mock.patch.object(gate_source, 'prepare_tools',
                                                return_value=('/nix/store/' + 'a' * 32 + '-fixture',)))
-        _ = self.enterContext(mock.patch.object(gate_source, 'refresh_bases', return_value=()))
 
         def scaler(arguments: Sequence[str], *, env: dict[str, str] | None = None,
                    **_options: object) -> subprocess.CompletedProcess[str]:
@@ -2827,8 +2824,7 @@ sys.exit(7)
         subject, commands = self.gate_fixture()
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
         west: dict[str, object] = {'region': 'us-west-2', 'image': 'ami-west', 'subnets': [],
-            'template': 'lt-west', 'version': '1', 'security_group': 'sg-west', 'stack': 'fixture-west',
-            'source_bucket': 'fixture-source-west'}
+            'template': 'lt-west', 'version': '1', 'security_group': 'sg-west', 'stack': 'fixture-west'}
         network = deploy.RegionalNetwork('us-west-2', 'vpc-fixture-west', [], 'ami-west')
         def regional(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
                      _parameters: dict[str, str], given: deploy.RegionalNetwork,
@@ -2836,12 +2832,9 @@ sys.exit(7)
             self.assertTrue(any('execute-change-set' in command for command in commands))
             self.assertEqual(given, network)
             return west
-        with (mock.patch.object(subject, 'regional_network', return_value=network),
-              mock.patch.object(subject, 'regional_gate_stack', side_effect=regional),
-              mock.patch.object(gate_source, 'refresh_bases', return_value=()) as publish):
+        with mock.patch.object(subject, 'regional_network', return_value=network), \
+                mock.patch.object(subject, 'regional_gate_stack', side_effect=regional):
             self.assertTrue(subject.gate_up(approve_resources=True))
-        publish.assert_called_once()
-        self.assertIs(cast(object, publish.call_args.kwargs['force']), True)
         change_set = next(command for command in commands if 'create-change-set' in command)
         passed = {ledger.text(row, 'ParameterKey'): row for row in
                   ledger.rows({'rows': json.loads(change_set[change_set.index('--parameters') + 1])}, 'rows')}
@@ -2855,8 +2848,6 @@ sys.exit(7)
         saved = remote.read_record(self.state / 'gate-deployment.json')
         self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
-        self.assertEqual(ledger.rows(saved, 'regions')[0]['source_bucket'], 'fixture-source-home')
-        self.assertEqual(publish.call_args.kwargs['regions'], list(ledger.rows(saved, 'regions')))
         self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
 
     def test_gate_up_deploys_regions_without_digests_and_reads_live_outputs_on_skip(self) -> None:
@@ -4013,34 +4004,6 @@ sys.exit(7)
                         self.assertEqual(snapshot.requests, (quota_requests.OpenQuotaRequest(
                             selected_region, 'L-3819A6DF', 'G and VT Spot', '4', request_status, 'private-case', ''),))
 
-    def test_regional_source_bucket_uses_private_encrypted_storage_and_scoped_policy(self) -> None:
-        definition = deploy.region_gate_template()
-        resources = ledger.mapping(definition['Resources'])
-        bucket = ledger.mapping(ledger.mapping(resources['GateSourceBucket'])['Properties'])
-        self.assertEqual(bucket['PublicAccessBlockConfiguration'], dict.fromkeys((
-            'BlockPublicAcls', 'IgnorePublicAcls', 'BlockPublicPolicy', 'RestrictPublicBuckets'), True))
-        encryption = ledger.mapping(bucket['BucketEncryption'])
-        self.assertEqual(encryption['ServerSideEncryptionConfiguration'],
-                         [{'ServerSideEncryptionByDefault': {'SSEAlgorithm': 'AES256'}}])
-        self.assertIn({'Key': {'Ref': 'CostTagKey'}, 'Value': {'Ref': 'CostTagValue'}}, ledger.rows(bucket, 'Tags'))
-        bases, deltas = ledger.rows(ledger.mapping(bucket['LifecycleConfiguration']), 'Rules')
-        self.assertEqual(bases['Prefix'], gate_source.BASE_BUNDLE_PREFIX)
-        self.assertFalse(gate_source.CURRENT_BASE_KEY.startswith(ledger.text(bases, 'Prefix')))
-        self.assertEqual(bases['ExpirationInDays'], {'Ref': 'GateSourceBaseDays'})
-        self.assertEqual((deltas['Prefix'], deltas['ExpirationInDays']),
-                         (gate_source.DELTA_PREFIX, gate_source.DELTA_RETENTION_DAYS))
-        self.assertEqual(gate_source.BASE_RETENTION_DAYS, 15)
-        policy = ledger.mapping(ledger.mapping(resources['GateSourceBucketPolicy'])['Properties'])
-        self.assertEqual(policy['Bucket'], {'Ref': 'GateSourceBucket'})
-        deny, objects, listing = ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
-        self.assertEqual((deny['Effect'], deny['Condition']), ('Deny', {'Bool': {'aws:SecureTransport': 'false'}}))
-        self.assertEqual(objects['Action'], ['s3:GetObject', 's3:PutObject'])
-        self.assertEqual(objects['Resource'], [{'Fn::Sub': '${GateSourceBucket.Arn}/' + key} for key in (
-            gate_source.CURRENT_BASE_KEY, gate_source.BASE_BUNDLE_PREFIX + '*', gate_source.DELTA_PREFIX + '*')])
-        self.assertEqual(listing['Condition'], {'StringEquals': {'s3:prefix': gate_source.CURRENT_BASE_KEY}})
-        self.assertEqual(objects['Principal'], {'AWS': {'Fn::Sub':
-            'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${ScalerUserName}'}})
-
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
         home_api = subject._api(aws_config.read_deployment_settings(self.settings))  # pyright: ignore[reportPrivateUsage]
@@ -4063,7 +4026,7 @@ sys.exit(7)
             elif operation == 'describe-stacks' and region == 'us-west-2':
                 reply = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'StackId': 'fixture-stack-west',
                     'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in
-                    {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '2', 'GateSecurityGroup': 'sg-west', 'GateSourceBucket': 'fixture-source-west'}.items()]}]}
+                    {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '2', 'GateSecurityGroup': 'sg-west'}.items()]}]}
             elif operation not in ('deploy', 'wait'):
                 return original(arguments, capture_output=True, text=True, timeout=1, check=False)
             commands.append(args)
@@ -4084,7 +4047,7 @@ sys.exit(7)
         self.assertIn('fixture-owner', query)
         self.assertIn('Name=name,Values=fixture-nixos', query)
         resources = ledger.mapping(deploy.region_gate_template()['Resources'])
-        self.assertEqual(len(resources), 9)
+        self.assertEqual(len(resources), 7)
         self.assertFalse(any(ledger.text(ledger.mapping(row), 'Type').startswith('AWS::IAM::') and name != 'GateExpiryRole'
                              for name, row in resources.items()))
         self.assertNotIn('GateBucket', resources)
@@ -4113,7 +4076,7 @@ sys.exit(7)
         definition = deploy.region_gate_template()
         templates = ({**definition, 'Description': 'first template'}, {**definition, 'Description': 'second template'})
         paths: list[Path] = []
-        outputs = {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '1', 'GateSecurityGroup': 'sg-west', 'GateSourceBucket': 'fixture-source-west'}
+        outputs = {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '1', 'GateSecurityGroup': 'sg-west'}
 
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
@@ -4165,7 +4128,7 @@ sys.exit(7)
             elif operation == 'describe-stacks' and region == 'us-west-1':
                 reply = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': [
                     {'OutputKey': key, 'OutputValue': value} for key, value in
-                    {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '1', 'GateSecurityGroup': 'sg-west', 'GateSourceBucket': 'fixture-source-west'}.items()]}]}
+                    {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '1', 'GateSecurityGroup': 'sg-west'}.items()]}]}
             elif operation == 'deploy':
                 commands.append(args)
                 if stack['deploy'] == 'fails':
@@ -4338,11 +4301,11 @@ sys.exit(7)
             write(destination, text)
         with mock.patch.object(teardown, 'write_text_atomic', side_effect=fail_record):
             with self.assertRaisesRegex(OSError, 'fixture record failure'):
-                _ = teardown.remove_regional_gates(api, self.state, 'fixture')
+                _ = teardown.remove_regional_gates(api, self.state)
         self.assertTrue(deleted)
-        self.assertTrue(teardown.remove_regional_gates(api, self.state, 'fixture'))
+        self.assertTrue(teardown.remove_regional_gates(api, self.state))
         self.assertEqual(snapshots, ['snap-west'])
-        self.assertFalse(teardown.remove_regional_gates(api, self.state, 'fixture'))
+        self.assertFalse(teardown.remove_regional_gates(api, self.state))
 
     def test_down_removes_regional_stack_and_copied_image_before_snapshot(self) -> None:
         from scripts.aws_target import teardown
@@ -4358,13 +4321,11 @@ sys.exit(7)
             reply: dict[str, object] = {'Reservations': []}
             if 'describe-instances' in args and args[args.index('--region') + 1] == 'us-west-2':
                 reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture-west'}]}]}
-            if 'describe-stacks' in args:
-                reply = {'Stacks': [{'StackName': 'fixture-gates-us-west-2'}]}
             if 'describe-images' in args:
                 reply = {'Images': [{'BlockDeviceMappings': [{'Ebs': {'SnapshotId': 'snap-west'}}]}]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
-        self.assertTrue(teardown.remove_regional_gates(api, self.state, 'fixture'))
+        self.assertTrue(teardown.remove_regional_gates(api, self.state))
         operations = [command[command.index('--region') + 3] for command in calls]
         self.assertLess(operations.index('terminate-instances'), operations.index('wait'))
         self.assertLess(operations.index('wait'), operations.index('delete-stack'))
@@ -4373,7 +4334,7 @@ sys.exit(7)
         sweeps = [command for command in calls if 'describe-instances' in command]
         self.assertEqual([command[command.index('--region') + 1] for command in sweeps], ['us-east-2', 'us-west-2'])
         self.assertTrue(all(command[command.index('--region') + 1] == 'us-west-2' for command in calls if command not in sweeps))
-        self.assertFalse(teardown.remove_regional_gates(api, self.state, 'fixture'))
+        self.assertFalse(teardown.remove_regional_gates(api, self.state))
 
 
     def test_gate_stack_updates_print_named_start_and_done_lines(self) -> None:
@@ -5371,8 +5332,8 @@ else: raise AssertionError(args)
         stack = remote.read_record(stack_path)
         stack['status'] = 'DELETE_FAILED'
         saved = remote.read_record(self.state / 'deployment.json')
-        source_bucket = gate_source.bucket_name(ledger.text(saved, 'deployment_id'), ledger.text(saved, 'region'))
-        ledger.mapping(stack['outputs'])['GateSourceBucket'] = source_bucket
+        bucket = 'cloud-claude-gate-' + ledger.text(saved, 'deployment_id')
+        ledger.mapping(stack['outputs'])['GateBucket'] = bucket
         write_text_atomic(stack_path, json.dumps(stack))
         (self.root / 'deleted-scaler').touch()
         success, output = self.down_output()
@@ -5392,7 +5353,7 @@ else: raise AssertionError(args)
         self.assertEqual(len(self.commands('list-access-keys')), before)
         self.assertEqual(len(self.commands('delete-stack')), 1)
         args = cast(list[str], self.commands('list-objects-v2')[-1]['args'])
-        self.assertEqual(args[args.index('--bucket') + 1], source_bucket)
+        self.assertEqual(args[args.index('--bucket') + 1], bucket)
         self.assertFalse((self.state / 'down.json').exists())
 
     def test_down_refuses_a_live_claim_after_disabling_routing(self) -> None:

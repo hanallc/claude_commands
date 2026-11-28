@@ -913,7 +913,7 @@ class GateWorker:
         return switch
 
     def _launch_access(self, request: dict[str, object], deployment: dict[str, object]) -> AbstractContextManager[None]:
-        if request.get('source_form') == 'regional-bundle':
+        if request.get('source_form') == gate_source.SOURCE_FORM:
             return gate_source.source_write_access(self.book.directory, ledger.text(deployment, 'deployment_id'))
         return nullcontext()
 
@@ -926,7 +926,7 @@ class GateWorker:
             self.box_region = str(launch.get('region', self.api.region))
             self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
-        private_source = request.get('source_form') == 'regional-bundle'
+        private_source = request.get('source_form') == gate_source.SOURCE_FORM
         sizes = settings().words('instance_types')
         deployed = run_cost.deployed_gate_variants(deployment, sizes)
         if 'instance_types' in deployment:
@@ -960,7 +960,6 @@ class GateWorker:
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         unreachable: set[str] = set()
-        source_failures: list[str] = []
         for offset in range(index, stop):
             earlier_call_may_have_launched = bool(launch.get('arguments')) and offset == index
             fresh_assignment = not earlier_call_may_have_launched and request.get('placement_claim') is not None
@@ -978,37 +977,12 @@ class GateWorker:
                 subnet = {'id': variant.subnet_id, 'zone': variant.zone}
                 self.box_region = ledger.text(regional, 'region')
                 zone = variant.zone
-                source_record: dict[str, object] = {}
                 tools: tuple[str, ...] = ()
-                source_urls: dict[str, gate_source.SourceObject] = {}
                 if private_source:
-                    permission = self.launch_switch(request)
-                    if isinstance(permission, CloudDeclined):
-                        self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
-                        return permission
                     source = gate_source.deployment_source(deployment)
-                    if not isinstance(source, gate_source.PrivateBundleSource):
+                    if not isinstance(source, gate_source.CurrentFilesSource):
                         raise gate_source.GateToolsUnavailable('GateToolsUnavailable: the saved deployment has no gate tool paths')
                     tools = source.tool_paths
-                    try:
-                        source_bucket = gate_source.source_bucket(regional)
-                    except ValueError:
-                        source_failures.append(f'RegionalSourceBaseUnavailable in {self.box_region}')
-                        unreachable.add(self.box_region)
-                        continue
-                    try:
-                        pin = gate_source.pin_source(self.regional_api(self.box_region), source_bucket, folder, request,
-                            self.clock(), write_access=lambda: self._launch_access(request, deployment))
-                    except (gate_source.RegionalSourceBaseUnavailable, gate_source.SourceBaseMismatch,
-                            gate_source.SourceDeltaUploadFailed) as error:
-                        source_failures.append(str(error))
-                        unreachable.add(self.box_region)
-                        continue
-                    source_urls['source_base'] = pin.base.bundle
-                    source_record = {'bucket': source_bucket.name, 'base': pin.base.record(), 'form': 'base-only'}
-                    if isinstance(pin, gate_source.BaseAndDelta):
-                        source_urls['source_delta'] = pin.delta
-                        source_record.update(form='base-and-delta', delta=asdict(pin.delta))
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
@@ -1031,13 +1005,9 @@ class GateWorker:
                              request=url('GET', 'requests/' + ledger.text(request, 'attempt') + '.json'),
                              log=url('PUT', prefix + '/gate.log'), result=url('PUT', prefix + '/result.json'),
                              boot_error=url('PUT', prefix + '/boot-error.json'))
-                if source_record:
-                    links['source_base_commit'] = ledger.text(ledger.mapping(source_record['base']), 'commit')
-                    for name, bundle in source_urls.items():
-                        host = f"{source_record['bucket']}.s3.{self.box_region}.amazonaws.com"
-                        links[name] = s3_presign.presign('GET', host, bundle.key, self.box_region, signing,
-                            datetime.fromtimestamp(at, UTC), max(1, ledger.instant(request, 'expires') - at))
-                        links[name + '_sha256'] = bundle.sha256
+                if private_source:
+                    links['source'] = url('GET', gate_source.object_key(request))
+                    links['source_sha256'] = gate_source.archive_sha256(gate_source.archive_path(folder, request))
                 elif request['source_key']:
                     links['source'] = url('GET', ledger.text(request, 'source_key'))
                 if request.get('task') == 'paired':
@@ -1060,8 +1030,6 @@ class GateWorker:
                     arguments['ImageId'] = ledger.text(regional, 'image')
                 launch = {**saved_order, 'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone,
                           'gate_time_limit_s': seconds}
-                if source_record:
-                    launch['regional_source'] = source_record
                 if not fresh_assignment and not private_source:
                     save(path, launch)
             api = self.regional_api(self.box_region)
@@ -1149,8 +1117,7 @@ class GateWorker:
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return CloudDeclined(f'{size} in {zone}: {launch_error_code(str(error))}')
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-        return CloudDeclined('; '.join(source_failures) if source_failures
-                             else 'Spot capacity is unavailable in every configured region')
+        return CloudDeclined('Spot capacity is unavailable in every configured region')
 
     def artifact_etags(self, bucket: str, prefix: str) -> dict[str, str]:
         listing = self.api.call('list-objects-v2', '--bucket', bucket, '--prefix', prefix,
@@ -1174,7 +1141,13 @@ class GateWorker:
                 attempt = ledger.text(request, 'attempt')
                 guest = folder / 'guest.py'
                 _ = guest.write_text(gate_box.GUEST)
-                if request['source_key']:
+                if request.get('source_form') == gate_source.SOURCE_FORM:
+                    permission = self.launch_switch(request)
+                    if isinstance(permission, CloudDeclined):
+                        self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
+                        return permission
+                    self.upload(bucket, gate_source.object_key(request), gate_source.archive_path(folder, request))
+                elif request['source_key']:
                     self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
                 self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
                 self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
@@ -1365,7 +1338,7 @@ class GateWorker:
                 return {'status': 'interrupted', 'reason': str(error), 'interruption_code': interruption_code}
             return {'status': 'fallback', 'reason': str(error)}
         finally:
-            if request.get('source_form') == 'regional-bundle' and request.get('task') != 'paired':
+            if request.get('source_form') == gate_source.SOURCE_FORM and request.get('task') != 'paired':
                 discard_settled_source_archive(folder, self.book, attempt)
 
 
@@ -1783,12 +1756,13 @@ def settle_incompatible_attempt(folder: Path, book: ledger.CostLedger,
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
             selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
             gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
-            source: gate_source.PrivateBundleSource | gate_source.PublicCloneSource = gate_source.PUBLIC_CLONE_SOURCE
+            source: gate_source.CurrentFilesSource | gate_source.PublicCloneSource = gate_source.PUBLIC_CLONE_SOURCE
             ) -> dict[str, object]:
     request = prepare_request(repo, folder, mode, limit, selected=selected)
     commit, base = (ledger.text(request, key) for key in ('commit', 'origin_main'))
-    if isinstance(source, gate_source.PrivateBundleSource):
-        request['source_form'] = 'regional-bundle'
+    if isinstance(source, gate_source.CurrentFilesSource):
+        request['source_form'] = gate_source.SOURCE_FORM
+        request['origin_main_tree'] = gate_source.git(repo, 'rev-parse', base + '^{tree}')
     elif int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', base)):
         bundle = folder / 'source.bundle'
         create_source_bundle(repo, bundle, (commit,), exclude=base)
@@ -2144,7 +2118,7 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
     launch = folder / 'launch.json'
     result = folder / 'outcome.json'
     archive = folder / gate_source.SOURCE_ARCHIVE
-    private_source = request.get('source_form') == 'regional-bundle'
+    private_source = request.get('source_form') == gate_source.SOURCE_FORM
 
     def discard_unstarted_archive() -> None:
         if not archive.is_file():
@@ -2246,7 +2220,7 @@ def execute_gate_worker(folder: Path, worker: Callable[[], GateWorker]) -> int:
         return 0
     request = read(folder / 'request.json')
     outcome: dict[str, object]
-    if (request.get('source_form') == 'regional-bundle' and not (folder / 'launch.json').exists()
+    if (request.get('source_form') == gate_source.SOURCE_FORM and not (folder / 'launch.json').exists()
             and not (folder / gate_source.SOURCE_ARCHIVE).is_file()):
         outcome = {'status': 'fallback', 'reason': 'The gate source archive is absent'}
     else:

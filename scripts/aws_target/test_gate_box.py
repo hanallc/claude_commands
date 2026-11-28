@@ -300,7 +300,7 @@ subprocess.run = fail_log_put
             self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
-    def test_private_guest_checks_each_bundle_hash_and_the_requested_tree(self) -> None:
+    def test_guest_checks_the_current_files_hash_and_both_trees(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repo = root / 'source'
@@ -308,65 +308,52 @@ subprocess.run = fail_log_put
             _ = gate_source.git(repo, 'init', '-q')
             _ = gate_source.git(repo, 'config', 'user.name', 'Fixture')
             _ = gate_source.git(repo, 'config', 'user.email', 'fixture@example.invalid')
-            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Fixture base')
-            base = gate_source.git(repo, 'rev-parse', 'HEAD')
-            base_bundle, delta = root / 'base.bundle', root / 'delta.bundle'
-            gate_source.create_bundle(repo, base_bundle, (base,))
-            _ = (repo / 'tracked').write_text('candidate')
+            _ = (repo / 'removed').write_text('Historical file')
+            _ = gate_source.git(repo, 'add', 'removed')
+            historical_blob = gate_source.git(repo, 'rev-parse', ':removed')
+            _ = gate_source.git(repo, 'commit', '-qm', 'Fixture history')
+            previous = gate_source.git(repo, 'rev-parse', 'HEAD')
+            _ = gate_source.git(repo, 'rm', 'removed')
+            _ = (repo / 'tracked').write_text('Main file')
             _ = gate_source.git(repo, 'add', 'tracked')
-            _ = gate_source.git(repo, 'commit', '-qm', 'Fixture candidate')
-            commit = gate_source.git(repo, 'rev-parse', 'HEAD')
-            tree = gate_source.git(repo, 'rev-parse', 'HEAD^{tree}')
-            gate_source.create_bundle(repo, delta, (commit,), exclude=base)
-            links = {'commit': commit, 'tree': tree, 'source_base_commit': base, 'source_delta': 'present',
-                     'source_base_sha256': gate_source.bundle_sha256(base_bundle),
-                     'source_delta_sha256': gate_source.bundle_sha256(delta)}
+            _ = gate_source.git(repo, 'commit', '-qm', 'Fixture main')
+            main = gate_source.git(repo, 'rev-parse', 'HEAD')
+            _ = (repo / 'tracked').write_text('Candidate file')
+            _ = gate_source.git(repo, 'commit', '-qam', 'Fixture candidate')
+            candidate = gate_source.git(repo, 'rev-parse', 'HEAD')
+            gate_source.archive(repo, root, (candidate, main))
+            archive = root / gate_source.SOURCE_ARCHIVE
+            links = {'commit': candidate, 'tree': gate_source.git(repo, 'rev-parse', 'HEAD^{tree}'),
+                     'source_sha256': gate_source.archive_sha256(archive)}
+            request: dict[str, object] = {'origin_main': main,
+                'origin_main_tree': gate_source.git(repo, 'rev-parse', main + '^{tree}')}
 
             def get(name: str, destination: Path) -> None:
-                bundle = base_bundle if name == 'source_base' else delta
-                _ = destination.write_bytes(bundle.read_bytes())
+                self.assertEqual(name, 'source')
+                _ = destination.write_bytes(archive.read_bytes())
 
             box = root / 'valid'
             box.mkdir()
-            checkout = gate_box.restore_private_source(box, links, {'origin_main': base}, get)
-            self.assertEqual(gate_source.git(checkout, 'rev-parse', 'HEAD'), commit)
-            self.assertEqual((checkout / 'tracked').read_text(), 'candidate')
-            for field, diagnostic in (('source_base_sha256', 'source_base checksum'),
-                                      ('source_delta_sha256', 'source_delta checksum'), ('tree', 'commit or tree')):
+            checkout = gate_box.restore_current_files(box, links, request, get)
+            self.assertEqual(gate_source.git(checkout, 'rev-parse', 'HEAD'), candidate)
+            self.assertEqual(gate_source.git(checkout, 'rev-parse', 'origin/main'), main)
+            self.assertEqual(gate_source.git(checkout, 'show', 'origin/main:tracked'), 'Main file')
+            self.assertEqual((checkout / 'tracked').read_text(), 'Candidate file')
+            self.assertEqual(set(gate_source.git(checkout, 'rev-list', '--all').splitlines()), {candidate, main})
+            lookup = subprocess.run(['git', '-C', str(checkout), 'cat-file', '--batch-check'],
+                input=f'{previous}\n{historical_blob}\n', text=True, capture_output=True, check=True)
+            self.assertEqual(lookup.stdout.splitlines(), [f'{previous} missing', f'{historical_blob} missing'])
+            self.assertFalse((box / gate_source.SOURCE_ARCHIVE).exists())
+
+            for field, diagnostic in (('source_sha256', 'source checksum'),
+                                      ('tree', 'commit or tree'), ('origin_main_tree', 'commit or tree')):
                 with self.subTest(field=field):
                     box = root / field
                     box.mkdir()
+                    modified_links = {**links, field: '0' * 64} if field in links else links
+                    modified_request = {**request, field: '0' * 40} if field in request else request
                     with self.assertRaisesRegex(gate_box.GuestSourceRejected, diagnostic):
-                        _ = gate_box.restore_private_source(box, {**links, field: '0' * 64}, {'origin_main': base}, get)
-
-    def test_private_guest_rejects_a_delta_with_a_missing_prerequisite(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            repo = root / 'source'
-            repo.mkdir()
-            _ = gate_source.git(repo, 'init', '-q')
-            _ = gate_source.git(repo, 'config', 'user.name', 'Fixture')
-            _ = gate_source.git(repo, 'config', 'user.email', 'fixture@example.invalid')
-            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Fixture base')
-            base = gate_source.git(repo, 'rev-parse', 'HEAD')
-            base_bundle, delta = root / 'base.bundle', root / 'delta.bundle'
-            gate_source.create_bundle(repo, base_bundle, (base,))
-            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Missing commit')
-            missing = gate_source.git(repo, 'rev-parse', 'HEAD')
-            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Fixture candidate')
-            commit = gate_source.git(repo, 'rev-parse', 'HEAD')
-            gate_source.create_bundle(repo, delta, (commit,), exclude=missing)
-
-            def get(name: str, destination: Path) -> None:
-                _ = destination.write_bytes((base_bundle if name == 'source_base' else delta).read_bytes())
-
-            box = root / 'guest'
-            box.mkdir()
-            links = {'source_base_commit': base, 'source_delta': 'present',
-                     'source_base_sha256': gate_source.bundle_sha256(base_bundle),
-                     'source_delta_sha256': gate_source.bundle_sha256(delta)}
-            with self.assertRaisesRegex(gate_box.GuestSourceRejected, 'could not be restored'):
-                _ = gate_box.restore_private_source(box, links, {'origin_main': base}, get)
+                        _ = gate_box.restore_current_files(box, modified_links, modified_request, get)
 
     def test_private_boot_uses_only_verified_nix_store_paths(self) -> None:
         links = {**dict.fromkeys(('guest', 'request', 'log', 'result', 'boot_error'), 'https://example.invalid/fixture'),
@@ -658,8 +645,10 @@ else:
                 self.assertNotIn('instance-id', script)
                 boot_script = root / 'boot.sh'
                 _ = boot_script.write_text(script)
+                environment = dict(os.environ)
+                _ = environment.pop('PYTHONPATH', None)
                 reply = subprocess.run(['bash', '-x', str(boot_script)], text=True, capture_output=True, check=False,
-                    timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**os.environ, 'FIXTURE': str(root),
+                    timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**environment, 'FIXTURE': str(root),
                     'GATE_BOX_DIR': str(box), 'FAIL_STAGE': failure, 'FIXTURE_SIGNED_LINK': signed['log'],
                     'PATH': str(tools) + os.pathsep + os.environ['PATH']})
                 log = (box / 'boot.log').read_text()
@@ -680,7 +669,8 @@ else:
                 self.assertTrue(results, log + reply.stderr)
                 passed = failure in ('', 'final log upload', 'shell log signal', 'transient result upload')
                 expected_error = not passed or candidate_change in ('missing', 'old transfer')
-                self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass', log)
+                self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass',
+                                 log + '\n' + str(results[-1].get('error', '')))
                 if candidate_change == 'old transfer':
                     error = ledger.text(results[-1], 'error')
                     self.assertIn('CalledProcessError', error)

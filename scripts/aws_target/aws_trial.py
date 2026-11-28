@@ -573,10 +573,11 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
         source_fields: dict[str, object] = {}
-        if isinstance(source, gate_source.PrivateBundleSource):
+        if isinstance(source, gate_source.CurrentFilesSource):
             origin_main = checked_git(args.repo, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}')
             gate_source.archive(args.repo, folder, (trial.base.commit, trial.changed.commit, origin_main))
-            source_fields = {'source_form': 'regional-bundle', 'origin_main': origin_main}
+            source_fields = {'source_form': gate_source.SOURCE_FORM, 'origin_main': origin_main,
+                             'origin_main_tree': gate_source.git(args.repo, 'rev-parse', origin_main + '^{tree}')}
         else:
             clone_url = trial.clone_url
             prefix = cloud_gate.settings().text('trial_branch_prefix')

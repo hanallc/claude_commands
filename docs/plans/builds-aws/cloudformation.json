@@ -73,9 +73,6 @@
       "Type": "String",
       "Default": ""
     },
-    "GateSourceBaseDays": {
-      "Type": "Number"
-    },
     "GateArtifactDays": {
       "Type": "Number",
       "Default": 7
@@ -420,72 +417,6 @@
         ]
       }
     },
-    "GateSourceBucket": {
-      "Type": "AWS::S3::Bucket",
-      "Condition": "Gates",
-      "Properties": {
-        "PublicAccessBlockConfiguration": {
-          "BlockPublicAcls": true,
-          "IgnorePublicAcls": true,
-          "BlockPublicPolicy": true,
-          "RestrictPublicBuckets": true
-        },
-        "BucketEncryption": {
-          "ServerSideEncryptionConfiguration": [
-            {
-              "ServerSideEncryptionByDefault": {
-                "SSEAlgorithm": "AES256"
-              }
-            }
-          ]
-        },
-        "LifecycleConfiguration": {
-          "Rules": [
-            {
-              "Id": "GateSourceBases",
-              "Status": "Enabled",
-              "Prefix": "base/g",
-              "ExpirationInDays": {
-                "Ref": "GateSourceBaseDays"
-              }
-            },
-            {
-              "Id": "GateSourceDeltas",
-              "Status": "Enabled",
-              "Prefix": "delta/",
-              "ExpirationInDays": 1
-            }
-          ]
-        },
-        "Tags": [
-          {
-            "Key": {
-              "Ref": "CostTagKey"
-            },
-            "Value": {
-              "Ref": "CostTagValue"
-            }
-          },
-          {
-            "Key": "GateDeployment",
-            "Value": {
-              "Ref": "DeploymentId"
-            }
-          },
-          {
-            "Key": "Workload",
-            "Value": "cloud-claude-gate"
-          },
-          {
-            "Key": "Name",
-            "Value": "cloud-claude-gate"
-          }
-        ],
-        "BucketName": {
-          "Fn::Sub": "gate-src-${DeploymentId}-${AWS::Region}"
-        }
-      }
-    },
     "GateBucket": {
       "Type": "AWS::S3::Bucket",
       "Condition": "Gates",
@@ -545,84 +476,6 @@
         ],
         "BucketName": {
           "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
-        }
-      }
-    },
-    "GateSourceBucketPolicy": {
-      "Type": "AWS::S3::BucketPolicy",
-      "Condition": "Gates",
-      "Properties": {
-        "Bucket": {
-          "Ref": "GateSourceBucket"
-        },
-        "PolicyDocument": {
-          "Version": "2012-10-17",
-          "Statement": [
-            {
-              "Effect": "Deny",
-              "Principal": "*",
-              "Action": "s3:*",
-              "Resource": [
-                {
-                  "Fn::GetAtt": [
-                    "GateSourceBucket",
-                    "Arn"
-                  ]
-                },
-                {
-                  "Fn::Sub": "${GateSourceBucket.Arn}/*"
-                }
-              ],
-              "Condition": {
-                "Bool": {
-                  "aws:SecureTransport": "false"
-                }
-              }
-            },
-            {
-              "Effect": "Allow",
-              "Principal": {
-                "AWS": {
-                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${ScalerUserName}"
-                }
-              },
-              "Action": [
-                "s3:GetObject",
-                "s3:PutObject"
-              ],
-              "Resource": [
-                {
-                  "Fn::Sub": "${GateSourceBucket.Arn}/base/current.json"
-                },
-                {
-                  "Fn::Sub": "${GateSourceBucket.Arn}/base/g*"
-                },
-                {
-                  "Fn::Sub": "${GateSourceBucket.Arn}/delta/*"
-                }
-              ]
-            },
-            {
-              "Effect": "Allow",
-              "Principal": {
-                "AWS": {
-                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${ScalerUserName}"
-                }
-              },
-              "Action": "s3:ListBucket",
-              "Resource": {
-                "Fn::GetAtt": [
-                  "GateSourceBucket",
-                  "Arn"
-                ]
-              },
-              "Condition": {
-                "StringEquals": {
-                  "s3:prefix": "base/current.json"
-                }
-              }
-            }
-          ]
         }
       }
     },
@@ -1421,12 +1274,6 @@
     "ScalerUserName": {
       "Value": {
         "Ref": "ScalerUser"
-      }
-    },
-    "GateSourceBucket": {
-      "Condition": "Gates",
-      "Value": {
-        "Ref": "GateSourceBucket"
       }
     },
     "GateBucket": {

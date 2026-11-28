@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import cast, final
 
-from scripts.aws_target import admin_secrets, box, gate_source, ledger, remote
+from scripts.aws_target import admin_secrets, box, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock
 from scripts.aws_target.config import deployment_record
 from scripts.lib import conf
@@ -246,7 +246,9 @@ class TargetRemoval:
         self.identity = RemovalIdentity(self.identity.stack, self.identity.region, account, stack_id, deployment_id,
                                         str(outputs.get('InstanceId', '')), str(saved.get('data_volume_id', '')),
                                         str(saved.get('budget_name', '')))
-        _ = verified_gate_deployment(self.directory, self.api.region, deployment_id)
+        gate_path = self.directory / 'gate-deployment.json'
+        if gate_path.exists() and remote.read_record(gate_path).get('deployment_id') != deployment_id:
+            raise ValueError('The gate record differs from the verified deployment')
         _ = self._has_matching_journal()
         stack = self._stack()
         if not stack:
@@ -317,7 +319,7 @@ class TargetRemoval:
             return not current
 
         delete_gate_stack(self.api, stack, self.identity.stack_id, self.identity.deployment_id,
-            self._stack, lambda: self._wait(deleted, 'foundation deletion did not finish'), include_requests=True)
+            self._stack, lambda: self._wait(deleted, 'foundation deletion did not finish'))
         print('removed: foundation stack, scaler user, policies, and Budget actions')
         return True
 
@@ -398,7 +400,7 @@ class TargetRemoval:
         return changed
 
     def regional_gates(self) -> bool:
-        return remove_regional_gates(self.api, self.directory, self.identity.deployment_id, include_home=True)
+        return remove_regional_gates(self.api, self.directory, include_home=True)
 
     def gate_image(self) -> bool:
         outcome = remove_gate_images(self.api, self.directory, self.clock)
@@ -449,20 +451,14 @@ def stack_outputs(stack: dict[str, object]) -> tuple[dict[str, object], ...]:
     return ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
 
 
-def verified_gate_buckets(api: AwsCli, stack: dict[str, object], deployment: str, *,
-                          include_requests: bool) -> dict[str, str]:
-    expected = {'GateSourceBucket': gate_source.bucket_name(deployment, api.region)}
-    if include_requests:
-        expected['GateBucket'] = f'cloud-claude-gate-{deployment}'
-    buckets: dict[str, str] = {}
+def verified_gate_bucket(stack: dict[str, object], deployment: str) -> tuple[str, ...]:
     for output in stack_outputs(stack):
-        key = output.get('OutputKey')
-        if isinstance(key, str) and key in expected:
+        if output.get('OutputKey') == 'GateBucket':
             bucket = ledger.text(output, 'OutputValue')
-            if bucket != expected[key]:
-                raise ValueError(f'The {key} bucket differs from the saved deployment')
-            buckets[key] = bucket
-    return buckets
+            if bucket != f'cloud-claude-gate-{deployment}':
+                raise ValueError('The GateBucket differs from the saved deployment')
+            return (bucket,)
+    return ()
 
 
 def empty_gate_bucket(api: AwsCli, bucket: str) -> None:
@@ -488,29 +484,25 @@ def gate_bucket_not_empty(reason: str) -> bool:
     return 'BucketNotEmpty' in reason or 'bucket you tried to delete is not empty' in reason.lower()
 
 
-def gate_bucket_delete_failed(api: AwsCli, stack_id: str, buckets: dict[str, str]) -> bool:
-    pending = set(buckets)
+def gate_bucket_delete_failed(api: AwsCli, stack_id: str) -> bool:
     events = api.call('describe-stack-events', '--stack-name', stack_id, service='cloudformation')
     for event in ledger.rows(events, 'StackEvents'):
         if (event.get('PhysicalResourceId') == stack_id and event.get('ResourceType') == 'AWS::CloudFormation::Stack'
                 and event.get('ResourceStatus') == 'DELETE_IN_PROGRESS'):
             break
-        key = event.get('LogicalResourceId')
-        if isinstance(key, str) and key in pending:
-            pending.remove(key)
-            if event.get('ResourceStatus') == 'DELETE_FAILED' and gate_bucket_not_empty(str(event.get('ResourceStatusReason', ''))):
-                return True
+        if event.get('LogicalResourceId') == 'GateBucket':
+            return (event.get('ResourceStatus') == 'DELETE_FAILED'
+                    and gate_bucket_not_empty(str(event.get('ResourceStatusReason', ''))))
     return False
 
 
 def delete_gate_stack(api: AwsCli, stack: dict[str, object], name: str, deployment: str,
-                      read_stack: Callable[[], dict[str, object]], wait: Callable[[], None], *,
-                      include_requests: bool = False) -> None:
+                      read_stack: Callable[[], dict[str, object]], wait: Callable[[], None]) -> None:
     start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
-    buckets = verified_gate_buckets(api, stack, deployment, include_requests=include_requests) if start_delete else {}
+    buckets = verified_gate_bucket(stack, deployment) if start_delete else ()
     for retry in range(GATE_BUCKET_DELETE_RETRIES + 1):
         if start_delete:
-            for bucket in buckets.values():
+            for bucket in buckets:
                 empty_gate_bucket(api, bucket)
         try:
             if start_delete:
@@ -527,40 +519,29 @@ def delete_gate_stack(api: AwsCli, stack: dict[str, object], name: str, deployme
                 return
             if stack.get('StackId') != stack_id:
                 raise ValueError('The gate stack identity changed during deletion') from error
-            buckets = verified_gate_buckets(api, stack, deployment, include_requests=include_requests)
-            if not buckets or not (not_empty or gate_bucket_delete_failed(api, stack_id, buckets)):
+            buckets = verified_gate_bucket(stack, deployment)
+            if not buckets or not (not_empty or gate_bucket_delete_failed(api, stack_id)):
                 raise
             start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
 
 
-def verified_gate_deployment(directory: Path, region: str, deployment: str) -> dict[str, object]:
-    from scripts.aws_target.config import gate_deployment
-
-    path = directory / 'gate-deployment.json'
-    if not path.exists():
-        return {}
-    manifest = gate_deployment(path, region)
-    if manifest.get('deployment_id') != deployment:
-        raise ValueError('The gate record differs from the verified deployment')
-    return manifest
-
-
-def remove_regional_gates(api: AwsCli, directory: Path, deployment: str, *, include_home: bool = False) -> bool:
+def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = False) -> bool:
     """Remove regional stacks before deleting their copied images."""
-    manifest = verified_gate_deployment(directory, api.region, deployment)
+    from scripts.aws_target.config import gate_deployment
+    manifest_path = directory / 'gate-deployment.json'
+    manifest = gate_deployment(manifest_path, api.region) if manifest_path.exists() else {}
     stack_path = directory / 'regional-stacks.json'
     stacks = remote.read_record(stack_path) if stack_path.exists() else {}
-    regions = ledger.rows(manifest, 'regions') if manifest else ()
-    for row in regions:
+    for row in ledger.rows(manifest, 'regions') if manifest else ():
         if row.get('stack'):
             stacks[ledger.text(row, 'region')] = row['stack']
     changed = bool(stacks)
     sweep_regions = dict.fromkeys([*conf.read_or_repository('cloud_gate').words('regions'), *stacks,
-        *(ledger.text(row, 'region') for row in regions)]) if stacks or include_home and manifest else {}
+        *(ledger.text(row, 'region') for row in ledger.rows(manifest, 'regions'))]) if stacks or include_home and manifest else {}
     for region in sweep_regions:
         target = api.in_region(region)
         reply = target.call('describe-instances', '--filters',
-            'Name=tag:GateDeployment,Values=' + deployment,
+            'Name=tag:GateDeployment,Values=' + ledger.text(manifest, 'deployment_id'),
             'Name=tag:Workload,Values=cloud-claude-gate',
             'Name=instance-state-name,Values=pending,running,stopping,stopped')
         instances = [ledger.text(instance, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
@@ -571,17 +552,8 @@ def remove_regional_gates(api: AwsCli, directory: Path, deployment: str, *, incl
     for region, name in list(stacks.items()):
         target = api.in_region(region)
         try:
-            def read_stack() -> dict[str, object]:
-                reply = target.call('describe-stacks', '--stack-name', str(name), service='cloudformation')
-                saved_stacks = ledger.rows(reply, 'Stacks')
-                if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
-                    raise ValueError('The regional stack differs from the saved deployment')
-                return saved_stacks[0]
-
-            def wait_for_stack() -> None:
-                _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
-
-            delete_gate_stack(target, read_stack(), str(name), deployment, read_stack, wait_for_stack)
+            _ = target.call('delete-stack', '--stack-name', str(name), service='cloudformation')
+            _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
         except AwsUnavailable as error:
             if 'does not exist' not in str(error):
                 raise
@@ -589,7 +561,7 @@ def remove_regional_gates(api: AwsCli, directory: Path, deployment: str, *, incl
         write_text_atomic(stack_path, json.dumps(stacks) + '\n')
     if manifest and len(ledger.rows(manifest, 'regions')) > 1:
         manifest['regions'] = ledger.rows(manifest, 'regions')[:1]
-        write_text_atomic(directory / 'gate-deployment.json', json.dumps(manifest, sort_keys=True) + '\n')
+        write_text_atomic(manifest_path, json.dumps(manifest, sort_keys=True) + '\n')
     image_path = directory / 'regional-images.json'
     images = remote.read_record(image_path) if image_path.exists() else {}
     for identity, value in list(images.items()):

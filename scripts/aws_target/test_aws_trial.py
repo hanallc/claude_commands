@@ -962,7 +962,7 @@ else:
         with self.assertRaises(ValueError):
             trial.validate_paired_result(row, request, 'i-other')
 
-    def guest(self, *, limit: float | None = None, private: bool = False, missing_delta: bool = False
+    def guest(self, *, limit: float | None = None, private: bool = False, missing_package: bool = False
               ) -> tuple[dict[str, object], list[dict[str, object]]]:
         from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
@@ -974,16 +974,18 @@ else:
         links: dict[str, object] = {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
                                     'instance_type': 'm7a.8xlarge'}
         if private:
-            request.update(source_form='regional-bundle', origin_main=self.base, clone_url='https://github.com/denied')
-            base_bundle, delta = box / 'base-object', box / 'delta-object'
-            gate_source.create_bundle(self.repo, base_bundle, (self.base,))
-            gate_source.create_bundle(self.repo, delta, (self.changed,), exclude=self.base)
-            links.update(source_base='base-object', source_base_commit=self.base,
-                         source_base_sha256=gate_source.bundle_sha256(base_bundle), source_delta='delta-object',
-                         source_delta_sha256=gate_source.bundle_sha256(delta))
-            if missing_delta:
-                delta.unlink()
+            request.update(source_form=gate_source.SOURCE_FORM, origin_main=self.base,
+                           origin_main_tree=gate_source.git(self.repo, 'rev-parse', self.base + '^{tree}'),
+                           clone_url='https://github.com/denied')
+            gate_source.archive(self.repo, box, (self.base, self.changed))
+            archive = box / gate_source.SOURCE_ARCHIVE
+            links.update(commit=request['commit'], tree=request['tree'],
+                         source='package', source_sha256=gate_source.archive_sha256(archive))
+            if missing_package:
+                archive.unlink()
                 links['boot_error'] = 'boot-error'
+            else:
+                _ = archive.rename(box / 'package')
         cloud_gate.save(box / 'request.json', request)
         cloud_gate.save(box / 'links.json', links)
         tools = self.root / 'tools'
@@ -1039,15 +1041,15 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
             self.assertTrue((checkout / '.git/index').is_file())
             self.assertEqual(trial.checked_git(checkout, 'rev-parse', 'refs/remotes/origin/main'), self.base)
 
-    def test_private_guest_boot_error_names_the_missing_delta_and_http_status(self) -> None:
-        reply, traces = self.guest(private=True, missing_delta=True)
+    def test_private_guest_boot_error_names_the_missing_package_and_http_status(self) -> None:
+        reply, traces = self.guest(private=True, missing_package=True)
         boot = cloud_gate.read(self.root / 'box/uploaded-boot-error')
         self.assertEqual(boot['verdict'], 'error')
-        self.assertEqual(boot['error'], 'GuestSourceRejected: GET source_delta failed (curl exit 22, HTTP 404)')
+        self.assertEqual(boot['error'], 'GuestSourceRejected: GET source failed (curl exit 22, HTTP 404)')
         self.assertEqual(reply['error'], boot['error'])
         self.assertEqual(traces, [])
 
-    def test_private_paired_trial_sends_a_bundle_without_remote_branch_commands(self) -> None:
+    def test_paired_trial_prepares_one_package_without_remote_branch_commands(self) -> None:
         _ = trial.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)
         previous = self.remote_branches()
         cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture',
@@ -1063,10 +1065,11 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
         folder, = (self.state / 'paired-trials').iterdir()
         request_path, = folder.glob('*/request.json')
         request = cloud_gate.read(request_path)
-        self.assertEqual(request['source_form'], 'regional-bundle')
-        bundle = folder / gate_source.SOURCE_ARCHIVE
-        heads = gate_source.git(self.repo, 'bundle', 'list-heads', str(bundle))
-        self.assertEqual({line.split()[0] for line in heads.splitlines()}, {self.base, self.changed})
+        self.assertEqual(request['source_form'], gate_source.SOURCE_FORM)
+        self.assertEqual(request['origin_main'], self.base)
+        archive = folder / gate_source.SOURCE_ARCHIVE
+        self.assertEqual(tuple(folder.rglob('*.pack')), (archive,))
+        self.assertEqual(archive.read_bytes()[:4], b'PACK')
 
     def test_local_guest_uses_two_trees_alternating_isolated_processes(self) -> None:
         reply, traces = self.guest()

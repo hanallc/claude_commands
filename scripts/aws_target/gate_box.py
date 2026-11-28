@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from enum import StrEnum
 from hashlib import file_digest
 import math
+import re
 import subprocess
 
 from scripts.lib.python_startup import sitecustomize as python_startup
@@ -403,70 +404,79 @@ class GuestSourceRejected(ValueError):
     pass
 
 
-def restore_private_source(root: Path, links: Mapping[str, str], request: dict[str, object],
-                           get: Callable[[str, Path], None]) -> Path:
-    """Check the bundles and recreate the exact requested trees without a remote."""
+def restore_current_files(root: Path, links: Mapping[str, str], request: dict[str, object],
+                          get: Callable[[str, Path], None]) -> Path:
+    """Verify the source and check out the requested trees."""
     repo = root / 'repo'
-    repo.mkdir()
+    package = root / 'current-files.pack'
 
     def git(path: Path, *arguments: str) -> str:
         return subprocess.check_output(['git', '-C', str(path), *arguments], text=True).strip()
 
-    def import_bundle(name: str, *refs: str) -> None:
-        bundle = root / (name + '.bundle')
-        get(name, bundle)
-        with bundle.open('rb') as stream:
-            if file_digest(stream, 'sha256').hexdigest() != links[name + '_sha256']:
-                raise GuestSourceRejected(f'GuestSourceRejected: {name} checksum differs')
-        _ = git(repo, 'bundle', 'verify', str(bundle))
-        _ = git(repo, 'fetch', '--no-tags', str(bundle), *refs)
-
-    def verify(path: Path, commit: str, tree: str) -> None:
-        if (git(path, 'rev-parse', 'HEAD') != commit
-                or git(path, 'rev-parse', 'HEAD^{tree}') != tree):
+    def verify(commit: str, tree: str) -> None:
+        if (git(repo, 'rev-parse', '--verify', commit + '^{commit}') != commit
+                or git(repo, 'rev-parse', '--verify', commit + '^{tree}') != tree):
             raise GuestSourceRejected('GuestSourceRejected: the requested commit or tree differs')
 
     try:
-        _ = git(repo, 'init', '-q')
-        base = links['source_base_commit']
-        import_bundle('source_base', base)
-        if git(repo, 'rev-parse', 'FETCH_HEAD^{commit}') != base:
-            raise GuestSourceRejected('GuestSourceRejected: the pinned base commit differs')
-        _ = git(repo, 'update-ref', 'refs/gate-source/base', base)
-        if 'source_delta' in links:
-            import_bundle('source_delta', 'refs/cloud-gates/*:refs/gate-source/delta/*')
         origin_main = str(request['origin_main'])
-        _ = git(repo, 'update-ref', 'refs/remotes/origin/main', origin_main)
+        revisions: dict[str, tuple[str, str]] = {}
         if request.get('task') == 'paired':
             for variant in ('base', 'changed'):
                 revision = request[variant]
                 if not isinstance(revision, dict):
                     raise GuestSourceRejected('GuestSourceRejected: the paired revision is invalid')
                 identity = cast(dict[str, object], revision)
-                checkout = root / variant
-                commit = str(identity['commit'])
+                revisions[variant] = (str(identity['commit']), str(identity['tree']))
+            if revisions['changed'] != (links['commit'], links['tree']):
+                raise GuestSourceRejected('GuestSourceRejected: the paired candidate differs')
+        else:
+            revisions['repo'] = (links['commit'], links['tree'])
+
+        object_format = 'sha256' if len(origin_main) == 64 else 'sha1'
+        commits = dict.fromkeys((origin_main, *(commit for commit, _ in revisions.values())))
+        if any(len(commit) != len(origin_main) or not re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', commit)
+               for commit in commits):
+            raise GuestSourceRejected('GuestSourceRejected: an invalid commit id')
+        shallow = ''.join(commit + '\n' for commit in commits)
+
+        get('source', package)
+        with package.open('rb') as stream:
+            if file_digest(stream, 'sha256').hexdigest() != links['source_sha256']:
+                raise GuestSourceRejected('GuestSourceRejected: source checksum differs')
+            _ = stream.seek(0)
+            repo.mkdir()
+            _ = git(repo, 'init', '-q', '--object-format=' + object_format)
+            _ = (repo / '.git/shallow').write_text(shallow)
+            _ = subprocess.run(['git', '-C', str(repo), 'index-pack', '--stdin', '--strict'],
+                               stdin=stream, stdout=subprocess.DEVNULL, check=True)
+
+        verify(origin_main, str(request['origin_main_tree']))
+        for commit, tree in revisions.values():
+            verify(commit, tree)
+        for name, (commit, _) in revisions.items():
+            checkout = root / name
+            if checkout != repo:
                 checkout.mkdir()
-                _ = git(checkout, 'init', '-q')
-                # Share the verified objects for the life of the trial.
-                alternates = checkout / '.git/objects/info/alternates'
-                _ = alternates.write_text(str(repo.resolve() / '.git/objects') + '\n')
-                _ = git(checkout, 'update-ref', 'refs/remotes/origin/main', origin_main)
-                _ = git(checkout, 'checkout', '--detach', commit)
-                verify(checkout, commit, str(identity['tree']))
-            return root / 'changed'
-        _ = git(repo, 'checkout', '--detach', links['commit'])
-        verify(repo, links['commit'], links['tree'])
-        return repo
+                _ = git(checkout, 'init', '-q', '--object-format=' + object_format)
+                # Share the objects and preserve the shallow history in each checkout.
+                _ = (checkout / '.git/objects/info/alternates').write_text(str(repo.resolve() / '.git/objects') + '\n')
+                _ = (checkout / '.git/shallow').write_text(shallow)
+            _ = git(checkout, 'update-ref', 'refs/remotes/origin/main', origin_main)
+            _ = git(checkout, 'checkout', '--detach', commit)
+        return root / 'changed' if request.get('task') == 'paired' else repo
     except GuestTransferFailed as error:
         raise GuestSourceRejected(f'GuestSourceRejected: {error}') from error
     except (OSError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         raise GuestSourceRejected('GuestSourceRejected: the requested source could not be restored') from error
+    finally:
+        package.unlink(missing_ok=True)
 
 
-PRIVATE_GUEST_SOURCE = (
-    'from collections.abc import Callable, Mapping\nfrom hashlib import file_digest\nfrom pathlib import Path\n'
+CURRENT_FILES_GUEST_SOURCE = (
+    'import re\nfrom collections.abc import Callable, Mapping\nfrom hashlib import file_digest\nfrom pathlib import Path\n'
     + 'from typing import cast\n' + inspect.getsource(GuestSourceRejected) + '\n'
-    + inspect.getsource(restore_private_source))
+    + inspect.getsource(restore_current_files))
 
 
 # The live bootstrap verifies the tree before it calls the candidate entry point.
@@ -494,7 +504,7 @@ for metadata_path in ('/etc/ec2-metadata/instance-identity-document', '/run/clou
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         continue
     break
-''' + GUEST_TRANSFERS + PRIVATE_GUEST_SOURCE + r'''links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
+''' + GUEST_TRANSFERS + CURRENT_FILES_GUEST_SOURCE + r'''links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {**timestamps, 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
 try:
@@ -514,8 +524,8 @@ try:
         links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
     else:
         repo = root / 'repo'
-        if gate_request.get('source_form') == 'regional-bundle':
-            repo = restore_private_source(root, links, gate_request, get)
+        if gate_request.get('source_form') == 'current-files':
+            repo = restore_current_files(root, links, gate_request, get)
         elif links.get('production') and gate_request.get('task') == 'paired':
             subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
             for variant in ('base', 'changed'):
