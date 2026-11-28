@@ -4819,7 +4819,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             assert isinstance(evidence, placement.FreshHostEvidence), evidence
             self.assertEqual(evidence.eligibility, ALLOWED_HOST)
             capture.assert_called_once()
-            self.assertIn("fixture-mirrors/hana", str(capture.call_args))
+            script = cast(list[str], capture.call_args.args[0])[-1]
+            self.assertIn("'fixture-mirrors'/'hana'", script)
+            self.assertIn("fixture-mirrors".encode().hex(), script)
             self.assertEqual(warnings.getvalue().count("mirror_root='/outside'"), 1)
 
     def test_edit_during_read_uses_the_stamp_of_the_read_contents(self) -> None:
