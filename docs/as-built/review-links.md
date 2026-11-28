@@ -931,6 +931,21 @@ The dialog shows Error lines and Script errors when the page has errors.
 Review and Accounts reuse gzip bytes for an unchanged page with its current owner control.
 A Bug with a screenshot also includes the viewport.
 A new draft selects the page's default assignee when one is available.
+Under **Where it goes**, **Change** opens the assignee menu at the end of the route.
+**None** is first, followed by the page role when there is one.
+Press **Enter** to apply the focused choice and close the assignee menu.
+**Other studio personnel** opens a chip list of the available studio personnel in alphabetical order.
+The page role chip starts selected when there is a page role.
+The chip list scrolls the selected chip into view when it opens.
+When the list changes size, it scrolls the focused chip into view.
+If no chip has focus, the list scrolls the selected chip into view.
+Select a chip to set the assignee and return to the route.
+The menu and the chip list close when focus leaves them.
+Press **Escape** or select **Change** again to close the open choices and return focus to **Change**.
+The open choices follow **Change** when the dialog moves.
+The choices check the available space again when the assignment row changes size.
+The choices open above **Change** if there is more room above and they cannot fit below.
+Scroll the menu or chip list to reach any choices that do not fit.
 Select **None** to send the item to the producer without an assignee.
 The route ends with **bob assigns it** when bob is the producer.
 For a Bug, the route says **bob tracks this bug and assigns it.**
@@ -938,6 +953,7 @@ Before you choose a producer, the route ends with **The producer assigns it**.
 The producer notice says **You assign it.**
 Changing the producer keeps **None** selected.
 The browser keeps the assignee choice in the submitted draft for recovery and Retry.
+**Undo** restores the assignee choice.
 **Send** closes the New item dialog at once.
 The user can work on the page while the fading **Undo** toast shows.
 **Undo** reopens the dialog with the same type, recipient, words, images and page capture.

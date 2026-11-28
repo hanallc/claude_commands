@@ -2548,6 +2548,54 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 class NewItemDialogTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_change_opens_one_assignee_menu_with_none_first(self) -> None:
+        self.check_assignee_choice("menu")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_other_studio_personnel_is_the_last_menu_choice(self) -> None:
+        self.check_assignee_choice("other-menu")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_other_studio_personnel_lists_chips_in_name_order(self) -> None:
+        self.check_assignee_choice("other-chips")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_other_studio_personnel_selects_an_assignee_in_one_click(self) -> None:
+        self.check_assignee_choice("other-selection")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_enter_applies_the_focused_assignee(self) -> None:
+        self.check_assignee_choice("other-enter")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_personnel_keeps_the_selected_chip_visible_after_resize(self) -> None:
+        self.check_assignee_choice("other-resize")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_personnel_keeps_the_focused_chip_visible_after_resize(self) -> None:
+        self.check_assignee_choice("other-focus-resize")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_assignee_menu_closes_when_focus_leaves(self) -> None:
+        self.check_assignee_choice("menu-focus")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_assignee_menu_fits_a_short_viewport(self) -> None:
+        self.check_assignee_choice("menu-fit")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_assignee_menu_follows_the_dialog_when_width_changes(self) -> None:
+        self.check_assignee_choice("menu-width")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_closing_assignee_menu_with_change_returns_focus(self) -> None:
+        self.check_assignee_choice("menu-toggle")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_assignee_menu_fits_when_the_route_row_grows(self) -> None:
+        self.check_assignee_choice("menu-grow")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_none_assignee_is_first_and_sends_null(self) -> None:
         self.check_assignee_choice("none")
 
@@ -2563,26 +2611,44 @@ class NewItemDialogTests(unittest.TestCase):
     def test_none_assignee_survives_separate_edits_reload_and_retry(self) -> None:
         self.check_assignee_choice("retry")
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_undo_keeps_none_selected(self) -> None:
+        self.check_assignee_choice("undo")
+
     def check_assignee_choice(self, scenario: str) -> None:
         probe = r"""
 const scenario = __SCENARIO__, nativeFetch = window.fetch;
 const draftKey = 'console.new-item.submitted';
 const submitted = JSON.parse(sessionStorage.getItem(draftKey));
 const recovering = scenario === 'retry' && Boolean(submitted);
+frameElement.width = 1440;
+frameElement.height = 900;
 const dialog = document.querySelector('#review-new-item');
 const trigger = document.querySelector('[data-owner-new]');
 const route = dialog.querySelector('[data-route]');
 const change = route.querySelector('[data-route-change]');
+const menu = route.querySelector('[data-assignees]');
+const other = menu.querySelector('[data-other-assignees]');
+const personnel = menu.querySelector('[data-assignee-personnel]');
 const send = dialog.querySelector('[type="submit"]');
 const words = dialog.querySelector('textarea');
 const separate = dialog.querySelector('[data-later-draft]');
-const assignees = () => [...route.querySelectorAll('[name="assignee_id"]')];
+const assignees = () => [...menu.querySelectorAll('[name="assignee_id"]')];
 const checked = () => assignees().find(input => input.checked);
 const copy = () => route.querySelector('[data-route-copy]').textContent;
 const routeEnd = () => route.querySelector('[data-route-assignee]').textContent;
 const posts = [];
+const hold = 'a'.repeat(24), toast = () => window.top.document.querySelector('[data-send-undo] button');
 const check = (ok, message) => { if (!ok) throw new Error(message); };
-const observe = (test, message) => new Promise((resolve, reject) => {
+const focusResize = scenario === 'other-focus-resize';
+const longRoster = focusResize || scenario === 'other-resize';
+const buildName = scenario === 'menu-grow' ? 'Release package owners'
+                : longRoster ? 'studio builds' : 'builds';
+const crew = longRoster ? Array.from({length:42}, (_, index) => {
+ const id = (index < 36 ? 'crew-' : 'visual-') + String(index + 1).padStart(2, '0');
+ return {id, name:id};
+}) : [];
+const observe = (test, message, root = dialog) => new Promise((resolve, reject) => {
  const ready = () => {
   if (!test()) return;
   clearTimeout(deadline);
@@ -2594,46 +2660,315 @@ const observe = (test, message) => new Promise((resolve, reject) => {
   observer.disconnect();
   reject(new Error(message));
  }, 8000);
- observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+ observer.observe(root, {attributes:true, childList:true, subtree:true});
  ready();
 });
 window.fetch = (path, options) => {
+ if (path === '/send-hold/' + hold + '/undo') return Promise.resolve(Response.json({outcome:'undone'}));
  if (String(path).startsWith('/send-hold/')) return Promise.resolve(Response.json({}));
  if (!String(path).startsWith('/console/review/new-item')) return nativeFetch(path, options);
  if (!options.body) return Promise.resolve(Response.json({
   token:recovering ? 'fresh' : 'first', page_owner:'dwight', page_assignee:recovering ? 'tests' : 'builds',
-  recipients:[{id:'dwight',name:'dwight',proposal:true},{id:'release',name:'release',proposal:true}],
-  assignees:[{id:'builds',name:'builds'},{id:'tests',name:'tests'}],
+  recipients:[{id:'dwight',name:scenario === 'menu-grow' ? 'Bo' : 'dwight',proposal:true},
+   {id:'release',name:'release',proposal:true}],
+  assignees:[{id:'builds',name:buildName}, {id:'tests',name:'tests'},
+   ...(scenario.startsWith('other-') ? [{id:'accounts',name:'Accounts'}] : []), ...crew],
  }));
  const payload = JSON.parse(options.body);
  if (payload.page_capture) return Promise.resolve(Response.json({}, {status:503}));
  if (payload.discard_capture) return Promise.resolve(Response.json({}));
  posts.push(payload);
+ if (scenario === 'undo' && posts.length === 1) {
+  return Promise.resolve(Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}}));
+ }
  if (scenario === 'retry' && !recovering) {
   return Promise.resolve(Response.json({error:'The reply was lost.'}, {status:503}));
  }
  return Promise.resolve(Response.json({id:'I1',key:'investigation/dwight/I1'}));
+};
+const choose = input => {
+ if (menu.hidden) change.click();
+ check(!menu.hidden && input.getClientRects().length, 'Change must show the assignee option.');
+ input.click();
+ check(menu.hidden && change.getAttribute('aria-expanded') === 'false', 'Selection must close the menu.');
+};
+const chooseChip = id => {
+ if (menu.hidden) change.click();
+ other.click();
+ const chip = personnel.querySelector(`button[value="${id}"]`);
+ check(chip && !personnel.hidden, 'The chip list must show the assignee.');
+ chip.click();
+ check(menu.hidden && routeEnd() === chip.textContent, 'The chip must set the assignee and close the list.');
 };
 (async () => {
  const failures = [];
  try {
   trigger.click();
   await observe(() => !route.hidden, 'The route did not open.');
-  const [none, builds, tests] = assignees();
+  const [none, builds] = assignees();
   if (recovering) {
    check(send.textContent === 'Retry' && words.readOnly, 'The submitted draft did not recover.');
    check(checked() === none && none.value === '', 'Recovery must select None even if the page default changes.');
    check(copy() === 'dwight tracks this bug and assigns it.', 'Recovery must show the saved route.');
   } else {
+   check(menu.hidden && assignees().every(input => !input.getClientRects().length),
+         'The assignee options must start hidden.');
    change.click();
-   check(!none.closest('fieldset').hidden, 'Change must open the assignee choices.');
+   check(!menu.hidden && change.getAttribute('aria-expanded') === 'true', 'Change must open the assignee menu.');
    check(none.value === '' && none.labels[0].textContent === 'None',
-         'The first assignee chip must offer None.');
+         'The first menu choice must offer None.');
    check(checked() === builds && builds.value === 'builds', 'Builds must stay selected at open.');
-   check(copy() === 'dwight tracks this bug and gives it to builds.', 'The route must show the page default.');
-   if (scenario !== 'default') {
-    tests.click();
-    none.click();
+   const producer = scenario === 'menu-grow' ? 'Bo' : 'dwight';
+   check(copy() === producer + ' tracks this bug and gives it to ' + builds.labels[0].textContent + '.',
+         'The route must show the page default.');
+   if (scenario === 'other-menu') {
+    const labels = [...menu.querySelectorAll('label,button')].filter(row => row.getClientRects().length);
+    check(labels.map(row => row.textContent).join(',') === 'None,builds,Other studio personnel',
+          'The menu must show None, builds, and Other studio personnel in that order.');
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'other-enter') {
+    chooseChip('accounts');
+    change.click();
+    none.focus({preventScroll:true});
+    check(document.activeElement === none && !checked() && routeEnd() === 'Accounts',
+          'Focus must move to None before it applies.');
+    const enter = new KeyboardEvent('keydown', {key:'Enter',bubbles:true,cancelable:true});
+    none.dispatchEvent(enter);
+    check(enter.defaultPrevented && menu.hidden && dialog.open && document.activeElement === change,
+          'Enter must close the menu and return focus to Change.');
+    check(checked() === none && routeEnd() === 'dwight assigns it', 'Enter must apply the focused choice.');
+   }
+   if (longRoster) {
+    other.click();
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const chips = [...personnel.querySelectorAll('button')];
+    const selected = personnel.querySelector('[aria-pressed="true"]');
+    const fullyVisible = (chip, margin = 1) => {
+     const row = chip.getBoundingClientRect(), box = menu.getBoundingClientRect();
+     const top = box.top + menu.clientTop;
+     return row.top >= top - margin && row.bottom <= top + menu.clientHeight + margin &&
+            document.elementFromPoint(row.left + row.width / 2, row.top + row.height / 2) === chip;
+    };
+    check(chips.length === 47 && chips.indexOf(selected) >= 36 && selected.value === 'builds',
+          'The long list must select the page role near the end.');
+    check(menu.scrollHeight > menu.clientHeight && menu.scrollTop > 0 && fullyVisible(selected, 2),
+          'The long list must scroll the selected chip into view on open.');
+    const focused = focusResize ? chips[0] : selected;
+    if (focusResize) {
+     focused.focus();
+     check(document.activeElement === focused && fullyVisible(focused) && !fullyVisible(selected),
+           'Focus must move to a chip near the start of the list.');
+    }
+    const resize = async height => {
+     const resized = new Promise(resolve => addEventListener('resize', resolve, {once:true}));
+     frameElement.height = height;
+     await resized;
+     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    };
+    const oldHeight = menu.clientHeight;
+    await resize(480);
+    check(menu.clientHeight < oldHeight, 'The shorter viewport must reduce the chip box height.');
+    check(!menu.hidden && document.activeElement === focused && fullyVisible(focused),
+          'The focused chip must stay fully visible after the resize.');
+    if (focusResize) {
+     menu.focus({preventScroll:true});
+     check(document.activeElement === menu && !fullyVisible(selected),
+           'Focus must move to the box while the selected chip is out of view.');
+     await resize(550);
+     check(!menu.hidden && document.activeElement === menu && fullyVisible(selected),
+           'The resize must reveal the selected chip when no chip has focus.');
+    }
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'other-chips' || scenario === 'other-selection') {
+    check(other && personnel?.hidden, 'Other studio personnel must open a separate chip list.');
+    if (scenario === 'other-chips') choose(none);
+    if (menu.hidden) change.click();
+    other.click();
+    const chips = [...personnel.querySelectorAll('button')];
+    check(!personnel.hidden && !other.getClientRects().length &&
+          chips.map(chip => chip.textContent).join(',') === 'Accounts,builds,dwight,release,tests',
+          'The chip list must show all the staff in alphabetical order.');
+    const pageRole = chips[1];
+    check(chips.filter(chip => chip.getAttribute('aria-pressed') === 'true').length === 1 &&
+          pageRole.getAttribute('aria-pressed') === 'true' && document.activeElement === pageRole,
+          'The page role must start selected and focused.');
+    if (scenario === 'other-chips') {
+     const resized = new Promise(resolve => addEventListener('resize', resolve, {once:true}));
+     frameElement.height = 480;
+     await resized;
+     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+     const body = dialog.querySelector('.new-item-body').getBoundingClientRect();
+     const box = menu.getBoundingClientRect();
+     check(!menu.hidden && box.top >= body.top && box.bottom <= body.bottom && chips.every(chip => {
+      const row = chip.getBoundingClientRect();
+      const hit = document.elementFromPoint(row.left + row.width / 2, row.top + row.height / 2);
+      return row.top >= box.top && row.bottom <= box.bottom && chip.contains(hit);
+     }), 'The chip list must keep every choice reachable at 480 px.');
+     const escape = new KeyboardEvent('keydown', {key:'Escape',bubbles:true,cancelable:true});
+     pageRole.dispatchEvent(escape);
+     check(escape.defaultPrevented && menu.hidden && dialog.open && document.activeElement === change &&
+           routeEnd() === 'dwight assigns it', 'Escape must close the chip list without selecting the page role.');
+     change.click();
+     other.click();
+     const focused = document.activeElement;
+     words.focus();
+     if (!document.hasFocus())
+      focused.dispatchEvent(new FocusEvent('focusout', {bubbles:true,relatedTarget:words}));
+     check(menu.hidden && document.activeElement === words, 'The chip list must close when focus leaves it.');
+     await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+     return;
+    }
+    chips[3].click();
+    check(personnel.hidden && menu.hidden && dialog.open && document.activeElement === change &&
+          routeEnd() === 'release' && copy() === 'dwight tracks this bug and gives it to release.',
+          'One click must select release and return to the New item dialog.');
+    change.click();
+    check(!menu.hidden && !checked() && document.activeElement === other,
+          'Change must focus Other studio personnel when the assignee has no menu radio.');
+    other.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true,cancelable:true}));
+   }
+   if (scenario === 'menu-focus') {
+    const moveFocus = target => {
+     const previous = document.activeElement;
+     target.focus();
+     // Firefox screenshot mode moves focus without sending focus events.
+     if (!document.hasFocus())
+      previous.dispatchEvent(new FocusEvent('focusout', {bubbles:true,relatedTarget:target}));
+    };
+    moveFocus(words);
+    check(menu.hidden && change.getAttribute('aria-expanded') === 'false' && document.activeElement === words,
+          'Leaving the menu must close it and keep focus on the words field.');
+    change.click();
+    moveFocus(change);
+    check(menu.hidden && document.activeElement === change, 'Moving focus back to Change must close the menu.');
+    change.click();
+    const escape = new KeyboardEvent('keydown', {key:'Escape',bubbles:true,cancelable:true});
+    checked().dispatchEvent(escape);
+    check(escape.defaultPrevented && menu.hidden && dialog.open && document.activeElement === change,
+          'Escape must close only the open menu and return focus to Change.');
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'menu-toggle') {
+    check(document.activeElement === builds, 'Opening the menu must focus the selected radio.');
+    change.dispatchEvent(new MouseEvent('mousedown', {bubbles:true,cancelable:true,button:0}));
+    change.click();
+    check(menu.hidden && dialog.open && document.activeElement === change,
+          'Closing the menu with Change must return focus to Change.');
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'menu-grow') {
+    const body = dialog.querySelector('.new-item-body'), assignment = change.parentElement;
+    choose(none);
+    change.click();
+    const menuHeight = menu.getBoundingClientRect().height;
+    change.click();
+    const resized = new Promise(resolve => addEventListener('resize', resolve, {once:true}));
+    frameElement.height = 480;
+    await resized;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const bounds = body.getBoundingClientRect();
+    body.scrollTop += assignment.getBoundingClientRect().bottom + 18 + menuHeight - bounds.bottom;
+    change.click();
+    const before = assignment.getBoundingClientRect();
+    const initialMenu = menu.getBoundingClientRect();
+    check(!menu.hidden && initialMenu.top >= before.bottom && initialMenu.bottom <= bounds.bottom,
+          `The menu must fit below Change before the route grows. Room below: ${bounds.bottom - before.bottom}.`);
+    const oldBodyHeight = body.clientHeight, oldScroll = body.scrollTop;
+    // Apply the radio change that an arrow key makes.
+    builds.checked = true;
+    builds.focus({preventScroll:true});
+    builds.dispatchEvent(new Event('input', {bubbles:true}));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const after = assignment.getBoundingClientRect(), box = menu.getBoundingClientRect();
+    check(after.height > before.height && checked() === builds && document.activeElement === builds &&
+          body.clientHeight === oldBodyHeight && body.scrollTop === oldScroll,
+          `The assignment row must wrap without moving the dialog body. Row: ${before.height} to ${after.height}. ` +
+          `Body: ${oldBodyHeight} to ${body.clientHeight}. Scroll: ${oldScroll} to ${body.scrollTop}. ` +
+          `Selected: ${checked()?.value}. Focus: ${document.activeElement.value}.`);
+    check(!menu.hidden && box.top >= bounds.top && box.bottom <= bounds.bottom,
+          'The open menu must fit after the route row grows.');
+    const clipped = [...assignees().map(input => input.labels[0]), other].filter(choice => {
+     const row = choice.getBoundingClientRect();
+     const target = document.elementFromPoint(row.left + row.width / 2, row.top + row.height / 2);
+     return row.top < box.top || row.bottom > box.bottom || !choice.contains(target);
+    }).map(choice => choice.textContent);
+    check(!clipped.length, `The menu clips ${clipped.join(', ')} after the route row grows.` +
+          ` Menu height: ${box.height}/${menuHeight}. Room above: ${after.top - bounds.top}.`);
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'menu-fit') {
+    choose(none);
+    change.click();
+    const body = dialog.querySelector('.new-item-body'), originalScroll = body.scrollTop;
+    const resized = new Promise(resolve => addEventListener('resize', resolve, {once:true}));
+    frameElement.height = 480;
+    await resized;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const bounds = body.getBoundingClientRect(), box = menu.getBoundingClientRect();
+    check(innerHeight === 480 && body.scrollTop === originalScroll && !menu.hidden,
+          'The open menu must stay open at 480 px without scrolling the dialog.');
+    check(box.height > 0 && box.top >= bounds.top && box.bottom <= bounds.bottom,
+          'The whole menu must fit inside the dialog body.');
+    check([...assignees().map(input => input.labels[0]), other].every(choice => {
+     const row = choice.getBoundingClientRect();
+     const target = document.elementFromPoint(row.left + row.width / 2, row.top + row.height / 2);
+     return row.top >= box.top && row.bottom <= box.bottom && choice.contains(target);
+    }), 'All three choices must be visible and reachable.');
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'menu-width') {
+    choose(none);
+    change.click();
+    const body = dialog.querySelector('.new-item-body');
+    const bodyWidth = body.offsetWidth, dialogLeft = dialog.getBoundingClientRect().left;
+    const menuOffset = () => change.getBoundingClientRect().right - menu.getBoundingClientRect().right;
+    const originalOffset = menuOffset();
+    const resized = new Promise(resolve => addEventListener('resize', resolve, {once:true}));
+    frameElement.width = 1120;
+    await resized;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    check(innerWidth === 1120 && innerHeight === 900 && body.offsetWidth === bodyWidth &&
+          dialog.getBoundingClientRect().left < dialogLeft, 'The dialog must move without changing width.');
+    const checkMenuPosition = () => {
+     check(!menu.hidden && Math.abs(menuOffset() - originalOffset) < 1 &&
+           menu.getBoundingClientRect().right <= dialog.getBoundingClientRect().right,
+           'The open menu must follow Change and stay within the dialog.');
+    };
+    checkMenuPosition();
+    const resizedLeft = dialog.getBoundingClientRect().left;
+    dialog.style.insetInlineStart = '48px';
+    check(dialog.getBoundingClientRect().left !== resizedLeft, 'The dialog must move again at the same window size.');
+    checkMenuPosition();
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'menu') {
+    check(change.getAttribute('aria-controls') === menu.id && menu.closest('.route-assignment') === change.parentElement,
+          'Change must control the menu beside the route end.');
+    check(assignees().map(input => input.labels[0].textContent).join() === 'None,builds',
+          'None must come before the page role.');
+    check(dialog.querySelectorAll('[name="assignee_id"]').length === assignees().length &&
+          !menu.querySelector('.new-item-chip'), 'All assignee choices must be in one menu.');
+    check(document.activeElement === builds, 'Change must focus the selected assignee.');
+    check(menu.getBoundingClientRect().top >= change.getBoundingClientRect().bottom,
+          'The menu must open below Change.');
+    builds.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true,cancelable:true}));
+    check(menu.hidden && dialog.open && document.activeElement === change,
+          'Escape must close the menu and return focus to Change.');
+    await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+    return;
+   }
+   if (scenario === 'none') chooseChip('tests');
+   if (!['default', 'other-selection', 'other-enter'].includes(scenario)) {
+    choose(none);
     check(checked() === none && copy() === 'dwight tracks this bug and assigns it.' && routeEnd() === 'dwight assigns it',
           'None must clear the assignee and show the producer route.');
    }
@@ -2656,15 +2991,28 @@ window.fetch = (path, options) => {
    check(stored.payload.assignee_id === null && posts[0].assignee_id === null,
          'The saved draft and first Send must use null.');
    separate.click();
-   tests.click();
-   check(checked() === tests, 'The separate draft must accept a different assignee.');
+   chooseChip('tests');
+   check(!checked() && routeEnd() === 'tests', 'The separate draft must accept an assignee from the chip list.');
    separate.click();
    check(checked() === none && send.textContent === 'Retry', 'Return to Retry must restore None.');
    location.reload();
    return;
   }
+  if (scenario === 'undo') {
+   await observe(toast, 'The Undo button did not appear.', window.top.document.body);
+   check(!dialog.open && posts.length === 1 && posts[0].assignee_id === null,
+         'The held Send must carry None.');
+   toast().click();
+   await observe(() => dialog.open && !send.disabled, 'Undo did not restore the draft.');
+   change.click();
+   check(!menu.hidden && checked() === none && routeEnd() === 'dwight assigns it',
+         'Undo must restore None in the assignee menu and route.');
+   change.click();
+   send.click();
+  }
   await created;
-  check(posts.length === 1 && posts[0].assignee_id === (scenario === 'default' ? 'builds' : null),
+  check(posts.length === (scenario === 'undo' ? 2 : 1) &&
+        posts.every(post => post.assignee_id === ({default:'builds', 'other-selection':'release'}[scenario] ?? null)),
         'Send must use the assignee shown in the route.');
   check(posts[0].recipient_id === (scenario === 'producer' ? 'release' : 'dwight'), 'Send must use the selected producer.');
   if (recovering) {
@@ -2679,7 +3027,7 @@ window.fetch = (path, options) => {
 """
         page = bug_fixture_page(script=probe.replace("__SCENARIO__", json.dumps(scenario))).replace(
             b'data-page-owner="review"', b'data-page-owner="builds"')
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(page, window_size=(1480, 940)), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_producer_route_and_assignee_change_in_the_browser(self) -> None:
@@ -2732,13 +3080,25 @@ window.fetch = (path, options) => {
    check(posts.length === 0, 'A disabled Send makes no request.');
    dialog.querySelector('[name="recipient_id"][value="dwight"]').click();
    check(!send.disabled && hint.hidden, 'The producer enables Send.');
+   change.click();
+   const menu = route.querySelector('[data-assignees]');
+   check([...menu.querySelectorAll('label')].map(label => label.textContent).join() === 'None',
+         'The List has no page role in the menu.');
+   menu.querySelector('[data-other-assignees]').click();
+   const personnel = menu.querySelector('[data-assignee-personnel]');
+   check(!personnel.hidden && !personnel.querySelector('[aria-pressed="true"]'),
+         'The List opens the chip list without a selected page role.');
+   document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true,cancelable:true}));
+   check(menu.hidden && text('assignee') === 'dwight assigns it', 'Escape keeps the List assignee empty.');
   } else {
    check(text('copy') === 'dwight tracks this bug and gives it to spacetime.', 'The page sets the producer and assignee.');
    check(!dialog.querySelector('[data-kind="enhancement"]').hidden, 'The dialog still shows Enhancement.');
-   check(dialog.querySelector('[data-assignees]').closest('fieldset').hidden, 'The assignees start collapsed.');
+   const menu = route.querySelector('[data-assignees]');
+   check(menu.hidden, 'The assignee menu starts closed.');
    change.click();
-   check(change.getAttribute('aria-expanded') === 'true', 'Change opens the assignee choices.');
-   dialog.querySelector('[name="assignee_id"][value="fps"]').click();
+   check(!menu.hidden && change.getAttribute('aria-expanded') === 'true', 'Change opens the assignee menu.');
+   menu.querySelector('[data-other-assignees]').click();
+   menu.querySelector('[data-assignee-personnel] button[value="fps"]').click();
    check(text('copy') === 'dwight tracks this bug and gives it to fps.', 'The new assignee appears in the route.');
    check(dialog.querySelector('[name="recipient_id"]:checked').value === 'dwight', 'The producer stays selected.');
   }
