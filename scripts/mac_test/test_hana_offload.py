@@ -798,7 +798,7 @@ route_test
         assert isinstance(result, runner_result.UsableRunnerResult)
         self.assertEqual((result.word, result.reason),
                          ('hana_command_admission_refused', 'SourceChanged: inputs changed during source capture'))
-        self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
+        self.assertEqual(self.controller.attempt_evidence.cleanup, 'unconfirmed')
         self.assertEqual(self.fixture.objects.envelopes, [])
 
     def test_killed_capture_git_ends_the_attempt_with_a_runner_fault(self) -> None:
@@ -819,7 +819,7 @@ route_test
         self.assertIn('outcome=hana_command_admission_refused\n', report.read_text())
         self.assertIn('The Hana source capture failed', output.getvalue())
         self.assertIn('SIGKILL', output.getvalue())
-        self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
+        self.assertEqual(self.controller.attempt_evidence.cleanup, 'unconfirmed')
         self.assertEqual(self.fixture.objects.envelopes, [])
 
     def assert_result_transfer_loss(self, outcome: offload.MacOffloadResult, reason: str) -> None:
