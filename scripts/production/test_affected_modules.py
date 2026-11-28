@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -11,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import posixpath
+import signal
+import socket
 import subprocess
 import sqlite3
 import tempfile
@@ -23,6 +27,12 @@ from scripts.buildlog import index as buildlog_index
 from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
+
+
+def block_extraction_worker(peer: socket.socket) -> None:
+    with peer:
+        peer.sendall(f"{os.getpid()}\n".encode())
+        _ = peer.recv(1)
 
 
 class AffectedModulesTests(unittest.TestCase):
@@ -1080,6 +1090,133 @@ def shadow(root):
         assert isinstance(result, affected.FullSuite)
         self.assertIn("graph error: fact extraction worker: unsupported operand type", result.reason)
         self.assertFalse(self.cache_file().exists())
+
+    def test_pooled_extraction_reaps_workers_on_interrupt(self) -> None:
+        self.add_extraction_sources("base")
+        self.certify()
+        self.set_gate_config(processes=8)
+
+        def terminate(number: int, _frame: object) -> None:
+            raise SystemExit(128 + number)
+
+        for signum, error in ((signal.SIGINT, KeyboardInterrupt), (signal.SIGTERM, SystemExit)):
+            with self.subTest(signum=signum):
+                reader, peer = socket.socketpair()
+                worker_pid = 0
+
+                def interrupt(_value: None) -> affected.SourceFacts:
+                    nonlocal worker_pid
+                    with reader.makefile("rb") as ready:
+                        worker_pid = int(ready.readline())
+                    signal.raise_signal(signum)
+                    raise AssertionError("No interrupt handler ran")
+
+                def start(pool: ProcessPoolExecutor, *_args: object, **_kwargs: object
+                          ) -> Iterator[affected.SourceFacts]:
+                    _ = pool.submit(block_extraction_worker, peer)
+                    return map(interrupt, (None,))
+
+                reader.settimeout(10)
+                previous = signal.signal(signal.SIGTERM, terminate)
+                try:
+                    with (reader, peer, mock.patch.object(ProcessPoolExecutor, "map", autospec=True, side_effect=start),
+                          self.assertRaises(error)):
+                        _ = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+                finally:
+                    _ = signal.signal(signal.SIGTERM, previous)
+                self.assertGreater(worker_pid, 0)
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(worker_pid, os.WNOHANG)
+                self.assertFalse(self.cache_file().exists())
+                with self.cache_file().with_suffix(".lock").open("ab") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_broken_pool_keeps_results_already_used_and_extracts_the_rest_serially(self) -> None:
+        self.add_extraction_sources("base")
+        self.certify()
+        self.add_test("checks/test_new.py", "NEW = True\n")
+        _ = self.commit()
+        serial = affected.select_affected(self.repo, self.base, self.modules, set())
+        assert isinstance(serial, affected.AffectedSelection) and isinstance(serial.run, affected.SelectionRun)
+        self.set_gate_config(processes=8)
+
+        def break_after_first(fn: Callable[[str, str], affected.SourceFacts], texts: list[str], paths: list[str],
+                              *, chunksize: int) -> Iterator[affected.SourceFacts]:
+            self.assertGreater(chunksize, 0)
+            self.assertEqual(paths[0], "scripts/checks/test_new.py")
+            yield fn(texts[0], paths[0])
+            raise BrokenProcessPool("worker exited")
+
+        for failure in (BrokenProcessPool("worker exited during submission"), break_after_first):
+            with (self.subTest(failure=failure), mock.patch.object(ProcessPoolExecutor, "map", side_effect=failure),
+                  mock.patch.object(affected, "extract_facts", wraps=affected.extract_facts) as extract):
+                pooled = affected.select_affected(self.repo, self.base, self.modules, set())
+            self.assertEqual(pooled, serial)
+            assert isinstance(pooled.run, affected.SelectionRun)
+            self.assertEqual(pooled.run.cache_misses, serial.run.cache_misses)
+            self.assertEqual(pooled.run.extracted_files, serial.run.extracted_files)
+            self.assertEqual(extract.call_count, serial.run.extracted_files)
+            self.assertEqual(sum(call.args[1] == "scripts/checks/test_new.py" for call in extract.call_args_list), 1)
+
+    def test_pooled_source_read_error_matches_serial_without_rereading(self) -> None:
+        self.add_extraction_sources("base")
+        self.certify()
+        broken = self.repo / "scripts/component/source_8.py"
+        read_text = Path.read_text
+        results: list[affected.FullSuite] = []
+        for processes in (1, 8):
+            attempts = 0
+
+            def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                nonlocal attempts
+                if path == broken:
+                    attempts += 1
+                    if attempts == 1:
+                        raise OSError(f"cannot read {path}")
+                return read_text(path, encoding=encoding, errors=errors)
+
+            self.set_gate_config(processes=processes)
+            with mock.patch.object(Path, "read_text", autospec=True, side_effect=read):
+                selection = affected.select_affected(self.repo, self.base, self.modules, set())
+            self.assertEqual(attempts, 1)
+            assert isinstance(selection, affected.FullSuite)
+            results.append(selection)
+        serial, pooled = results
+        self.assertEqual(pooled, serial)
+        assert isinstance(serial.run, affected.SelectionRun) and isinstance(pooled.run, affected.SelectionRun)
+        self.assertEqual(pooled.run.cache_misses, serial.run.cache_misses)
+        self.assertEqual(pooled.run.extracted_files, serial.run.extracted_files)
+
+    def test_pooled_invalid_test_counts_only_the_sources_the_graph_uses(self) -> None:
+        self.add_extraction_sources("base")
+        self.add_test("a/test_invalid.py", "invalid (\n")
+        self.certify()
+        now = 0.0
+        read_text = Path.read_text
+        results: list[affected.FullSuite] = []
+
+        def clock() -> float:
+            return now
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal now
+            if path.is_relative_to(self.repo / "scripts"):
+                now += 1.0
+            return read_text(path, encoding=encoding, errors=errors)
+
+        for processes in (1, 8):
+            self.set_gate_config(processes=processes)
+            with (mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+                  mock.patch.object(affected, "monotonic", side_effect=clock)):
+                selection = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+            assert isinstance(selection, affected.FullSuite) and isinstance(selection.run, affected.SelectionRun)
+            results.append(selection)
+            self.assertIn("scripts/a/test_invalid.py", selection.reason)
+            self.assertEqual((selection.run.cache_misses, selection.run.extracted_files, selection.run.extraction_s),
+                             (1, 1, 1.0))
+            self.assertFalse(self.cache_file().exists())
+        serial, pooled = results
+        self.assertEqual(pooled, serial)
 
     def test_invalid_source_reads_count_misses_before_extraction(self) -> None:
         invalid = self.repo / "scripts/broken.py"

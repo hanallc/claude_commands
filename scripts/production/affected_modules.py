@@ -8,6 +8,7 @@ import ast
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,12 +19,14 @@ from importlib.metadata import packages_distributions
 from io import BytesIO
 from itertools import chain
 from multiprocessing import get_context
+from multiprocessing.process import BaseProcess
 from pathlib import Path, PurePosixPath
 import json
 import os
 import posixpath
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -31,7 +34,7 @@ import tempfile
 from time import monotonic
 from typing import cast
 
-from scripts.lib import conf
+from scripts.lib import cancellation, conf
 from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.test_times.gate_record import (
     ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
@@ -1089,37 +1092,103 @@ def pool_fact_paths(sources: list[str], blobs: dict[str, str], dirty: set[str],
     return missing
 
 
-def extract_pool_facts(paths: list[str], read_source: Callable[[str], str], processes: int,
-                       run: SelectionRun | None, *, worktree: bool) -> dict[str, SourceFacts]:
+@contextmanager
+def extraction_time(run: SelectionRun | None) -> Generator[None]:
     started = monotonic()
     try:
-        try:
-            texts = [read_source(path) for path in paths]
-        except (OSError, UnicodeError):
-            # Let the serial loop report the read failure in path order.
-            return {}
-        with ExitStack() as stack:
-            try:
-                # Spawn keeps the parent's file locks out of the workers.
-                pool = ProcessPoolExecutor(max_workers=processes, mp_context=get_context("spawn"))
-                _ = stack.callback(pool.shutdown, cancel_futures=True)
-                results = pool.map(extract_facts, texts, paths, chunksize=max(1, len(paths) // (processes * 2)))
-            except OSError:
-                return {}
-            if run is not None and worktree:
-                run.cache_misses += len(paths)
-            extracted: dict[str, SourceFacts] = {}
-            try:
-                for path, facts in zip(paths, results, strict=True):
-                    extracted[path] = facts
-                    if run is not None:
-                        run.extracted_files += 1
-            except Exception as error:
-                raise GraphError(f"fact extraction worker: {error}") from error
-            return extracted
+        yield
     finally:
         if run is not None:
             run.extraction_s += monotonic() - started
+
+
+@dataclass(frozen=True)
+class PreparedSource:
+    contents: str | OSError | UnicodeError
+    read_s: float
+
+
+def start_extraction_worker() -> None:
+    # The parent blocks cancellation while it registers new workers.
+    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
+
+
+def stop_extraction_pool(pool: ProcessPoolExecutor) -> None:
+    # Python 3.12 and 3.13 expose worker handles only through this attribute.
+    with cancellation.defer_cleanup_signals():
+        processes = cast(dict[int, BaseProcess] | None, getattr(pool, "_processes"))
+        workers = tuple(processes.values()) if processes is not None else ()
+        for worker in workers:
+            worker.kill()
+        try:
+            pool.shutdown(cancel_futures=True)
+        finally:
+            # Submission can fail before the executor starts its thread to reap workers.
+            for worker in workers:
+                worker.join()
+
+
+@contextmanager
+def pooled_fact_reader(paths: list[str], read_source: Callable[[str], str], processes: int,
+                       run: SelectionRun | None) -> Generator[Callable[[str], SourceFacts]]:
+    prepared: dict[str, PreparedSource] = {}
+    inputs: list[str] = []
+    texts: list[str] = []
+    for path in paths:
+        started = monotonic()
+        try:
+            source = read_source(path)
+        except (OSError, UnicodeError) as error:
+            prepared[path] = PreparedSource(error, monotonic() - started)
+            break
+        prepared[path] = PreparedSource(source, monotonic() - started)
+        inputs.append(path)
+        texts.append(source)
+
+    pool: ProcessPoolExecutor | None = None
+    results: Iterator[SourceFacts] | None = None
+
+    def abandon_pool() -> None:
+        nonlocal pool, results
+        if pool is not None:
+            stop_extraction_pool(pool)
+        pool = None
+        results = None
+
+    def read_facts(path: str) -> SourceFacts:
+        source = prepared[path]
+        if run is not None:
+            run.extraction_s += source.read_s
+        if not isinstance(source.contents, str):
+            raise source.contents
+        if run is not None:
+            run.extracted_files += 1
+        with extraction_time(run):
+            if results is not None:
+                try:
+                    return next(results)
+                except BrokenProcessPool:
+                    abandon_pool()
+                except Exception as error:
+                    raise GraphError(f"fact extraction worker: {error}") from error
+            return extract_facts(source.contents, path)
+
+    try:
+        if len(inputs) >= processes * 2:
+            with extraction_time(run), cancellation.defer_cleanup_signals():
+                try:
+                    pool = ProcessPoolExecutor(max_workers=processes, mp_context=get_context("spawn"),
+                                               initializer=start_extraction_worker)
+                    results = pool.map(extract_facts, texts, inputs, chunksize=len(inputs) // (processes * 2))
+                except (OSError, BrokenProcessPool):
+                    abandon_pool()
+        yield read_facts
+        if pool is not None:
+            with extraction_time(run), cancellation.defer_cleanup_signals():
+                pool.shutdown()
+    except BaseException:
+        abandon_pool()
+        raise
 
 
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
@@ -1135,71 +1204,68 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     if not worktree:
         missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
         if missing:
-            if run is not None:
-                run.cache_misses += len(missing)
-            started = monotonic()
-            try:
-                texts = blob_texts(repo, missing)
-            finally:
-                if run is not None:
-                    run.extraction_s += monotonic() - started
+            with extraction_time(run):
+                try:
+                    texts = blob_texts(repo, missing)
+                except (GraphError, OSError, ValueError):
+                    if run is not None:
+                        run.cache_misses += len(missing)
+                    raise
 
     def read_source(path: str) -> str:
         return (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
 
-    extracted: dict[str, SourceFacts] = {}
-    minimum_pool_misses = processes * 2
-    if processes > 1 and len(sources) >= minimum_pool_misses:
-        missing_paths = pool_fact_paths(sources, blobs, dirty, cached)
-        if len(missing_paths) >= minimum_pool_misses:
-            extracted = extract_pool_facts(missing_paths, read_source, processes, run, worktree=worktree)
+    def read_facts(path: str) -> SourceFacts:
+        with extraction_time(run):
+            text = read_source(path)
+            if run is not None:
+                run.extracted_files += 1
+            return extract_facts(text, path)
+
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
     tokens: dict[str, frozenset[str]] = {}
     config_reads: dict[str, frozenset[str]] = {}
     scan_facts: dict[str, SourceFacts] = {}
-    for path in sources:
-        blob = blobs.get(path) if path not in dirty else None
-        facts = cached.get(blob) if blob is not None else None
-        if facts is None:
-            facts = extracted.get(path)
+    with ExitStack() as stack:
+        facts_for_path = read_facts
+        minimum_pool_misses = processes * 2
+        if processes > 1 and len(sources) >= minimum_pool_misses:
+            missing_paths = pool_fact_paths(sources, blobs, dirty, cached)
+            if len(missing_paths) >= minimum_pool_misses:
+                facts_for_path = stack.enter_context(pooled_fact_reader(missing_paths, read_source, processes, run))
+        for path in sources:
+            blob = blobs.get(path) if path not in dirty else None
+            facts = cached.get(blob) if blob is not None else None
             if facts is None:
-                if worktree and run is not None:
+                if run is not None:
                     run.cache_misses += 1
-                started = monotonic()
-                try:
-                    text = read_source(path)
-                    if run is not None:
-                        run.extracted_files += 1
-                    facts = extract_facts(text, path)
-                finally:
-                    if run is not None:
-                        run.extraction_s += monotonic() - started
-            if blob is not None:
-                cached[blob] = facts
-        elif run is not None:
-            run.cache_hits += 1
-        if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
-            raise SyntaxError(f"{facts.syntax.message} ({path})")
-        if worktree:
-            tokens[path] = facts.tokens
-            config_reads[path] = facts.config_reads
-        scan_facts[path] = facts
-        dependencies: set[str] = set()
-        for level, module, names in facts.imports:
-            if level:
-                parents = Path(path).parent.parts
-                module = ".".join((*parents[:len(parents) - level + 1], *module.split("."))).rstrip(".")
-            for imported in (module, *(f"{module}.{name}" for name in names)):
-                root = imported.split(".")[0]
-                if root == "scripts" or root and root not in external:
-                    imported_paths = module_dependencies(imported, paths)
-                    if root != "scripts":
-                        imported_paths.update(bare_modules.get(root, set()))
-                    dependencies.update(imported_paths)
+                facts = facts_for_path(path)
+                if blob is not None:
+                    cached[blob] = facts
+            elif run is not None:
+                run.cache_hits += 1
+            if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
+                raise SyntaxError(f"{facts.syntax.message} ({path})")
+            if worktree:
+                tokens[path] = facts.tokens
+                config_reads[path] = facts.config_reads
+            scan_facts[path] = facts
+            dependencies: set[str] = set()
+            for level, module, names in facts.imports:
+                if level:
+                    parents = Path(path).parent.parts
+                    module = ".".join((*parents[:len(parents) - level + 1], *module.split("."))).rstrip(".")
+                for imported in (module, *(f"{module}.{name}" for name in names)):
+                    root = imported.split(".")[0]
+                    if root == "scripts" or root and root not in external:
+                        imported_paths = module_dependencies(imported, paths)
+                        if root != "scripts":
+                            imported_paths.update(bare_modules.get(root, set()))
+                        dependencies.update(imported_paths)
 
-        dependencies.discard(path)
-        graph[path] = dependencies
+            dependencies.discard(path)
+            graph[path] = dependencies
     scans = repository_scan_graph(repo, scan_facts, bare_modules) if worktree or unresolved_scan_paths(scan_facts) else {}
     return SourceGraph(graph, tokens, config_reads, scans)
 
