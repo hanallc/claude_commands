@@ -215,6 +215,10 @@ def fetch(*arguments):
     actions.append("fetch")
     return offload.Fetched(root / "fetched", 1)
 
+def verdict_lines(verdict):
+    channel = controller.native_verdict
+    return (channel.prefix + verdict + "\n" if channel is not None else "") + verdict + "\n"
+
 def stream(arguments, *limits):
     global remote_output, remote_status
     actions.append("run")
@@ -224,9 +228,10 @@ def stream(arguments, *limits):
     if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout") or (
             mode == "post-fetch-cleanup-timeout" and limits and isinstance(limits[0], offload.CleanupOnly)):
         (root / "mac-loss-ready").touch()
-        remote_output, remote_status = ((offload.MAC_NEXTTEST_SETUP_FAILURE + "\n", 101)
-                                        if mode == "setup-failure-cleanup-timeout" else ("mac_exit=42\n", 42))
-        program = f"import os, select; print({remote_output.rstrip()!r}, flush=True); "
+        verdict, remote_status = ((offload.MAC_NEXTTEST_SETUP_FAILURE, 101)
+                                  if mode == "setup-failure-cleanup-timeout" else ("mac_exit=42", 42))
+        remote_output = verdict_lines(verdict)
+        program = f"import os, select; print({remote_output!r}, end='', flush=True); "
         if mode == "post-fetch-cleanup-timeout":
             program += "os.close(1); os.close(2); "
         program += "select.select([], [], [])"
@@ -248,7 +253,7 @@ def stream(arguments, *limits):
         statuses = {"completed-decline": 75, "failed": 42, "post-fetch-cleanup-timeout": 42, "no-tests": 4}
         status = statuses.get(mode, 0)
         cleanup = "kept" if mode == "post-fetch-cleanup-timeout" else "0"
-        wire = f"mac_exit={status}\nmac_cleanup={cleanup}\n"
+        wire = verdict_lines(f"mac_exit={status}") + f"mac_cleanup={cleanup}\n"
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)
@@ -259,21 +264,11 @@ def stream(arguments, *limits):
 
     remote_output, remote_status = wire, status
 
-    if limits:
-        def start(*_args, **options):
-            return real_popen([sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", wire], **options)
-        with mock.patch.object(subprocess, "Popen", side_effect=start):
-            return offload.ProcessController.stream_mac_run(controller, arguments, *limits)
-
-    class Remote:
-        stdout = io.StringIO(wire)
-        def wait(self):
-            return status
-        def poll(self):
-            return status
-
-    with mock.patch.object(subprocess, "Popen", return_value=Remote()):
-        return offload.ProcessController.stream_mac_run(controller, arguments)
+    def start(*_args, **options):
+        program = "import sys; sys.stdout.write(sys.argv[1]); sys.exit(int(sys.argv[2]))"
+        return real_popen([sys.executable, "-I", "-S", "-c", program, wire, str(status)], **options)
+    with mock.patch.object(subprocess, "Popen", side_effect=start):
+        return offload.ProcessController.stream_mac_run(controller, arguments, *limits)
 
 real_run = subprocess.run
 real_popen = subprocess.Popen

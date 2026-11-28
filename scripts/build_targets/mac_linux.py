@@ -45,6 +45,11 @@ from scripts.build_targets import target_config
 from scripts.buildlog import machine_facts, store
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
+from scripts.mac_test.claim_state import (
+    FULL_BUNDLE_RETRY_SUFFIX as FULL_BUNDLE_RETRY_SUFFIX,
+    PLACED_GUEST_ATTEMPT_PREFIX,
+    placed_guest_attempt as _placed_guest_attempt,
+)
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import (
     AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection,
@@ -95,9 +100,6 @@ RUN_LOCK_FD = 9
 # number comes after it.
 RUN_COPY = '--run-copy'
 ARM_RECORD_PREFIX = 'mac-linux-armed'
-# The guest keeps placed arm and refusal records after the armed deadline.
-PLACED_GUEST_ATTEMPT_PREFIX = 'gate-'
-FULL_BUNDLE_RETRY_SUFFIX = '-full'
 # The guest prints this line, with the attempt, before it starts the argv of a command request.
 RUN_START = 'mac-linux run start'
 GUEST_PROGRESS = 'mac-linux progress '
@@ -255,7 +257,20 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     """Take the Mac repository claim for the guest route."""
     from scripts.build_queue import mac_run
 
-    return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
+    return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job, keep_claim_on_error=_retain_guest_claim)
+
+
+def _retain_guest_claim(error: BaseException) -> bool:
+    return isinstance(error, (GuestOutage, GuestEndSaveFailed))
+
+
+def save_lost_guest_fence(claim: claim_state.ClaimIdentity, record_guest_end: claim_state.GuestEndRecordWrite) -> bool:
+    """Protect the exact claim until the guest end record is durable."""
+    pid = os.getpid()
+    start = process_start.process_start(pid)
+    return isinstance(start, process_start.Started) and claim_state.save_lost_mac_fence(
+        claim_state.state_paths(GUEST_CLAIM_TARGET), claim, claim_state.ClaimProcessOwner(pid, start.start),
+        record_guest_end=record_guest_end)
 
 
 def consume_launch_permission(launch: GuestLaunchRecovery,
@@ -326,6 +341,7 @@ class GuestGateDispatch:
     start_folder_payload: bytes = b''
     folder_start_reports: ExitStack = field(default_factory=ExitStack, repr=False, compare=False)
     samples: GuestGateSamples | GuestGateSamplesUnavailable = GuestGateSamplesUnavailable()
+    end_unproven: GuestEndUnproven | None = None
 
 
 class GuestRunRequest(TypedDict):
@@ -624,6 +640,7 @@ def inner_connect_failure[Output: (bytes, str)](
 
 def retry_guest_connect[Output: (bytes, str)](
     run: Callable[[float], subprocess.CompletedProcess[Output]], deadline: float, *, bundle_stream: bool = False,
+    on_refusal: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[Output]:
     """Retry only when the inner SSH client could not connect."""
     diagnostic = ''
@@ -634,6 +651,8 @@ def retry_guest_connect[Output: (bytes, str)](
         diagnostic = inner_connect_failure(reply, bundle_stream=bundle_stream)
         if not diagnostic:
             return reply
+        if on_refusal is not None:
+            on_refusal()
         if attempts == CONNECT_ATTEMPTS or deadline - monotonic() <= CONNECT_RETRY_SECONDS:
             break
         sleep(CONNECT_RETRY_SECONDS)
@@ -779,6 +798,28 @@ class GuestEndUnproven(GuestUnavailable):
         super().__init__(message)
         self.armed: ArmedGuestAttempt = armed
         self.retry_before_settlement: bool = retry_before_settlement
+
+
+class GuestLossCandidate(GuestEndUnproven):
+    """The guest missed the outage deadline and its fence still needs a save."""
+
+    def __init__(self, message: str, armed: ArmedGuestAttempt, outage_since: float) -> None:
+        super().__init__(message, armed)
+        self.outage_since: float = outage_since
+
+
+class GuestOutage(GuestEndUnproven):
+    """The guest missed the outage deadline and the route saved its fence."""
+
+    def __init__(self, message: str, armed: ArmedGuestAttempt, outage_since: float,
+                 saved_claim: claim_state.ClaimIdentity) -> None:
+        super().__init__(message, armed)
+        self.outage_since: float = outage_since
+        self.saved_claim: claim_state.ClaimIdentity = saved_claim
+
+
+class GuestEndSaveFailed(GuestEndUnproven):
+    """The route could not save the state of an unproven guest end."""
 
 
 GUEST_ARM_RECORDS = '''\
@@ -1157,7 +1198,24 @@ class GuestEndPending:
 
 
 @dataclass(frozen=True)
-class GuestEndConnectPending(GuestEndPending):
+class GuestEndAnsweredPending(GuestEndPending):
+    """The cleanup command answered without end proof."""
+
+
+@dataclass(frozen=True)
+class GuestEndLocalFailure(GuestEndPending):
+    """A local error stopped the end proof request."""
+
+
+@dataclass(frozen=True)
+class GuestEndTransportPending(GuestEndPending):
+    """An SSH client reported a transport failure during cleanup."""
+
+    keepalive_expired: bool = False
+
+
+@dataclass(frozen=True)
+class GuestEndConnectPending(GuestEndTransportPending):
     """The inner SSH client could not connect for this proof request."""
 
 
@@ -1206,14 +1264,28 @@ def _prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt,
         if now >= proof_deadline:
             return GuestEndPending('The proof deadline expired before cleanup SSH.')
         reply = run(command, min(GUEST_CLEANUP_TIMEOUT_SECONDS, settings.unreachable_wait_seconds, proof_deadline - now))
-    except (GuestUnavailable, OSError, subprocess.TimeoutExpired) as error:
+    except OSError as error:
+        return GuestEndLocalFailure(str(error) or type(error).__name__)
+    except subprocess.TimeoutExpired as error:
+        diagnostics = error.stderr.decode(errors='replace') if isinstance(error.stderr, bytes) else error.stderr
+        if isinstance(diagnostics, str) and any(map(eligibility.ssh_local_error, diagnostics.splitlines())):
+            return GuestEndLocalFailure(diagnostics.strip())
         return GuestEndPending(str(error) or type(error).__name__)
-    if diagnostic := inner_connect_failure(reply):
-        return GuestEndConnectPending(diagnostic)
+    except GuestUnavailable as error:
+        return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
         return GuestEndProven()
     reason = reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}'
-    return GuestEndPending(reason)
+    diagnostics = reply.stderr.splitlines()
+    if reply.returncode and any(map(eligibility.ssh_local_error, diagnostics)):
+        return GuestEndLocalFailure(reason)
+    if diagnostic := inner_connect_failure(reply):
+        return GuestEndConnectPending(diagnostic)
+    if reply.returncode == 255 and not reply.stdout:
+        if any(map(eligibility.ssh_transport_failed, diagnostics)):
+            return GuestEndTransportPending(reason, any(map(eligibility.ssh_keepalive_expired, diagnostics)))
+        return GuestEndPending(reason)
+    return GuestEndAnsweredPending(reason)
 
 
 def prove_kept_guest_end(armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndPending:
@@ -1229,52 +1301,70 @@ def prove_kept_guest_end(armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndP
 class GuestEndWait:
     """Ask the guest for proof that the run ended, until it gives it or the unreachable wait expires.
 
-    The wait starts at the first request. A call after an interrupt continues with the same deadline.
+    The first miss sets the outage deadline. A call after an interrupt keeps that deadline.
     """
 
     settings: GuestSettings
     armed: ArmedGuestAttempt
-    deadline: float | None = None
+    outage: eligibility.MacOutageWindow | None = None
+    deadline: float = math.inf
     retry: bool = False
     proven: bool = False
     first_failure: str = ''
+    local_failure: GuestEndLocalFailure | None = None
     connect_attempts: int = 0
 
     def run(self) -> None:
-        while not self.proven:
+        while not self.proven and self.local_failure is None:
             now = monotonic()
-            if self.deadline is None:
+            if self.deadline == math.inf:
                 self.deadline = now + self.settings.unreachable_wait_seconds
-            remaining = self.deadline - now
+            deadline = self.outage.deadline if self.outage is not None else self.deadline
+            remaining = deadline - now
             if remaining <= 0:
                 return
             if self.retry:
                 short_retry = 0 < self.connect_attempts < CONNECT_ATTEMPTS
                 pause = CONNECT_RETRY_SECONDS if short_retry else SSH_CONNECT_TIMEOUT_SECONDS
                 sleep(min(pause, remaining))
-                if monotonic() >= self.deadline:
+                if monotonic() >= deadline:
                     return
                 if not short_retry:
                     self.connect_attempts = 0
             self.retry = True
             self.connect_attempts += 1
-            proof = prove_guest_end(self.settings, self.armed, proof_deadline=self.deadline)
+            probe_started, probe_at = monotonic(), time()
+            proof = prove_guest_end(self.settings, self.armed, proof_deadline=deadline)
             if not isinstance(proof, GuestEndConnectPending):
                 self.connect_attempts = 0
-            if monotonic() >= self.deadline:
+            if isinstance(proof, GuestEndLocalFailure):
+                self.local_failure = proof
+                return
+            if isinstance(proof, (GuestEndProven, GuestEndAnsweredPending)):
+                self.outage = None
+            elif isinstance(proof, GuestEndTransportPending) and self.outage is None:
+                at, started = (time(), monotonic()) if proof.keepalive_expired else (probe_at, probe_started)
+                self.outage = eligibility.mac_outage_window(self.settings.unreachable_wait_seconds, at, started,
+                                                            keepalive_expired=proof.keepalive_expired)
+                deadline = self.outage.deadline
+            if monotonic() >= deadline:
                 return
             if isinstance(proof, GuestEndProven):
                 self.proven = True
             elif not self.first_failure:
                 self.first_failure = proof.detail
 
-    def unreachable(self, *, retry_before_settlement: bool = False) -> GuestEndUnproven:
+    def unreachable(self, *, retry_before_settlement: bool = False,
+                    loss: eligibility.MacOutageWindow | None = None) -> GuestEndUnproven:
         guest = self.settings.ssh_hops[-1]
-        error = GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
-                                 + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
-                                 self.armed, retry_before_settlement=retry_before_settlement)
+        detail = (f'guest unreachable: {guest} did not confirm the run ended '
+                  + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})')
+        error = (GuestLossCandidate(detail, self.armed, loss.outage_since) if loss is not None
+                 else GuestEndUnproven(detail, self.armed, retry_before_settlement=retry_before_settlement))
         if self.first_failure:
             error.add_note(f'First cleanup failure: {self.first_failure}')
+        if self.local_failure is not None:
+            error.add_note(self.local_failure.detail)
         return error
 
     def cleanup_detail(self) -> str:
@@ -1323,9 +1413,14 @@ class BundleSend:
 
 
 @dataclass(frozen=True)
+class BundleSizeUnavailable:
+    """The stream gave no usable bundle byte count."""
+
+
+@dataclass(frozen=True)
 class GuestReply:
     result: str
-    bundle_bytes: int
+    bundle_bytes: int | BundleSizeUnavailable
     bundle_form: BundleForm
     bundle_reason: BundleReason
     stream_report: str
@@ -1432,8 +1527,10 @@ exec 3>&1
 size=$(
     exec 4>&1
     linked_ssh "$@" >&3
-) || exit "$?"
-printf '\\n%s\\n' "$size"
+)
+status=$?
+if [ -n "$size" ] || [ "$status" -eq 0 ]; then printf '\\n%s\\n' "$size"; fi
+exit "$status"
 '''
 
 
@@ -1553,11 +1650,14 @@ def _append_guest_end(dispatch: GuestGateDispatch, evidence: GuestEndProven | Gu
 
 def _write_guest_end(key: str, claim: str,
                      evidence: GuestEndProven | GuestNotStartedProven | ArmedGuestAttempt,
-                     detail: str) -> None:
+                     detail: str, *, outage: GuestLossCandidate | None = None) -> None:
     row: dict[str, object] = {'attempt': key, 'claim': claim, 'detail': detail, 'written_at': time()}
     if isinstance(evidence, ArmedGuestAttempt):
         row['result'] = 'unproven'
         row['armed'] = evidence.to_record()
+        if outage is not None:
+            row['outage'] = 'GUEST_END_UNPROVEN'
+            row['outage_since'] = outage.outage_since
     else:
         row['result'] = 'proven' if isinstance(evidence, GuestEndProven) else 'not started'
     _append_guest_end_row(row)
@@ -1621,10 +1721,6 @@ class GuestLaunchRecovery:
 @dataclass(frozen=True)
 class GuestLaunchUnrecorded:
     """Recovery has no journal entry for the attempt."""
-
-
-def _placed_guest_attempt(key: str) -> str:
-    return PLACED_GUEST_ATTEMPT_PREFIX + hashlib.sha256(key.encode()).hexdigest()
 
 
 def _record_guest_launch(assignment: PlacementAssignment, claim: claim_state.ClaimIdentity,
@@ -1768,7 +1864,9 @@ def reconcile_unproven(episode: str, attempt: int) -> None:
         from scripts.aws_target import cloud_gate
 
         overrides = [f'--setenv={key}={os.environ[key]}'
-                     for key in ('CONF_DIR', 'BUILD_TARGETS_STATE_DIR', 'PATH') if key in os.environ]
+                     for key in ('CONF_DIR', 'PATH') if key in os.environ]
+        if 'BUILD_TARGETS_STATE_DIR' in os.environ:
+            overrides.append(f'--setenv=BUILD_TARGETS_STATE_DIR={target_config.build_targets_state_root()}')
         command = ['systemd-run', '--user', '--no-block', '--collect', '--unit=' + unit,
                    '--property=UMask=0077', '--working-directory=' + str(Path(__file__).resolve().parents[2]),
                    *overrides, sys.executable, '-m', 'scripts.build_targets.mac_linux',
@@ -1815,16 +1913,20 @@ def reconcile_guest_end(episode: str, attempt: int) -> None:
 
 
 def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted | NoTerminalReport) -> None:
-    """Save the end proof before reporting the result."""
+    """Report the verdict with the saved cleanup state."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
     from scripts.build_queue import admission_wire as status_wire
 
-    try:
-        _append_guest_end(dispatch, GuestEndProven(), 'The guest confirmed the run ended')
-    except (OSError, ValueError) as error:
-        with suppress(OSError, ValueError):
-            print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
-        return
+    if dispatch.end_unproven is None:
+        try:
+            _append_guest_end(dispatch, GuestEndProven(), 'The guest confirmed the run ended')
+        except (OSError, ValueError) as error:
+            with suppress(OSError, ValueError):
+                print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
+            return
+        path = placement.DispatchPathSettled()
+    else:
+        path = placement.DispatchPathPending(str(dispatch.end_unproven))
 
     started = dispatch.started
     if started is None or isinstance(result, placement.NoTerminalReport):
@@ -1838,8 +1940,8 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted 
 
     def send(deadline: float, timeout: float) -> None:
         request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
-            execution_identity.ObservedExecution(execution), result,
-            placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+            execution_identity.ObservedExecution(execution), result, path,
+            code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
         reply = send_guest_execution(request, deadline=deadline, timeout=timeout)
         if (reply.assignment != assignment or reply.reason
                 or not isinstance(reply.permission, placement.PermissionConsumed)
@@ -2156,13 +2258,22 @@ def stream_arguments(settings: GuestSettings, shell: str, prefix: str, send: Bun
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
-               prefix: str, bundle: FullBundle | DeltaBundle, dispatch: GuestGateDispatch) -> GuestReply:
+               prefix: str, bundle: FullBundle | DeltaBundle, dispatch: GuestGateDispatch) -> MacLinuxGateRun:
     bootstrap = runner_bootstrap(request)
     send = bundle_send(repo, source, bundle, prefix)
     armed: ArmedGuestAttempt | None = None
     end: GuestEndWait | None = None
     stream: subprocess.CompletedProcess[bytes] | None = None
+    verdict: MacLinuxGateRun | MissingGuestVerdict | MalformedGuestVerdict = MissingGuestVerdict()
+    transfer_allows_outage = True
+    cleanup_failed_locally = False
     first_error: BaseException | None = None
+    connection_wait: eligibility.MacOutageWindow | None = None
+    refusals: list[eligibility.MacOutageWindow] = []
+
+    def record_refusal() -> None:
+        if not refusals:
+            refusals.append(eligibility.mac_outage_window(settings.unreachable_wait_seconds, time(), monotonic()))
 
     while True:
         try:
@@ -2188,7 +2299,9 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             acceptance = shlex.quote(f'{GUEST_ACCEPTED} {armed.attempt}')
                             shell = f"printf '%s\\n' {acceptance} >&2\n"
                             shell += run_shell(settings, source, len(bootstrap), armed)
-                            connect_deadline = monotonic() + settings.unreachable_wait_seconds
+                            connection_wait = eligibility.mac_outage_window(settings.unreachable_wait_seconds,
+                                                                            time(), monotonic())
+                            connect_deadline = connection_wait.deadline
 
                             def send_stream(remaining: float) -> subprocess.CompletedProcess[bytes]:
                                 arguments = stream_arguments(
@@ -2198,14 +2311,44 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                                     repo, arguments, bootstrap, settings.transfer_timeout_seconds, link,
                                     armed_for_stream, dispatch, connect_deadline=connect_deadline)
 
-                            stream = retry_guest_connect(send_stream, connect_deadline, bundle_stream=True)
+                            stream = retry_guest_connect(send_stream, connect_deadline, bundle_stream=True,
+                                                         on_refusal=record_refusal)
                     if end is None:
                         end = GuestEndWait(settings, armed)
+                        cause = first_error.__cause__ if first_error is not None else None
+                        transfer_allows_outage = (first_error is None or isinstance(first_error, GuestConnectAttemptsFailed)
+                                                  or isinstance(cause, subprocess.TimeoutExpired))
+                        observed = stream
+                        if observed is None and isinstance(cause, subprocess.TimeoutExpired):
+                            observed = subprocess.CompletedProcess([], 1,
+                                cause.stdout if isinstance(cause.stdout, bytes) else b'',
+                                cause.stderr if isinstance(cause.stderr, bytes) else b'')
+                        if observed is not None:
+                            verdict = validated_stream_verdict(observed, request, source, send, len(bootstrap),
+                                                               tests_started=dispatch.started == armed)
+                        diagnostics = observed.stderr.decode(errors='replace').splitlines() if observed is not None else []
+                        accepted = dispatch.started == armed or f'{GUEST_ACCEPTED} {armed.attempt}' in diagnostics
+                        transport_failed = (stream is not None and stream.returncode == 255
+                                            and any(map(eligibility.ssh_transport_failed, diagnostics)))
+                        if any(map(eligibility.ssh_local_error, diagnostics)) or (
+                                stream is not None and stream.returncode and not accepted and not transport_failed):
+                            transfer_allows_outage = False
+                        elif refusals and not accepted:
+                            end.outage, = refusals
+                        elif transport_failed:
+                            keepalive = any(map(eligibility.ssh_keepalive_expired, diagnostics))
+                            end.outage = eligibility.mac_outage_window(settings.unreachable_wait_seconds,
+                                time(), monotonic(), keepalive_expired=keepalive)
+                        elif (connection_wait is not None and isinstance(first_error, GuestTookNoRun)
+                              and isinstance(cause, subprocess.TimeoutExpired)):
+                            end.deadline = connection_wait.deadline
                     end.run()
                     break
                 except BaseException as error:
                     if armed is None:
                         raise
+                    if end is not None:
+                        cleanup_failed_locally = True
                     # Report the first interrupt even if the transfer failed before it.
                     first_error = first_raised(first_error, error)
             break
@@ -2216,25 +2359,88 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             first_error = first_raised(first_error, error)
 
     assert end is not None
+    if end.proven:
+        dispatch.settled = True
+    if isinstance(verdict, MacLinuxGateRun) and (first_error is None or isinstance(first_error, Exception)):
+        if not end.proven:
+            dispatch.end_unproven = end.unreachable()
+        return verdict
     if not end.proven:
         retry_before_settlement = (dispatch.started is None
             and (stream is None or run_start_line(request['attempt']).encode() not in stream.stderr.splitlines())
             and (first_error is None or isinstance(first_error, GuestTookNoRun | GuestNotLocked)))
-        error = end.unreachable(retry_before_settlement=retry_before_settlement)
+        outage = end.outage
+        loss = (outage if isinstance(verdict, MissingGuestVerdict) and transfer_allows_outage
+                and not cleanup_failed_locally and end.local_failure is None and not retry_before_settlement
+                and outage is not None and monotonic() >= outage.deadline else None)
+        error = end.unreachable(retry_before_settlement=retry_before_settlement, loss=loss)
+        if isinstance(verdict, MalformedGuestVerdict):
+            error.add_note(str(verdict.error))
         if stream is not None and stream.returncode:
             error.add_note(stream_report(stream))
-        if first_error is not None and isinstance(first_error.__cause__, subprocess.TimeoutExpired):
+        if first_error is not None:
             error.add_note(str(first_error))
         raise error
 
-    dispatch.settled = True
     cleanup_detail = end.cleanup_detail()
+    if first_error is not None and not isinstance(first_error, Exception):
+        first_error.add_note(cleanup_detail)
+        raise first_error
+    if isinstance(verdict, MalformedGuestVerdict):
+        verdict.error.add_note(cleanup_detail)
+        raise verdict.error
     if first_error is not None:
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
-    return stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail,
-                        tests_started=dispatch.started == end.armed)
+    reply = stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail,
+                         tests_started=dispatch.started == end.armed)
+    return completed_run(reply, request, source)
+
+
+class MissingGuestVerdict:
+    """The stream delivered no verdict bytes."""
+
+
+@dataclass(frozen=True)
+class MalformedGuestVerdict:
+    """The stream delivered an unusable verdict."""
+
+    error: GuestUnavailable
+
+
+def validated_stream_verdict(stream: subprocess.CompletedProcess[bytes], request: GuestRequest, source: CandidateSource,
+                             send: BundleSend, bootstrap_bytes: int, *, tests_started: bool
+                             ) -> MacLinuxGateRun | MissingGuestVerdict | MalformedGuestVerdict:
+    """Read a complete verdict even when the stream failed after its delivery."""
+    result, verdict_end, tail = stream.stdout.partition(b'\n')
+    count = tail.removeprefix(b'\n').removesuffix(b'\n').strip(b' \t\r')
+    if not result.strip() and (not tail.strip() or count.isdigit()):
+        return MissingGuestVerdict()
+    if not result.lstrip().startswith(b'{'):
+        detail = stream_report(stream)
+        if not stream.returncode or result.strip().isdigit():
+            last_line = stream.stdout.decode(errors='replace').rstrip().rpartition('\n')[2]
+            detail = f'the guest stream gave no byte count ({last_line[-200:]!r}); {detail}'
+        return MalformedGuestVerdict(guest_failure(tests_started, detail))
+    if not verdict_end:
+        return MalformedGuestVerdict(guest_failure(tests_started,
+            f'The guest reply is incomplete. {stream_report(stream)}'))
+    bundle_bytes: int | BundleSizeUnavailable = BundleSizeUnavailable()
+    if tail.endswith(b'\n') and count.isdigit():
+        try:
+            size = int(count) - bootstrap_bytes
+        except ValueError:
+            pass
+        else:
+            if size >= 0:
+                bundle_bytes = size
+    reply = GuestReply(result.decode(errors='replace'), bundle_bytes, send.form, send.reason,
+                       stream_report(stream), tests_started)
+    try:
+        return completed_run(reply, request, source)
+    except GuestUnavailable as error:
+        return MalformedGuestVerdict(error)
 
 
 def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, bootstrap_bytes: int, send: BundleSend,
@@ -2294,7 +2500,7 @@ def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundl
 
 
 def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
-                    dispatch: GuestGateDispatch) -> GuestReply:
+                    dispatch: GuestGateDispatch) -> MacLinuxGateRun:
     bundle = guest_bundle(repo, settings)
     with bundle_refs(repo, source, request['attempt']) as prefix:
         return run_remote(repo, settings, source, request, prefix, bundle, dispatch)
@@ -2450,7 +2656,7 @@ def wait_for_start(process: subprocess.Popen[bytes], attempt: str) -> None:
 class MacLinuxGateRun(GateRun):
     """Keep the bundle details and the skip counts from the guest."""
 
-    bundle_bytes: int
+    bundle_bytes: int | BundleSizeUnavailable
     bundle_form: BundleForm
     bundle_reason: BundleReason
     module_skips: dict[str, int]
@@ -2548,6 +2754,64 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         saved, launch = launch, None
         _release_guest_launch(saved)
 
+    def save_unproven(claim: claim_state.ClaimIdentity, dispatch: GuestGateDispatch,
+                      error: GuestEndUnproven) -> GuestEndUnproven:
+        nonlocal launch
+        end_record = claim_state.GuestEndRecordIdentity(
+            attempt_key(dispatch.assignment.episode, dispatch.assignment.attempt), dispatch.claim.claim_id)
+
+        def write_end(outage: GuestLossCandidate | None = None) -> None:
+            try:
+                _write_guest_end(end_record.attempt_key, end_record.claim_id, error.armed, str(error), outage=outage)
+            except OSError as journal_error:
+                failure = GuestEndSaveFailed(str(error), error.armed)
+                failure.add_note(f'Cannot save the Mac Linux guest end: {journal_error}')
+                raise failure from journal_error
+
+        fence_failure = ''
+        result: GuestEndUnproven
+        try:
+            if not isinstance(error, GuestLossCandidate):
+                write_end()
+                return error
+            try:
+                saved = save_lost_guest_fence(claim, claim_state.GuestEndRecordWrite(end_record, lambda: write_end(error)))
+            except (OSError, ValueError) as fence_error:
+                fence_failure = f'Cannot save the lost Mac Linux claim: {fence_error}'
+                saved = False
+            if saved:
+                result = GuestOutage(str(error), error.armed, error.outage_since, claim)
+            else:
+                fence_failure = fence_failure or 'Cannot save the exact lost Mac Linux claim'
+                write_end()
+                result = GuestEndSaveFailed(str(error), error.armed)
+                result.add_note(fence_failure)
+        except GuestEndSaveFailed as failure:
+            if fence_failure:
+                failure.add_note(fence_failure)
+            result = failure
+        finally:
+            # Keep the launch record if the end record save fails.
+            launch = None
+        for note in cast(list[str], getattr(error, '__notes__', [])):
+            result.add_note(note)
+        return result
+
+    @contextmanager
+    def reservation() -> Generator[claim_state.ClaimIdentity]:
+        with mac_linux_reservation(repo, mode, gate_job) as claim:
+            try:
+                yield claim
+            except GuestEndUnproven as error:
+                if dispatch is not None:
+                    recorded = save_unproven(claim, dispatch, error)
+                    if recorded is not error:
+                        raise recorded from error
+                raise
+            else:
+                if dispatch is not None and dispatch.end_unproven is not None:
+                    dispatch.end_unproven = save_unproven(claim, dispatch, dispatch.end_unproven)
+
     def refused(reason: str, *, uncertain_claim: ProviderClaimReference | None = None,
                 lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
         nonlocal dispatch
@@ -2614,7 +2878,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         try:
-            with mac_linux_reservation(repo, mode, gate_job) as claim:
+            with reservation() as claim:
                 try:
                     identity = read_guest_checkout(settings, repo)
                 except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
@@ -2624,18 +2888,15 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 settings = replace(settings, checkout_identity=identity)
                 launch = _record_guest_launch(assignment, claim, settings)
                 dispatch = GuestGateDispatch(assignment, consume_launch_permission(launch, assignment))
-                reply = transfer_source(repo, settings, source, request, dispatch)
-                run = completed_run(reply, request, source)
+                run = transfer_source(repo, settings, source, request, dispatch)
         except GuestMissingPrerequisite:
             if dispatch is None:
                 raise
             request = request.copy()
             request['attempt'] = guest_attempt + FULL_BUNDLE_RETRY_SUFFIX
-            with (mac_linux_reservation(repo, mode, gate_job),
-                  bundle_refs(repo, source, request['attempt']) as prefix):
-                reply = run_remote(repo, settings, source, request, prefix,
-                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
-                run = completed_run(reply, request, source)
+            with (reservation(), bundle_refs(repo, source, request['attempt']) as prefix):
+                run = run_remote(repo, settings, source, request, prefix,
+                                 FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
         status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
         checkout_changed = (gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head
                             or cloud_gate.working_tree(repo)[0] != source.tree)
@@ -2653,22 +2914,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                        uncertain_claim=error.claim if isinstance(error, GuestPermissionUnknown) else None,
                        lock_refused=isinstance(error, GuestNotLocked))
     except GuestEndUnproven as error:
-        if dispatch is not None:
-            try:
-                _append_guest_end(dispatch, error.armed, str(error))
-                launch = None
-            except OSError as journal_error:
-                error.add_note(f'Cannot save the Mac Linux guest end: {journal_error}')
-                try:
-                    release_launch()
-                except OSError as release_error:
-                    detail = f'{error}. Cannot save the Mac Linux guest end: {journal_error}.'
-                    return GuestGateBlocked(f'{detail} Cannot release the Mac Linux launch holder: {release_error}')
-            else:
-                if error.retry_before_settlement and dispatch.started is None:
-                    notes = cast(list[str], getattr(error, '__notes__', []))
-                    return GuestNotStarted(' '.join((str(error), *notes)), settlement_required=True,
-                                           retry_before_settlement=True)
+        if error.retry_before_settlement and dispatch is not None and dispatch.started is None:
+            notes = cast(list[str], getattr(error, '__notes__', []))
+            return GuestNotStarted(' '.join((str(error), *notes)), settlement_required=True,
+                                   retry_before_settlement=True)
         raise
     except GuestResultUnavailable as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
@@ -2680,7 +2929,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             return GuestGateBlocked(detail) if dispatch.arm_requested else refused(detail)
         return f'{TARGET}: {detail}'
     finally:
-        if dispatch is not None and dispatch.settled:
+        if dispatch is not None and (dispatch.settled or dispatch.end_unproven is not None):
             settle_guest_dispatch(dispatch, completion)
         if launch is not None and (dispatch is None or not dispatch.settled):
             try:

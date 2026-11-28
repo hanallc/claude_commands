@@ -122,6 +122,8 @@ def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str
     elif "\n)\nprobe_status=$?\n" in remote:
         case.assertTrue(remote.startswith("(\n"))
         remote = remote.removeprefix("(\n").split("\n)\nprobe_status=$?\n", 1)[0]
+    elif remote.startswith("(\n") and remote.endswith("\n) 2>&1"):
+        remote = remote.removeprefix("(\n").removesuffix("\n) 2>&1")
     words = shlex.split(remote)
     if "mirror-use" not in words:
         return [*argv[:-1], remote]
@@ -140,6 +142,12 @@ def split_mac_run_command(remote: str) -> tuple[list[str], str]:
         invocation, separator, cleanup = remote.rpartition(status)
         if separator:
             return shlex.split(invocation), cleanup
+    reporter = ' "$HOME/.claude/scripts/lib/py" -B -c ' + shlex.quote(offload.MAC_VERDICT_REPORTER) + " "
+    invocation, separator, report_and_cleanup = remote.rpartition(reporter)
+    if separator:
+        _, boundary, cleanup = report_and_cleanup.partition(";")
+        if boundary:
+            return shlex.split(invocation.removesuffix(" ||").removesuffix(";")), boundary + cleanup
     raise AssertionError(f"Missing Mac status command in {remote!r}")
 
 

@@ -145,6 +145,30 @@ class MacRunTests(unittest.TestCase):
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start + "-other"))
         self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
 
+    def test_accepted_guest_retirement_requires_the_exact_saved_claim(self) -> None:
+        armed = mac_linux.ArmedGuestAttempt("fixture-attempt", "machine", "boot", 100, "guest", "/fixture")
+        with self.assertRaises(mac_linux.GuestOutage):
+            with mac_linux.mac_linux_reservation(self.checkout, SuiteMode.GATE, GATE_JOB_NOT_RECORDED) as identity:
+                claim, = claim_state.read_claims(self.paths)
+                owner = claim_state.ClaimProcessOwner(claim.record["pid"], claim.record["proc_start"])
+                self.assertFalse(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+                end = claim_state.GuestEndRecordIdentity("fixture-attempt", identity.claim_id)
+                record_end = claim_state.GuestEndRecordWrite(end, lambda: None)
+                self.assertTrue(claim_state.save_lost_mac_fence(self.paths, identity, owner, record_guest_end=record_end))
+                raise mac_linux.GuestOutage("fixture guest outage", armed, 100.0, identity)
+        claim, = claim_state.read_claims(self.paths)
+        identity = claim_state.claim_identity(claim.record)
+        owner = claim_state.ClaimProcessOwner(claim.record["pid"], claim.record["proc_start"])
+        self.assertTrue(mac_run.claim_held("mac", identity.claim_id, owner.pid, owner.proc_start))
+        ordinary = mac_test.release_exact_claims(self.paths, owner.pid, identity, "", expected_owner=owner)
+        self.assertIsInstance(ordinary, mac_test.ClaimReleaseRefused)
+        wrong = replace(owner, proc_start="different-start")
+        self.assertFalse(claim_state.retire_lost_mac_claim(self.paths, identity, wrong))
+        self.assertEqual(claim_state.read_claims(self.paths), (claim,))
+        self.assertTrue(claim_state.retire_lost_mac_claim(self.paths, identity, owner))
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+        self.assertEqual(claim_state.read_lost_mac_fences(self.paths), ())
+
     def test_claim_kind_reads_the_mac_linux_claim_id_prefix(self) -> None:
         with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             guest, = claim_state.read_claims(self.paths)
@@ -2048,6 +2072,15 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             probe.assert_not_called()
             self.assertEqual(claim_state.read_claims(self.paths), (claim,))
         self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_guest_release_preserves_a_claim_with_a_new_process_start(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "did not release the exact repository claim"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                claim, = claim_state.read_claims(self.paths)
+                current = {**claim.record, "proc_start": "new-owner-start"}
+                _ = claim.path.write_text(json.dumps(current) + "\n")
+        retained, = claim_state.read_claims(self.paths)
+        self.assertEqual(retained.record["proc_start"], "new-owner-start")
 
     def test_release_errors_reach_the_caller_after_the_guest_run(self) -> None:
         refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")

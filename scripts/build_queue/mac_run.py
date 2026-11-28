@@ -1,12 +1,13 @@
 """Hold the repository claim for a mac-linux run."""
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from enum import Enum
 import os
 from pathlib import Path
 from uuid import uuid4
 
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
-from scripts.lib import cancellation
+from scripts.lib import cancellation, process_start
 from scripts.mac_test import claim_state, mac_test
 from scripts.production.gate_routes import SuiteMode
 
@@ -15,21 +16,30 @@ class MacRunRefused(Exception):
     """The Mac refused the repository claim before the run started."""
 
 
+class ReleaseClaimOnError(Enum):
+    RELEASE = "release"
+
+
 @contextmanager
 def held(repo: Path, target: str, work: SuiteMode | StepJob,
-         gate_job: StepJob | GateJobNotRecorded) -> Generator[claim_state.ClaimIdentity]:
+         gate_job: StepJob | GateJobNotRecorded, *,
+         keep_claim_on_error: Callable[[BaseException], bool] | ReleaseClaimOnError = ReleaseClaimOnError.RELEASE,
+         ) -> Generator[claim_state.ClaimIdentity]:
     """Hold the Mac repository claim until the guest run ends, and give its identity."""
     if isinstance(work, StepJob):
         step = work.step
     else:
         step = gate_job.step if isinstance(gate_job, StepJob) else work.value
-    with repository_claim(repo, target, f"mac-linux {step}", mac_test.MacClaimKind.GUEST) as identity:
+    with repository_claim(repo, target, f"mac-linux {step}", mac_test.MacClaimKind.GUEST,
+                          keep_claim_on_error=keep_claim_on_error) as identity:
         yield identity
 
 
 @contextmanager
 def repository_claim(repo: Path, target: str, what: str,
-                     kind: mac_test.MacClaimKind) -> Generator[claim_state.ClaimIdentity]:
+                     kind: mac_test.MacClaimKind, *,
+                     keep_claim_on_error: Callable[[BaseException], bool] | ReleaseClaimOnError = ReleaseClaimOnError.RELEASE,
+                     ) -> Generator[claim_state.ClaimIdentity]:
     """Hold the Mac claim for the checkout's repository until the block ends, and give its identity."""
     try:
         paths = claim_state.state_paths(target)
@@ -52,6 +62,10 @@ def repository_claim(repo: Path, target: str, what: str,
     args = mac_test.CliArguments()
     args.pid, args.target, args.worktree = os.getpid(), target, worktree
     args.what = what
+    start = process_start.process_start(args.pid)
+    if not isinstance(start, process_start.Started):
+        raise MacRunRefused(f"cannot claim: process {args.pid} is not running")
+    owner = claim_state.ClaimProcessOwner(args.pid, start.start)
     args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
     acquired = False
     try:
@@ -72,14 +86,14 @@ def repository_claim(repo: Path, target: str, what: str,
             raise MacRunRefused(f"{target} needs cleanup before the run can start")
         yield identity
     except BaseException as error:
-        if acquired:
+        if acquired and (keep_claim_on_error is ReleaseClaimOnError.RELEASE or not keep_claim_on_error(error)):
             try:
-                _release(paths, args.pid, identity)
+                _release(paths, owner, identity)
             except BaseException as release_error:
                 error.add_note(f"Mac claim release failed: {release_error}")
         raise
     else:
-        _release(paths, args.pid, identity)
+        _release(paths, owner, identity)
 
 
 def claim_held(target: str, claim_id: str, pid: int, start: str) -> bool:
@@ -92,9 +106,10 @@ def claim_held(target: str, claim_id: str, pid: int, start: str) -> bool:
                for claim in claim_state.read_claims(claim_state.state_paths(target)))
 
 
-def _release(paths: claim_state.StatePaths, pid: int, identity: claim_state.ClaimIdentity) -> None:
+def _release(paths: claim_state.StatePaths, owner: claim_state.ClaimProcessOwner,
+             identity: claim_state.ClaimIdentity) -> None:
     with cancellation.defer_cleanup_signals():
-        released = mac_test.release_exact_claims(paths, pid, identity, "")
+        released = mac_test.release_exact_claims(paths, owner.pid, identity, "", expected_owner=owner)
         if isinstance(released, mac_test.ClaimReleaseRefused):
             raise RuntimeError(released.reason)
         if released.count != 1:

@@ -165,18 +165,19 @@ def require_target_name(target: str) -> None:
 
 
 def ssh_target_state_directory(target: str) -> Path:
-    """Return the state path without requiring target registration."""
+    """Return the absolute state path for a target."""
     require_target_name(target)
     if target != "mac":
         return build_targets_state_root() / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
-    return Path(configured).expanduser()
+    return Path(configured).expanduser().absolute()
 
 
 def build_targets_state_root() -> Path:
-    """Return the shared state root for SSH build targets."""
+    """Return the absolute state root for SSH build targets."""
     configured = os.environ.get("BUILD_TARGETS_STATE_DIR")
-    return Path(configured).expanduser() if configured else Path.home() / ".local/state/build-targets"
+    root = Path(configured).expanduser() if configured else Path.home() / ".local/state/build-targets"
+    return root.absolute()
 
 
 def provision_mac_linux_state_root(root: Path) -> None:

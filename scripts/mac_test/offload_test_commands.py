@@ -184,13 +184,23 @@ if [[ $command != ssh ]]; then
     exit 99
 fi
 remote=${!#}
+report_verdict() {
+    local verdict=$1 key=${2:-}
+    if [[ -n $key ]]; then printf 'dispatch_mac_verdict=%s %s\n' "$key" "$verdict"; fi
+    printf '%s\n' "$verdict"
+}
 if [[ $remote == *dispatch_start_settled=* && $remote == *"printf 'leftovers=0"* &&
       $remote != *'select_leftovers()'* ]]; then
     /bin/bash -c "$remote"
     exit $?
 fi
 if [[ $remote == *sweep.sweep_workspace* && $remote != *'~/.claude/scripts/lint/lint '* ]]; then
-    printf 'mac_exit=0\n%s\n' "$run_cleanup_line"
+    if [[ $remote =~ dispatch_mac_verdict=([a-f0-9]{64})[[:space:]]mac_exit=([0-9]+) ]]; then
+        report_verdict "mac_exit=${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+    else
+        report_verdict mac_exit=0
+    fi
+    printf '%s\n' "$run_cleanup_line"
     exit 0
 fi
 if [[ $remote == *'sweep.py --floor-only --host mac' ]]; then
@@ -255,7 +265,13 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
         fi
     done
     if (( run_status_reported )); then
-        printf '%s\n' "$run_status_line"
+        verdict=${run_status_line##*$'\n'}
+        if [[ $run_status_line == *$'\n'* ]]; then printf '%s\n' "${run_status_line%$'\n'*}"; fi
+        key=
+        if [[ $remote =~ /dispatch-fences/[^[:space:]]+[[:space:]]([a-f0-9]{64})[[:space:]] ]]; then
+            key=${BASH_REMATCH[1]}
+        fi
+        report_verdict "$verdict" "$key"
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
         python3 - "$claim_file" <<'SETTLE_FENCE'
 ''' + python_tool_source(r'''

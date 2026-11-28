@@ -195,16 +195,11 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertIn("SHOT_OUTPUT=", shlex.split(self.events_for("ssh")[-1]["args"][-1]))
 
     def test_fetch_publishes_files_before_releasing_claim(self) -> None:
-        self.configure_fetch(fetch_contents="PNG bytes\n", fetch_answer="fetch_kib=12\nrc=0")
+        self.configure_fetch(fetch_contents="PNG bytes\n", fetch_answer="fetch_kib=12\nrc=0",
+                             run_cleanup_line="mac_cleanup=kept")
         stub = self.bin_directory / "command-stub"
         _ = stub.write_text(stub.read_text().replace('exit "${pull_status:-0}"',
-            'printf "Total bytes sent: 72\\nTotal bytes received: 128\\n"; exit "${pull_status:-0}"').replace(
-                'if [[ $remote == *fetch_kib=* ]]; then',
-                'if [[ $remote == *sweep.sweep_workspace* ]]; then\n'
-                + '    printf "mac_exit=0\\nmac_cleanup=kept\\n"\n'
-                + '    exit 0\n'
-                + 'fi\n'
-                + 'if [[ $remote == *fetch_kib=* ]]; then'))
+            'printf "Total bytes sent: 72\\nTotal bytes received: 128\\n"; exit "${pull_status:-0}"'))
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots/", "--target", "mac"), call_id="call-forward",
             subprocess_cli=True, separate_stderr=True, assigned_adapter=True,

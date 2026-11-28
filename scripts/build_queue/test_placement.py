@@ -1892,12 +1892,13 @@ class PlacementTests(unittest.TestCase):
                 tree = "other-tree" if checkout_change == "tree" else source.tree
 
                 def transfer(_repo: Path, settings: mac_linux.GuestSettings, _source: mac_linux.CandidateSource,
-                             guest: mac_linux.GuestRequest, dispatch: mac_linux.GuestGateDispatch) -> mac_linux.GuestReply:
+                             guest: mac_linux.GuestRequest,
+                             dispatch: mac_linux.GuestGateDispatch) -> mac_linux.MacLinuxGateRun:
                     dispatch.arm_requested = True
                     dispatch.started = mac_linux.ArmedGuestAttempt(guest["attempt"], checkout.machine_id,
                         "guest-boot", 10, settings.guest_user, checkout.checkout)
                     dispatch.settled = True
-                    return mac_linux.GuestReply("", 1, result.bundle_form, result.bundle_reason, "", True)
+                    return result
 
                 def send(message: wire.ExecutionReport | status_wire.PlacementStatusRequest, *,
                          deadline: float, timeout: float) -> wire.Reply:
@@ -1913,7 +1914,6 @@ class PlacementTests(unittest.TestCase):
                       mock.patch.object(mac_linux, "mac_linux_reservation", return_value=nullcontext(claim)),
                       mock.patch.object(mac_linux, "consume_launch_permission", return_value=granted.claim),
                       mock.patch.object(mac_linux, "transfer_source", side_effect=transfer),
-                      mock.patch.object(mac_linux, "completed_run", return_value=result),
                       mock.patch.object(production_gate, "checked_git", return_value=head),
                       mock.patch.object(cloud_gate, "working_tree", return_value=(tree, set[str]())),
                       mock.patch.object(mac_linux, "_guest_queue_query", side_effect=send) as sent,

@@ -84,6 +84,8 @@ from scripts.mac_test.claim_state import (
     target_claim_scope as target_claim_scope,
     claim_files as claim_files,
     read_claims as read_claims,
+    read_lost_mac_fences as read_lost_mac_fences,
+    MAC_LINUX_CLAIM_ID_PREFIX as MAC_LINUX_CLAIM_ID_PREFIX,
     record_after_unlock as record_after_unlock,
     pending_hold_events as pending_hold_events,
     coordination_depth as coordination_depth,
@@ -104,7 +106,6 @@ if TYPE_CHECKING:
     from scripts.mac_test import eligibility, offload
 
 MESSAGE_TIMEOUT_S = 30.0
-MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 
 @dataclass(frozen=True)
@@ -935,7 +936,8 @@ def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     claims, retained = claim_state.sweep_mac_replacements(paths, read_claims(paths))
     live: list[HeldClaim] = []
     for claim in claims:
-        if claim.path in retained or run_is_live(claim.record):
+        if (claim.path in retained or run_is_live(claim.record)
+                or claim_state.has_saved_lost_mac_fence(paths, claim.path, claim.record)):
             live.append(claim)
         elif claim_state.claim_pending_start(paths, claim.path, claim.record).exists():
             release = CliArguments()
@@ -1507,22 +1509,26 @@ def watcher_is_running(paths: StatePaths) -> bool:
         return not acquired
 
 
-def start_watcher(paths: StatePaths) -> None:
-    if watcher_is_running(paths):
-        return
+def _watcher_command(paths: StatePaths, unit: str, action: Literal["watch", "watch-claim"]) -> list[str]:
+    state_overrides: list[str] = []
+    if "MAC_TEST_STATE_DIR" in os.environ:
+        state_overrides.append(f"--setenv=MAC_TEST_STATE_DIR={target_config.ssh_target_state_directory('mac')}")
+    if "BUILD_TARGETS_STATE_DIR" in os.environ:
+        state_overrides.append(f"--setenv=BUILD_TARGETS_STATE_DIR={target_config.build_targets_state_root()}")
     environment = [
         f"{name}={value}"
         for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
+        if (name.startswith("MAC_TEST_") and name != "MAC_TEST_STATE_DIR") or name == "BUILD_TARGETS_CONFIG"
     ]
-    command = [
+    return [
         "systemd-run",
         "--user",
         "--collect",
         "--quiet",
         "--no-block",
         "--unit",
-        f"mac-test-watch-{os.getpid()}",
+        f"{unit}-{os.getpid()}",
+        *state_overrides,
         "--",
         "/usr/bin/env",
         f"HOME={os.environ.get('HOME', '')}",
@@ -1530,9 +1536,15 @@ def start_watcher(paths: StatePaths) -> None:
         *environment,
         str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).resolve()),
-        "watch",
+        action,
         *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
     ]
+
+
+def start_watcher(paths: StatePaths) -> None:
+    if watcher_is_running(paths):
+        return
+    command = _watcher_command(paths, "mac-test-watch", "watch")
     try:
         result = subprocess.run(
             command,
@@ -1554,19 +1566,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
     with lock_if_available(paths.claim_watch_lock) as acquired:
         if not acquired:
             return
-    environment = [
-        f"{name}={value}"
-        for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
-    ]
-    command = [
-        "systemd-run", "--user", "--collect", "--quiet", "--no-block",
-        "--unit", f"mac-test-claim-watch-{os.getpid()}", "--", "/usr/bin/env",
-        f"HOME={os.environ.get('HOME', '')}",
-        f"PATH={os.environ.get('PATH', '')}",
-        *environment, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "watch-claim",
-        *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
-    ]
+    command = _watcher_command(paths, "mac-test-claim-watch", "watch-claim")
     try:
         result = subprocess.run(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
@@ -1660,13 +1660,25 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     """Check each kept mirror and share one idle check per host."""
 
     with locked(paths.lock):
-        claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+        claim_state.recover_lost_mac_retirement(paths)
+        claims = read_claims(paths)
+        active = {claim.path: claim.record for claim in claims}
+        staged: set[Path] = set()
+        fences: list[HeldClaim] = []
+        for fence in claim_state.read_lost_mac_fences(paths):
+            path = paths.claims / fence.claim_file_name
+            if (original := active.get(path)) is not None and claim_state.same_lost_mac_fence(original, fence.record):
+                staged.add(path)
+            elif "remote_host" in fence.record:
+                fences.append(fence)
+        claims = tuple(claim for claim in claims if claim.path not in staged and run_is_live(claim.record))
+    watched = (bool(fences) and watch_lost_mac_fences(paths, tuple(fences))) or bool(staged)
     if paths.platform == "macos":
         # The Mac activity probe cannot see guest work. The guest holder releases its claim.
         claims = tuple(claim for claim in claims
                        if "remote_host" in claim.record or claim_kind(claim.record) is MacClaimKind.MIRROR)
     if not claims:
-        return False
+        return watched
     if paths.platform == "linux":
         # The Linux controller must confirm remote cleanup before claim removal.
         return True
@@ -1679,13 +1691,34 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
             with transfer_bytes.measure_transfers(traffic[host]):
                 activity[host] = check_mac_activity(config, host)
     now = utc_now()
-    watched = False
     for claim in claims:
         host = claim_host(claim.record, config)
         with transfer_bytes.measure_transfers(traffic[host]):
             if watch_claim(paths, config, claim, activity[host], now):
                 watched = True
     return watched
+
+
+def watch_lost_mac_fences(paths: StatePaths, fences: tuple[HeldClaim, ...]) -> bool:
+    """Reconcile each saved fence under the lease for its original mirror."""
+    from scripts.copies import copies
+    from scripts.mac_test import offload
+
+    pending = False
+    for claim in fences:
+        run = claim.record
+        assert "remote_host" in run and "mac_watch_origin" in run
+        saved = claim_state.saved_mac_repository(run)
+        root = MacMirrorRoot(run["mac_watch_origin"]["mirror_root"])
+        try:
+            with offload.mac_cleanup_lease(saved, run["remote_host"], paths.target, mirror_root=root):
+                result = release_exact_claims(paths, run["pid"], claim_state.claim_identity(run), "",
+                                              watched_claim=claim, watched_idle=True)
+        except (OSError, ValueError, copies.CopyError):
+            pending = True
+        else:
+            pending = pending or isinstance(result, ClaimReleaseRefused)
+    return pending
 
 
 def watch_claim(
@@ -1830,7 +1863,8 @@ def command_watch_claim(paths: StatePaths, config: MacTestConfig) -> int:
             try:
                 if not claim_watch_pass(paths, config):
                     with locked(paths.lock):
-                        if not any(run_is_live(claim.record) for claim in read_claims(paths)):
+                        if (not any(run_is_live(claim.record) for claim in read_claims(paths))
+                                and not claim_state.read_lost_mac_fences(paths)):
                             # A new claimant must see the watcher lock released.
                             watcher_lock.close()
                             return 0
@@ -2120,9 +2154,15 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             and not claim_state.valid_mac_path_component(mac_repository.mirror_name)):
         return ClaimDenied(12, "invalid Mac repository path")
     try:
+        claim_state.recover_lost_mac_retirement(paths)
         claims = live_claims(paths)
+        fences = claim_state.read_lost_mac_fences(paths)
     except ClaimStateUnreadable as error:
         return unreadable_claim(error.path)
+    for fence in fences:
+        if claim_blocks_scope(paths, fence, scope):
+            start_claim_watcher(paths)
+            return ClaimBusy(fence.record)
     if isinstance(replaces, _VerifiedMacReservation):
         claims = tuple(claim for claim in claims if claim.path != replaces.path)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope, mac=paths.platform == "macos"))
@@ -2598,6 +2638,7 @@ def release_exact_claims(
     finish_wait: bool = False,
     release_deadline: offload.ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
     watched_claim: HeldClaim | None = None, watched_idle: bool = False,
+    expected_owner: claim_state.ClaimProcessOwner | None = None,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
@@ -2618,7 +2659,10 @@ def release_exact_claims(
                 record = read_run(path)
             except StateReadError:
                 continue
-            if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
+            if (isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity
+                    and (expected_owner is None or expected_owner.matches(record))):
+                if claim_state.has_saved_lost_mac_fence(paths, path, record):
+                    return ClaimReleaseRefused("the lost claim is pending retirement")
                 owned.append((path, record))
         if watched_claim is not None and (not owned or not same_cleanup_claim(owned[0][1], watched_claim.record)):
             return ClaimReleaseRefused("the exact claim changed before release")
@@ -2714,6 +2758,8 @@ def release_exact_claims(
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
                 if watched_claim is not None and not same_cleanup_claim(current, watched_claim.record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
+                if claim_state.has_saved_lost_mac_fence(paths, path, current):
+                    return ClaimReleaseRefused("the lost claim is pending retirement")
                 try:
                     retired.update(claim_state.retire_replaced_reservation(paths, path, current))
                 except claim_state.ReservationRetirementError as error:
@@ -2767,7 +2813,7 @@ def free_now(
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
-    Read local records without taking the claim lock or contacting the Mac.
+    Read local records without taking the claim lock.
     Mirror runs can replace a test copy and take over a kept claim for cleanup.
     Guest runs skip the mirror checks.
     """
@@ -2808,8 +2854,13 @@ def free_now(
         if not isinstance(block, NoMacBlock):
             return "blocked"
         claims = read_claims(paths)
+        fences = claim_state.read_lost_mac_fences(paths)
     except (OSError, StateReadError):
         return "state"
+    if any(claim_blocks_scope(paths, fence, scope) for fence in fences):
+        if recover_mac_backoff:
+            start_claim_watcher(paths)
+        return "busy"
     repository_name = (None if guest else repository.repo_name(str(repo_root)) if paths.platform == "linux"
                        else scope.name if isinstance(scope, RepositoryScope) else None)
     if repository_name is not None and isinstance(

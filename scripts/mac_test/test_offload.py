@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import fields, replace
 import io
 from pathlib import Path
@@ -281,6 +281,17 @@ for = ["fixture"]
         self.check_scope_start(symlink=False)
 
 
+@contextmanager
+def fixture_ssh_process(stdout: bytes, stderr: bytes, status: int) -> Generator[mock.Mock]:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        _ = output.write(stdout)
+        _ = errors.write(stderr)
+        _ = output.seek(0)
+        _ = errors.seek(0)
+        yield mock.Mock(stdout=output, stderr=errors, wait=mock.Mock(return_value=status),
+                        poll=mock.Mock(return_value=status))
+
+
 class RunnerCompletionTests(unittest.TestCase):
     def test_missing_stdout_preserves_the_published_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -357,21 +368,151 @@ class RunnerCompletionTests(unittest.TestCase):
         self.assertNotIn("running on natedev instead", output.getvalue())
 
         wire = "admission-wait-ended café\r\n"
-        for stream in (io.StringIO(wire), io.BytesIO(wire.encode("utf-8"))):
-            with self.subTest(stream=type(stream).__name__):
-                controller = offload.ProcessController()
-                process = mock.Mock(stdout=stream, wait=mock.Mock(return_value=143))
-                with mock.patch.object(subprocess, "Popen", return_value=process), \
-                     redirect_stdout(io.StringIO()) as streamed:
-                    answer = controller.stream_mac_run(["ssh", "fixture", "run"])
-                self.assertEqual(answer, offload.MissingMacStatus(
-                    "runner exited with status 143 without a final status"))
-                self.assertEqual(streamed.getvalue(), wire.replace("\r\n", "\n"))
-                self.assertEqual(controller.attempt_evidence.traffic.transfers, [{
-                    "operation": "ssh_run", "sent_bytes": 3,
-                    "received_bytes": len(wire.encode("utf-8")), "complete": True,
-                }])
+        controller = offload.ProcessController()
+        with (fixture_ssh_process(wire.encode(), b"", 143) as process,
+              mock.patch.object(subprocess, "Popen", return_value=process),
+              redirect_stdout(io.StringIO()) as streamed):
+            answer = controller.stream_mac_run(["ssh", "fixture", "run"])
+        self.assertEqual(answer, offload.MissingMacStatus(
+            "runner exited with status 143 without a final status"))
+        self.assertEqual(streamed.getvalue(), wire.replace("\r\n", "\n"))
+        self.assertEqual(controller.attempt_evidence.traffic.transfers, [{
+            "operation": "ssh_run", "sent_bytes": 3,
+            "received_bytes": len(wire.encode("utf-8")), "complete": True,
+        }])
 
+
+    def test_mac_keepalive_reports_the_first_missed_answer(self) -> None:
+        diagnostic = b"Timeout, server fixture-mac not responding.\n"
+        with (fixture_ssh_process(b"", diagnostic, 255) as process,
+              mock.patch.object(subprocess, "Popen", return_value=process),
+              mock.patch.object(time, "time", return_value=1600.0),
+              mock.patch.object(time, "monotonic", return_value=650.0), redirect_stdout(io.StringIO())):
+            status = offload.ProcessController().stream_mac_run(["ssh", "fixture-mac", "run"])
+        self.assertEqual(status, offload.MacSshDisconnected(1600.0, 650.0, True))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured = target_config.SshTarget("mac", "macos", root / "target.conf")
+            config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, 600),
+                                               1, 1, 1, "1", {})
+            result_file = offload.ResultFile(root / "result")
+            request = offload.OffloadRequest(root, "hana", "call", result_file, (),
+                                             owner="verify", holder_session="fixture")
+            controller = offload.ProcessController()
+            with (
+                mock.patch.dict(os.environ, copies_environment(root)),
+                mock.patch.object(eligibility, "configured_ssh_target", return_value=configured),
+                mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture-mac")),
+                mock.patch.object(offload, "ensure_mac_disk_floor"),
+                mock.patch.object(offload, "copy_tree_with_key",
+                                  return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
+                mock.patch.object(offload, "remote_test_command", return_value="fixture step"),
+                mock.patch.object(controller, "stream_mac_run", return_value=status),
+                mock.patch.object(offload, "save_lost_native_fence", return_value=True) as save,
+                mock.patch.object(time, "monotonic", return_value=650.0),
+                mock.patch.object(time, "sleep") as pause,
+                mock.patch.object(offload, "settle_pending_start") as settle,
+                mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")),
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected external command")),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = offload.claimed_run(controller, config, request, eligibility.KnownRepository("hana"), 50.0)
+                self.assertEqual(offload.publish_offload_result(controller, request, result), 75)
+            self.assertEqual(result, offload.MacRunOutage(600.0, outage_since=1000.0))
+            self.assertIn("outage=MAC_STATUS_MISSING\noutage_since=1000.0\n", result_file.path.read_text())
+            save.assert_called_once_with(controller, request.target)
+            pause.assert_not_called()
+            settle.assert_not_called()
+
+    def test_mac_verdict_beats_ssh_disconnect(self) -> None:
+        with (fixture_ssh_process(b"mac_exit=42\n", b"Timeout, server fixture-mac not responding.\n", 255) as process,
+              mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO())):
+            result = offload.ProcessController().stream_mac_run(["ssh", "fixture-mac", "run"])
+        self.assertEqual(result, offload.ReportedMacStatus(42))
+
+    def test_bad_verdict_and_local_ssh_errors_do_not_report_an_outage(self) -> None:
+        diagnostic = b"Timeout, server fixture-mac not responding.\n"
+        for stdout, stderr in ((b"mac_exit=invalid\n", diagnostic), (b"mac_exit=256\n", diagnostic),
+                               (b"", b"ssh: Bad configuration option\n"),
+                               (b"", b"user@fixture-mac: Permission denied (publickey).\n")):
+            with (self.subTest(stdout=stdout, stderr=stderr), fixture_ssh_process(stdout, stderr, 255) as process,
+                  mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO())):
+                result = offload.ProcessController().stream_mac_run(["ssh", "fixture-mac", "run"])
+                self.assertIsInstance(result, offload.MissingMacStatus)
+        with mock.patch.object(subprocess, "Popen", side_effect=FileNotFoundError):
+            result = offload.ProcessController().stream_mac_run(["ssh", "fixture-mac", "run"])
+        self.assertEqual(result, offload.MISSING_MAC_STATUS)
+
+    def test_native_verdict_precedes_malformed_payload_and_ssh_errors(self) -> None:
+        controller = offload.ProcessController()
+        controller.native_verdict = offload.NativeMacVerdictChannel(Path("fixture-fence"), "fixture-attempt")
+        prefix = controller.native_verdict.prefix.encode()
+        bad_config = b"/fixture/ssh_config: line 2: Bad configuration option: bad\n"
+        transport = b"client_loop: send disconnect: Broken pipe\n"
+        for output, errors, expected in (
+            (prefix + b"mac_ex", transport, offload.MalformedMacVerdict()),
+            (prefix.rstrip(), transport, offload.MalformedMacVerdict()),
+            (prefix.rstrip() + b"\tmac_exit=0\n", transport, offload.MalformedMacVerdict()),
+            (prefix + b"mac_exit=4", transport, offload.MalformedMacVerdict()),
+            (prefix + b"mac_ex", transport + bad_config, offload.MalformedMacVerdict()),
+            (prefix + b"mac_exit=42\n" + prefix + b"mac_ex", transport + bad_config, offload.ReportedMacStatus(42)),
+            (b"", transport + bad_config, offload.MacSshLocalError(bad_config.decode().strip())),
+        ):
+            with (self.subTest(output=output, errors=errors),
+                  fixture_ssh_process(output, errors, 255) as process,
+                  mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO())):
+                self.assertEqual(controller.stream_mac_run(["ssh", "fixture", "run"]), expected)
+
+    def test_later_invalid_legacy_status_resets_the_result(self) -> None:
+        for output, expected in (
+            (b"mac_exit=0\nmac_exit=256\n", offload.MissingMacStatus("runner exited with status 0 without a final status")),
+            (b"mac_exit=0\nmac_exit=bad\n", offload.MissingMacStatus("runner exited with status 0 without a final status")),
+            (b"mac_exit=256\nmac_exit=4", offload.ReportedMacStatus(4)),
+        ):
+            with (self.subTest(output=output), fixture_ssh_process(output, b"", 0) as process,
+                  mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO())):
+                self.assertEqual(offload.ProcessController().stream_mac_run(["ssh", "fixture", "run"]), expected)
+
+    def test_ssh_config_errors_and_runner_output_do_not_prove_transport_loss(self) -> None:
+        errors = b"/fixture/ssh_config: line 2: Bad configuration option: bad\n"
+        for stdout, stderr, expected in (
+            (b"", errors, offload.MissingMacStatus("runner exited with status 255 without a final status")),
+            (b"mac_exit=42\n", errors, offload.ReportedMacStatus(42)),
+            (b"Timeout, server fixture-mac not responding.\n", b"",
+             offload.MissingMacStatus("runner exited with status 255 without a final status")),
+            (b"", b"", offload.MissingMacStatus("runner exited with status 255 without a final status")),
+        ):
+            with (self.subTest(stdout=stdout, stderr=stderr), fixture_ssh_process(stdout, stderr, 255) as process,
+                  mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO())):
+                self.assertEqual(offload.ProcessController().stream_mac_run(["ssh", "fixture-mac", "run"]), expected)
+
+    def test_native_runner_log_does_not_supply_an_attempt_verdict(self) -> None:
+        controller = offload.ProcessController()
+        controller.native_verdict = offload.NativeMacVerdictChannel(Path("fixture-fence"), "fixture-attempt")
+        prefix = controller.native_verdict.prefix.encode()
+        transport = b"client_loop: send disconnect: Broken pipe\n"
+        for output in (b"mac_exit=0\n", b"dispatch_mac_verdict=another-attempt mac_exit=0\n"):
+            with (self.subTest(output=output), fixture_ssh_process(output, transport, 255) as process,
+                  mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO()) as log):
+                answer = controller.stream_mac_run(["ssh", "fixture", "run"])
+            self.assertIsInstance(answer, offload.MacSshDisconnected)
+            self.assertIn(output.decode(), log.getvalue())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            channel = controller.native_verdict
+            reporter = subprocess.run([
+                sys.executable, "-B", "-c", offload.MAC_VERDICT_REPORTER, str(channel.fence), channel.key,
+                "nextest", "4096", "1024", sys.executable, "-c", "print('mac_exit=0'); raise SystemExit(42)",
+            ], env={**os.environ, "HOME": str(root)}, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertIn(b"mac_exit=0\n", reporter.stdout)
+            self.assertTrue(reporter.stdout.endswith(prefix + b"mac_exit=42\nmac_exit=42\n"))
+            self.assertEqual((root / "fixture-fence.verdict").read_bytes(), prefix + b"mac_exit=42\n")
+        with (fixture_ssh_process(reporter.stdout, transport, 255) as process,
+              mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO()) as log):
+            self.assertEqual(controller.stream_mac_run(["ssh", "fixture", "run"]), offload.ReportedMacStatus(42))
+        self.assertNotIn("mac_exit=42", log.getvalue())
 
     def test_capture_timeout_closes_the_pipes_before_reaping(self) -> None:
         arguments = ["ssh", "fixture", "true"]
@@ -444,9 +585,9 @@ subprocess.run([sys.executable, "-I", "-S", "-c", sys.argv[2], str(fd)], pass_fd
 
     def test_split_utf8_tail_preserves_status_and_counts_raw_bytes(self) -> None:
         wire = b"mac_test: tail fragment: \xa9\nmac_exit=42\nmac_cleanup=kept\n"
-        process = mock.Mock(stdout=io.BytesIO(wire), wait=mock.Mock(return_value=0))
         controller = offload.ProcessController()
-        with mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO()) as output:
+        with (fixture_ssh_process(wire, b"", 0) as process,
+              mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO()) as output):
             result = controller.stream_mac_run(["ssh", "fixture", "run"])
         self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupKept()))
         self.assertEqual(output.getvalue(), "mac_test: tail fragment: \ufffd\n")
@@ -2139,12 +2280,11 @@ class OffloadCommandTests(OffloadCommandFixture):
                 controller.claim_identity = identity
                 wire_output = "résultat\nanomaly\nmac_exit=0\nmac_cleanup=0 32715571 59\n" + marker
                 copy_process = mock.Mock(communicate=mock.Mock(return_value=(stats.encode(), b"")), returncode=0)
-                run_process = mock.Mock(stdout=io.BytesIO(wire_output.encode("utf-8")),
-                                        wait=mock.Mock(return_value=0), poll=mock.Mock(return_value=0))
                 request = offload.OffloadRequest(self.repository, "hana", "byte-record",
                     offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture", target="mac")
                 with (
                     mock.patch.dict(os.environ, self.environment, clear=True),
+                    fixture_ssh_process(wire_output.encode("utf-8"), b"", 0) as run_process,
                     mock.patch.object(subprocess, "Popen", side_effect=[copy_process, run_process]),
                     redirect_stdout(io.StringIO()) as captured,
                 ):
