@@ -29,9 +29,10 @@ down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
 down would remove regional gate stacks and copied images before the home foundation stack.
+down would delete the contents of the home gate bucket.
 down would remove the foundation stack and retained Budget.
 down would delete the data volume and the gate image with its snapshot. The /home build cache is lost.
-down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
+down would remove deployment.json, gate-deployment.json, up.json, setup proofs, and the prepared bundle.
 down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
 
@@ -318,7 +319,7 @@ class TargetRemoval:
                 raise AwsUnavailable(f"The foundation has status DELETE_FAILED. {current.get('StackStatusReason', '')}")
             return not current
 
-        delete_gate_stack(self.api, stack, self.identity.stack_id, self.identity.deployment_id,
+        delete_gate_stack(self.api, stack, self.identity,
             self._stack, lambda: self._wait(deleted, 'foundation deletion did not finish'))
         print('removed: foundation stack, scaler user, policies, and Budget actions')
         return True
@@ -461,10 +462,20 @@ def verified_gate_bucket(stack: dict[str, object], deployment: str) -> tuple[str
     return ()
 
 
-def empty_gate_bucket(api: AwsCli, bucket: str) -> None:
+def empty_gate_bucket(api: AwsCli, bucket: str, *, deployment: str, account_id: str) -> None:
+    target = ('--bucket', bucket, '--expected-bucket-owner', account_id)
+    try:
+        tags = api.call('get-bucket-tagging', *target, service='s3api')
+    except AwsUnavailable as error:
+        if 'NoSuchBucket' in str(error):
+            return
+        raise
+    deployments = [row.get('Value') for row in ledger.rows(tags, 'TagSet') if row.get('Key') == 'GateDeployment']
+    if deployments != [deployment]:
+        raise ValueError('The live gate bucket tag differs from the saved deployment')
     while True:
         try:
-            objects = api.call('list-objects-v2', '--bucket', bucket, '--no-paginate',
+            objects = api.call('list-objects-v2', *target, '--no-paginate',
                                '--max-keys', str(GATE_BUCKET_DELETE_BATCH_SIZE), service='s3api')
         except AwsUnavailable as error:
             if 'NoSuchBucket' in str(error):
@@ -474,7 +485,7 @@ def empty_gate_bucket(api: AwsCli, bucket: str) -> None:
         if not batch:
             return
         keys = [{'Key': ledger.text(row, 'Key')} for row in batch]
-        removed = api.call('delete-objects', '--bucket', bucket, '--delete',
+        removed = api.call('delete-objects', *target, '--delete',
                            json.dumps({'Objects': keys, 'Quiet': True}), service='s3api')
         if removed.get('Errors'):
             raise AwsUnavailable(f'The gate bucket {bucket} still contains objects')
@@ -496,17 +507,17 @@ def gate_bucket_delete_failed(api: AwsCli, stack_id: str) -> bool:
     return False
 
 
-def delete_gate_stack(api: AwsCli, stack: dict[str, object], name: str, deployment: str,
+def delete_gate_stack(api: AwsCli, stack: dict[str, object], identity: RemovalIdentity,
                       read_stack: Callable[[], dict[str, object]], wait: Callable[[], None]) -> None:
     start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
-    buckets = verified_gate_bucket(stack, deployment) if start_delete else ()
+    buckets = verified_gate_bucket(stack, identity.deployment_id) if start_delete else ()
     for retry in range(GATE_BUCKET_DELETE_RETRIES + 1):
         if start_delete:
             for bucket in buckets:
-                empty_gate_bucket(api, bucket)
+                empty_gate_bucket(api, bucket, deployment=identity.deployment_id, account_id=identity.account_id)
         try:
             if start_delete:
-                _ = api.call('delete-stack', '--stack-name', name, service='cloudformation')
+                _ = api.call('delete-stack', '--stack-name', identity.stack_id, service='cloudformation')
             wait()
             return
         except AwsUnavailable as error:
@@ -519,7 +530,7 @@ def delete_gate_stack(api: AwsCli, stack: dict[str, object], name: str, deployme
                 return
             if stack.get('StackId') != stack_id:
                 raise ValueError('The gate stack identity changed during deletion') from error
-            buckets = verified_gate_bucket(stack, deployment)
+            buckets = verified_gate_bucket(stack, identity.deployment_id)
             if not buckets or not (not_empty or gate_bucket_delete_failed(api, stack_id)):
                 raise
             start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'

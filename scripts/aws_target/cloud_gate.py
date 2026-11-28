@@ -1066,7 +1066,10 @@ class GateWorker:
                             if retry == 0 and (fresh_assignment or private_source and not earlier_call_may_have_launched):
                                 save(path, launch)
                             self.book.require_gate_launchable(attempt)
-                            reply = api.call('run-instances', '--cli-input-json', launch_json)
+                            try:
+                                reply = api.call('run-instances', '--cli-input-json', launch_json)
+                            except subprocess.TimeoutExpired as error:
+                                raise subprocess.TimeoutExpired('ec2 run-instances', error.timeout) from None
                             self.record_launch(request, size, zone, 'launched')
                             instances = ledger.rows(reply, 'Instances')
                             if len(instances) != 1:

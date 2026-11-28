@@ -1071,6 +1071,51 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
         self.assertEqual(tuple(folder.rglob('*.pack')), (archive,))
         self.assertEqual(archive.read_bytes()[:4], b'PACK')
 
+    def test_failed_paired_submission_discards_only_the_unowned_package(self) -> None:
+        _ = trial.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture',
+            'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture']})
+        tools = self.root / 'systemd-bin'
+        tools.mkdir()
+        systemctl = tools / 'systemctl'
+        _ = systemctl.write_text('''#!/bin/sh
+set -eu
+test "$1 $2" = '--user show'
+test "$3" = "$TRIAL_UNIT"
+test "$4" = '--property=LoadState,ActiveState,ControlGroup,Job'
+printf '%s\\n' "$TRIAL_SERVICE_STATE"
+''')
+        systemctl.chmod(0o700)
+        arguments = ['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                     '--modules', 'fixture/test_sample.py']
+        book = ledger.CostLedger(self.state)
+        now = 1700000000
+        for hold in ('unowned', 'service', 'booking'):
+            with self.subTest(hold=hold), mock.patch.dict(os.environ, {
+                    'PATH': str(tools) + os.pathsep + os.environ['PATH'],
+                    'TRIAL_SERVICE_STATE': ('LoadState=loaded\nActiveState=active\nControlGroup=/trial\nJob='
+                                            if hold == 'service' else 'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob='),
+            }):
+                def refuse(command: Sequence[str]) -> int:
+                    folder = Path(command[command.index('--paired-worker') + 1])
+                    self.assertTrue((folder / gate_source.SOURCE_ARCHIVE).is_file())
+                    os.environ['TRIAL_UNIT'] = 'cloud-paired-trial-' + folder.name
+                    if hold == 'booking':
+                        request, = folder.glob('*/request.json')
+                        book.record_inventory(ledger.ResourceInventory(now,
+                            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+                        book.observe(ledger.InstanceObservation(now, 'stopped', 'fixture'))
+                        reservation = ledger.GateReservation(request.parent.name, now, now + 60, Decimal('.8'), Decimal('.02'))
+                        self.assertIsInstance(book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+                    return 1
+
+                with mock.patch.object(subprocess, 'call', side_effect=refuse) as start:
+                    self.assertEqual(trial.paired_main(arguments, self.state), 1)
+                start.assert_called_once()
+                folder = self.state / 'paired-trials' / os.environ['TRIAL_UNIT'].removeprefix('cloud-paired-trial-')
+                self.assertEqual((folder / gate_source.SOURCE_ARCHIVE).is_file(), hold != 'unowned')
+                self.assertEqual(len(tuple(folder.glob('*/request.json'))), 1)
+
     def test_local_guest_uses_two_trees_alternating_isolated_processes(self) -> None:
         reply, traces = self.guest()
         runs = ledger.rows(reply, 'runs')

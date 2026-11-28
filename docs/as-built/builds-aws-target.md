@@ -1033,18 +1033,24 @@ The pack contains no older commits or objects found only in older trees.
 The scaler uploads the pack once to the home bucket alongside the request and guest program.
 Each launch region receives a signed GET and the expected SHA-256.
 An uncertain launch reuses the saved launch arguments.
+For an EC2 launch timeout, the failure reason and launch history record the operation and timeout duration.
 The local pack stays until settlement and is removed after an interrupted submission when no worker can use it.
 
 The guest checks the SHA-256 before it imports the pack.
 It checks both commit and tree IDs before it starts tests.
+The guest writes a source rejection to the log before the boot-error upload.
+If the upload fails, the shell retries with the saved error.
 The guest records the captured main as `origin/main` and imports the commits as shallow tips.
 Paired trials include both trial revisions and the captured main in one pack.
 The paired checkouts share the verified Git objects and have separate indexes.
+After a failed paired submission, the caller removes the pack if the service is absent and no booking remains open.
 
 The scaler holds the shared account stack lock during package uploads and launches.
 Teardown holds the exclusive lock.
-Teardown verifies the home bucket identity and empties it before it deletes the foundation stack.
+Teardown verifies the live deployment tag before it empties the home bucket.
+Each S3 request for this deletion specifies the expected account owner.
 If a late write blocks deletion, teardown verifies the stack and bucket again before it retries.
+Teardown removes `gate-deployment.json` with the other local deployment records.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.

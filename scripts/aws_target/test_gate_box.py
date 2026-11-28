@@ -385,6 +385,9 @@ subprocess.run = fail_log_put
     def test_shell_boot_error_filters_the_completed_record(self) -> None:
         self.production_boot_stubs(('boot error record',))
 
+    def test_shell_retries_the_source_rejection_after_the_guest_put_fails(self) -> None:
+        self.production_boot_stubs(('source rejection upload',))
+
     def test_production_boot_powers_off_when_the_error_record_write_fails(self) -> None:
         self.production_boot_stubs(('boot error write',))
 
@@ -449,6 +452,7 @@ with mock.patch.object(gate, 'process_memory_mib'):
             'bwrap unavailable': 'stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial (exit 1)',
             'result upload': 'The box failed at stage result upload (exit 1)',
             'paired request download': 'The box failed at stage tools ready (exit 7)',
+            'source rejection upload': 'GuestSourceRejected: source checksum differs',
         }
         for failure in failures:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
@@ -458,6 +462,9 @@ with mock.patch.object(gate, 'process_memory_mib'):
                 (root / 'home').mkdir()
                 if failure == 'boot error write':
                     (box / 'boot-error.json').mkdir(parents=True)
+                if failure == 'boot error record':
+                    box.mkdir()
+                    _ = (box / 'boot-error.json').write_text('{"verdict":"error","error":"previous boot"}')
                 for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
@@ -506,10 +513,12 @@ def run_guest(root, links, result):
 ''')
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 request_mode = mode.wire if wire else mode.value
+                source_fields = ({'source_form': 'current-files', 'origin_main_tree': 'e' * 40}
+                                 if failure == 'source rejection upload' else {})
                 _ = (root / 'request.json').write_text(json.dumps({
                     'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
                     'mode': request_mode,
-                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
+                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py'], **source_fields}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, signal, subprocess, sys
 from urllib.parse import urlsplit
 root = pathlib.Path(os.environ['FIXTURE'])
@@ -572,6 +581,12 @@ elif name == 'curl':
     else:
         source = args[args.index('--data-binary') + 1]
         body = sys.stdin.read() if source == '@-' else pathlib.Path(source[1:]).read_text()
+        if destination.endswith('/boot-error.json') and os.environ['FAIL_STAGE'] == 'source rejection upload':
+            box = root / 'box'
+            assert json.loads(body)['error'] in (box / 'gate.log').read_text()
+            if not (root / 'failed').exists():
+                event('source rejection upload failed')
+                fail('source rejection upload', url)
         if destination.endswith('/gate.log') and 'Cloud gate: uploading' in body:
             fail('final log upload', url)
         event('upload result' if destination.endswith(('result.json', 'boot-error.json')) else 'upload log')
@@ -633,6 +648,8 @@ else:
                     links['paired'] = 'true'
                 if failure == 'timings download':
                     links['module_seconds'] = 'https://fixture.invalid/artifacts/attempt/module_seconds.json'
+                if failure == 'source rejection upload':
+                    links['source_sha256'] = '0' * 64
                 signed = {key: value + '?key=' + key + '&signature=' + TRANSFER_MARKER
                           if key != 'origin' and value.startswith('https://') else value for key, value in links.items()}
                 script = gate_box.user_data(signed, 'f' * 40, 20, 5, 1800)
@@ -671,6 +688,13 @@ else:
                 expected_error = not passed or candidate_change in ('missing', 'old transfer')
                 self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass',
                                  log + '\n' + str(results[-1].get('error', '')))
+                if failure == 'source rejection upload':
+                    rejection = boot_errors[failure]
+                    self.assertEqual(reply.returncode, 1, log + reply.stderr)
+                    self.assertIn('source rejection upload failed', trace)
+                    self.assertIn(rejection, (box / 'gate.log').read_text())
+                    self.assertIn(rejection, ledger.text(uploads[-2], 'body'))
+                    self.assertNotIn('stage=tests start', log)
                 if candidate_change == 'old transfer':
                     error = ledger.text(results[-1], 'error')
                     self.assertIn('CalledProcessError', error)

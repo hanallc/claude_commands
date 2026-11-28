@@ -1622,6 +1622,26 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         self.assertIn('account stack is busy', ledger.text(result, 'reason'))
         self.assertFalse(any('put-object' in args or 'run-instances' in args for args in self.fake.commands))
 
+    def test_launch_timeout_hides_signed_links_and_keeps_the_booking_open(self) -> None:
+        self.current_files_fixture()
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if 'run-instances' in arguments:
+                self.assertIn('X-Amz-Signature=', arguments[arguments.index('--cli-input-json') + 1])
+                raise subprocess.TimeoutExpired(arguments, 1.5)
+            return self.fake(arguments, **options)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=transport), self.book,
+            self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+        result = worker.execute(self.folder, self.request, self.deployment)
+        reason = "Command 'ec2 run-instances' timed out after 1.5 seconds"
+        self.assertEqual(result, {'status': 'fallback', 'reason': reason})
+        history = self.book.launch_history_path.read_text()
+        self.assertIn('TimeoutExpired: ' + reason, history)
+        self.assertNotIn('X-Amz-Signature=', history)
+        self.assertTrue(ledger.gate_is_open(self.book.read_snapshot().gate_reservations[0]))
+        self.assertTrue((self.folder / gate_source.SOURCE_ARCHIVE).is_file())
+
     def test_current_files_archive_remains_until_an_uncertain_launch_settles(self) -> None:
         self.current_files_fixture()
         self.fake.launch_timeouts = 1

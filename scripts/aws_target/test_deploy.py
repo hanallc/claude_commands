@@ -5245,6 +5245,8 @@ else: raise AssertionError(args)
         with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
             self.assertTrue(self.deployment().down())
         self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('delete the contents of the home gate bucket', output.getvalue())
+        self.assertIn('gate-deployment.json', output.getvalue())
         self.assertIn('admin.gpg, and the box image', output.getvalue())
         self.assertIn('--approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
@@ -5344,6 +5346,8 @@ else: raise AssertionError(args)
         write_text_atomic(self.root / 'describe-stack-resource.json', json.dumps({'StackResourceDetail': {
             'PhysicalResourceId': 'build-scaler', 'ResourceStatus': 'DELETE_COMPLETE',
         }}))
+        write_text_atomic(self.root / 'get-bucket-tagging.json',
+                          json.dumps({'TagSet': [{'Key': 'GateDeployment', 'Value': saved['deployment_id']}]}))
         write_text_atomic(self.root / 'list-objects-v2.json', '{}')
         before = len(self.commands('list-access-keys'))
 

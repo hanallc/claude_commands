@@ -578,10 +578,12 @@ except Exception as error:
     result['verdict'] = 'error'
     rejected = isinstance(error, GuestSourceRejected) or str(error) == 'candidate predates guest entry point'
     result['error'] = str(error) if rejected else safe_gate_record(traceback.format_exc().encode()).decode()
-    if rejected and 'boot_error' in links:
-        put('boot_error', json.dumps(result).encode())
     with log.open('a') as output:
-        output.write(result['error'])
+        output.write(result['error'] + '\n')
+    if rejected and 'boot_error' in links:
+        record = safe_gate_record(json.dumps(result).encode())
+        (root / 'boot-error.json').write_bytes(record)
+        put('boot_error', record)
 finally:
     if not (links.get('production') and gate_request.get('task') == 'paired'):
         try:
@@ -686,8 +688,8 @@ def boot_trap(cold: str, warm: str, *, production: bool, private_tools: bool = F
         fi
         message=$(printf '%s' "$message" | LC_ALL=C tr -d '[:cntrl:]' | sed 's/[\\"]/\\&/g')
         file="${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
-        printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"
-        if [ "$?" -eq 0 ]; then
+        if {{ [ -f "$file" ] && [ -s "$file" ]; }} ||
+            printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"; then
             safe_gate_record < "$file" |
                 gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
         fi
@@ -769,6 +771,7 @@ umask 077
 box_dir=${{GATE_BOX_DIR:-/var/lib/gate-trial}}
 export box_dir GATE_BOX_DIR="$box_dir"
 mkdir -p "$box_dir"
+if [ -f "$box_dir/boot-error.json" ]; then rm -f "$box_dir/boot-error.json"; fi
 : > "$box_dir/boot.log"
 exec >> "$box_dir/boot.log" 2>&1
 export PATH=$PATH:/run/current-system/sw/bin
