@@ -4303,6 +4303,45 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(observed, worker_panes.UncertainWorker)
         self.assertIn("w1:p1: cannot read recovery process", observed.reason)
 
+    def test_unreadable_worker_moved_to_another_tab_keeps_its_recorded_pane(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1")
+        self.assertIsInstance(self.observation(row), worker_panes.OpenWorker)
+        self.world.locations["w1:p1"]["tab_id"] = "w1:t2"
+        self.world.unknown["w1:p1"] = "cannot read moved worker process"
+
+        self.assertEqual(self.observation(row), worker_panes.ProcessUnknownWorker(
+            row, "w1:p1", "terminal-w1:p1", "cannot read moved worker process"))
+
+    def test_failed_foreign_recovery_read_does_not_hide_a_local_shell(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        self.world.add(row, "w2:p1", live=False, workspace="w2", tab="w2:t2")
+        server_result = self.world.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments == ("pane", "process-info", "--pane", "w2:p1") and "w2:p1" in self.world.process_reads:
+                raise herdr_types.HerdrFailure("cannot read foreign recovery process")
+            return server_result(*arguments, deadline=deadline)
+
+        with patch.object(self.world, "result", side_effect=result):
+            observed = self.observation(row)
+        self.assertEqual(observed, worker_panes.StoppedWorker(row, "w1:p1", "terminal-w1:p1"))
+        self.assertEqual(self.world.process_reads.count("w2:p1"), 1)
+        self.assertEqual(self.world.process_reads.count("w1:p1"), 2)
+
+    def test_newer_foreign_recovery_record_does_not_displace_a_local_shell(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        self.world.add(row, "w2:p1", live=False, workspace="w2", tab="w2:t2")
+        path = pane_launch.record_directory() / "agents.json"
+        entries = pane_launch.read(path)
+        entries["w1:p1"]["written_at"] = "2026-11-28T14:00:00+00:00"
+        entries["w2:p1"]["written_at"] = "2026-11-28T14:01:00+00:00"
+        pane_launch.save(path, entries)
+
+        self.assertEqual(self.observation(row), worker_panes.StoppedWorker(row, "w1:p1", "terminal-w1:p1"))
+
     def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")
         self.world.add(self.parent, "w1:p9", live=False, label="foreign")

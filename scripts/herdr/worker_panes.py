@@ -621,8 +621,9 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         else:
             unknown_workers.setdefault(owner.id, []).append(item)
     # Only a worker that launched a pane in a parent tab can recover one.
-    launched_here = {launch_owners[pane_id] for pane in panes
-                     if (pane_id := _text(pane, "pane_id")) in launch_owners and _text(pane, "tab_id") in parent_tabs}
+    parent_tab_panes = [pane for pane in panes if _text(pane, "tab_id") in parent_tabs]
+    launched_here = {launch_owners[pane_id] for pane in parent_tab_panes
+                     if (pane_id := _text(pane, "pane_id")) in launch_owners}
     states: list[WorkerPane] = []
     for row in selected:
         matches = scan.found.get(row.id, [])
@@ -655,9 +656,8 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
             try:
                 recovery = [pane for pane in pane_launch.reference_panes(
                     pane_launch.StaffLaunchReference(row.id), record, client, read.launches.entries,
-                    evidence=pane_launch.NativePaneEvidence(panes, scan), strict_retained_reads=True)
+                    evidence=pane_launch.NativePaneEvidence(parent_tab_panes, scan), strict_retained_reads=True)
                     if launch_owners.get(_text(pane, "pane_id")) == row.id
-                    and _text(pane, "tab_id") in parent_tabs
                     and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
             except (pane_launch.PaneProcessUnreadable, subprocess.SubprocessError) as error:
                 incomplete_reason = f"recovery pane evidence is incomplete: {error}"
