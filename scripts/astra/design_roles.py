@@ -699,20 +699,21 @@ def _check_host(design: HeldDesign) -> None:
         raise RoleRefused('design host differs from local host')
 
 
-def _migrate_parent(design: HeldDesign, role: Role) -> HeldDesign:
-    """Read legacy identity from a proved worker binding."""
-    instance = _instance(design, role)
+def _resolve_legacy_role(design_id: str, instance: RoleInstance, *, local_staff: bool = False) -> RoleInstance:
+    """Resolve legacy identity for use in memory."""
     lifecycle = instance.lifecycle
     saved_parent = instance.parent
     if isinstance(lifecycle, RoleNotOpened) and (lifecycle.creation == 'not_started' or not lifecycle.claim):
         if isinstance(saved_parent, RoleIdentityUnresolved):
-            return _set_instance(design, replace(instance, parent=saved_parent.saved_parent))
-        return design
+            return replace(instance, parent=saved_parent.saved_parent)
+        return instance
+    if isinstance(saved_parent, RoleIdentityUnresolved) and isinstance(saved_parent.saved_parent, RoleParentUnrecorded):
+        saved_parent = saved_parent.saved_parent
     if not isinstance(saved_parent, RoleParentUnrecorded) or isinstance(lifecycle, RoleEnded):
-        return design
-    record = staff.authority_snapshot()
+        return instance
+    record = staff.local_snapshot() if local_staff else staff.snapshot()
     parent: staff.StaffId | RoleIdentityUnresolved
-    claim = staff.DesignWorkerClaim(design.placement.design_id, role)
+    claim = staff.DesignWorkerClaim(design_id, instance.role)
     if isinstance(lifecycle, RoleNotOpened) and lifecycle.creation == 'outcome_unknown':
         if claim in record.design_workers:
             lifecycle = RoleWorkerPublished(record.design_workers[claim])
@@ -728,10 +729,7 @@ def _migrate_parent(design: HeldDesign, role: Role) -> HeldDesign:
     else:
         parent = RoleIdentityUnresolved('the legacy launch has no recorded worker ID', saved_parent)
     updated = replace(instance, parent=parent, lifecycle=lifecycle)
-    migrated = _set_instance(design, replace(updated, name=instance_name(updated, record)))
-    if migrated != design:
-        _save(migrated)
-    return migrated
+    return replace(updated, name=instance_name(updated, record))
 
 
 def _require_identity(instance: RoleInstance) -> None:
@@ -742,7 +740,7 @@ def _require_identity(instance: RoleInstance) -> None:
 def recorded_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
     design = read_design(claim.design_id)
     _check_host(design)
-    instance = _instance(design, claim.role)
+    instance = _resolve_legacy_role(claim.design_id, _instance(design, claim.role))
     _require_identity(instance)
     return instance
 
@@ -992,11 +990,11 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
-        design = _migrate_parent(design, role)
-        instance = _instance(design, role)
+        instance = _resolve_legacy_role(design_id, instance)
         _require_identity(instance)
         if (not isinstance(instance.lifecycle, RoleNotOpened)
                 or instance.lifecycle.claim and instance.lifecycle.creation == 'outcome_unknown'):
+            design = _set_instance(design, instance)
             if not isinstance(instance.lifecycle, (RoleNotOpened, RoleWorkerPublished)):
                 _project_hold(design, role, staff.snapshot())
             else:
@@ -1065,8 +1063,8 @@ def recover(instance_id: str) -> HeldDesign:
         design = read_design(design_id)
         _check_host(design)
         _require_no_transition(directory)
-        design = _migrate_parent(design, role)
-        instance = _instance(design, role)
+        saved = _instance(design, role)
+        instance = _resolve_legacy_role(design_id, saved)
         _require_identity(instance)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
@@ -1078,7 +1076,7 @@ def recover(instance_id: str) -> HeldDesign:
         if isinstance(lifecycle, RoleWorkerPublished) and staff.authority_snapshot().by_id(lifecycle.staff_id) is None:
             raise RoleRefused('RoleNeedsRecovery: the recorded worker retired; run end to finish this role')
         _pane_recovery_idle(lifecycle, claim)
-        observed = _set_instance(design, replace(instance, assignment_claim=''))
+        observed = _set_instance(design, replace(saved, assignment_claim=''))
         updated = _set_lifecycle(observed, role, RoleOpen(lifecycle.staff_id))
         _save(updated)
         _project_hold(updated, role, staff.snapshot())
@@ -1097,8 +1095,8 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
     with _lock(directory):
         design = read_design(design_id)
         _check_host(design)
-        design = _migrate_parent(design, role)
-        instance = _instance(design, role)
+        saved = _instance(design, role)
+        instance = _resolve_legacy_role(design_id, saved)
         _require_identity(instance)
         if not isinstance(instance.lifecycle, (RoleOpen, RolePausedForMove)):
             raise RoleRefused(type(instance.lifecycle).__name__ + ': role is unavailable')
@@ -1113,7 +1111,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
             raise RoleRefused('binding changed before dispatch')
         selected = _instance(current, role)
         _idle(current)
-        if selected != instance:
+        if selected != saved:
             raise RoleRefused('role changed before dispatch')
         _require_no_transition(directory)
         current = _set_instance(current, replace(selected, assignment_claim=str(prompt)))
@@ -1261,7 +1259,7 @@ def end_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
     fence = {'generation': design.placement.generation, 'reason': 'explicit end', 'role': claim.role}
     if _read_transition(directory) != fence:
         raise RoleRefused('the design end claim changed before close')
-    instance = _instance(design, claim.role)
+    instance = _resolve_legacy_role(claim.design_id, _instance(design, claim.role))
     _require_identity(instance)
     if isinstance(instance.lifecycle, RoleEnded):
         raise RoleRefused('the design role already ended')
@@ -1279,8 +1277,7 @@ def end(instance_id: str) -> HeldDesign:
     with _lock(directory):
         design = read_design(design_id)
         _check_host(design)
-        design = _migrate_parent(design, role)
-        instance = _instance(design, role)
+        instance = _resolve_legacy_role(design_id, _instance(design, role))
         lifecycle = instance.lifecycle
         if not isinstance(lifecycle, RoleEnded):
             _require_identity(instance)
@@ -1333,7 +1330,8 @@ def list_roles() -> dict[str, object]:
     for path in sorted(state_root().glob('*/design.json')):
         try:
             design = _load_design(path.parent.name, repair_empty_repository=False, local_staff=True)
-            for role in design.roles:
+            for saved in design.roles:
+                role = _resolve_legacy_role(design.placement.design_id, saved, local_staff=True)
                 lifecycle = role.lifecycle
                 pending = _read_transition(path.parent)
                 if pending and not isinstance(lifecycle, (RoleNotOpened, RoleEnded)):

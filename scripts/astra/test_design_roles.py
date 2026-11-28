@@ -868,22 +868,20 @@ class DurableRolesTests(HeldRolePaneCase):
         instance = self.instance(design_roles.read_design(path.parent.name), "designer")
         parent = self.panes.command_case.fixture.parent.id
         decoy = fixture_worker(instance.name, parent)
+        before = path.read_bytes()
         for operation in (design_roles.recover, design_roles.end):
             with self.assertRaisesRegex(design_roles.RoleRefused, "legacy launch has no recorded worker ID"):
                 _ = operation(identifier)
+            self.assertEqual(path.read_bytes(), before)
         saved = self.instance(design_roles.read_design(path.parent.name), "designer")
-        self.assertIsInstance(saved.parent, design_roles.RoleIdentityUnresolved)
+        self.assertIsInstance(saved.parent, design_roles.RoleParentUnrecorded)
         self.assertEqual(saved.lifecycle, instance.lifecycle)
         self.assertEqual(staff.by_id(decoy.id), decoy)
         self.assertFalse((path.parent / "transition.json").exists())
-        before = path.read_bytes()
-        with self.assertRaisesRegex(design_roles.RoleRefused, "RoleIdentityUnresolved"):
-            _ = design_roles.end(identifier)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(staff.by_id(decoy.id), decoy)
         rendered = design_roles.render_roles(design_roles.list_roles())
         self.assertIn("RoleIdentityUnresolved", rendered)
         self.assertIn("the legacy launch has no recorded worker ID", rendered)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_legacy_role_with_a_retired_worker_stays_unresolved(self) -> None:
         design = self.open_designer()
@@ -894,18 +892,14 @@ class DurableRolesTests(HeldRolePaneCase):
         self.panes.world.remove_pane("w1:p1")
         _ = staff.retire(role.lifecycle.staff_id)
         _ = self.legacy_role_record(design.placement.design_id)
-        with self.assertRaisesRegex(design_roles.RoleRefused, "the recorded worker has no proved staff parent"):
-            _ = design_roles.end(identifier)
-        saved = self.instance(design_roles.read_design(path.parent.name), "designer")
-        self.assertEqual(saved.lifecycle, role.lifecycle)
-        self.assertIsInstance(saved.parent, design_roles.RoleIdentityUnresolved)
-        self.assertIsInstance(cast(design_roles.RoleIdentityUnresolved, saved.parent).saved_parent,
-                              design_roles.RoleParentUnrecorded)
         before = path.read_bytes()
         for operation in (design_roles.recover, design_roles.end):
-            with self.assertRaisesRegex(design_roles.RoleRefused, "RoleIdentityUnresolved"):
+            with self.assertRaisesRegex(design_roles.RoleRefused, "the recorded worker has no proved staff parent"):
                 _ = operation(identifier)
             self.assertEqual(path.read_bytes(), before)
+        saved = self.instance(design_roles.read_design(path.parent.name), "designer")
+        self.assertEqual(saved.lifecycle, role.lifecycle)
+        self.assertIsInstance(saved.parent, design_roles.RoleParentUnrecorded)
         self.assertFalse((path.parent / "transition.json").exists())
 
     def test_legacy_worker_uses_its_actual_showrunner_when_the_run_owner_differs(self) -> None:
@@ -924,7 +918,8 @@ class DurableRolesTests(HeldRolePaneCase):
         _ = self.legacy_role_record(design.placement.design_id, "reviewer")
         identifier = design.placement.design_id + "/reviewer"
         recovered = design_roles.recover(identifier)
-        self.assertEqual(self.instance(recovered, "reviewer").parent, showrunner.id)
+        self.assertEqual(design_roles.worker_parent(recovered, "reviewer", staff.snapshot()).id, showrunner.id)
+        self.assertIsInstance(self.instance(recovered, "reviewer").parent, design_roles.RoleParentUnrecorded)
         self.assertEqual(self.instance(recovered, "reviewer").lifecycle, instance.lifecycle)
         self.assertIsInstance(self.instance(design_roles.end(identifier), "reviewer").lifecycle, design_roles.RoleEnded)
 
@@ -937,11 +932,13 @@ class DurableRolesTests(HeldRolePaneCase):
         saved = cast(dict[str, object], json.loads(state.read_text()))
         del saved["owner_staff_id"]
         write_text_atomic(state, json.dumps(saved))
+        before = path.read_bytes()
         with self.assertRaisesRegex(design_roles.RoleRefused, "RoleIdentityUnresolved: the legacy launch has no recorded worker ID"):
             _ = design_roles.end(path.parent.name + "/designer")
         instance = self.instance(design_roles.read_design(path.parent.name), "designer")
         self.assertIsInstance(instance.lifecycle, design_roles.RoleNotOpened)
-        self.assertIsInstance(instance.parent, design_roles.RoleIdentityUnresolved)
+        self.assertIsInstance(instance.parent, design_roles.RoleParentUnrecorded)
+        self.assertEqual(path.read_bytes(), before)
         self.assertFalse((path.parent / "transition.json").exists())
 
     def test_failed_submit_preserves_an_end_after_another_session_recovers(self) -> None:
@@ -1049,25 +1046,44 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertFalse((path.parent / "transition.json").exists())
         self.assertEqual(len(world.launches), 1)
 
-    def test_legacy_design_saves_the_bound_run_owner_once(self) -> None:
+    def test_legacy_design_uses_the_staff_parent_without_saving_it(self) -> None:
         design = self.open_designer()
         design_id = design.placement.design_id
-        path = design_roles.design_directory(design_id) / "design.json"
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        entry = next(item for item in cast(list[dict[str, object]], fields["roles"]) if item["role"] == "designer")
-        parent_id = entry.pop("parent")
-        write_text_atomic(path, json.dumps(fields))
+        _ = self.legacy_role_record(design_id)
         parent = self.panes.command_case.fixture.parent
         owner = staff.snapshot().parent_of(parent)
         assert owner is not None
         other = fixture_member("unit", name="other-holder", parent=owner.id)
         with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
             recovered = design_roles.recover(design_id + "/designer")
-        self.assertEqual(self.instance(recovered, "designer").parent, parent_id)
+        self.assertIsInstance(self.instance(recovered, "designer").parent, design_roles.RoleParentUnrecorded)
+        _ = self.resume(recovered, "designer")
         state = self.run_a / "progress_history_state.json"
         saved = cast(dict[str, object], json.loads(state.read_text()))
         write_text_atomic(state, json.dumps({**saved, "owner_staff_id": other.id}))
-        self.assertEqual(self.instance(design_roles.read_design(design_id), "designer").parent, parent_id)
+        current = design_roles.read_design(design_id)
+        self.assertIsInstance(self.instance(current, "designer").parent, design_roles.RoleParentUnrecorded)
+        self.assertEqual(design_roles.worker_parent(current, "designer", staff.snapshot()).id, parent.id)
+
+    def test_refused_legacy_resume_preserves_a_pending_rebind(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        path = self.legacy_role_record(identifier)
+        document = self.repository / "next-design.md"
+        _ = document.write_text("# Next design\n")
+
+        def rebind() -> design_roles.HeldDesign:
+            return design_roles.rebind(identifier, expected_generation=1,
+                                       reason="next document", document=str(document))
+
+        with (stop_once(design_roles, "authority_request", when="before", matches=lambda action: action == "advance"),
+              self.assertRaises(InjectedStop)):
+            _ = rebind()
+        before = path.read_bytes()
+        with self.assertRaisesRegex(design_roles.RoleRefused, "a lifecycle transition is incomplete"):
+            _ = self.resume(design, "designer")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(rebind().document, str(document))
 
     def test_pane_rebind_rerun_before_transition_clear_finishes_publication(self) -> None:
         world = self.pane_start()
