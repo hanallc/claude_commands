@@ -208,8 +208,7 @@ Use these sources:
    Cite Nate's List question when its List page receipt matches a saved send receipt in state `sent`.
    For a signed Images answer, check that the source is "nate via Images" and `image_answer.signed` is true.
    Check the completed Images page delivery for the same List item, keeper, key, and words.
-   Cite only the approval line as approval.
-   For a feedback answer on the List, quote only Nate's feedback.
+   Quote only its approval line, `Image <id>: your image is approved.`
 2. Question records and change review verdicts.
    Read `{checker_root}/scripts/production/update_registration.py` for the question record code.
    Follow the store paths in the showrunner documents and the showrunner state root.
@@ -222,7 +221,7 @@ Use these sources:
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 6. Nate's Images page answers in {image_answers}/*.json.
    Check the completed Images page delivery for the same decision.
-   Use `image_text` for context. Quote only an Approved `answer`.
+   Use `image_text` for context. Quote only its approval line, `Image <id>: your image is approved.`
 
 Check that Nate wrote the words and used them to set behavior.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.

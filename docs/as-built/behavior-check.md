@@ -32,7 +32,7 @@ The check accepts typed Claude turns, sent List Tell feedback, and saved List or
 The check accepts a List question from Nate when its List page receipt matches a saved send receipt in state `sent`.
 The check counts only a signed Images Approved answer with a matching, completed server delivery to all recipients.
 For a List entry, the server record must match the List item, keeper, delivery key, and words.
-Only the approval line counts as Nate's words. Images feedback is not a source.
+Only the approval line, `Image <id>: your image is approved.`, counts as Nate's words. Images feedback is not a source.
 The Images store keeps standalone answers in `.review-link-image-decisions/*.json` under the configured review links directory.
 The check reads an Approved `answer` as Nate's words when the archived decision matches the server delivery.
 The reviewer uses `image_text` for context.
