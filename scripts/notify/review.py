@@ -42,7 +42,8 @@ from scripts.lib import conf_reads, models_registry, nix_env
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.file_lock import LockAvailability, LockResult, exclusive, probe_existing_exclusive, take_exclusive
 
-from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
+from scripts.notify.user_action import (LEGACY_NO_ACTION_LINE, ActionRequired, NoActionRequired, UserAction,
+                         action_conflicts, notification_body, notification_header, notification_message, parse_user_action, read_notification,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
@@ -646,7 +647,7 @@ def length_failures(draft: Draft) -> list[str]:
     failures: list[str] = []
     if len(draft.title) >= 45:
         failures.append("push-title-under-45")
-    if len(first_line(draft.action, draft.session) + "\n" + draft.body) >= 500:
+    if len(notification_message(draft.action, draft.body, draft.session)) >= 500:
         failures.append("push-body-under-500")
     return failures
 
@@ -658,7 +659,7 @@ CODE_RULES = ("push-title-under-45", "push-body-under-500", ONE_ACTION_RULE)
 
 def code_failures(draft: Draft) -> list[RuleFailure]:
     """The length failures, and push-one-action when the body gives a second action."""
-    message = first_line(draft.action, draft.session) + "\n" + draft.body
+    message = notification_message(draft.action, draft.body, draft.session)
     failures = [RuleFailure(rule, draft.title if rule == "push-title-under-45" else message)
                 for rule in length_failures(draft)]
     conflicts = action_conflicts(draft.action, draft.body)
@@ -675,7 +676,7 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False,
                        console: bool = False) -> list[RuleFailure]:
     if not isinstance(value, list):
         raise ValueError("failed_rules")
-    original = [draft.body] if reply else [draft.title, first_line(draft.action, draft.session) + "\n" + draft.body]
+    original = [draft.body] if reply else [draft.title, notification_message(draft.action, draft.body, draft.session)]
     if isinstance(draft.action, ActionRequired):
         original.append(draft.action.text)
     failures: list[RuleFailure] = []
@@ -733,11 +734,12 @@ def validate(value: object, draft: Draft, revision: bool,
                     raise ValueError("session changed")
                 body = remaining
             body_first_line, _, remaining_body = body.partition("\n")
-            if body_first_line == first_line(action):
+            action_line = notification_header(action) or LEGACY_NO_ACTION_LINE
+            if body_first_line == action_line:
                 body = remaining_body.removeprefix("\n")
         if not content_only and len(title) > 250:
             raise ValueError("title exceeds 250")
-        if not content_only and len(first_line(action, session) + "\n" + body) > 1024:
+        if not content_only and len(notification_message(action, body, session)) > 1024:
             raise ValueError("message exceeds 1024")
         questions = _strings(record.get("questions"), "questions")
         if not console:
@@ -1110,6 +1112,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             "Keep title empty and action null. Questions are empty unless the verdict is ask. "
             "No phone length limits apply. The previous reply and date are context for ask-once and time-zone rules. "
             "Times are in the user zone the draft gives.")
+        if isinstance(context, PushReview):
+            prompt += ("\nUse the code-counted length failures. The message length includes the body and all displayed header lines. "
+                       "It includes the line breaks between them. A push with no action has no action line.\n")
         if isinstance(context, PushReview) and check_template_fit:
             prompt += ("\nRegistered fixed templates (id: purpose):\n"
                        + "\n".join(f"{entry.id}: {entry.purpose}" for entry in push_texts.catalog() if not entry.agent_written)
@@ -1142,9 +1147,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                 draft_prompt = (f"Console text kind: {context.console_kind}\n{layout}"
                                 f"Draft:\n{draft.body}\nRevision: {str(revision).lower()}")
         else:
-            action_line = first_line(draft.action, draft.session) if isinstance(draft.action, ActionRequired) or isinstance(draft.session, SessionLine) else "no action"
-            draft_prompt = (f"Title: {draft.title}\n{action_line}\n"
-                            f"Body (text after the action line; never repeat it): {draft.body}\n"
+            body = notification_body(draft.action, draft.body)
+            message = notification_message(draft.action, f"Body: {body}", draft.session)
+            draft_prompt = (f"Title: {draft.title}\n{message}\n"
                             f"Priority: {draft.priority}\nRevision: {str(revision).lower()}\n"
                             f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}\n"
                             f"Code-found second actions: {'; '.join(action_conflicts(draft.action, draft.body)) or 'none'}")
@@ -1406,7 +1411,8 @@ def _read_hold(path: Path) -> HoldLookup:
         if (isinstance(held.draft.action, ActionRequired)
                 != isinstance(held.best_version.action, ActionRequired)):
             raise ValueError("hold action form changed")
-        if len(held.best_version.title) > 250 or len(first_line(held.best_version.action, held.best_version.session) + "\n" + held.best_version.body) > 1024:
+        version = held.best_version
+        if len(version.title) > 250 or len(notification_message(version.action, version.body, version.session)) > 1024:
             raise ValueError("hold transport limits")
         if not 1 <= len(held.questions) <= 3 or any(not question.strip() for question in held.questions):
             raise ValueError("hold questions")
@@ -1642,7 +1648,8 @@ def best_version(draft: Draft, outcome: ReviewOutcome) -> Draft:
     return draft
 
 
-def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, header: bool = True) -> None:
+def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, header: bool = True,
+                 reply: bool = False) -> None:
     verdict = "send"
     failed: list[str] = []
     if isinstance(outcome, Unreviewed):
@@ -1660,10 +1667,9 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, heade
     print(f"{stamp + ' ' if stamp else ''}{verdict}; failed rules: {', '.join(failed) or 'none'}")
     if version.title:
         print(version.title)
-    if header:
-        print(first_line(version.action, version.session))
-    if version.body:
-        print(version.body)
+    message = version.body if reply else notification_message(version.action, version.body, version.session, header=header)
+    if message:
+        print(message)
     if isinstance(outcome, (Rewritten, Questions, Unreviewed, Failed, Withheld)):
         for failure in outcome.failures:
             print("failure: " + json.dumps({"rule": failure.rule, "quote": failure.quote}))
@@ -1686,15 +1692,10 @@ def replay(limit: int = 0) -> int:
             if not _text(record, "outcome").startswith("sent"):
                 continue
             message = _text(record, "message")
-            session, message_body = split_session(message)
-            action_line, _, body = message_body.partition("\n")
-            if action_line.startswith("Action: "):
-                action: UserAction = ActionRequired(action_line.removeprefix("Action: "))
-            elif action_line == "No action needed.":
-                action = NoActionRequired()
-            else:
-                action, body = NoActionRequired(), message_body
-            draft = Draft(_text(record, "source"), _text(record, "priority"),
+            priority = _text(record, "priority")
+            header = _text(record, "header") if "header" in record else None
+            action, body, session = read_notification(message, header)
+            draft = Draft(_text(record, "source"), priority,
                           _text(record, "title"), action, body, False, session)
             stamp = _text(record, "time")
         except ValueError:
@@ -1819,7 +1820,7 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
     for reply in selected:
         draft = Draft("review.sample", "0", "", NoActionRequired(), reply.text, False)
         outcome = _review(draft, False, runner, reply.context, timeout_seconds=timeout_seconds)
-        print_review(draft, outcome, reply.context.date.isoformat())
+        print_review(draft, outcome, reply.context.date.isoformat(), reply=True)
         log_review(draft, outcome, sample=reply.context)
         if isinstance(outcome, Unreviewed):
             unreviewed += 1
@@ -2066,7 +2067,7 @@ def main(argv: list[str]) -> int:
         parser.error("state a non-empty action")
     session, body = split_session(cast(str, arguments.text))
     draft = Draft("review.check", cast(str, arguments.priority), cast(str, arguments.title),
-                  chosen, body, False, session)
+                  chosen, notification_body(chosen, body), False, session)
     outcome = review(draft, False)
     print_review(draft, outcome)
     log_review(draft, outcome, dry=True)
