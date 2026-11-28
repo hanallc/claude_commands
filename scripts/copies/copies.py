@@ -2504,10 +2504,12 @@ def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) 
             continue
 
 
-def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
+def remote_copies_command(action: str, mirror: RemoteFolderRegistration, *tail: str) -> str:
     """Build the remote command with one mirror identity."""
-    mirror_word = (shlex.quote(mirror.path) if mirror.path.startswith("/")
-                   else quote_shell_path_parts(mirror.path))
+    if isinstance(mirror, RemoteFixedFolder) or not mirror.path.startswith("/"):
+        mirror_word = quote_shell_path_parts(mirror.path)
+    else:
+        mirror_word = shlex.quote(mirror.path)
     arguments = ["--owner", mirror.owner]
     for option, value in (("--repository", mirror.repository.name), ("--session", mirror.session)):
         arguments.extend([f"{option}={value}"] if value.startswith("-") else [option, value])
@@ -2515,7 +2517,7 @@ def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
             + f"{shlex.quote(action)} --path {mirror_word} " + shlex.join([*arguments, *tail]))
 
 
-def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str],
+def remote_rsync(source: Path, mirror: RemoteFolderRegistration, excludes: Path, options: list[str],
                  *, receiver_setup: str = "", protect_fixed_recovery: bool = False) -> list[str]:
     """Refresh a leased mirror through the remote copy owner."""
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
@@ -2532,7 +2534,7 @@ def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: li
             f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
 
 
-def remote_use_command(mirror: RemoteMirror, command: str) -> str:
+def remote_use_command(mirror: RemoteFolderRegistration, command: str) -> str:
     return remote_copies_command("mirror-use", mirror, "--", "sh", "-c", command)
 
 

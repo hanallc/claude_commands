@@ -67,9 +67,17 @@ class MirrorScriptTests(unittest.TestCase):
         return arguments[-1]
 
     def test_mac_control_scripts_do_not_match_mirror_selectors(self) -> None:
+        self.assert_control_scripts_skip_selectors(self.repositories)
+
+    def test_fixed_mac_control_scripts_do_not_match_mirror_selectors(self) -> None:
+        folder = offload.HeldOffloadFolder(Path("/private/verify builds + output/hana/mac"))
+        self.addCleanup(offload.offload_fixed_folder.reset, offload.offload_fixed_folder.set(folder))
+        self.assert_control_scripts_skip_selectors(self.repositories[:1])
+
+    def assert_control_scripts_skip_selectors(self, repositories: tuple[eligibility.KnownRepository, ...]) -> None:
         config = eligibility.read_config(self.settings.source)
-        paths = [offload.remote_mirror(repository) for repository in self.repositories]
-        patterns = [command_pattern(scope) for scope in (*self.repositories, offload.ALL_MIRRORS)]
+        paths = [offload.remote_mirror(repository) for repository in repositories]
+        patterns = [command_pattern(scope) for scope in (*repositories, offload.ALL_MIRRORS)]
         identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
         fence = offload.start_fence_relative(identity, "mac").with_suffix(".lock")
         machine = "d764b59a-1a37-4c78-8a1a-9c0aa3e5962b"
@@ -85,7 +93,7 @@ class MirrorScriptTests(unittest.TestCase):
               mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(config.free_floor_gib, "mac")),
               mock.patch.object(controller, "capture", side_effect=capture)):
             self.assertEqual(offload.ensure_mac_disk_floor(
-                controller, config, self.repositories[0], offload.ProbeSnapshot(0, "mac"),
+                controller, config, repositories[0], offload.ProbeSnapshot(0, "mac"),
             ), offload.MacDiskReady(config.free_floor_gib))
         floor_sweep, = captured
         scripts: dict[str, str] = {
@@ -97,12 +105,12 @@ class MirrorScriptTests(unittest.TestCase):
             "fence holder program": offload.FENCE_HOLDER_PROGRAM,
             "fence release": offload.start_fence_command(identity, "mac", settle=True, report_holders=True),
         }
-        for repository in self.repositories:
+        for repository in repositories:
             request = offload.OffloadRequest(
                 CONFIG, repository.name, "script-test", offload.NO_RESULT_FILE, (),
                 owner="verify", holder_session="fixture-session",
             )
-            mirror = offload.request_mirror(config, request, repository)
+            mirror = offload.request_remote_folder(config, request, repository)
             cleanup = offload.remote_cleanup_command(config, request, repository)
             observe = offload.leftover_check_script(repository, fence=fence, observe=True, mirror_root=self.root)
             fetch_size = offload.fetch_size_command(repository, "mac", 1, offload.FetchFolder("target/shots"))

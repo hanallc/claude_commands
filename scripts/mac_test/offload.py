@@ -2742,7 +2742,7 @@ def copy_tree(
             raise ValueError("a fixed source transfer needs an exact claim")
         receiver_setup = (dispatch_fence_setup(identity, request.target, controller.claim_scope_key)
                           + INHERIT_DISPATCH_FENCE)
-    mirror = request_mirror(config, request, repository)
+    mirror = request_remote_folder(config, request, repository)
     try:
         with mirror_exclude_file(ignored) as exclude_path:
             mac = target_config.uses_legacy_mac_layout(
@@ -3727,7 +3727,7 @@ def claimed_run(
                 return MacCleanupUnconfirmed(elapsed_seconds(started), "launch authorization has no confirmed reply")
         release_allowed = False
         identity = controller.claim_identity
-        mirror = request_mirror(config, request, repository)
+        mirror = request_remote_folder(config, request, repository)
         command = copies.remote_use_command(mirror, step_command)
         if not linux:
             command = after_mac_floor_group(mirror.path, command)
@@ -4414,6 +4414,16 @@ def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: K
     return copies.RemoteMirror(request.owner, scope, config.host,
                                remote_mirror(repository, request.target, request.slot),
                                request.holder_session)
+
+
+def request_remote_folder(config: OffloadConfig, request: OffloadRequest,
+                          repository: KnownRepository) -> copies.RemoteFolderRegistration:
+    from scripts.copies import copies
+
+    mirror = request_mirror(config, request, repository)
+    if isinstance(offload_fixed_folder.get(), HeldOffloadFolder):
+        return copies.RemoteFixedFolder(mirror.owner, mirror.repository, mirror.host, mirror.path, mirror.session)
+    return mirror
 
 
 def cleanup_taken_over_claim(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
