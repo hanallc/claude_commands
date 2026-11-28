@@ -332,10 +332,14 @@ class MergeGateFixture(unittest.TestCase):
         return config_environment(directory)
 
     @classmethod
+    def fixture_runs_parent(cls, _configuration: Path) -> Path:
+        return gate.gate_suite_parent(SCRIPT.parents[2], gate.CHECKOUT_TEST_RUNS)
+
+    @classmethod
     @override
     def setUpClass(cls) -> None:
-        test_runs = gate.gate_suite_parent(SCRIPT.parents[2], gate.CHECKOUT_TEST_RUNS)
         configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
+        test_runs = cls.fixture_runs_parent(configuration)
         environment = fixture_git_environment(configuration)
         for key in ("BASH_ENV", "STAFF_CONFIG"):
             _ = environment.pop(key, None)

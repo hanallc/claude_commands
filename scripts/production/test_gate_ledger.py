@@ -267,6 +267,13 @@ class MergeGateLedgerTests(MergeGateFixture):
         pin_ledger_settings(directory, directory)
         return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
 
+    @classmethod
+    @override
+    def fixture_runs_parent(cls, configuration: Path) -> Path:
+        parent = configuration / "gate-test-runs"
+        parent.mkdir(mode=0o700)
+        return parent
+
     @override
     def install_fixture_runner(self) -> None:
         self.write(self.checkout / "scripts/test_times/module_run.py", LEDGER_RUNNER)

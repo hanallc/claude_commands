@@ -32,6 +32,7 @@ from scripts.buildlog import treekey
 from scripts.copies import copies
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_folders, conf, scratch
+from scripts.lib.testing_folders import PreparedTestRunsParent
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -1082,6 +1083,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(first_step, 'admitted_run') as place,
                   mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
                   mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
+                  mock.patch.object(gate, 'gate_suite_parent', return_value=PreparedTestRunsParent(repo)),
                   mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
                   mock.patch.object(gate, 'gate_recovery', side_effect=recovery),
                   mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),

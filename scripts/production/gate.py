@@ -231,11 +231,20 @@ class NativeMacGateParent:
     path: Path
 
 
+@dataclass(frozen=True)
+class MacLinuxGuestGateParent:
+    """Use the Mac Linux sandbox's temporary root for the gate suites."""
+
+    temporary_root: Path
+    account_home: Path
+
+
 class CheckoutTestRuns:
     """Use the test-runs parent of the checkout under test."""
 
 
 CHECKOUT_TEST_RUNS = CheckoutTestRuns()
+GateSuiteLocation = CheckoutTestRuns | NativeMacGateParent | MacLinuxGuestGateParent
 SHARED_MACHINE = SharedMachine()
 
 
@@ -1787,11 +1796,17 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
-def gate_suite_parent(repo: Path, location: CheckoutTestRuns | NativeMacGateParent) -> PreparedTestRunsParent:
+def gate_suite_parent(repo: Path, location: GateSuiteLocation) -> PreparedTestRunsParent:
     """Prepare the suite parent for this checkout."""
     try:
-        parent = (location.path if isinstance(location, NativeMacGateParent)
-                  else build_folders.test_runs_parent(repo, placement=build_folders.TestRunPlacement.GATE))
+        if isinstance(location, MacLinuxGuestGateParent):
+            parent = location.temporary_root.resolve() / "gate-test-runs"
+            if parent.is_symlink() or parent.is_relative_to(location.account_home.resolve()):
+                raise GateRefused(f"{parent}: the guest gate folder must be a directory outside the account home")
+        elif isinstance(location, NativeMacGateParent):
+            parent = location.path
+        else:
+            parent = build_folders.test_runs_parent(repo, placement=build_folders.TestRunPlacement.GATE)
         resolved = parent.resolve()
         try:
             _ = git_files.locate(next(path for path in (resolved, *resolved.parents) if path.is_dir()))
@@ -1799,7 +1814,7 @@ def gate_suite_parent(repo: Path, location: CheckoutTestRuns | NativeMacGatePare
             pass
         else:
             raise GateRefused(f"{parent}: the gate folder is inside a Git checkout")
-        if isinstance(location, CheckoutTestRuns):
+        if isinstance(location, (CheckoutTestRuns, MacLinuxGuestGateParent)):
             parent.mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, build_folders.InvalidFolderForm, git_files.GitFilesError) as error:
         raise GateRefused(f"cannot prepare the test-runs parent for {repo}: {error}") from error
@@ -1899,7 +1914,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
                machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine = SHARED_MACHINE,
-               suite_location: CheckoutTestRuns | NativeMacGateParent = CHECKOUT_TEST_RUNS,
+               suite_location: GateSuiteLocation = CHECKOUT_TEST_RUNS,
                local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
@@ -1912,7 +1927,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
 def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float, max_running_jobs: int, *,
                 source: Literal["tests-only", "checkpoint"], full: bool, mode: SuiteMode,
                 machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine,
-                suite_location: CheckoutTestRuns | NativeMacGateParent,
+                suite_location: GateSuiteLocation,
                 local_grant: LocalGateAssignment | NoLocalGateGrant, selected: AllModules | SelectedModules | NamedModules,
                 time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit) -> GateRun:
     shared = not isinstance(machine, WholeMachine)

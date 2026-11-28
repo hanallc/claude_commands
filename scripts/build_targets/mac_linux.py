@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import errno
 import fcntl
+from functools import partial
 import hashlib
 from io import BytesIO
 import json
@@ -2692,7 +2693,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
 def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:
     # Mount the guest root before mounting proc for the new PID namespace.
     return ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
-            '--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '/dev/shm', '--', *command]
+            '--proc', '/proc', '--bind', str(tmp), str(TEMP), '--tmpfs', '/dev/shm',
+            '--setenv', 'TMPDIR', str(TEMP), '--', *command]
 
 
 def guest_tool(real: Path, copy: Path) -> bool:
@@ -3108,7 +3110,11 @@ def run_copy(request_path: Path, reply: int) -> None:
                 machine = gate.WholeMachine(module_progress=send_progress)
             else:
                 machine = gate.WholeMachine()
-            run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
+            suites = gate.run_suites
+            if hasattr(gate, 'MacLinuxGuestGateParent'):
+                suites = partial(suites, suite_location=gate.MacLinuxGuestGateParent(
+                    build_folders.inherited_temporary_parent(), home))
+            run = suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],
