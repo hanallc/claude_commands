@@ -1,7 +1,7 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
 from datetime import UTC, datetime, timedelta
 import io
 import json
@@ -21,14 +21,15 @@ import unittest
 from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import conf, removal_guard, scratch
+from scripts.lib import build_folders, conf, removal_guard, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_hold import override_guard
 from scripts.build_hold.test_override_guard import installed_script
 from scripts.lint import tmp_sweep
-from scripts.mac_test import mac_queue_run, mac_test, mac_transport
+from scripts.lint import sweep
+from scripts.mac_test import floor_claims, mac_queue_run, mac_test, mac_transport
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -538,6 +539,94 @@ if sys.argv[1] == "prepare":
             self.assertEqual(result.stdout.splitlines(), ["Mac output", "mac_exit=0"])
             self.assertTrue((root / "remote").is_file())
 
+    def test_queued_mirror_command_waits_for_the_floor_and_holds_the_lease(self) -> None:
+        self.check_queued_mirror_lease("hana", "hana", git=True)
+
+    def test_queue_leases_the_resolved_cwd_even_for_a_different_or_non_git_worktree(self) -> None:
+        for git in (True, False):
+            with self.subTest(git=git):
+                self.check_queued_mirror_lease("source", "other", git=git)
+
+    def check_queued_mirror_lease(self, worktree: str, mirror_name: str, *, git: bool) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = root / worktree
+        checkout.mkdir()
+        if git:
+            _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                                f"https://example.test/{worktree}"], check=True, capture_output=True)
+        environment = queue_fixture(root, ssh_source="import os, sys\nos.execl('/bin/zsh', 'zsh', '-c', sys.argv[-1])\n")
+        _ = write_config_fixture(root / "config/mac_test.conf", "mirror_root=~/mirrors\nfloor_sweep_timeout_s=5\n")
+        mirror = root / "mirrors" / mirror_name
+        workdir = mirror / "subdir"
+        workdir.mkdir(parents=True)
+        alias = root / "alias"
+        alias.symlink_to(workdir, target_is_directory=True)
+        shim = root / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        _ = shim.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        shim.chmod(0o755)
+        started = root / "started"
+        lease = floor_claims.mirror_lock_path(mirror)
+        group = lease.with_name(lease.name + build_folders.MacFloorLeaseFile.GROUP.value)
+        work = """import fcntl, sys
+from pathlib import Path
+
+assert Path.cwd() == Path(sys.argv[3]).resolve()
+with Path(sys.argv[2]).open() as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        Path(sys.argv[1]).touch()
+    else:
+        raise SystemExit("queued command has no shared lease")
+"""
+        command = self.command(checkout, "run")[:-3]
+        command[command.index("--cwd") + 1] = str(alias)
+        command.extend((sys.executable, "-c", work, str(started), str(group), str(workdir)))
+        with ExitStack() as floor:
+            self.assertTrue(floor.enter_context(sweep.mac_floor_mirror_leases({mirror})))
+            with subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  bufsize=0, start_new_session=True) as process:
+                try:
+                    assert process.stdout is not None
+                    stdout = cast(BinaryIO, process.stdout)
+                    self.assertTrue(select.select([stdout], [], [], 8)[0])
+                    self.assertEqual(stdout.readline(), b"Mac queue: camera shot\n")
+                    self.assertTrue(select.select([stdout], [], [], 8)[0])
+                    self.assertIn(b"waiting for the Mac floor sweep", stdout.readline())
+                    self.assertFalse(started.exists())
+                    floor.close()
+                    output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(process.returncode, 0, output.decode())
+                finally:
+                    if process.poll() is None:
+                        send_process_group(process.pid, signal.SIGKILL)
+        self.assertTrue(started.is_file())
+
+    def test_a_cwd_outside_the_mirror_does_not_wait_for_the_worktrees_lease(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = root / "source"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                            "https://example.test/source"], check=True, capture_output=True)
+        environment = queue_fixture(root, ssh_source="import os, sys\nos.execl('/bin/zsh', 'zsh', '-c', sys.argv[-1])\n")
+        _ = write_config_fixture(root / "config/mac_test.conf", "mirror_root=~/mirrors\nfloor_sweep_timeout_s=0.2\n")
+        shim = root / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        _ = shim.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        shim.chmod(0o755)
+        command = self.command(checkout, "run")[:-3]
+        command[command.index("--cwd") + 1] = str(checkout)
+        command.append("pwd")
+        with sweep.mac_floor_mirror_leases({root / "mirrors/source"}) as acquired:
+            self.assertTrue(acquired)
+            result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(checkout.resolve()), result.stdout.splitlines())
+        self.assertNotIn("the Mac floor sweep", result.stderr)
+
     def test_every_run_returns_the_placement_and_keeps_the_mac_status(self) -> None:
         cases = ((0, False, False), (23, False, False), (125, False, False), (2, True, False), (0, False, True), (2, True, True))
         for kind in ("shot", "install", "probe", "run"):
@@ -574,9 +663,9 @@ if sys.argv[1] == "prepare":
             remote = cast(list[str], json.loads((root / "remote").read_text()))
             wrapper = shlex.split(remote[2])
             work = shlex.split(wrapper[0].removeprefix("work="))
-            self.assertEqual(work[:3], ["cd", "/Mac scratch/checkout", "&&"])
-            self.assertEqual(work[3], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1] + "/attempt")
-            self.assertEqual(work[4:], self.command(root)[-3:])
+            self.assertEqual(work[0], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1] + "/attempt")
+            self.assertEqual(work[1:3], ["/bin/zsh", "-c"])
+            self.assertEqual(shlex.split(work[3])[-4:], ["/Mac scratch/checkout", *self.command(root)[-3:]])
             self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
 
     def test_no_wait_returns_the_busy_status_after_one_queue_call(self) -> None:
