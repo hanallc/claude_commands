@@ -12,9 +12,7 @@ import re
 from pathlib import Path
 from string import Formatter
 from types import UnionType
-from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict, override
-
-from scripts.build_queue import placement
+from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, TypeGuard, cast, get_args, get_origin, get_type_hints, is_typeddict, override
 
 if TYPE_CHECKING:
     from scripts.message.unit_labels import UnitLabels
@@ -354,6 +352,12 @@ def current_wait_shape(record: dict[str, object]) -> dict[str, object]:
     return shaped
 
 
+def _mac_outage_enum(schema: object) -> TypeGuard[type[Enum]]:
+    # The AWS box can load this codec without the placement module.
+    return (isinstance(schema, type) and schema.__name__ == "MacOutage"
+            and schema.__module__ == "scripts.build_queue.placement" and issubclass(schema, Enum))
+
+
 def snapshot_value(value: object) -> object:
     """Convert each shared record once within this encoding."""
     converted: dict[int, object] = {}
@@ -366,7 +370,7 @@ def snapshot_value(value: object) -> object:
             return converted[identity]
         if isinstance(item, Path):
             result: object = str(item)
-        elif isinstance(item, placement.MacOutage):
+        elif isinstance(item, Enum) and _mac_outage_enum(type(item)):
             result = item.name
         elif is_dataclass(item) and not isinstance(item, type):
             result = legacy_wait_shape(type(item), legacy_pressure_shape(wire_record(type(item),
@@ -440,10 +444,10 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         return None
     if schema is Path:
         return Path(cast(str, parse_snapshot_value(value, str)))
-    if schema is placement.MacOutage:
-        if not isinstance(value, str) or value not in placement.MacOutage.__members__:
+    if _mac_outage_enum(schema):
+        if not isinstance(value, str) or value not in schema.__members__:
             raise ValueError("invalid Mac outage evidence")
-        return placement.MacOutage[value]
+        return schema[value]
     if origin in (list, tuple, frozenset, Sequence):
         if not isinstance(value, list):
             raise ValueError("invalid snapshot sequence")

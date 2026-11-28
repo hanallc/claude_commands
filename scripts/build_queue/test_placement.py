@@ -4296,6 +4296,12 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                             else:
                                 pending.unlink()
                             _ = fixture.run_pass()
+                            self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                            self.assertIsInstance(fixture.server.assignments[key].terminal_report, placement.NoTerminalReport)
+                            _ = fixture.connect(wire.ExecutionReport("adapter-lost", assignment, reference,
+                                execution_identity.ExecutionNotStarted(), placement.AttemptDeclined("lost"),
+                                placement.DispatchPathSettled())).replies()
+                            _ = fixture.run_pass()
                             closed = fixture.server.assignments[key]
                             self.assertIsInstance(closed.state, placement.ClosedAssignment)
                             self.assertEqual(closed.terminal_report, placement.TerminalAttemptReport(
