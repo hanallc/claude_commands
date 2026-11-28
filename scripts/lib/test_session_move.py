@@ -1164,11 +1164,14 @@ from scripts.lint import tmp_sweep
 from scripts.message import session_records
 from scripts.production import staff
 proc = Path(sys.argv[1])
-add_proc_pid(proc, os.getpid())
-with (mock.patch.object(tmp_sweep, "PROC_DIR", str(proc)),
-      mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
-      mock.patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ()))):
-    sys.exit(session_move.main([]))
+link = add_proc_pid(proc, os.getpid())
+try:
+    with (mock.patch.object(tmp_sweep, "PROC_DIR", str(proc)),
+          mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+          mock.patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ()))):
+        sys.exit(session_move.main([]))
+finally:
+    link.unlink()
 """
         result = subprocess.run(
             [unshare, "--map-root-user", "--mount", "--propagation", "private",
