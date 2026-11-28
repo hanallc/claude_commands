@@ -11,7 +11,7 @@ import math
 import os
 import re
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NotRequired, TypedDict, TypeGuard, assert_never, cast
+from typing import Callable, Literal, NamedTuple, NotRequired, TypedDict, TypeGuard, assert_never, cast
 from zoneinfo import ZoneInfo
 
 import sys
@@ -40,9 +40,6 @@ from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
-
-if TYPE_CHECKING:
-    from scripts.lib.scratch import RemovalIntentAccess
 
 GIB = 1 << 30
 DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
@@ -2260,14 +2257,15 @@ def checked_owner(owner: str) -> str:
     return owner
 
 
-def recorded_owner(source: Path, *, intent: RemovalIntentAccess | None = None) -> str:
+def recorded_owner(source: Path, *,
+                   intent: copy_record.RemovalIntentAccess = copy_record.RemovalIntentAccess.RECOVER) -> str:
     """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
     for active in reversed(ACTIVE_GATES.get()):
         if active.tree == source.resolve():
             return active.owner
     from scripts.lib import scratch
 
-    record = scratch.task_of(source, intent=scratch.RemovalIntentAccess.RECOVER if intent is None else intent)
+    record = scratch.task_of(source, intent=intent)
     if isinstance(record, copy_record.Registered):
         owner = record.fields.get("owner_unit")
         if isinstance(owner, str):
@@ -2285,11 +2283,9 @@ def recorded_owner(source: Path, *, intent: RemovalIntentAccess | None = None) -
 
 def folder_owner(worktree: Path) -> str:
     """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
-    from scripts.lib import scratch
-
     try:
         # The queue request reads the owner only; it never clears a stale removal intent.
-        return recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
+        return recorded_owner(worktree, intent=copy_record.RemovalIntentAccess.READ_ONLY)
     except (CopyError, OSError):
         return ""
 
