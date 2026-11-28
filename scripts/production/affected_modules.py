@@ -1456,7 +1456,7 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
-        processes = settings.value("affected.extract.processes", conf.positive_whole, default=8)
+        processes = settings.value("affected.extract.processes", conf.positive_whole)
         with fact_cache(state_dir, run) as cached:
             with run.graph_build():
                 graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True, run=run, processes=processes)

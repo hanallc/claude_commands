@@ -39,8 +39,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
-        self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
-                   + "# text:\nscan_roots=\n")
+        self.set_gate_config()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
         self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
@@ -59,6 +58,12 @@ class AffectedModulesTests(unittest.TestCase):
         target = self.repo / path
         target.parent.mkdir(parents=True, exist_ok=True)
         _ = target.write_text(text, encoding="utf-8")
+
+    def set_gate_config(self, *, branches: str = "main builds natedev sdlc", scan_roots: str = "",
+                        processes: int = 1) -> None:
+        self.write(".git/test-config/gate.conf", f"# text:\nlanding_branches={branches}\n"
+                   + f"# text:\nscan_roots={scan_roots}\n"
+                   + f"# whole: 1..\naffected.extract.processes={processes}\n")
 
     def add_test(self, path: str, text: str) -> None:
         self.write(f"scripts/{path}", text)
@@ -376,8 +381,7 @@ FILES = collect(Path(__file__).parent)
         self.write("commands/component/seed.txt", "fixture\n")
         for expression, changed, selected, declaration in cases:
             with self.subTest(scan=expression, changed=changed, declaration=declaration):
-                self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
-                           + f"# text:\nscan_roots={declaration}\n")
+                self.set_gate_config(scan_roots=declaration)
                 self.write(changed, "# before\n")
                 self.write("scripts/component/audit.py", "import os\nfrom scripts.component import directory_walk\n"
                     + "def scan(folder):\n    return list(folder.rglob('*.py'))\n"
@@ -448,8 +452,7 @@ FILES = collect(Path(__file__).parent)
                     path = self.repo / word.partition(":")[2]
                     if not path.exists():
                         path.mkdir(parents=True)
-                self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
-                           + f"# text:\nscan_roots={declaration}\n")
+                self.set_gate_config(scan_roots=declaration)
                 for name in names:
                     self.add_test(name, "from pathlib import Path\n"
                                   + "ROOT = Path(__file__).resolve().parents[2]\nFILES = list(ROOT.rglob('*'))\n")
@@ -721,8 +724,7 @@ FILES = collect(Path(__file__).parent)
         )
         for certificate, branches, expected_base, changed in cases:
             with self.subTest(branches=branches, certificate=certificate):
-                self.write(".git/test-config/gate.conf", f"# text:\nlanding_branches={branches}\n"
-                           + "# text:\nscan_roots=\n")
+                self.set_gate_config(branches=branches)
                 with mock.patch.object(affected, "git_output", wraps=affected.git_output) as git:
                     result = affected.select_affected(self.repo, certificate, self.modules, set())
                 self.assertIsInstance(result, affected.AffectedSelection)
@@ -995,10 +997,12 @@ def shadow(root):
             self.assertGreaterEqual(run.graph_s, 0)
             self.assertGreaterEqual(run.other_s, 0)
 
-    def set_extraction_processes(self, processes: int) -> None:
-        config = ".git/test-config/gate.conf"
-        with (self.repo / config).open("a", encoding="utf-8") as stream:
-            _ = stream.write(f"# whole: 1..\naffected.extract.processes={processes}\n")
+    def test_missing_extraction_processes_requires_the_full_suite(self) -> None:
+        self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main\n")
+        result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        assert isinstance(result, affected.FullSuite)
+        self.assertIn("affected.extract.processes='<missing>'", result.reason)
+        self.assertFalse(self.cache_file().exists())
 
     def add_extraction_sources(self, value: str) -> None:
         for index in range(24):
@@ -1019,14 +1023,11 @@ def shadow(root):
         dirty = affected.dirty_paths(self.repo)
         serial_state = self.cache_dir() / "serial"
         pool_state = self.cache_dir() / "pool"
-        config = self.repo / ".git/test-config/gate.conf"
-        original = config.read_text()
-        self.set_extraction_processes(1)
+        self.set_gate_config(processes=1)
         with mock.patch.object(affected, "ProcessPoolExecutor") as serial_pool:
             serial = affected.select_affected(self.repo, self.base, self.modules, dirty, state_dir=serial_state)
         serial_pool.assert_not_called()
-        _ = config.write_text(original)
-        self.set_extraction_processes(8)
+        self.set_gate_config(processes=8)
         with mock.patch.object(affected, "ProcessPoolExecutor", wraps=ProcessPoolExecutor) as pool:
             pooled = affected.select_affected(self.repo, self.base, self.modules, dirty, state_dir=pool_state)
         self.assertEqual(pool.call_count, 2)
@@ -1048,7 +1049,7 @@ def shadow(root):
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.add_test("checks/test_new.py", "NEW = True\n")
         _ = self.commit()
-        self.set_extraction_processes(8)
+        self.set_gate_config(processes=8)
         with mock.patch.object(affected, "ProcessPoolExecutor") as pool:
             result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         pool.assert_not_called()
@@ -1061,7 +1062,7 @@ def shadow(root):
         self.certify()
         self.add_test("checks/test_new.py", "NEW = True\n")
         _ = self.commit()
-        self.set_extraction_processes(8)
+        self.set_gate_config(processes=8)
         with mock.patch.object(ProcessPoolExecutor, "map", side_effect=OSError("cannot start worker")) as start:
             result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         start.assert_called_once()
@@ -1073,7 +1074,7 @@ def shadow(root):
     def test_pooled_extraction_worker_error_returns_a_graph_error(self) -> None:
         self.add_extraction_sources("base")
         self.certify()
-        self.set_extraction_processes(8)
+        self.set_gate_config(processes=8)
         with mock.patch.object(affected, "extract_facts", pow):
             result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         assert isinstance(result, affected.FullSuite)

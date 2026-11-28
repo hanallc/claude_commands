@@ -655,7 +655,7 @@ The selector keeps cached facts for the current tree and its base tree.
 The current and base graphs share one cache read and one cache update.
 The selector extracts missing base facts only when it builds the base graph for a removed Python file.
 The selector reads the missing source text in the parent and sends batches to a process pool for extraction.
-The pool has up to `affected.extract.processes` workers, with a default of eight.
+The pool has up to `affected.extract.processes` workers. `config/gate.conf` sets this value to eight.
 The selector runs serially with one worker, fewer than twice the configured worker count in misses, or an OS error during pool startup.
 Spawn keeps the parent’s cache lock and database state out of the workers.
 The parent uses the results in path order and builds the graph and publishes the cache.
