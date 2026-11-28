@@ -27,7 +27,7 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_queue import admission_protocol, admission_service, admission_records, placement
 from scripts.buildlog import store
-from scripts.agents import detached_runs
+from scripts.agents import detached_run_record, detached_runs
 from scripts.build_targets import target_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
@@ -363,7 +363,7 @@ class HoldEnforcerTests(unittest.TestCase):
         return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
 
     def write_detached_run(self, path: Path, *, command_started: bool, command: list[str] | None = None) -> None:
-        record: detached_runs.RunRecord = {
+        record: detached_run_record.RunRecord = {
             "run_id": path.stem, "status": "running", "session_dir": str(self.root),
             "worker": "gate-owner", "staff_id": "", "label": "fixture gate",
             "command": command if command is not None else ["bash", "verify.sh", "check"],
@@ -1036,7 +1036,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 row, = self.rows()[row_count:]
                 self.assertEqual(row["stop_status"], "stopped" if confirmed else "not_stopped")
                 request_id = cast(str, row["stop_request_id"])
-                self.assertEqual(detached_runs.confirms_hold_stop(record, record.stem, request_id), confirmed)
+                self.assertEqual(detached_run_record.confirms_hold_stop(record, record.stem, request_id), confirmed)
                 saved = cast(dict[str, object], json.loads(record.read_text()))
                 if outcome in ("unconfirmed", "stopped"):
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
@@ -1112,7 +1112,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     row, = [row for row in self.rows() if row["action"] == "stopped"][stopped_before:]
                     self.assertEqual(row["stop_status"], "requested")
                     request_id = cast(str, row["stop_request_id"])
-                    self.assertFalse(detached_runs.confirms_hold_stop(record, record.stem, request_id))
+                    self.assertFalse(detached_run_record.confirms_hold_stop(record, record.stem, request_id))
                     _ = events.write_text("populated 0\n")
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
@@ -1138,12 +1138,12 @@ class HoldEnforcerTests(unittest.TestCase):
                       mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
                     self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
 
-                saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+                saved = cast(detached_run_record.RunRecord, json.loads(record.read_text()))
                 self.assertEqual((saved["status"], saved.get("exit_code")), ("finished", exit_code))
                 self.assertEqual(saved.get("stop_reason"), "stopped for timed test; run again after the release")
                 self.assertIs(saved.get("stop_pass_requested"), True)
                 request, = saved.get("hold_stop_requests", [])
-                self.assertTrue(detached_runs.confirms_hold_stop(record, record.stem, request))
+                self.assertTrue(detached_run_record.confirms_hold_stop(record, record.stem, request))
                 result = detached_runs.result_text(saved, detached_runs.command_result(saved))
                 self.assertIn(f"Result: STOPPED (exit {exit_code})", result)
 
@@ -1163,7 +1163,7 @@ class HoldEnforcerTests(unittest.TestCase):
             "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
             "device": stat.st_dev, "inode": stat.st_ino,
         }
-        saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+        saved = cast(detached_run_record.RunRecord, json.loads(record.read_text()))
         saved["command_slice"] = identity
         write_text_atomic(record, json.dumps(saved))
         _ = self.process(100, "python3", start=10_000,
@@ -1196,7 +1196,7 @@ class HoldEnforcerTests(unittest.TestCase):
             request_id = cast(str, row["stop_request_id"])
             confirmation = build_hold.stop_confirmation_path(request_id)
             self.assertFalse(confirmation.exists())
-            self.assertFalse(detached_runs.confirms_hold_stop(record, record.stem, request_id))
+            self.assertFalse(detached_run_record.confirms_hold_stop(record, record.stem, request_id))
             self.assertEqual(detached_runs.reap_orphans(str(self.root)), [record.stem])
             term.assert_called_once()
             self.assertTrue(process_stop.slice_has_ended(identity))
@@ -1204,7 +1204,7 @@ class HoldEnforcerTests(unittest.TestCase):
             with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
                 self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
                 self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "hold is already released.")
-        self.assertTrue(detached_runs.confirms_hold_stop(record, record.stem, request_id))
+        self.assertTrue(detached_run_record.confirms_hold_stop(record, record.stem, request_id))
         send.assert_called_once()
         self.assertEqual(cast(str, send.call_args.args[1]), "codex:recover-worker")
         notice = cast(str, send.call_args.args[2])
@@ -1233,7 +1233,7 @@ class HoldEnforcerTests(unittest.TestCase):
             "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
             "device": stat.st_dev, "inode": stat.st_ino,
         }
-        saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+        saved = cast(detached_run_record.RunRecord, json.loads(record.read_text()))
         saved["command_slice"] = identity
         write_text_atomic(record, json.dumps(saved))
         _ = self.process(100, "python3", start=10_000,
@@ -1362,7 +1362,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 command = ("python3", "-m", "unittest", "test_example")
                 self.write_detached_run(path, command_started=True, command=list(command))
                 process_start = 11_000 + index
-                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                record = cast(detached_run_record.RunRecord, json.loads(path.read_text()))
                 record.update(worker=worker.name, staff_id=str(worker.id), label=label, command_started=str(process_start))
                 _ = path.write_text(json.dumps(record))
                 _ = self.process(100, "python3", start=10_000,
@@ -1494,7 +1494,7 @@ class HoldEnforcerTests(unittest.TestCase):
         detached = path != "direct"
         if detached:
             self.write_detached_run(record, command_started=True, command=list(command))
-            saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+            saved = cast(detached_run_record.RunRecord, json.loads(record.read_text()))
             saved["label"] = " ".join(command)
             _ = record.write_text(json.dumps(saved))
             _ = self.process(100, "python3", start=10_000,
@@ -1535,10 +1535,10 @@ class HoldEnforcerTests(unittest.TestCase):
         confirmation = build_hold.stop_confirmation_path(request_id)
         if fault == "after runner confirmation":
             self.assertFalse(confirmation.exists())
-            self.assertTrue(detached_runs.confirms_hold_stop(record, record.stem, request_id))
-            self.assertFalse(detached_runs.confirms_hold_stop(record, record.stem, "other-request"))
+            self.assertTrue(detached_run_record.confirms_hold_stop(record, record.stem, request_id))
+            self.assertFalse(detached_run_record.confirms_hold_stop(record, record.stem, "other-request"))
             if prune:
-                saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+                saved = cast(detached_run_record.RunRecord, json.loads(record.read_text()))
                 saved.update(status="finished", exit_code=143, started_at=saved["started_at"] - 1)
                 write_text_atomic(record, json.dumps(saved))
                 self.write_detached_run(runs / "newer.json", command_started=False)

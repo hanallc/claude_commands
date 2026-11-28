@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from contextvars import ContextVar
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -30,7 +31,8 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
-from scripts.lib import conf
+from scripts.buildlog.store import host_name
+from scripts.lib import conf, copy_record
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.process_stat import PROC_ROOT, process_fields
 from scripts.lib.showrunner_state import state_root
@@ -2226,15 +2228,66 @@ def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
     return QueueCaller("", owner, unit)
 
 
-def folder_owner(worktree: Path) -> str:
-    """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
-    from scripts.copies import copies
+OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
+@dataclass(frozen=True)
+class ActiveGate:
+    """The caller holds the copy for the gate."""
+
+    tree: Path
+    source: Path
+    owner: str
+
+
+ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
+
+
+COPY_ERROR_STATUS = 2
+
+
+class CopyError(Exception):
+    """An invalid request or an unavailable checkout."""
+
+    exit_code: int = COPY_ERROR_STATUS
+
+
+def checked_owner(owner: str) -> str:
+    if not OWNER.fullmatch(owner):
+        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
+    return owner
+
+
+def recorded_owner(source: Path, *,
+                   intent: copy_record.RemovalIntentAccess = copy_record.RemovalIntentAccess.RECOVER) -> str:
+    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
+    for active in reversed(ACTIVE_GATES.get()):
+        if active.tree == source.resolve():
+            return active.owner
     from scripts.lib import scratch
 
+    record = scratch.task_of(source, intent=intent)
+    if isinstance(record, copy_record.Registered):
+        owner = record.fields.get("owner_unit")
+        if isinstance(owner, str):
+            return checked_owner(owner)
+    try:
+        snapshot = staff.local_snapshot()
+        machine = host_name() or ("mac" if sys.platform == "darwin" else "natedev")
+        member = snapshot.by_worktree(machine, source.resolve())
+        if member is not None:
+            return str(member.id)
+    except staff.StaffUnreadable:
+        pass
+    return ""
+
+
+def folder_owner(worktree: Path) -> str:
+    """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
     try:
         # The queue request reads the owner only; it never clears a stale removal intent.
-        return copies.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
-    except (copies.CopyError, OSError):
+        return recorded_owner(worktree, intent=copy_record.RemovalIntentAccess.READ_ONLY)
+    except (CopyError, OSError):
         return ""
 
 
