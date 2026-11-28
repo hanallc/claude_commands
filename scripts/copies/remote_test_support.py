@@ -1,7 +1,7 @@
 """Run the remote copy commands against private local hosts."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from importlib import import_module
 import os
@@ -16,10 +16,13 @@ from types import SimpleNamespace
 from typing import cast, final
 from unittest import mock
 
+from scripts.copies import copies
+from scripts.lib import process_group
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.test_hang_guard import FixtureHang, LauncherHangGuard
 from scripts.mac_test import floor_claims
 
 
@@ -126,4 +129,24 @@ os.execve('/bin/bash', ['bash', '-c', sys.argv[-1]], environment)
         "MAC_TEST_STATE_DIR": str(root / "local-claims"),
         "REMOTE_CLAIM_STATE": str(root / "remote-claims"),
     }):
+        yield
+
+
+@contextmanager
+def local_mirror_removal_transport(root: Path) -> Generator[None]:
+    """Wait for the fixture's mirror removal command to exit."""
+    run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+    def run_local(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if not command or command[0] != "ssh" or shlex.split(command[-1])[2:3] != ["mirror-remove"]:
+            return run(command, **options)
+        guard = LauncherHangGuard("local mirror removal")
+        try:
+            return process_group.run_process_group(command, timeout=guard.remaining())
+        except subprocess.TimeoutExpired as error:
+            raise FixtureHang(f"{guard.name}: command did not exit within {error.timeout:g} seconds") from error
+
+    transport = SimpleNamespace(**vars(subprocess))
+    transport.run = run_local
+    with local_remote_transport(root), mock.patch.object(copies, "subprocess", transport):
         yield

@@ -36,7 +36,7 @@ from scripts.copies import copies
 from scripts.copies import remote_test_support
 from scripts.copies.workspace_test_support import registered_workspace
 from scripts.copies.copies_test_support import fake_remote_removal, publish_mirror
-from scripts.copies.remote_test_support import local_remote_transport
+from scripts.copies.remote_test_support import local_mirror_removal_transport
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
@@ -2116,13 +2116,13 @@ fi
     def test_retirement_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
         mirror = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/alpha"), "alpha-session")
-        with local_remote_transport(self.root):
+        with local_mirror_removal_transport(self.root):
             _ = write_config_fixture(self.root / ".claude/config/mac_test.conf", "mirror_root=~/mirrors\n")
             self.assertEqual(publish_mirror(mirror), 0)
             code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(Path(mirror.path).exists())
-        self.assertFalse(copies.remote_record_path(mirror).exists())
+        self.assertFalse(Path(mirror.path).exists(), output)
+        self.assertFalse(copies.remote_record_path(mirror).exists(), output)
 
 @final
 class ResumeUnitTests(ShutdownRepositoryFixture):

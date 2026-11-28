@@ -34,7 +34,7 @@ from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib import build_folders
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
-from scripts.copies.remote_test_support import local_remote_transport
+from scripts.copies.remote_test_support import local_mirror_removal_transport
 from scripts.review_links import change_browser, change_page, new_item_dialog, reply_tokens, review_actions, review_items, review_later, review_submissions
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
@@ -742,7 +742,7 @@ class TidyWrappedTests(unittest.TestCase):
         doc = self.doc("done", "wrapped")
         mirror = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/done"), "done-session")
-        with local_remote_transport(self.root):
+        with local_mirror_removal_transport(self.root):
             self.assertEqual(publish_mirror(mirror), 0)
             _ = tidy_wrapped.tidy("done", doc)
         self.assertFalse(Path(mirror.path).exists())
