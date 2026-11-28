@@ -98,7 +98,7 @@ def typed_turn(row: object) -> Iterator[NateWords]:
             match part_fields:
                 case {"type": "text", "text": str(text)} if len(part_fields) == 2:
                     parts.append(text)
-                case {"type": "image", "source": dict()} if row_type == "user" and len(part_fields) == 2:
+                case {"type": "image", "source": dict()} if len(part_fields) == 2:
                     continue
                 case _:
                     return

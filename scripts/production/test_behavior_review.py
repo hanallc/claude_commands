@@ -483,6 +483,13 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         turn = {**self.typed_turn(MOVE_REQUEST), "message": {"role": "user", "content": content}}
         self.assertIsInstance(self.verify_requested(self.transcript(turn), MOVE_REQUEST), behavior_review.NateRequest)
 
+    def test_queued_command_with_an_image_verifies_the_text_quote(self) -> None:
+        queued = self.queued_turn([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+            {"type": "text", "text": MOVE_REQUEST},
+        ])
+        self.assertIsInstance(self.verify_requested(self.transcript(queued), MOVE_REQUEST), behavior_review.NateRequest)
+
     def test_queued_peer_command_does_not_verify(self) -> None:
         turn = self.queued_turn(MOVE_REQUEST, origin={"kind": "peer", "from": "fixture-peer"})
         self.assertIsInstance(self.verify_requested(self.transcript(turn), MOVE_REQUEST), behavior_review.NateSpecified)
@@ -495,6 +502,21 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 finding = self.verify_requested(self.transcript(turn), MOVE_REQUEST)
                 self.assertIsInstance(finding, behavior_review.NateSpecified)
 
+    def test_queued_synthetic_command_does_not_verify(self) -> None:
+        turn = {**self.queued_turn(MOVE_REQUEST), "isSynthetic": True}
+        self.assertIsInstance(self.verify_requested(self.transcript(turn), MOVE_REQUEST), behavior_review.NateSpecified)
+
+    def test_queued_compact_summary_command_does_not_verify(self) -> None:
+        turn = self.queued_turn(MOVE_REQUEST, isCompactSummary=True)
+        self.assertIsInstance(self.verify_requested(self.transcript(turn), MOVE_REQUEST), behavior_review.NateSpecified)
+
+    def test_queued_command_with_bad_time_does_not_hide_a_later_quote(self) -> None:
+        invalid = self.queued_turn(MOVE_REQUEST, timestamp="invalid")
+        valid_quote = "Keep the item open."
+        source = self.transcript(invalid, self.queued_turn(valid_quote))
+        self.assertIsInstance(self.verify_requested(source, MOVE_REQUEST), behavior_review.NateSpecified)
+        self.assertIsInstance(self.verify_requested(source, valid_quote), behavior_review.NateRequest)
+
     def test_queued_command_requires_exact_provenance_text_and_time(self) -> None:
         for case, turn in (
             ("unknown attachment", self.queued_turn(MOVE_REQUEST, type="note")),
@@ -502,7 +524,9 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             ("numeric human turn", self.queued_turn(MOVE_REQUEST, humanTurn=1)),
             ("non-prompt mode", self.queued_turn(MOVE_REQUEST, commandMode="task-notification")),
             ("extra text field", self.queued_turn([{"type": "text", "text": MOVE_REQUEST, "extra": True}])),
-            ("image", self.queued_turn([{"type": "text", "text": MOVE_REQUEST}, {"type": "image", "source": {}}])),
+            ("malformed image", self.queued_turn([
+                {"type": "text", "text": MOVE_REQUEST}, {"type": "image", "source": "invalid"},
+            ])),
             ("naive time", self.queued_turn(MOVE_REQUEST, timestamp="2026-11-27T17:47:57")),
             ("invalid time", self.queued_turn(MOVE_REQUEST, timestamp="invalid")),
             ("paste", self.queued_turn(f"<pasted_content>\n{MOVE_REQUEST}\n</pasted_content>")),
