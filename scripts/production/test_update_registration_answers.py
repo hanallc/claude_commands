@@ -23,7 +23,7 @@ from scripts.production.update_registration_test_support import RegistrationFixt
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import delivery_state, staff
+from scripts.production import delivery_state, record_store, staff
 from scripts.production.staff_test_support import fixture_member
 
 
@@ -53,7 +53,7 @@ class RegistrationTests(RegistrationFixture):
             return review.QuestionAccepted(text)
 
         with mock.patch.object(review, "review_question", side_effect=read_draft) as reader:
-            with self.assertRaisesRegex(new_item_dialog.SubmissionError, "The selected Question changed"):
+            with self.assertRaisesRegex(record_store.SubmissionError, "The selected Question changed"):
                 _ = registration.reply_to_submission(saved.path, key, text, saved.reply_token, owner=owner.id)
         reader.assert_called_once()
         self.assertNotIn(text, saved.path.read_text())

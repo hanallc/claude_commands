@@ -30,6 +30,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, unrouted_alert, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
+from scripts.production.record_store import SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError
 from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_tokens, review_events, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
@@ -40,7 +41,7 @@ from scripts.review_links.new_item_dialog import (
     MemoryReading as MemoryReading,
     MemorySegment as MemorySegment, MemoryTone as MemoryTone, NewItemRequest as NewItemRequest,
     NoEvidence as NoEvidence, PastedImage as PastedImage, ReviewSubmission as ReviewSubmission,
-    SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError, SubmissionKind as SubmissionKind,
+    SubmissionKind as SubmissionKind,
     TipCaption as TipCaption, TipDetail as TipDetail, TipField as TipField,
     read_evidence as read_evidence, read_request as read_request,
 )

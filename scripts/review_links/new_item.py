@@ -27,7 +27,7 @@ from scripts.lib import atomic_file, conf, main_publish
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
-from scripts.production import investigation, producer_map, repeat_rule, staff, the_list, unrouted_alert
+from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list, unrouted_alert
 from scripts.review_links import change_page, for_you, list_draft, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
@@ -518,7 +518,7 @@ class FilingRefusal(StrEnum):
     UNAVAILABLE_PRODUCER = "unavailable producer"
 
 
-class FilingRefused(new_item_dialog.SubmissionError):
+class FilingRefused(record_store.SubmissionError):
     """The filing checks failed before the item was saved."""
 
     def __init__(self, reason: FilingRefusal, message: str) -> None:
@@ -579,7 +579,7 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
         member, mapped = _assignment(assignee, members)
         try:
             review_submissions.require_available_recipient(member, members)
-        except new_item_dialog.SubmissionConflict as error:
+        except record_store.SubmissionConflict as error:
             raise FilingRefused(FilingRefusal.UNAVAILABLE_OWNER, str(error)) from error
     elif producer is None:
         member, mapped = assignee, _mapped_producer(assignee, members)
@@ -588,7 +588,7 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
     if member.id != mapped.producer.id:
         try:
             _ = review_submissions.selected_recipient(mapped.producer.id, members)
-        except new_item_dialog.SubmissionConflict as error:
+        except record_store.SubmissionConflict as error:
             raise FilingRefused(FilingRefusal.UNAVAILABLE_PRODUCER, str(error)) from error
     keeper = the_list.producer_id(members, "morty")
     run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
@@ -668,7 +668,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
             members = staff.snapshot()
             recipient = review_submissions.selected_recipient(request.recipient_id, members)
             if request.producer_route and recipient.kind != "producer":
-                raise new_item_dialog.SubmissionError("Pick a producer.")
+                raise record_store.SubmissionError("Pick a producer.")
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
             filing = prepare_scheduled(owner, request.words, members, producer=producer)

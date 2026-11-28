@@ -9,18 +9,23 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import select
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import cast, final, override
+from typing import TextIO, cast, final, override
 import unittest
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS
+from scripts.lib import build_folders
+from scripts.lint import sweep
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment, write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
+from scripts.mac_test import floor_claims
+from scripts.mac_test.offload_test_commands import write_shell
 from scripts.mac_test.mac_transport import MacPlacement, RemoteRun, RemoteState
 from scripts.production import hand_made, hand_made_mac
 from scripts.production.hand_made_mac import START, MacLines, MacTransport, MirrorUse
@@ -519,6 +524,74 @@ class StartScriptTests(unittest.TestCase):
 
 @final
 class CopiedCheckoutTests(unittest.TestCase):
+    def test_the_copy_waits_for_the_floor_and_holds_its_lease_on_the_mac(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        repo = root / "repo"
+        _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        home = root / "home"
+        shim = home / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        mirror = home / MIRROR
+        lease = floor_claims.mirror_lock_path(mirror)
+        group = lease.with_name(lease.name + build_folders.MacFloorLeaseFile.GROUP.value)
+        receiver = root / "receiver.py"
+        _ = receiver.write_text(
+            "from pathlib import Path\n"
+            + "import fcntl, sys\n"
+            + "with Path(sys.argv[1]).open() as lock:\n"
+            + "    try:\n"
+            + "        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            + "    except BlockingIOError:\n"
+            + "        Path(sys.argv[2]).touch()\n"
+            + "    else:\n"
+            + "        raise SystemExit('receiver has no shared lease')\n")
+        started = root / "received"
+        python = shlex.quote(sys.executable)
+        write_shell(shim, f'if [ "$1" = -B ]; then exec {python} "$@"; fi\n'
+                    + "exec " + shlex.join([sys.executable, str(receiver), str(group), str(started)]) + "\n")
+        config = root / "config"
+        # The mirror sits below the configured root, so the copy takes the floor lease of its folder.
+        _ = write_config_fixture(config / "mac_test.conf",
+                                 f"floor_sweep_timeout_s=5\nmirror_root=~/{Path(MIRROR).parent}\n")
+        checkout = Path(__file__).resolve().parents[2]
+
+        def rsync(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            command = next(word.removeprefix("--rsync-path=") for word in argv if word.startswith("--rsync-path="))
+            with ExitStack() as floor:
+                self.assertTrue(floor.enter_context(sweep.mac_floor_mirror_leases({mirror})))
+                environment = {**os.environ, "HOME": str(home), "PYTHONPATH": str(checkout)}
+                with subprocess.Popen(["/bin/sh", "-c", command], cwd=home, env=environment,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                    assert process.stderr is not None
+                    stderr = cast(TextIO, process.stderr)
+                    try:
+                        self.assertTrue(select.select([stderr], [], [], 8)[0])
+                        waiting = stderr.readline()
+                        if "waiting for the Mac floor sweep" not in waiting:
+                            _, errors = process.communicate(timeout=8)
+                            self.fail("Expected the receiver to wait for the Mac floor sweep.\n" + waiting + errors)
+                        self.assertFalse(started.exists())
+                        floor.close()
+                        output, errors = process.communicate(timeout=8)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                    return subprocess.CompletedProcess(argv, process.returncode, output, errors)
+
+        settings = eligibility.SshConnectionSettings("mac-host", 7.0, 30.0, UNREACHABLE_WAIT_FIXTURE_SECONDS)
+        for target, value in ((eligibility, {"repository_identity": eligibility.KnownRepository("repo"),
+                                             "read_connection_settings": settings}),
+                              (offload, {"remote_mirror": MIRROR, "holder_session": "fixture-session"}),
+                              (copies, {"source_owner": "fixture-owner", "remote_lease": nullcontext(),
+                                        "register_remote": None})):
+            for name, result in value.items():
+                _ = self.enterContext(mock.patch.object(target, name, return_value=result))
+        with (mock.patch.dict(os.environ, config_environment(config)),
+              mock.patch.object(subprocess, "run", side_effect=rsync),
+              hand_made_mac.copied_checkout(repo, "mac-host") as copied):
+            self.assertTrue(started.is_file())
+            self.assertIn("run_after_mac_floor_group", copied.use("pwd"))
+
     def test_the_copy_leaves_out_git_ignored_files_and_uses_the_offload_ssh_options(self) -> None:
         repo = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve() / "repo"
         repo.mkdir()

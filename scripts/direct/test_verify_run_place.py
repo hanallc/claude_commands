@@ -16,7 +16,7 @@ from typing import TypedDict, cast
 import unittest
 from unittest import mock
 
-from scripts.agents import detached_runs
+from scripts.agents import detached_run_record, detached_runs
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib import conf
@@ -145,7 +145,7 @@ fi
                 started = process_start(process.pid)
                 self.assertIsInstance(started, Started)
                 assert isinstance(started, Started)
-                record: detached_runs.RunRecord = {
+                record: detached_run_record.RunRecord = {
                     "run_id": "run", "status": "running", "session_dir": str(fixture.root),
                     "worker": "fixture", "staff_id": "", "label": "verify list",
                     "command": ["bash", str(script), "test,lint"],
@@ -159,7 +159,7 @@ fi
                     self.verb_status(process, status)
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, statuses[-1], output + errors)
-                saved = cast(detached_runs.RunRecord, json.loads(record_path.read_text()))
+                saved = cast(detached_run_record.RunRecord, json.loads(record_path.read_text()))
                 self.assertEqual(detached_runs.command_result(saved), detached_runs.CompletedCommand(statuses[-1]))
 
     def test_later_verbs_use_fresh_placement(self) -> None:
