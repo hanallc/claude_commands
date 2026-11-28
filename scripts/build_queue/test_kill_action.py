@@ -118,7 +118,7 @@ class KillActionTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         return admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
 
-    def resume(self) -> kill_action.KillResult:
+    def resume(self, *, expect_recovery: bool = True) -> kill_action.KillResult:
         resumed = kill_action.KillActions(self.root)
         workers: list[threading.Thread] = []
         start = threading.Thread.start
@@ -131,12 +131,15 @@ class KillActionTests(unittest.TestCase):
         with (patch.object(threading.Thread, "start", new=record_thread),
               patch.object(kill_action, "live_targets", return_value={})):
             resumed.resume()
-            (worker,) = workers
-            worker.join(TEST_HANG_GUARD_SECS)
-            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(workers), int(expect_recovery))
+            if expect_recovery:
+                (worker,) = workers
+                worker.join(TEST_HANG_GUARD_SECS)
+                self.assertFalse(worker.is_alive())
+            first_workers = workers.copy()
             recovered = kill_action.KillActions(self.root)
             recovered.resume()
-            self.assertEqual(workers, [worker])
+            self.assertEqual(workers, first_workers)
             offers, (result,) = recovered.options(15)
             self.assertEqual(offers, {})
         return result
@@ -806,16 +809,26 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
               patch.object(kill_action, "request_stop", new=stop_and_finish) if finish_during_stop else nullcontext(),
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as sent):
             offers, _ = actions.options(15)
-            outcome = actions.stop(reference, offers[reference]["handle"], "")
+            with path.with_suffix(".completion.lock").open("a") as completion:
+                if not finish_during_stop:
+                    # Keep the record running until Kill reads the stop result.
+                    fcntl.flock(completion, fcntl.LOCK_EX)
+                outcome = actions.stop(reference, offers[reference]["handle"], "")
+            assert isinstance(outcome, dict)
             if finish_during_stop:
-                assert isinstance(outcome, dict)
                 self.assertEqual((outcome["stop"], outcome["delivery"]),
                                  (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
+            else:
+                self.assertEqual((outcome["stop"], outcome["delivery"]),
+                                 (kill_action.StopState.STOPPING, kill_action.DeliveryState.PENDING))
+                sent.assert_not_called()
             self.assertEqual(supervisor.wait(TEST_HANG_GUARD_SECS), 0, path.with_suffix(".log").read_text())
             record = worker_lifecycle.read_json_object(path)
             self.assertEqual((record["status"], record["exit_code"]), ("finished", 128 + signal.SIGTERM))
             self.assertIs(record["completion_pending"], False)
-            result = self.resume()
+            result = self.resume(expect_recovery=not finish_during_stop)
+            if finish_during_stop:
+                self.assertEqual(result, outcome)
         self.assertEqual((result["stop"], result["delivery"]),
                          (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
         stopped.assert_called_once()
