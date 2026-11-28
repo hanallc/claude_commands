@@ -249,7 +249,7 @@ Each local Promote checkout must exist before the command pushes.
 For an enrolled production, use the exact staff document for live policy.
 The showrunner starts in the main checkout from `Repository`.
 The serving merge unit publishes from the integration worktree on `Merge branch`.
-Run the enrolled production's merge checks in item 143 test copies.
+Run the enrolled production's merge tests in item 143 test copies.
 Resolve the live LOG relative to the main checkout.
 Removal tools protect both checkouts and their branches.
 Sync refuses incoming paths that overlap the live document, LOG, or notes.
@@ -292,7 +292,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
   Publication records survive promotion failure.
   A style notice becomes complete only after successful delivery.
   A completed child handoff retry changes nothing and sends no second notice.
-  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductionmerge_gatepy).
+  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-script).
 - **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
   The checkpoint command passes `--phase-id <phase id>` for the phase it checkpoints.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
@@ -532,7 +532,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
 - **Unit targeted tests.** A `claude_commands` unit runs `gate.py --affected` through `copies.py run`.
   Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
   The gate uses the shared runner with affected-module selection.
-- **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
+- **The `~/.claude` repo's own gate.** `scripts/production/gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
@@ -906,8 +906,11 @@ A missing folder uses its nearest existing parent until the folder appears.
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
-  The model checks how the parts relate on each review of a structured question.
-  The cache reuses independent checks for unchanged parts with the same rules, date, and time zone.
+  The model checks how the parts of a structured question relate and returns a draft verdict.
+  The cache reuses an approval when the title, exact draft text, rules, date, time zone, and caption layout match.
+  The model reviews a held split draft again.
+  Changes to the draft, including spaces between parts, require a new draft verdict.
+  The cache reuses independent verdicts for unchanged parts with the same rules, date, and time zone.
   It keeps the latest valid verdicts and removes drafts inactive for seven days.
   If a cache lock stays busy until the deadline, the filing command holds the draft.
   The review allows at most three questions for missing facts across all verdicts.

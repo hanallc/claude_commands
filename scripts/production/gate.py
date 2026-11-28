@@ -102,7 +102,7 @@ from scripts.production.gate_routes import (
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production.affected_modules import (  # noqa: E402
-    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
+    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, SelectionRun, select_affected,
 )
 from scripts.lib.release_waiter import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
@@ -816,7 +816,7 @@ class GateRecovery:
                                    recorded_merge=self.rollback_head, recovery=self)
                     self.rollback = ""
                     self.save()
-            except (GateRefused, copies.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
+            except (GateRefused, admission_records.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
                 if self.groups or self.tokens:
                     raise
                 raise RollbackRecoveryRefused(f"gate recovery kept {self.path} for {repo}: {error}") from error
@@ -1634,13 +1634,20 @@ def full_required() -> FullSuite | NoFullRunRequired:
         return FullSuite(f"last nightly run was red (unreadable marker: {error})")
 
 
-def report_selection(selection: AffectedSelection | FullSuite, total: int, selection_s: float) -> None:
+def report_selection(selection: AffectedSelection | FullSuite, total: int) -> None:
     if isinstance(selection, FullSuite):
         print(f"full suite: {selection.reason}", flush=True)
         return
     when = datetime.fromisoformat(selection.base.at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+    details = ""
+    selection_s = 0.0
+    if isinstance(run := selection.run, SelectionRun):
+        selection_s = run.total_s
+        details = (f" (cache {run.cache_hits} hits, {run.cache_misses} misses; read {run.cache_read_s:.1f} s, "
+                   + f"extract {run.extracted_files} files {run.extraction_s:.1f} s, graph {run.graph_s:.1f} s, "
+                   + f"other {run.other_s:.1f} s; lock {run.lock.value})")
     print(f"affected: {len(selection.modules)} of {total} modules (base {selection.base.commit[:12]}, {when}), "
-          + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s", flush=True)
+          + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s{details}", flush=True)
     if len(selection.modules) <= 10:
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
@@ -1657,10 +1664,8 @@ def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | Unrecordabl
     base = ledger.certified_base()
     paths = [path for _, path in modules]
     state_dir = gate_state_dir()
-    started = time.monotonic()
     selection = select_affected(repo, base, paths, dirty, state_dir=state_dir)
-    selection_s = time.monotonic() - started
-    report_selection(selection, len(modules), selection_s)
+    report_selection(selection, len(modules))
     return selection, ledger
 
 
@@ -2422,7 +2427,6 @@ def live_state_refusal(repo: Path, target: str) -> str:
         except (OSError, subprocess.SubprocessError) as error:
             return f"promotion refused: live state check could not export {target}: {error}"
         settings = tree / "config" / "gate.conf"
-        # Chunk 6 removes the old config path.
         if not settings.exists():
             settings = tree / "config" / "merge_gate.conf"
         if not settings.exists():
@@ -3470,7 +3474,7 @@ def nightly_git(repo: Path, *arguments: str) -> str:
 def _nightly_unit(args: GateArguments) -> str:
     """Use the production's merge unit or the nightly role."""
     if args.unit:
-        return copies.checked_owner(args.unit)
+        return admission_records.checked_owner(args.unit)
     if not args.production:
         raise GateRefused("nightly needs --unit or --production")
     record = staff.snapshot()
@@ -3486,7 +3490,7 @@ def _nightly_unit(args: GateArguments) -> str:
         return "nightly"
     if len(units) > 1:
         raise GateRefused(f"{owner.name}: the production record has multiple merge units. Pass --unit.")
-    return copies.checked_owner(str(units[0].id))
+    return admission_records.checked_owner(str(units[0].id))
 
 
 def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
@@ -4087,7 +4091,7 @@ def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> 
             return 0 if result.passed else 1
     except GatePlacementIncomplete:
         raise
-    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (admission_records.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
 
@@ -4205,7 +4209,7 @@ def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.Argume
     if args.nightly and args.unit:
         try:
             _ = _nightly_unit(args)
-        except copies.CopyError as error:
+        except admission_records.CopyError as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             raise SystemExit(1) from None
     if not args.modules:
@@ -4304,7 +4308,7 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
             return 0
     except GatePlacementIncomplete:
         raise
-    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (admission_records.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
 

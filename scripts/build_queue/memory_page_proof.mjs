@@ -1071,7 +1071,7 @@ try {
                 preview:document.querySelector('#kill-message').textContent, submit:document.querySelector('#kill-submit').textContent};
             })()`);
             assert.deepEqual(outside,{icons:2,icon:confirmation.icon,pid:'8102',label:'Kill this run',
-              fields:['queue · targeted_test.py','8102 and its child processes','5 min','test, a worker of queue'],
+              fields:['queue · gate.py','8102 and its child processes','5 min','test, a worker of queue'],
               unit:'queue',unitWeight:'700',
               labels:['Run','Pid','Age','Started by'],warning:killWarning(outsideRow.owner),wordsLabel:killWordsLabel,
               belowTable:true,fits:true,preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
@@ -1204,7 +1204,7 @@ try {
           assert.deepEqual(result.rows, [
             {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s'],
               color:'role.showrunner', clipped:false},
-            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s'],
+            {cells:['gate.py', 'queue · test', '8102', '5 min', '75%', '139 s'],
               color:'role.unit-director', clipped:false},
           ]);
           assert.equal(await evaluate(`(() => {
@@ -3632,7 +3632,10 @@ try {
             await show(readings.mac_three);
             const macProof=await evaluate(`(() => {
               const rows=latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build');
-              const unit=document.querySelector('#barwrap').getBoundingClientRect().width/latest.total;
+              const trackWidth=document.querySelector('#walk .track').getBoundingClientRect().width;
+              const totalBytes=latest.ram.total_bytes;
+              const totalGiB=recorded(totalBytes) && totalBytes>0 ? totalBytes/GIB : latest.total;
+              const unit=trackWidth/totalGiB;
               return rows.map(({row,index})=>{
                 const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');

@@ -9,9 +9,6 @@ import shutil
 from time import perf_counter
 from typing import NamedTuple
 
-from scripts.lib.checkout_test_support import runtime_files
-
-
 SOURCE = Path(__file__).resolve().parents[2]
 COPY_HELPERS = (
     "scripts/lib", "scripts/buildlog", "scripts/copies", "scripts/mac_test", "scripts/message",
@@ -44,6 +41,16 @@ class CopyTime(NamedTuple):
 
 
 COPY_TIMES: list[CopyTime] = []
+
+
+@cache
+def runtime_files() -> tuple[Path, ...]:
+    """List runtime files and the test modules that fixture copies need."""
+    helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
+    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
+                 for path in sorted((SOURCE / folder).rglob("*"))
+                 if (path.is_file() or path.is_symlink() and path.is_dir()) and "__pycache__" not in path.parts
+                 and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
 
 
 @cache
