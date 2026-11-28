@@ -115,9 +115,9 @@ def published_console_page(root: Path, path: str) -> str:
 
 
 CONSOLE_DOCUMENTS = {
-    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "studio",
+    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
     review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
-    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "studio",
+    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
 }
 
 # Keep the old action path for open tabs and held sends.
@@ -136,8 +136,8 @@ def capture_page_key(root: Path, place: str) -> str:
 
 
 def capture_matches_page(root: Path, place: str, page: str) -> bool:
-    """Match a capture to its page, including old List requests."""
-    return capture_page_key(root, place) == ("studio" if page == "list" else page)
+    """Match old Studio capture requests to the List page."""
+    return capture_page_key(root, place) == ("list" if new_item_dialog.is_list_submission_page(page) else page)
 
 
 def deferred_capture_request(root: Path, page: str, value: object
@@ -973,7 +973,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         root = server.root
         route = urlsplit(self.path)
-        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query in ("page=studio", "page=list")
+        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
         held = route.path.startswith(send_hold.HOLD_PATH + "/")
         fixture_page = route.path in LIST_ACTION_PATHS or route.path.startswith(f"{studio_page.AVATAR_PATH}/")
         if server.mode is ServerMode.LIST_FIXTURE and not fixture_page and not fixture_options and not held:
@@ -2202,7 +2202,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                            if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                            else reviews))
-                content = owned_document(content, "studio")
+                content = owned_document(content, "list")
         except (OSError, ValueError) as error:
             print(f"review-links studio: {error}", file=sys.stderr)
             self.html_response(503, change_page.document(f"<p>{studio_page.TITLE} page is not available.</p>"))

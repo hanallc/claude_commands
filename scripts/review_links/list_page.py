@@ -2563,7 +2563,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-item-aliases="{html.escape(json.dumps(aliases), quote=True)}"'
                + f' data-closed-keys="{html.escape(json.dumps([entry.key for entry in closed]), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
-               + page_frame.title(studio_page.TITLE, "studio", frozen_controls=picture_row)
+               + page_frame.title(studio_page.TITLE, "list", frozen_controls=picture_row)
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)

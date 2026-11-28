@@ -1752,7 +1752,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
             continue
     assignees = {row.id: row for row in members.rows if row.kind in ("showrunner", "unit")
                  and _page_owner_is_active(row, members)}
-    # Old List requests have no preferred producer. The Studio uses its page owner.
+    # The List owner keeps the List. The List does not choose an assignee.
     key = f"page.{page}.owner"
     designated = staff.StaffId(settings.values(key).get(key, "")) if page != "list" else staff.StaffId("")
     producer = producers.get(designated)
@@ -1773,7 +1773,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
         recipients=[_recipient_option(row, members) for row in producers.values()],
         assignees=[AssigneeOption(id=row.id, name=row.name) for row in ordered],
         page_owner=producer.id if producer is not None else staff.StaffId(""), page_owner_reason=reason,
-        page_assignee=owner.id if owner is not None and page != "studio" else staff.StaffId(""))
+        page_assignee=owner.id if owner is not None else staff.StaffId(""))
 
 
 def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
@@ -2192,7 +2192,7 @@ def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidenc
                           uploads: tuple[_ImageUpload, ...], screenshot: new_item_dialog.SubmissionScreenshot,
                           delivery: InitialDelivery | NoInitialDelivery) -> str:
     digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
-    # Keep the same fingerprint for a draft sent from the old List and from the Studio.
+    # Use the same fingerprint for a List draft from either page.
     page = "list" if new_item_dialog.is_list_submission_page(request.page) else request.page
     fields: list[object] = [request.kind, request.recipient_id, words, new_item_dialog.evidence_fields(evidence),
                             _image_fingerprints(uploads), page, request.page_recipient,
