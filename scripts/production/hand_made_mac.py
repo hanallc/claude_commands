@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
-import functools
 import os
 from pathlib import Path
 import re
@@ -105,7 +104,8 @@ def copied_checkout(repo: Path, host: str) -> Generator[MirrorUse]:
                                          offload.remote_mirror(repository), offload.holder_session())
             lease.enter_context(copies.remote_lease(mirror))
             with offload.mirror_exclude_file(ignored) as excludes:
-                copy = subprocess.run(copies.remote_rsync(repo, mirror, excludes, options),
+                arguments = offload.mac_floor_rsync(mirror.path, copies.remote_rsync(repo, mirror, excludes, options))
+                copy = subprocess.run(arguments,
                                       stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
             if copy.returncode != 0:
                 detail = copy.stderr.strip().splitlines()
@@ -113,7 +113,10 @@ def copied_checkout(repo: Path, host: str) -> Generator[MirrorUse]:
             copies.register_remote(mirror)
         except (copies.CopyError, OSError, ValueError) as error:
             raise MachineFailed(f"the copy to the Mac mirror failed: {error}") from error
-        yield MirrorUse(mirror.path, functools.partial(copies.remote_use_command, mirror))
+        def use(command: str) -> str:
+            return offload.after_mac_floor_group(mirror.path, copies.remote_use_command(mirror, command))
+
+        yield MirrorUse(mirror.path, use)
 
 
 @dataclass(frozen=True)
