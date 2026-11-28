@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
-from scripts.review_links import send_hold, setting_controls
+from scripts.review_links import console_theme, send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
@@ -419,6 +419,190 @@ def action_failure(notice: str | None, message: str = "") -> str:
     identity = f' id="{html.escape(notice, quote=True)}"' if notice else ""
     hidden = " hidden" if not message else ""
     return f'<p class="action-failure"{identity} role="alert"{hidden}>{html.escape(message)}</p>'
+
+
+def with_version_notice(content: bytes, endpoint: str) -> bytes:
+    """Place the notice above all console page frames."""
+    notice = ('<section class="version-notice" aria-labelledby="version-notice-title" hidden>'
+              + '<header><h2 id="version-notice-title">New version loaded</h2>'
+              + '<button type="submit" form="version-clear" name="clear" value="all">Clear all</button></header>'
+              + f'<form id="version-clear" action="{html.escape(endpoint, quote=True)}" method="post">'
+              + action_failure("version-clear-failure") + '<ul></ul></form></section>')
+    return (content.replace(b"</head>", (_VERSION_STYLE + "</head>").encode(), 1)
+            .replace(b'<main class="workspace">', ('<main class="workspace">' + notice).encode(), 1)
+            .replace(b"</body>", ("<script>" + _VERSION_SCRIPT + "</script></body>").encode(), 1))
+
+
+_VERSION_STYLE = '<style>' + console_theme.TOKENS.replace(':root', '.workspace:has(>.version-notice:not([hidden]))') + '''
+.workspace:has(>.version-notice:not([hidden])){background:var(--bg)}
+.version-notice{flex:none;margin:16px auto 0;width:min(1060px,calc(100% - 48px));max-height:45dvh;overflow:auto;
+border:1px solid var(--line);border-inline-start:3px solid var(--accent);border-radius:12px;
+background:var(--card);color:var(--ink);padding:6px 16px;font:15px/1.45 system-ui,sans-serif}
+.version-notice header,.version-notice li{display:flex;align-items:center;gap:16px;padding-block:4px}
+.version-notice h2{margin:0;font-size:16px;font-weight:650}
+.version-notice button{margin-inline-start:auto;flex:none;padding:5px 12px;border-radius:8px;
+background:var(--card);color:var(--ink);border:1px solid var(--line);font:13px/18px system-ui,sans-serif;cursor:pointer}
+.version-notice button:hover{background:var(--hover)}
+.version-notice ul{list-style:none;padding:0;margin:0}
+.version-notice li{border-top:1px solid var(--line);color:var(--ink-2)}
+.version-notice li span{min-width:0;overflow-wrap:anywhere}
+.version-notice a{flex:none;color:var(--accent);font-weight:600;text-underline-offset:3px}
+.version-notice a[aria-expanded=true]{color:var(--ink)}
+.version-notice [role=alert]{color:var(--error)}
+.frame-area > iframe[data-version-card]{z-index:8;background:transparent}
+@media(max-width:480px){.version-notice{width:calc(100% - 24px);padding-inline:10px}
+.version-notice li,.version-notice header{gap:8px}.version-notice button{min-height:40px}}
+</style>'''
+
+_VERSION_SCRIPT = r'''(() => {
+ const notice=document.querySelector('.version-notice'),form=notice.querySelector('form');
+ const rows=form.querySelector('ul'),failure=form.querySelector('[role=alert]');
+ const frames=document.querySelector('.frame-area'),shell=document.querySelector('#console-shell');
+ let current,visible='',reading=false,clearing=false,card,source,edit=0;
+ function closeCard(){
+  card?.remove();card=null;
+  source?.setAttribute('aria-expanded','false');
+  if(source?.isConnected) source.focus({preventScroll:true});
+  source=null;
+ }
+ function render(data){
+  current=data;
+  const signature=JSON.stringify(data.changes);
+  if(signature===visible) return;
+  visible=signature;
+  const focused=notice.contains(document.activeElement);
+  const position=[...rows.children].findIndex(row=>row.contains(document.activeElement));
+  rows.replaceChildren(...data.changes.map(change=>{
+   const row=document.createElement('li'),link=document.createElement('a');
+   const title=document.createElement('span'),button=document.createElement('button');
+   const item=new URLSearchParams({item:change.key,reveal:'1'});
+   link.href='/console/studio.html?'+item;
+   link.textContent='#'+change.number;
+   link.dataset.versionItem=change.key;
+   link.setAttribute('aria-haspopup','dialog');
+   link.setAttribute('aria-expanded',String(source?.dataset.versionItem===change.key));
+   title.textContent=change.title;
+   button.type='submit';button.name='clear';button.value=String(change.number);button.textContent='Clear';
+   button.setAttribute('aria-label','Clear #'+change.number);
+   row.append(link,title,button);
+   return row;
+  }));
+  if(card) source=[...rows.querySelectorAll('a')].find(link=>link.getAttribute('aria-expanded')==='true');
+  notice.hidden=!rows.children.length && failure.hidden;
+  if(focused && position>=0){
+   const target=rows.children[Math.min(position,rows.children.length-1)]?.querySelector('button');
+   (target || document.querySelector('.nav-entry[aria-current], [data-console-page]:not([hidden])'))
+    ?.focus({preventScroll:true});
+  }else if(focused && notice.hidden) document.querySelector('.nav-entry[aria-current]')?.focus({preventScroll:true});
+ }
+ async function refresh(){
+  if(reading || clearing || document.visibilityState!=='visible') return;
+  const started=edit;
+  reading=true;
+  try{
+   const response=await fetch(form.action,{cache:'no-store'});
+   if(response.ok){
+    const data=await response.json();
+    if(started===edit) render(data);
+   }
+  }catch(_){}finally{reading=false;}
+ }
+ form.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(clearing || !current) return;
+  clearing=true;
+  edit++;
+  showActionFailure(failure);
+  try{
+   const {revision,token}=current,clear=event.submitter.value;
+   const response=await fetch(form.action,{method:'POST',body:new URLSearchParams({revision,token,clear})});
+   const data=await response.json();
+   if(!response.ok) throw new Error(data.reason || 'The change could not clear. Try again.');
+   render(data);
+  }catch(error){
+   showActionFailure(failure,error instanceof SyntaxError ? 'The change could not clear. Try again.' : error.message);
+  }finally{clearing=false;}
+ });
+ rows.addEventListener('click',event=>{
+  const link=event.target.closest('a');
+  if(!link || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  const key=link.dataset.versionItem;
+  source?.setAttribute('aria-expanded','false');
+  source=link;source.setAttribute('aria-expanded','true');
+  if(card?.contentDocument?.openVersionListItem?.(key)) return;
+  if(!card){
+   card=document.createElement('iframe');card.title='List item';card.dataset.versionCard='';
+   card.addEventListener('version-card-closed',closeCard);
+   card.addEventListener('load',()=>{
+    if(!card || card.contentDocument?.openVersionListItem) return;
+    closeCard();
+    showActionFailure(failure,'The List item could not open. Try again.');
+   });
+  }
+  const url=new URL(link.href);
+  url.searchParams.set('version-card','1');
+  card.src=url;
+  if(!card.isConnected) frames.append(card);
+ });
+ document.addEventListener('keydown',event=>{
+  if(event.key==='Escape' && card && !event.defaultPrevented){event.preventDefault();closeCard();}
+ });
+ document.addEventListener('visibilitychange',refresh);
+ window.addEventListener('focus',refresh);
+ setInterval(refresh,Number(shell.dataset.refreshSeconds)*1000);
+ void refresh();
+})();'''
+
+
+def version_list_card(content: bytes, closed_row: str = "") -> bytes:
+    """Show the Studio List overlay over the current console page."""
+    if closed_row:
+        table = content.index(b'<table aria-label="The List">')
+        end = content.index(b"</thead>", table) + len(b"</thead>")
+        content = content[:end] + closed_row.encode() + content[end:]
+    return (content.replace(b"</head>", _VERSION_CARD_STYLE.encode() + b"</head>", 1)
+            .replace(b"</body>", _VERSION_CARD_SCRIPT.encode() + b"</body>", 1))
+
+
+_VERSION_CARD_STYLE = '''<style>
+html,body{background:transparent}
+main{visibility:hidden}
+[data-list-review-dialog]{visibility:visible}
+</style>'''
+
+_VERSION_CARD_SCRIPT = r'''<script>
+(() => {
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const host=window.frameElement;
+ if(!host?.hasAttribute('data-version-card')) return;
+ document.openVersionListItem=key=>{
+  const list=document.querySelector('[data-list]');
+  const aliases=JSON.parse(list.dataset.itemAliases);
+  key=Object.hasOwn(aliases,key) ? aliases[key] : key;
+  const item=list.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  if(!item) return false;
+  // Use the Studio linked item action so the overlay keeps its standard controls.
+  const link=document.createElement('a');
+  link.dataset.listLinkedCard='';link.hidden=true;
+  link.href='#'+new URLSearchParams({item:key});
+  link.textContent=item.querySelector('[data-label="Item"] strong').textContent;
+  item.querySelector('td').append(link);
+  link.click();link.remove();
+  return dialog.open;
+ };
+ const key=new URLSearchParams(location.search).get('item') || new URLSearchParams(location.hash.slice(1)).get('item');
+ if(!key || !document.openVersionListItem(key)){
+  delete document.openVersionListItem;
+  return;
+ }
+ new MutationObserver(()=>{
+  if(dialog.open) host.hidden=false;
+  else if(dialog.querySelector('iframe[data-saving]')) host.hidden=true;
+  else host.dispatchEvent(new Event('version-card-closed'));
+ }).observe(dialog,{attributes:true,attributeFilter:['open','data-saving'],subtree:true,childList:true});
+})();
+</script>'''
 
 
 ACTION_STATUS_SCRIPT = r'''function showActionFailure(status,message=''){

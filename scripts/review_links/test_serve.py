@@ -46,7 +46,7 @@ from pathlib import Path
 from unittest.mock import ANY, Mock, ThreadingMock, call, patch
 
 
-from typing import IO, Literal, TextIO, TypedDict, cast, override
+from typing import BinaryIO, IO, Literal, TextIO, TypedDict, cast, override
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -77,6 +77,7 @@ from scripts.review_links import (
     accounts_page, answer_sources, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
     placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
 )
+from scripts.review_links import version_notice
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -90,6 +91,74 @@ ROLE_COLOR_CONFIG = (
     "role.producer=#90fe42\n"
     "role.worker=#ff0404\n"
 )
+
+VERSION_BROWSER_PROBE = br"""<script>
+(async()=>{
+ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const notice=document.querySelector('.version-notice');
+ const links=()=>[...notice.querySelectorAll('li a')];
+ const studio=()=>document.querySelector('iframe[data-console-page="studio"]');
+ const frame=()=>document.querySelector('iframe[data-version-card]');
+ const overlay=()=>frame()?.contentDocument.querySelector('[data-list-linked-overlay]:not([hidden])');
+ const until=async(test,label)=>{
+  const end=performance.now()+7000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  await until(()=>studio()?.contentDocument.querySelector('[data-list-count]')?.textContent,'Studio did not load.');
+  const page=studio().contentDocument;
+  const proof=new URLSearchParams(location.search).has('shot');
+  if(!proof){
+   check(notice.hidden,'The notice starts hidden.');
+   await fetch('/version-publish');
+   window.dispatchEvent(new Event('focus'));
+  }
+  await until(()=>links().length===3,'The open page did not show the three changes.');
+  check(studio().contentDocument===page,'The live update preserves the open page.');
+  check(links().map(link=>link.textContent).join(',')==='#504,#499,#493','The notice shows the List numbers.');
+  check(!notice.hidden && matchMedia('(prefers-color-scheme:dark)').matches &&
+        innerWidth===1440 && innerHeight===900,'The notice shows in a 1440 by 900 dark console.');
+  if(proof) return;
+  links()[0].click();
+  await until(()=>overlay()?.querySelector('[data-number="504"]'),'The List 504 overlay did not open.');
+  const card=frame();
+  check(card.contentDocument.querySelector('dialog[open] [data-close]')?.textContent==='Close',
+        'The shared List overlay shows Close.');
+  links()[1].click();
+  await until(()=>overlay()?.querySelector('[data-number="499"]'),'List 499 did not replace List 504.');
+  check(frame()===card && overlay().querySelectorAll('[data-list-item]').length===1,'One overlay shows the selected item.');
+  const dialog=card.contentDocument.querySelector('dialog[open]');
+  const realm=card.contentWindow;
+  dialog.dispatchEvent(new realm.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  await until(()=>!frame(),'Escape did not close the overlay.');
+  check(studio().contentDocument===page && document.activeElement===links()[1],'Escape restores the page and link.');
+  links()[2].click();
+  await until(()=>overlay()?.textContent.includes('The List item is closed.'),'The closed List item did not open.');
+  frame().contentDocument.querySelector('dialog[open] [data-close]').click();
+  await until(()=>!frame(),'Close did not close the overlay.');
+  const send=window.fetch;
+  window.fetch=(url,options)=>{
+   if(url.endsWith('/version-notice') && options?.method==='POST') options.body.set('token','bad-token');
+   return send(url,options);
+  };
+  notice.querySelector('li button').click();
+  const failure=notice.querySelector('[role=alert]');
+  await until(()=>!failure.hidden,'The refusal did not show the failure line.');
+  check(links().length===3,'A refused Clear keeps the lines.');
+  window.fetch=send;
+  notice.querySelector('li button').click();
+  await until(()=>links().length===2,'Clear did not remove the first line.');
+  check(failure.hidden && links()[0].textContent==='#499','Clear removes only its line.');
+  notice.querySelector('header button').click();
+  await until(()=>notice.hidden,'Clear all did not remove the notice.');
+  check(studio().contentDocument===page,'Clear all leaves the Studio page open.');
+ }catch(error){failures.push(String(error));}
+ finally{await fetch('/version-results',{method:'POST',body:JSON.stringify(failures)});}
+})();
+</script><img hidden src="/version-complete">"""
 
 
 def png_chunk(kind: bytes, data: bytes) -> bytes:
@@ -6077,6 +6146,110 @@ class ReviewLinksServerTests(unittest.TestCase):
             return HttpReply(response.status, received.get("content-type", ""), response.read(), received)
         finally:
             connection.close()
+
+    def test_version_notice_clears_one_all_and_concurrent_requests(self) -> None:
+        self.server.verified_tailscale_address = "127.0.0.1"
+        revision = "a" * 40
+        changes = tuple(version_notice.Change(number, f"fixture/L{number}", f"Change {number}")
+                        for number in (493, 499, 504, 512))
+        record = version_notice.Notice(revision, changes)
+        state = self.root / version_notice.FILE
+        atomic_file.write_text_atomic(state, json.dumps(asdict(record)))
+        origin = f"http://127.0.0.1:{self.port}"
+
+        def clear(number: int | str, token: str = self.server.new_item_token, seen: str = revision) -> int:
+            code, _ = self.post(version_notice.PATH, urlencode(
+                {"token": token, "revision": seen, "clear": number}), origin=origin)
+            return code
+
+        self.assertEqual(clear("all", "bad-token"), 403)
+        self.assertEqual(clear("all", seen="b" * 40), 409)
+        self.assertEqual(version_notice.read(self.root), record)
+        self.assertEqual(clear(493), 200)
+        self.assertEqual(version_notice.read(self.root).changes[0], replace(changes[0], cleared=True))
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            self.assertEqual(list(workers.map(clear, (499, 504))), [200, 200])
+        self.assertEqual([line.cleared for line in version_notice.read(self.root).changes], [True, True, True, False])
+        self.assertEqual(clear("all"), 200)
+        self.assertEqual(self.request(version_notice.PATH).body,
+                         json.dumps({"revision": revision, "token": self.server.new_item_token, "changes": []}).encode())
+        self.assertTrue(all(line.cleared for line in version_notice.read(self.root).changes))
+        self.assertEqual(self.request("/" + state.name).status, 404)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
+    def test_browser_version_notice_clears_lines_and_opens_the_shared_overlay(self) -> None:
+        firefox = shutil.which("firefox")
+        assert firefox is not None
+        self.server.verified_tailscale_address = "127.0.0.1"
+        keeper = self.configure_list_keeper()
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((keeper,))))
+        changes: list[version_notice.Change] = []
+        for number, title in (
+            (493, "Umbrella items show their linked items and state."),
+            (499, "The Review window shows its List item number."),
+            (504, "The Studio picture filters stay in view when you scroll."),
+        ):
+            item = the_list.add(keeper.id, title, owner=the_list.UnassignedOwner.NATE, source="nate", number=number,
+                                changes={"next_step": "Read the change in the console."})
+            if number == 493:
+                _ = the_list.close(keeper.id, item.id, "The List item is closed.", source="nate")
+            changes.append(version_notice.Change(number, f"{keeper.id}/{item.id}", title))
+        notice = version_notice.Notice("b" * 40, tuple(reversed(changes)))
+        state = self.root / version_notice.FILE
+        results: list[list[str]] = []
+        complete = threading.Event()
+        root = self.root
+        shell = self.request("/console/").body
+
+        class VersionBrowser(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                route = urlsplit(self.path)
+                if route.path == "/version-browser":
+                    complete.clear()
+                    if parse_qs(route.query).get("shot") == ["1"]:
+                        atomic_file.write_text_atomic(state, json.dumps(asdict(notice)))
+                    self.html_response(200, shell.replace(b"</body>", VERSION_BROWSER_PROBE + b"</body>"))
+                    return None
+                if route.path == "/version-publish":
+                    atomic_file.write_text_atomic(state, json.dumps(asdict(notice)))
+                    self.json_response(200, {})
+                    return None
+                if route.path == "/version-complete":
+                    _ = complete.wait(12)
+                    self.json_response(200, {})
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/version-results":
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                    return
+                super().do_POST()
+
+        proof = os.environ.get("VERSION_NOTICE_PROOF")
+        route = "/version-browser?page=studio"
+
+        def capture(place: str) -> bytes:
+            return serve.page_screenshot(firefox, origin + place, new_item_dialog.PageCaptureRequest(place, 1440, 900, True))
+
+        origin = f"http://127.0.0.1:{self.port}"
+        self.server.RequestHandlerClass = VersionBrowser
+        try:
+            if proof:
+                screenshot = capture(route + "&shot=1")
+                self.assertEqual(results, [[]])
+                _ = Path(proof).write_bytes(screenshot)
+                results.clear()
+                state.unlink()
+            _ = capture(route)
+        finally:
+            self.server.RequestHandlerClass = serve.ReviewLinksHandler
+        self.assertEqual(results, [[]])
+        self.assertTrue(all(change.cleared for change in version_notice.read(root).changes))
 
     def test_console_page_gzip_matches_identity(self) -> None:
         page = b"<main><h1>The List</h1></main>"

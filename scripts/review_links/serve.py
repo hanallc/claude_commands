@@ -27,6 +27,7 @@ import time
 import threading
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from datetime import datetime
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -43,9 +44,12 @@ from scripts.build_queue import admission_client, admission_protocol as admissio
 from scripts.lib import atomic_file, conf, scratch, session_folder
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
+from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, change_review, record_store, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
+from scripts.review_links import version_notice
+from scripts.review_links.record_table import identity_attribute
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
 from scripts.whoami import usage_store
 
@@ -997,8 +1001,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links console: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The console is not available.</p>"))
                 return None
+            content = page_frame.with_version_notice(content, version_notice.PATH)
             self.html_response(200, content, content_security_policy="default-src 'self'; script-src 'unsafe-inline'; "
                                + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
+            return None
+        if route.path == version_notice.PATH:
+            self.version_notice_request(route.query)
             return None
         if route.path == "/console/for-you.json":
             extra: dict[str, object] = {}
@@ -1352,6 +1360,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == kill_action.PATH:
             self.build_kill_post(route.query)
             return
+        if route.path == version_notice.PATH:
+            self.version_notice_request(route.query)
+            return
         refusal = self.tailscale_refusal()
         if refusal:
             if route.path == console_tune.PAGE_PATH or route.path.startswith(send_hold.HOLD_PATH + "/"):
@@ -1614,6 +1625,47 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def valid_request_token(self, token: object) -> bool:
         server = cast(ReviewLinksServer, self.server)
         return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, server.new_item_token)
+
+    def version_notice_request(self, query: str) -> None:
+        """Read the current version notice or clear lines from it."""
+        post = self.command == "POST"
+        if self.tailscale_refusal() or not self.same_origin(required=post):
+            self.json_response(403, {"reason": "Use the console page to clear changes."})
+            return
+        if query or self.command not in ("GET", "HEAD", "POST"):
+            self.json_response(400, {"reason": "Use the console version notice."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            if post:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024 or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                    raise ValueError("Use the console version notice form.")
+                fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True, max_num_fields=3)
+                if set(fields) != {"token", "revision", "clear"} or any(len(values) != 1 for values in fields.values()):
+                    raise ValueError("Use the console version notice form.")
+                if not self.valid_request_token(fields["token"][0]):
+                    self.json_response(403, {"reason": "The clear token expired. Try again after the next live update."})
+                    return
+                selected = fields["clear"][0]
+                if selected != "all" and not re.fullmatch(r"[1-9][0-9]*", selected):
+                    raise ValueError("Choose one change to clear or use Clear all.")
+                notice = version_notice.clear(server.root, fields["revision"][0],
+                                              None if selected == "all" else int(selected))
+            else:
+                notice = version_notice.read(server.root)
+        except version_notice.VersionChanged as error:
+            self.json_response(409, {"reason": str(error)})
+        except ValueError as error:
+            if post:
+                self.browser_failure(400, "Use the console version notice form.", error)
+            else:
+                self.browser_failure(503, "The version notice is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The version notice could not save." if post else
+                                 "The version notice is unavailable.", error)
+        else:
+            self.json_response(200, notice.payload(server.new_item_token))
 
     def build_kill_options(self, query: str) -> None:
         if query or self.command != "GET":
@@ -2195,12 +2247,42 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                            if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                            else reviews))
-                content = owned_document(content, "studio")
+                if fields.get("version-card") == ["1"]:
+                    key = fields.get("item", [""])[0]
+                    content = page_frame.version_list_card(content, self.closed_version_item(content, key))
+                else:
+                    content = owned_document(content, "studio")
         except (OSError, ValueError) as error:
             print(f"review-links studio: {error}", file=sys.stderr)
             self.html_response(503, change_page.document(f"<p>{studio_page.TITLE} page is not available.</p>"))
             return
         self.html_response(200, content, delivery_pending=delivery)
+
+    def closed_version_item(self, content: bytes, key: str) -> str:
+        """Supply the overlay with a closed row named in the saved version notice."""
+        if not key or f'data-key="{identity_attribute(key)}"'.encode() in content:
+            return ""
+        server = cast(ReviewLinksServer, self.server)
+        if not any(change.key == key for change in version_notice.read(server.root).changes):
+            return ""
+        keeper_id, _, identity = key.partition("/")
+        keeper = staff.StaffId(keeper_id)
+        try:
+            item = the_list.load(keeper, identity)
+        except FileNotFoundError:
+            return ""
+        if item.state is not the_list.ItemState.CLOSED:
+            return ""
+        members = staff.snapshot()
+        names = staff_names.StaffNames(members)
+        owner = list_page.owner_name(members, item.owner)
+        return list_page.item_rows(
+            list_page.ListRecord(keeper, item), names, datetime.now(user_zone()), -1,
+            list_page.form_secret(server.root), {}, owner_cell=names.html(item.owner, owner),
+            owner_sort=owner.casefold(), search_text=list_page.SearchText(owner, item.title, ""), parked=False,
+            open_question=False, open_ask=False, visibility=the_list.QuestionAttention(), unread_answers=frozenset(),
+            schedule=the_list.NoSchedule.UNSET, mark=list_page.TopPriorityMark.HIDDEN,
+            routing=the_list.ListQuestionRouting(members), hidden=True)
 
     def studio_avatar(self, relative: str) -> BinaryIO | None:
         """Serve one Studio picture from the avatar root."""
@@ -3445,6 +3527,10 @@ def main(arguments: list[str]) -> int:
         if fixture is None:
             root = change_routing.review_root()
             root.mkdir(parents=True, exist_ok=True)
+            try:
+                version_notice.start(root, Path(__file__).resolve().parents[2])
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"review-links version notice: {error}", file=sys.stderr)
             service = ReviewLinksServer(address, root, initialize_review=True)
         else:
             root = fixture
