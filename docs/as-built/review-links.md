@@ -183,10 +183,10 @@ The Unit group control uses the role color before selection.
 An open AWS day applies role and staff-name color changes on the next Builds data reading.
 The refresh keeps focus on the same control in the open day.
 The Builds page uses the saved staff ID to color the name in the bump mark and tooltip.
-Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
-The slot tooltip colors the Showrunner label.
-Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
-Its Builds refresh updates the name spans and role colors without a new timer.
+Disks colors staff session names in the Sessions table and its tooltips.
+The page uses the saved owner to color a session folder with a generated name.
+Each page render reads the current role colors.
+Held folder names and task names stay plain.
 The console navigation shows no staff name fields.
 The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
 
@@ -2403,13 +2403,13 @@ A missing document reference in the source list does not block a row with an ava
 An unrouted row retains verdict controls when its list's staff showrunner has an available document.
 In that case, its owner remains unrouted and receives no message.
 
-`change_review.list_ready`, which `merge_checkpoint` and `merge_gate` call, stores each checkpoint unit's Producer id.
+`merge_checkpoint` and `gate` call `change_review.list_ready` to store each checkpoint unit's Producer ID.
 A row covers a text-matched change when its merge contains that checkpoint or its merge is unknown.
 An edited row covers a change from the same merge only when its Producer matches the checkpoint unit's fixed staff id.
 Within each producer, pair ready changes first, in commit order.
 Pair held changes next only when all uncovered held changes for that producer wait on one step.
 An empty Producer cell or an unknown checkpoint producer permits only text matching.
-`merge_gate` reads the staff record before the merge.
+`gate` reads the staff record before the merge.
 `merge_checkpoint` reads the staff record before the push.
 An unreadable staff record stops either run before anything is pushed.
 `merge_checkpoint` also undoes its unpushed local merge.

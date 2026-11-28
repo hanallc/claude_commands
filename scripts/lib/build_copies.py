@@ -249,6 +249,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
         except build_folders.BuildFolderClaimHeld as error:
             raise build_folders.CopySourceBusy(str(error)) from error
         name = build_folders.repo_word(repository)
+        floor = sources.enter_context(build_folders.mac_numbered_copy_lease(name))
         revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
         if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
             raise CopyGitFailure(f"{revision}: the commit tracks a reserved copy path")
@@ -317,7 +318,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
                     build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(path)),
-                }), (descriptor, *claims))
+                }), (descriptor, *claims, *floor))
                 return
         if isinstance(selection, ExactCopyRequest):
             raise BlockingIOError(f"{parent}: assigned copy {selection.number} is unavailable")

@@ -3,31 +3,25 @@
 import ast
 import importlib.util
 import os
-from functools import cache
 from pathlib import Path
 import shutil
 import shlex
 import subprocess
 import sys
 
+from scripts.lib.helper_tree_test_support import runtime_files as runtime_files
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, startup_pythonpath
 
 
 SOURCE = Path(__file__).resolve().parents[2]
-# Child fixtures can model a direct launch inside an outer gate module.
-STANDALONE_TEST_STARTUP = """import sys
-sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: False
+WITHOUT_GATE_ANCESTRY = """import sys
+startup = sys.modules["_devtools_python_startup"]
+startup._descends_from_gate_module = lambda: False
 """
-
-
-@cache
-def runtime_files() -> tuple[Path, ...]:
-    """List runtime files without compiled files or unrelated test modules."""
-    helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
-    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
-                 for path in sorted((SOURCE / folder).rglob("*"))
-                 if (path.is_file() or path.is_symlink() and path.is_dir()) and "__pycache__" not in path.parts
-                 and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
+# Model a launch outside a gate and outside an existing direct test scope.
+STANDALONE_TEST_STARTUP = WITHOUT_GATE_ANCESTRY + """
+startup._direct_test_scope_enforces_deadline = lambda unit: False
+"""
 
 
 def copy_with_bytecode(source: Path, destination: Path) -> None:
@@ -137,7 +131,7 @@ def direct_test_fixture_environment(root: Path, *, seconds: int | None = None) -
                                  f"# whole: 1..\ndirect_test.time_limit_seconds={seconds}\n")
     environment = {**os.environ, "TMPDIR": str(root), "CONF_DIR": str(config),
                    "XDG_CACHE_HOME": str(root / "cache"), "CLAUDE_PYTHON": sys.executable}
-    for name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
+    for name in ("GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
                  "TEST_TIMES_OUT", RUN_FOLDER_ENV):
         _ = environment.pop(name, None)
     return environment

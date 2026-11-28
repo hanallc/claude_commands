@@ -4,11 +4,13 @@ from __future__ import annotations
 import fcntl
 import os
 from pathlib import Path
+import subprocess
 from typing import BinaryIO
 from unittest.mock import patch
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 from scripts.lib import build_folders
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifySessionTempTests(VerifyStepRoutesFixture):
@@ -94,7 +96,10 @@ testing_folders.prepare_test_runs_parent = prepare_test_runs_parent
             self.addCleanup(self.fixture.stop_verify, process)
             self.fixture.wait_for_path(ready, (process,))
             process.terminate()
-            output, errors = process.communicate(timeout=8)
+            try:
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
+                self.fail("Verify did not exit after SIGTERM during temporary folder allocation.")
             self.assertEqual(process.returncode, 143, output + errors)
             self.assertFalse(observed.exists())
             self.assertEqual(self.fixture.local_runs(), [])
@@ -164,7 +169,10 @@ wait() {
         self.assertTrue(temporary.is_dir())
         self.assertIsNone(process.poll())
         self.assertEqual(release_step.write(b"x"), 1)
-        output, errors = process.communicate(timeout=8)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail("Verify did not exit after the step group received its release.")
         self.assertEqual(process.returncode, 143, output + errors)
         self.assertTrue(observed.with_suffix(".finished").exists())
         self.assert_temp_released(temporary, (self.fixture.root / "target").resolve(strict=True) / "test-runs")

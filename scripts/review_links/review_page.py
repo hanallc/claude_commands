@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.for_you.action import ActionStore, ActionStoreError, REVIEW_PATH
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
-from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
+from scripts.production import change_review, change_routing, proposal_issue, record_store, staff, update_registration
 from scripts.production.production_doc import Refusal as ProductionRefusal
 from scripts.production.record_store import FileStamp, state_root
 from scripts.rebuild import need
@@ -744,7 +744,7 @@ class ReviewSnapshotCache:
                         | review_submissions.ListDraftSend), *,
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
         capture_requested: bool = False,
-        refusal: new_item_dialog.SubmissionError | None = None,
+        refusal: record_store.SubmissionError | None = None,
         capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
         capture_target: new_item_dialog.ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
         = new_item_dialog.NoBoundCaptureTarget.UNBOUND,

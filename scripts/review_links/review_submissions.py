@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -23,11 +24,12 @@ from typing import Protocol, TypedDict, cast
 
 from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
-from scripts.lib.file_lock import exclusive
+from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, update_registration
+from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, unrouted_alert, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
+from scripts.production.record_store import SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError
 from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_tokens, review_events, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
@@ -38,7 +40,7 @@ from scripts.review_links.new_item_dialog import (
     MemoryReading as MemoryReading,
     MemorySegment as MemorySegment, MemoryTone as MemoryTone, NewItemRequest as NewItemRequest,
     NoEvidence as NoEvidence, PastedImage as PastedImage, ReviewSubmission as ReviewSubmission,
-    SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError, SubmissionKind as SubmissionKind,
+    SubmissionKind as SubmissionKind,
     TipCaption as TipCaption, TipDetail as TipDetail, TipField as TipField,
     read_evidence as read_evidence, read_request as read_request,
 )
@@ -408,24 +410,45 @@ def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
     return tuple(uploads)
 
 
-def _identify_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
+def _identify_image(extension: str, path: Path) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         ["magick", "identify", "-regard-warnings", "-limit", "width", "8192",
          "-limit", "height", "8192", "-limit", "area", "32MP",
          "-limit", "list-length", "32", "-limit", "memory", "128MiB",
          "-limit", "map", "128MiB", "-limit", "disk", "0",
-         "-format", "%m\n", extension + ":-"],
-        input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False)
+         "-format", "%m\n", f"{extension}:{path}"],
+        capture_output=True, timeout=4, check=False)
 
 
 def _validate_image(upload: _ImageUpload) -> None:
     try:
-        result = _identify_image(upload.extension, upload.data)
+        with tempfile.NamedTemporaryFile(prefix="review-image-") as source:
+            path = Path(source.name)
+            _ = source.write(upload.data)
+            source.flush()
+            result = _identify_image(upload.extension, path)
     except subprocess.TimeoutExpired:
         raise SubmissionError("The pasted image could not be read in time.") from None
-    names = result.stdout.splitlines()
-    if result.returncode or not names or any(name != upload.extension.upper().encode() for name in names):
-        raise SubmissionError("The pasted image does not match its type or exceeds the image limits.")
+    if result.returncode:
+        lines = [line for line in result.stderr.decode(errors="replace").splitlines() if line]
+        refused = next((line for line in lines if "@ error/" in line or
+                        not re.fullmatch(r"[^:]+: iCCP:.*? @ warning/png\.c/\S+", line)), "")
+        if refused or not lines:
+            reason = refused
+            display_path = os.fsencode(path).decode(errors="replace")
+            for quote in ("`", "'"):
+                quoted_path = f"{quote}{display_path}'"
+                reason = reason.replace(f" {quoted_path}", "").replace(quoted_path, "")
+            reason = re.sub(r"^[\w.-]+: | @ (?:warning|error)/.*$", "", reason).strip().removesuffix(".")
+            reason = reason or f"ImageMagick exited with status {result.returncode}"
+            raise SubmissionError(f"The pasted image could not be read: {reason}.")
+    names = result.stdout.decode("ascii", errors="replace").splitlines()
+    if not names:
+        raise SubmissionError("The pasted image could not be read: ImageMagick did not report an image format.")
+    expected = upload.extension.upper()
+    for name in names:
+        if name != expected:
+            raise SubmissionError(f"The pasted image is a {name}, not a {expected}.")
 
 
 def _attachment_root(snapshot_root: Path | None = None) -> Path:
@@ -564,6 +587,10 @@ class ListItemDestination:
     @property
     def payload_hash(self) -> str:
         return self.claim.payload_hash
+
+    @property
+    def pending_notices(self) -> tuple[ListAssignmentNotice, ...]:
+        return tuple(notice for notice in self.claim.notices if notice.recipient not in self.confirmed)
 
 
 class DraftAlreadyFiled(SubmissionConflict):
@@ -1988,7 +2015,6 @@ class ListDraftWriter(Protocol):
 
 def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: str, *,
                     prepare: Callable[[], AbstractContextManager[tuple[ListDraftClaim, ListDraftWriter]]],
-                    deliver: Callable[[ListAssignmentNotice, str, str], bool],
                     load_list_draft: LoadListDraft) -> ListItemDestination:
     """Recover the first Send or file a List item under its draft lock."""
     request_id = draft_id.value
@@ -2031,18 +2057,50 @@ def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: st
             _publish_receipt(folder, saved)
         else:
             atomic_file.sync_folder(folder)
-        failed = False
-        for notice in saved.claim.notices:
-            if notice.recipient in saved.confirmed:
-                continue
-            if deliver(notice, saved.id, f"new-item:{request_id}:{notice.role}"):
-                saved = replace(saved, confirmed=(*saved.confirmed, notice.recipient))
-                _write_location(receipt, saved)
-            else:
-                failed = True
-        if failed:
-            raise OSError(f"{saved.id} is saved. An assignment notice needs a retry.")
         return saved
+
+
+def deliver_list_notices(root: Path, draft_id: new_item_dialog.ScheduledDraftId,
+                         deliver: Callable[[ListAssignmentNotice, str, str], bool]) -> None:
+    """Retry the unconfirmed notices from the published receipt."""
+    folder = _attachment_root(root) / draft_id.value
+    receipt = folder / "receipt.json"
+    with exclusive(folder / ".notices.lock", wait=False) as lock:
+        if lock is LockResult.BUSY:
+            return
+        saved = _read_location_hint(folder, receipt_only=True)
+        if not isinstance(saved, ListItemDestination) or not saved.pending_notices:
+            return
+        settings = conf.read("review_links")
+        tries = settings.whole("delivery_tries")
+        pause = settings.number("delivery_pause_seconds")
+        for attempt in range(tries):
+            if not saved.pending_notices:
+                return
+            if attempt and pause:
+                time.sleep(pause)
+            for notice in saved.pending_notices:
+                if deliver(notice, saved.id, f"new-item:{draft_id.value}:{notice.role}"):
+                    saved = replace(saved, confirmed=(*saved.confirmed, notice.recipient))
+                    _write_location(receipt, saved)
+        for notice in saved.pending_notices:
+            unrouted_alert.notify(
+                root, f"List of {saved.claim.keeper}", {"#": saved.id, "Change": notice.text},
+                f"The assignment notice to {notice.recipient} could not be delivered.", (notice.recipient,),
+                still_unrouted=lambda: True)
+
+
+def pending_scheduled_notices(root: Path) -> Iterator[new_item_dialog.ScheduledDraftId]:
+    """Find published Scheduled receipts after a restart."""
+    for receipt in _attachment_root(root).glob("s1-*/receipt.json"):
+        draft = receipt.parent.name
+        if new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(draft) is not None:
+            try:
+                saved = _read_location_hint(receipt.parent, receipt_only=True)
+                if isinstance(saved, ListItemDestination) and saved.pending_notices:
+                    yield new_item_dialog.ScheduledDraftId(draft)
+            except (OSError, ValueError) as error:
+                print(f"Review notice receipt {draft}: {error}", file=sys.stderr)
 
 
 @contextmanager

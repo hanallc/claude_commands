@@ -81,7 +81,8 @@ class MachineWatchTests(NotificationGuardedTestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_HOLD_DIR": str(self.root / "holds"),
         }))
-        _ = write_config_fixture(config / "build_targets.conf", "enabled.mac-linux=on\n")
+        # Pin the Mac notices on: the repository value is a live setting that nate turns off.
+        _ = write_config_fixture(config / "build_targets.conf", "enabled.mac-linux=on\nnotices.mac=on\n")
         _ = write_config_fixture(config / "mac_test.conf", "offload=on\n")
         for stem in ("mac_linux", "hana_aws", "cloud_gate", "lint"):
             _ = write_config_fixture(config / f"{stem}.conf")
@@ -200,6 +201,49 @@ class MachineWatchTests(NotificationGuardedTestCase):
                 else:
                     self.assertEqual(self.option("--key"), f"machine-watch-{name}-{int(START)}")
                     self.assertIn(f"{name} has run no work for {int(notice // 60)} min", self.texts[-1])
+
+    def test_notices_off_stops_only_the_named_machine_push(self) -> None:
+        _ = write_config_fixture(self.root / "config/build_targets.conf", "notices.mac=off\n")
+        _ = write_config_fixture(self.root / "config/mac_linux.conf", "enabled=on\n")
+        notice = self.notice("mac")
+        now = START + notice
+        self.mac_pass(now)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(machine_watch.read_notice(self.paths.state / "mac.json"),
+                         {"since": START, "sent": False, "kind": machine_watch.NoticeKind.PUSH})
+
+        self.make_unusable("mac-linux")
+        self.watch("mac-linux", START)
+        self.watch("mac-linux", START + self.notice("mac-linux"))
+        self.assertEqual(self.receivers(), ["nate"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-linux-{int(START)}")
+
+        self.waiting_pass("mac", now + 1)
+        self.waiting_pass("mac", now + 1 + notice)
+        self.assertEqual(self.receivers(), ["nate", "bob", "builds"])
+
+    def test_missing_notices_key_defaults_to_on(self) -> None:
+        path = self.root / "config/build_targets.conf"
+        _ = write_config_fixture(path, "notices.unknown=invalid\n")
+        _ = path.write_text(path.read_text().replace("notices.mac=on\n", ""))
+        settings = conf.read("build_targets")
+        now = START + self.notice("mac")
+        self.write_alert(now, "unreachable", "", 2)
+
+        with mock.patch.object(conf.ConfigRead, "value", autospec=True,
+                               side_effect=conf.ConfigRead.value) as read_value:
+            machine_watch.watch_machine(self.target("mac"), self.paths, now, settings)
+
+        self.assertEqual(self.receivers(), ["nate"])
+        self.assertEqual(self.option("--text-id"), "mac_idle.unreachable")
+        read_value.assert_any_call(settings, "notices.mac", conf.on_off, default=True, recover_invalid=False,
+                                   host_override=conf.HostOverride.IGNORED)
+
+    def test_invalid_notices_value_is_refused(self) -> None:
+        _ = write_config_fixture(self.root / "config/build_targets.conf", "notices.mac=invalid\n")
+        with self.assertRaisesRegex(conf.Unusable, r"notices\.mac='invalid': expected (on or off|one of on, off)"):
+            self.mac_pass(START + self.notice("mac"))
+        self.assertEqual(self.commands, [])
 
     def test_steps_that_wait_on_an_idle_machine_message_bob_and_builds_once(self) -> None:
         """A machine that takes no work is ours to repair, so no machine sends a phone push for it."""
