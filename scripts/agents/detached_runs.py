@@ -1404,6 +1404,7 @@ PARKED_WORKER_RESULT = DEFERRED_WORKER_RESULT + "the worker is parked"
 BUSY_WORKER_RESULT = DEFERRED_WORKER_RESULT + "worker is working"
 WORKER_INPUT_NOT_READY = "worker is not ready for input"
 WORKER_READINESS_PENDING = DEFERRED_WORKER_RESULT + WORKER_INPUT_NOT_READY
+WORKER_TRANSCRIPT_PENDING = DEFERRED_WORKER_RESULT + "worker transcript is unavailable: "
 WORKER_INPUT_LOCK_HELD = DEFERRED_WORKER_RESULT + "the worker lock is held"
 WORKER_CLOSED_RESULT = DEFERRED_WORKER_RESULT + "worker pane is closed"
 WORKER_BLOCKED_RESULT = DEFERRED_WORKER_RESULT + "worker is blocked"
@@ -2695,7 +2696,7 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 raise _WorkerPassDeliveryBlocked(WORKER_READINESS_PENDING) from error
             if isinstance(coverage, ResultTranscriptUnknown):
-                raise _WorkerPassDeliveryBlocked(WORKER_READINESS_PENDING)
+                raise _WorkerPassDeliveryBlocked(WORKER_TRANSCRIPT_PENDING + coverage.reason)
             if coverage == ResultDoneCoverage.COVERED:
                 raise _WorkerPassDeliveryBlocked(COVERED_BY_DONE)
             if isinstance(stage, UnknownResultStage):
@@ -2778,10 +2779,12 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
                 try:
                     if _result_received(worker, membership, marker):
                         return save_outcome(f"already delivered: {record['run_id']}")
-                except (OSError, ValueError, subprocess.SubprocessError):
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
                     if failed_pane_attempt:
                         return WORKER_READINESS_PENDING
-                    return save_outcome(WORKER_READINESS_PENDING)
+                    pending = (WORKER_TRANSCRIPT_PENDING + str(error) if ownership is ResultPassOwnership.CURRENT
+                               else WORKER_READINESS_PENDING)
+                    return save_outcome(pending)
             target, reply_instruction = check_pass(worker, ownership, passed, assignment)
             if unconfirmed:
                 return saved
@@ -2991,8 +2994,18 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
                                                 input_lock=input_lock, pane_wait=pane_wait)
             if isinstance(delivery, PreparedResultRelay):
                 if not isinstance(input_lock, AcquireWorkerInputLock):
-                    _ = _save_delivery(path, RESULT_RELAY_PENDING, if_current=saved)
-                    _resume_result_after_unlock(input_lock, path)
+                    if (pane_wait is CompletionPaneWait.ALLOW and ownership is ResultPassOwnership.CURRENT
+                            and passed.get("status") == "canceled"):
+                        def relay_canceled_result(relay: PreparedResultRelay = delivery) -> None:
+                            try:
+                                _ = relay.complete()
+                            finally:
+                                _resume_orphan_result(relay.path)
+
+                        input_lock.defer_until_unlock((path, "resume result"), relay_canceled_result)
+                    else:
+                        _ = _save_delivery(path, RESULT_RELAY_PENDING, if_current=saved)
+                        _resume_result_after_unlock(input_lock, path)
                     return WorkerResultReplay.RETRY
                 delivery = delivery.complete()
         except (Exception, SystemExit, KeyboardInterrupt):
@@ -3402,8 +3415,9 @@ def _continue_orphan_result(path: Path, *, replay_completion: bool) -> None:
             _ = deliver(record, command_result(record))
         _send_staged_push_alert(path, check_receipt=True)
         current = _read_record_if_present(path)
-        # The director owns the result after accepting the alert for a failed prompt.
-        if current is None or (_failed_pane_attempt(current) and current.get("push_alert_attempted")):
+        # Keep the receipt state after the director accepts the alert.
+        if current is None or (current.get("push_alert_attempted")
+                               and (_failed_pane_attempt(current) or _awaits_pane_receipt(current))):
             return
     except (Exception, SystemExit) as error:
         detail = " ".join(str(error).splitlines())
@@ -3689,15 +3703,16 @@ def command_supervise(args: argparse.Namespace) -> int:
             except (OSError, ValueError, SystemExit) as error:
                 print(f"detached_runs: {record_path.stem}: result completion read failed: {error}", file=sys.stderr)
                 _wait_for_result_retry(retry_settings)
-        saved = _retry_result_delivery(record_path)
-        if saved is SupervisedResultPruned.REMOVED:
+        _ = _retry_result_delivery(record_path)
+        saved = _read_record_if_present(record_path)
+        if saved is None:
             return int(bool(record.get("scope_error")))
         if (saved.get("delivery") != record.get("delivery") and not _worker_result_pending(saved.get("delivery", ""))
                 and _needs_completion(saved)):
             completion = _finish_record(record_path, saved)
         if _result_push_failed(saved.get("delivery", "")):
             return 1
-        if record.get("scope_error"):
+        if saved.get("scope_error"):
             return 1
         if cancelled and completion == CompletionReplay.RETRY:
             return 1
