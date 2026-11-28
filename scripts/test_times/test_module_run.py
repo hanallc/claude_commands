@@ -316,6 +316,53 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
 
 
 class LiveConfigGuardTests(unittest.TestCase):
+    def test_shift_log_covers_the_module_and_keeps_setup_and_test_logs(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        source = """
+import os
+import unittest
+from pathlib import Path
+from scripts.lib import conf_reads
+
+def record(phase):
+    name = Path(os.environ.get("CONF_SHIFT_READ_LOG", "")).name
+    print(phase, conf_reads.shift_reads_enabled(), name)
+
+record("import")
+unittest.addModuleCleanup(record, "module cleanup")
+
+def setUpModule():
+    record("module setup")
+
+def tearDownModule():
+    record("module teardown")
+
+class Reads(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        record("class setup")
+        cls.addClassCleanup(record, "class cleanup")
+
+    def test_reads(self):
+        record("test")
+
+    @classmethod
+    def tearDownClass(cls):
+        record("class teardown")
+"""
+        fixture = run_fixture(root, "shift_lifecycle", source)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(fixture.timed.stdout.splitlines(), [
+            "import True shift-module",
+            "module setup True shift-fixture-0",
+            "class setup True shift-fixture-1",
+            "test True shift-1",
+            "class teardown True shift-module",
+            "class cleanup True shift-module",
+            "module teardown True shift-module",
+            "module cleanup True shift-module",
+        ])
+
     def test_child_guard_allows_private_cleanup_and_relative_open(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         protected, private, alias = (root / name for name in ("config", "private", "alias"))

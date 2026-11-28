@@ -418,6 +418,43 @@ conf_reads.record('disabled')
             _ = settings.text("word")
         self.assertIn("accounts.conf:count: 42 -> 43", log.read_text().splitlines())
 
+    def test_missing_override_file_uses_fixture_rules_for_explicit_repository_fallback(self) -> None:
+        log = self.root / "shift-reads"
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
+        repository = self.root / "repository-config/accounts.conf"
+        _ = repository.write_text("# whole: 0..\ncount=42\nnotes_directory=/raw\nword=raw\n")
+
+        settings = conf.read_or_repository("accounts")
+        self.assertEqual(settings.whole("count"), 43)
+        self.assertEqual(settings.text("notes_directory"), "~/rust/hanadocs/agents")
+        self.assertNotIn("word", settings.values())
+        self.assertIn("accounts.conf:count: 42 -> 43", log.read_text().splitlines())
+
+    def test_warm_repository_fixture_needs_no_new_reads_or_parses(self) -> None:
+        log = self.root / "shift-reads"
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
+        del os.environ["CONF_DIR"]
+        repository = self.root / "repository-config/accounts.conf"
+        _ = repository.write_text("# whole: 0..\ncount=42\n")
+        read = conf.read("accounts")
+        parse = cast(Callable[[str], dict[str, conf.Setting]], getattr(conf, "_parse"))
+
+        with (mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read_text,
+              mock.patch.object(conf, "_parse", wraps=parse) as parse_settings):
+            self.assertEqual(read.whole("count"), 43)
+            cold_parse_count = parse_settings.call_count
+            self.assertGreater(cold_parse_count, 0)
+            read_text.assert_called_once_with(repository, encoding="utf-8")
+
+            self.assertEqual(read.whole("count"), 43)
+            self.assertEqual(parse_settings.call_count, cold_parse_count)
+            read_text.assert_called_once_with(repository, encoding="utf-8")
+
+            _ = repository.write_text("# whole: 0..\ncount=50\n")
+            self.assertEqual(read.whole("count"), 51)
+            self.assertGreater(parse_settings.call_count, cold_parse_count)
+            self.assertEqual(read_text.call_count, 2)
+
     def test_missing_override_key_refuses_repository_values(self) -> None:
         source = self.directory / "accounts.conf"
         contents = "# whole: 1..\nusage_stale_minutes=23\n"

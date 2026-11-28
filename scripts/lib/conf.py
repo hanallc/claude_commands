@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 import math
 import os
 from pathlib import Path
@@ -240,7 +241,8 @@ class ConfigRead:
             repository = _repository_path(self.file)
             if repository != self.source:
                 try:
-                    value, _ = read_key(_read_repository_settings(self.file, repository))
+                    settings, _ = _read_repository(self.file, repository)
+                    value, _ = read_key(settings)
                     return RecoveredValue(value, reason)
                 except _MissingKey as error:
                     if conf_reads.shift_reads_enabled():
@@ -344,7 +346,8 @@ class ConfigRead:
         if fault.missing and self.repository_allowed and isinstance(self.file, str):
             try:
                 repository = _repository_path(self.file)
-                return _read_repository_settings(self.file, repository)
+                settings, _ = _read_repository(self.file, repository)
+                return settings.copy()
             except (OSError, UnicodeError):
                 pass
         for contents in _committed_files(self.source):
@@ -376,10 +379,17 @@ def read_bytes(source: Path) -> ConfigurationBytes:
 
 def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:
     """Read and parse the live file once; resolve faults when a setting is used."""
-    source = path(file)
+    return _read_file(file, path(file), load=load)
+
+
+def _read_file(file: str | Path, source: Path, *, load: Callable[[Path], ConfigurationBytes] | None = None,
+               fixture_stem: str | None = None) -> ConfigRead:
     repository_allowed = "CONF_DIR" not in os.environ
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
     try:
+        if fixture_stem is not None:
+            settings, stamp = _read_repository(fixture_stem, source)
+            return ConfigRead(file, source, settings.copy(), repository_allowed, stamp)
         if load is not None:
             snapshot = load(source)
             stamp = snapshot.stamp
@@ -401,7 +411,9 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
 def read_or_repository(stem: str) -> ConfigRead:
     """Use the repository file when the fixture has no copy."""
     if "CONF_DIR" in os.environ and not path(stem).exists():
-        return read(_repository_path(stem))
+        repository = _repository_path(stem)
+        fixture_stem = stem if conf_reads.shift_reads_enabled() else None
+        return _read_file(repository, path(repository), fixture_stem=fixture_stem)
     return read(stem)
 
 
@@ -450,13 +462,20 @@ def _read_settings(contents: str, source: Path) -> dict[str, Setting]:
     return settings
 
 
-def _read_repository_settings(stem: str, source: Path) -> dict[str, Setting]:
-    contents = source.read_text(encoding="utf-8")
+def _read_repository(stem: str, source: Path) -> tuple[dict[str, Setting], ConfigurationStamp | UnstampedConfiguration]:
     if conf_reads.shift_reads_enabled():
-        from scripts.lib import conf_fixture
+        stamp = ConfigurationStamp.from_stat(source.stat())
+        return _repository_fixture(stem, source, stamp), stamp
+    return _read_settings(source.read_text(encoding="utf-8"), source), UnstampedConfiguration.UNSTAMPED
 
-        contents = "\n".join(conf_fixture.config_lines(f"{stem}.conf", contents, settings=settings, decimal=decimal))
-    return _read_settings(contents, source)
+
+@lru_cache(maxsize=128)
+def _repository_fixture(stem: str, source: Path, _stamp: ConfigurationStamp) -> dict[str, Setting]:
+    from scripts.lib import conf_fixture
+
+    contents = source.read_text(encoding="utf-8")
+    lines = conf_fixture.config_lines(f"{stem}.conf", contents, settings=settings, decimal=decimal)
+    return _read_settings("\n".join(lines), source)
 
 
 def settings(source: str) -> dict[str, Setting]:

@@ -819,6 +819,8 @@ def main(owner: RunnerFolderOwner, run_root: Path) -> None:
         log.touch()
         TimedResult.shift_directory = log.parent
         TimedResult.select_shift_log = conf_reads.set_shift_read_log
+        previous = conf_reads.set_shift_read_log(str(log.parent / "shift-module"))
+        _ = cleanup.callback(conf_reads.set_shift_read_log, previous)
         with conf_reads.record_reads(log), preserve_child_shift_log(conf_reads.shift_child_environment):
             run_module(log, run_root, violation_log)
 
