@@ -85,6 +85,12 @@ class ImageDecision:
     time: datetime
 
 
+@dataclass(frozen=True)
+class VerifiedImageApproval:
+    line: str
+    time: datetime
+
+
 class NoImageDecision(Enum):
     OUTSIDE_STORE = auto()
     UNVERIFIED = auto()
@@ -614,28 +620,8 @@ def _answer_words(identity: str, answer: str, feedback: str) -> str:
     return summary + "\n" + feedback if feedback else summary
 
 
-def _removed_answer_message(saved: image_store.ImageAnswers, answer: str, feedback: str) -> str:
-    message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {saved['id']} was removed."
-    if feedback:
-        message += "\nFeedback: " + feedback
-    if "list_item" in saved:
-        message += "\nList item: " + saved["list_item"]
-    return message
-
-
-def _answer_message_matches(saved: image_store.ImageAnswers, message: str, answer: str, feedback: str) -> bool:
-    if message == _removed_answer_message(saved, answer, feedback):
-        return True
-    header = ANSWER_PREFIX + ANSWERS[answer]
-    if feedback:
-        header += "\nFeedback: " + feedback
-    if not message.startswith(header):
-        return False
-    link = rf"https?://[^/\n]+/{image_store.IMAGES_FOLDER}/{saved['id']}/"
-    pictures = re.compile(rf"\n(?:Image: {link}image\.[a-z]+|"
-                          + rf"Before: {link}before\.[a-z]+\nAfter: {link}after\.[a-z]+)\nTitle: ")
-    details = pictures.match(message, len(header))
-    return details is not None and pictures.search(message, details.end()) is None
+def approval_line(identity: str) -> str:
+    return _answer_words(identity, "approved", "")
 
 
 def _signed_delivery_key_matches(folder: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer,
@@ -653,30 +639,30 @@ def _signed_delivery_key_matches(folder: Path, saved: image_store.ImageAnswers, 
                for purpose in purposes for round_value in (round_id, None))
 
 
-def _completed_signed_answers(directory: Path, saved: image_store.ImageAnswers, recipients: set[str]
-                              ) -> Iterator[tuple[str, image_store.SignedImageAnswer]]:
+def _completed_signed_approvals(directory: Path, saved: image_store.ImageAnswers, recipients: set[str]
+                                ) -> Iterator[tuple[str, image_store.SignedImageAnswer]]:
     folder = directory / saved["id"]
     for position, (key, attempt) in enumerate(saved["attempts"].items()):
         signed = attempt.get("signed_answer")
-        if signed is None or set(attempt["recipients"]) != recipients or not _answer_delivered(attempt):
+        if (signed is None or signed["answer"] != "approved" or set(attempt["recipients"]) != recipients
+                or not _answer_delivered(attempt)):
             continue
-        answer, feedback = signed["answer"], signed["feedback"]
-        if (attempt.get("words") == _answer_words(saved["id"], answer, feedback)
-                and _answer_message_matches(saved, attempt["message"], answer, feedback)
+        if (attempt.get("words") == _answer_words(saved["id"], "approved", signed["feedback"])
+                and attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS["approved"]
                 and _signed_delivery_key_matches(folder, saved, signed, position, key)):
             yield key, signed
 
 
-def matches_list_answer(root: Path, identity: str, item: str, keeper: staff.StaffId,
-                        event: the_list.ImageAnswerChange) -> bool:
-    """Check the List entry against its completed Images page delivery."""
+def matches_list_approval(root: Path, identity: str, item: str, keeper: staff.StaffId,
+                          event: the_list.ImageAnswerChange) -> bool:
+    """Check the List approval against its completed Images page delivery."""
     directory = images_root(root)
     saved = image_store.find_answers(directory, identity)
     if (isinstance(saved, image_store.ImageAnswersUnavailable)
             or saved.get("list_item") != item or saved.get("list_keeper") != keeper):
         return False
-    for key, signed in _completed_signed_answers(directory, saved, {saved["owner"], event.producer}):
-        if (event.what != _answer_words(identity, signed["answer"], signed["feedback"])
+    for key, signed in _completed_signed_approvals(directory, saved, {saved["owner"], event.producer}):
+        if (event.what != _answer_words(identity, "approved", signed["feedback"])
                 or event.time != datetime.fromisoformat(signed["time"])):
             continue
         if event.key == _signed_answer_key(saved, signed):
@@ -691,24 +677,25 @@ def matches_list_answer(root: Path, identity: str, item: str, keeper: staff.Staf
     return False
 
 
-def verified_image_decision(root: Path, path: Path) -> ImageDecision | NoImageDecision:
-    """Require a completed Images page delivery for the archived decision."""
+def verified_image_approval(root: Path, path: Path) -> VerifiedImageApproval | NoImageDecision:
+    """Require a completed Images page delivery for the archived approval."""
     decision = read_image_decision(root, path)
     if isinstance(decision, NoImageDecision):
         return decision
+    if decision.answer != "approved":
+        return NoImageDecision.UNVERIFIED
     directory = images_root(root)
     saved = image_store.find_answers(directory, decision.image_id)
     if isinstance(saved, image_store.ImageAnswersUnavailable) or "list_item" in saved:
         return NoImageDecision.UNVERIFIED
     decision_key = path.stem.removeprefix(decision.image_id + "-")
-    for _, signed in _completed_signed_answers(directory, saved, {saved["owner"]}):
-        if (decision.answer, decision.feedback, decision.time) != (
-                signed["answer"], signed["feedback"], datetime.fromisoformat(signed["time"])):
+    for _, signed in _completed_signed_approvals(directory, saved, {saved["owner"]}):
+        if (decision.feedback, decision.time) != (signed["feedback"], datetime.fromisoformat(signed["time"])):
             continue
         if (decision_key == _signed_answer_key(saved, signed).removeprefix("review:")
                 or ("previous_answer_key" not in signed and "form_request_key" not in signed
                     and decision_key == _legacy_decision_key(saved, signed))):
-            return decision
+            return VerifiedImageApproval(approval_line(decision.image_id), decision.time)
     return NoImageDecision.UNVERIFIED
 
 
@@ -801,7 +788,11 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         key = form_key or draft.new_decision_key(folder, saved, round_id, len(attempts))
         previous = answered
         if record is None:
-            message = _removed_answer_message(saved, answer, feedback)
+            message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
+            if feedback:
+                message += "\nFeedback: " + feedback
+            if "list_item" in saved:
+                message += "\nList item: " + saved["list_item"]
         else:
             if not form_key:
                 legacy_key = draft.delivery_key(folder, saved, draft.round_id)

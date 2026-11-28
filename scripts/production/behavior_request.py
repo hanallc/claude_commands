@@ -134,16 +134,12 @@ def list_question_words(item: the_list.ListItem, keeper: staff.StaffId) -> Itera
 def list_image_words(event: the_list.ImageAnswerChange, item: str, keeper: staff.StaffId) -> Iterator[NateWords]:
     if event.source != the_list.IMAGE_ANSWER_SOURCE or not event.signed:
         return
-    line, _, feedback = event.what.partition("\n")
-    label, _, answer = line.partition(": ")
-    identity = label.removeprefix("Image ")
-    if (not label.startswith("Image ") or not image_store.IDENTITY.fullmatch(identity)
-            or not images.matches_list_answer(review_link.review_root(), identity, item, keeper, event)):
+    line = event.what.partition("\n")[0]
+    identity = line.partition(": ")[0].removeprefix("Image ")
+    if (not image_store.IDENTITY.fullmatch(identity) or line != images.approval_line(identity)
+            or not images.matches_list_approval(review_link.review_root(), identity, item, keeper, event)):
         return
-    if answer == images.ANSWERS["approved"]:
-        yield NateWords(line, event.time)
-    if feedback:
-        yield NateWords(feedback, event.time)
+    yield NateWords(line, event.time)
 
 
 def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
@@ -186,11 +182,9 @@ def source_words(path: Path) -> Iterator[NateWords]:
         yield from transcript_words(path)
         return
     if path.suffix == ".json":
-        decision = images.verified_image_decision(review_link.review_root(), path)
-        if isinstance(decision, images.ImageDecision):
-            yield NateWords(decision.answer, decision.time)
-            if decision.feedback:
-                yield NateWords(decision.feedback, decision.time)
+        approval = images.verified_image_approval(review_link.review_root(), path)
+        if isinstance(approval, images.VerifiedImageApproval):
+            yield NateWords(approval.line, approval.time)
         return
     if path.suffix != ".md" or path.is_symlink() or not path.is_file():
         return

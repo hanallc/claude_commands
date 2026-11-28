@@ -26,7 +26,7 @@ from scripts.review_links.test_page_question import question_outcome
 
 IMAGE = "5c6c129422b8"
 KEY = "review:" + "a" * 64
-APPROVAL = f"Image {IMAGE}: {images.ANSWERS['approved']}"
+APPROVAL = f"Image {IMAGE}: your image is approved."
 MOMENT = datetime(2026, 11, 27, 17, 18, tzinfo=UTC)
 
 
@@ -148,8 +148,7 @@ class BehaviorRequestImagesTests(TestCase):
                 image_store.write_answers(directory, wrong)
                 self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback}), {})
         image_store.write_answers(directory, answers)
-        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback}),
-                         {APPROVAL: MOMENT.date(), feedback: MOMENT.date()})
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback}), {APPROVAL: MOMENT.date()})
         entry = the_list.load(keeper, item.id).log[-1]
         assert isinstance(entry, the_list.ImageAnswerChange)
         self.assertNotEqual(entry.key, key)
@@ -218,38 +217,33 @@ class BehaviorRequestImagesTests(TestCase):
         _ = path.write_text(json.dumps({"review_message": legacy}))
         self.assertEqual(behavior_request.verified_dates(source, quotes), {})
 
-    def test_images_approval_and_feedback_have_distinct_words(self) -> None:
+    def test_images_approval_supplies_only_the_approval_line(self) -> None:
         keeper, item, source = self.new_list_item()
         feedback = "Keep the second row."
         _ = self.signed_answer(keeper, item=item.id, feedback=feedback)
         approval_note = APPROVAL + "\n" + feedback
         self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback, approval_note}),
-                         {APPROVAL: MOMENT.date(), feedback: MOMENT.date()})
+                         {APPROVAL: MOMENT.date()})
 
-    def test_images_requires_all_delivered_feedback_to_match(self) -> None:
+    def test_images_approval_verifies_when_the_subject_repeats_picture_details(self) -> None:
         keeper, item, source = self.new_list_item()
-        feedback = "Keep the second row.\nKeep the third row."
+        feedback = "Keep the second row."
         answers = self.signed_answer(keeper, item=item.id, feedback=feedback)
         key, attempt = next(iter(answers["attempts"].items()))
-        directory = images.images_root(self.root)
-        quotes = {APPROVAL, "Keep the third row."}
-        expected = {quote: MOMENT.date() for quote in quotes}
-        self.assertEqual(behavior_request.verified_dates(source, quotes), expected)
-        _, _, details = attempt["message"].partition(feedback)
-        for changed in ("Keep the second row.", "Keep the second row.\nRemove the third row.",
-                        feedback + "\nRemove the last row.", feedback + details):
-            with self.subTest(changed=changed):
-                wrong: image_store.ImageAnswer = {**attempt, "message": attempt["message"].replace(feedback, changed, 1)}
-                image_store.write_answers(directory, {**answers, "attempts": {key: wrong}})
-                self.assertEqual(behavior_request.verified_dates(source, quotes), {})
+        _, _, details = attempt["message"].partition("\nImage: ")
+        picture, _, _ = details.partition("\nFor: ")
+        message = attempt["message"].replace("\nFor: The picture\n", f"\nFor: The picture\nImage: {picture}\n", 1)
+        changed: image_store.ImageAnswer = {**attempt, "message": message}
+        image_store.write_answers(images.images_root(self.root), {**answers, "attempts": {key: changed}})
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback}), {APPROVAL: MOMENT.date()})
 
-    def test_signed_images_feedback_on_the_list_verifies_as_nates_words(self) -> None:
+    def test_signed_images_feedback_on_the_list_supplies_no_words(self) -> None:
         keeper, item, source = self.new_list_item()
         feedback = "Keep the second row."
         feedback_line = f"Image {IMAGE}: {images.ANSWERS['feedback']}"
         _ = self.signed_answer(keeper, item=item.id, action="feedback", feedback=feedback, request_id="")
-        self.assertEqual(behavior_request.verified_dates(source, {feedback_line, feedback_line + "\n" + feedback, feedback}),
-                         {feedback: MOMENT.date()})
+        quotes = {APPROVAL, feedback_line, feedback_line + "\n" + feedback, feedback}
+        self.assertEqual(behavior_request.verified_dates(source, quotes), {})
 
     def test_a_list_answer_without_the_signed_mark_cannot_verify(self) -> None:
         keeper = fixture_member("producer", name="morty")
@@ -271,17 +265,18 @@ class BehaviorRequestImagesTests(TestCase):
         feedback = "Keep the second row."
         answers = self.signed_answer(keeper, feedback=feedback)
         source, = images.decision_root(self.root).glob(f"{IMAGE}-*.json")
-        expected = {quote: MOMENT.date() for quote in ("approved", feedback)}
+        expected = {APPROVAL: MOMENT.date()}
+        quotes = {APPROVAL, "approved", feedback}
         directory = images.images_root(self.root)
         key, attempt = next(iter(answers["attempts"].items()))
         image_store.write_answers(directory, {**answers, "attempts": {key: {**attempt, "confirmed": []}}})
-        self.assertEqual(behavior_request.verified_dates(source, set(expected)), {})
+        self.assertEqual(behavior_request.verified_dates(source, quotes), {})
         image_store.write_answers(directory, answers)
-        self.assertEqual(behavior_request.verified_dates(source, set(expected)), expected)
+        self.assertEqual(behavior_request.verified_dates(source, quotes), expected)
         question = "Should we remove the second row?"
         fields = delivery_state.read_fields(source)
         _ = source.write_text(json.dumps({**fields, "image_text": question}))
-        quotes = {*expected, question}
+        quotes.add(question)
         self.assertEqual(behavior_request.verified_dates(source, quotes), expected)
         wrong_key = source.with_name(f"{IMAGE}-{'b' * 64}.json")
         _ = wrong_key.write_bytes(source.read_bytes())
