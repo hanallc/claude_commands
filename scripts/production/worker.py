@@ -2647,15 +2647,19 @@ class PreviousAnswer(Enum):
     NONE = "no answer is pending"
     UNCONFIRMED = "the transcript does not show the pending answer"
     ACCEPTED = "the transcript shows the pending answer"
+    DIFFERENT = "the transcript shows a different answer"
     NEXT_REQUEST = "the transcript shows a new request after the pending answer"
-
-
-class QuestionAnsweredByAnother(Enum):
-    RECORDED = "the Codex question was answered by another"
+    NEXT_REQUEST_AFTER_DIFFERENT = "the transcript shows a new request after a different answer"
 
 
 @dataclass(frozen=True)
-class CodexQuestionBox:
+class FreeTextQuestionBox:
+    call: str
+    question_id: str
+
+
+@dataclass(frozen=True)
+class ManualQuestionBox:
     call: str
 
 
@@ -2667,7 +2671,7 @@ class AnswerPrompt(Enum):
 class AnswerRequest:
     record_number: int
     request_digest: str
-    input_path: CodexQuestionBox | AnswerPrompt
+    input_path: FreeTextQuestionBox | ManualQuestionBox | AnswerPrompt
     previous: PreviousAnswer
 
 
@@ -2675,38 +2679,49 @@ def _answer_digest(text: str) -> str:
     return hashlib.sha256(text.strip().encode()).hexdigest()
 
 
-def _question_answer(output: object, answer_digest: object
-                     ) -> Literal[PreviousAnswer.ACCEPTED, PreviousAnswer.UNCONFIRMED] | QuestionAnsweredByAnother:
-    if not isinstance(output, str):
-        return PreviousAnswer.UNCONFIRMED
+def _question_fields(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def _question_json(value: object) -> dict[str, object]:
+    if not isinstance(value, str):
+        return {}
     try:
-        result = cast(object, json.loads(output))
+        return _question_fields(cast(object, json.loads(value)))
     except ValueError:
+        return {}
+
+
+def _question_box(call: str, arguments: object) -> FreeTextQuestionBox | ManualQuestionBox:
+    questions = _question_json(arguments).get("questions")
+    questions = cast(list[object], questions) if isinstance(questions, list) else []
+    if len(questions) == 1:
+        fields = _question_fields(questions[0])
+        question_id = fields.get("id")
+        if isinstance(question_id, str) and question_id and fields.get("options") in (None, []):
+            return FreeTextQuestionBox(call, question_id)
+    return ManualQuestionBox(call)
+
+
+def _question_answer(question: FreeTextQuestionBox, output: object, answer_digest: object) -> PreviousAnswer:
+    answers = _question_fields(_question_json(output).get("answers"))
+    if list(answers) != [question.question_id]:
         return PreviousAnswer.UNCONFIRMED
-    groups = cast(dict[str, object], result).get("answers") if isinstance(result, dict) else None
-    if not isinstance(groups, dict):
+    values = _question_fields(answers[question.question_id]).get("answers")
+    values = cast(list[object], values) if isinstance(values, list) else []
+    if len(values) != 1:
         return PreviousAnswer.UNCONFIRMED
-    answers: list[str] = []
-    notes: list[str] = []
-    for group in cast(dict[str, object], groups).values():
-        values = cast(dict[str, object], group).get("answers") if isinstance(group, dict) else None
-        if not isinstance(values, list):
-            return PreviousAnswer.UNCONFIRMED
-        for value in cast(list[object], values):
-            if not isinstance(value, str):
-                return PreviousAnswer.UNCONFIRMED
-            if value.startswith("user_note: "):
-                notes.append(value.removeprefix("user_note: "))
-            else:
-                answers.append(value)
-    recorded = [text.strip() for text in (notes or answers) if text.strip()]
-    if any(_answer_digest(script_prompt(text)) == answer_digest for text in recorded):
-        return PreviousAnswer.ACCEPTED
-    return QuestionAnsweredByAnother.RECORDED if recorded else PreviousAnswer.UNCONFIRMED
+    note = values[0]
+    if not isinstance(note, str) or not note.startswith("user_note: "):
+        return PreviousAnswer.UNCONFIRMED
+    text = note.removeprefix("user_note: ").strip()
+    if not text:
+        return PreviousAnswer.UNCONFIRMED
+    return PreviousAnswer.ACCEPTED if _answer_digest(script_prompt(text)) == answer_digest else PreviousAnswer.DIFFERENT
 
 
 def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend
-                    ) -> AnswerRequest | AnswerTranscriptUnavailable | QuestionAnsweredByAnother:
+                    ) -> AnswerRequest | AnswerTranscriptUnavailable:
     saved = worker_lifecycle.read_json_object(path)
     session = str(row.current_session)
     boundary = saved.get("record_number", 0)
@@ -2718,7 +2733,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
     source = worker_admission.transcript_source(row, backend)
     number = 0
     last: dict[str, object] = {}
-    open_questions: set[str] = set()
+    open_questions: dict[str, FreeTextQuestionBox | ManualQuestionBox] = {}
     saved_call = saved.get("question_call")
     previous = PreviousAnswer.UNCONFIRMED
     next_request = False
@@ -2742,16 +2757,14 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
             call = payload.get("call_id")
             if isinstance(call, str) and call:
                 if kind == "function_call" and payload.get("name") == "request_user_input":
-                    if number > boundary and previous is PreviousAnswer.ACCEPTED and call != saved_call:
+                    if (number > boundary and call != saved_call
+                            and previous in (PreviousAnswer.ACCEPTED, PreviousAnswer.DIFFERENT)):
                         next_request = True
-                    open_questions.add(call)
+                    open_questions[call] = _question_box(call, payload.get("arguments"))
                 elif kind == "function_call_output" and call in open_questions:
-                    if number > boundary and call == saved_call:
-                        answer = _question_answer(payload.get("output"), saved.get("answer_digest"))
-                        if isinstance(answer, QuestionAnsweredByAnother):
-                            return answer
-                        previous = answer
-                    open_questions.remove(call)
+                    closed = open_questions.pop(call)
+                    if number > boundary and call == saved_call and isinstance(closed, FreeTextQuestionBox):
+                        previous = _question_answer(closed, payload.get("output"), saved.get("answer_digest"))
         if not saved or number <= boundary:
             continue
         entry = worker_admission.transcript_entry(fields, set())
@@ -2759,16 +2772,19 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
             body = entry.removeprefix("user:\n")
             if _answer_digest(script_prompt(body)) == saved.get("answer_digest"):
                 previous = PreviousAnswer.ACCEPTED
-        elif previous is PreviousAnswer.ACCEPTED and (entry.startswith("assistant:\n") or turn_ended):
+        elif (previous in (PreviousAnswer.ACCEPTED, PreviousAnswer.DIFFERENT)
+              and (entry.startswith("assistant:\n") or turn_ended)):
             next_request = True
     if not number or number < boundary or len(open_questions) > 1:
         return AnswerTranscriptUnavailable.UNAVAILABLE
-    question = CodexQuestionBox(next(iter(open_questions))) if open_questions else AnswerPrompt.NORMAL
+    question = next(iter(open_questions.values())) if open_questions else AnswerPrompt.NORMAL
     if not saved:
         previous = PreviousAnswer.NONE
-    elif (previous is PreviousAnswer.ACCEPTED and next_request
-          and (not isinstance(question, CodexQuestionBox) or question.call != saved_call)):
-        previous = PreviousAnswer.NEXT_REQUEST
+    elif next_request and (isinstance(question, AnswerPrompt) or question.call != saved_call):
+        if previous is PreviousAnswer.ACCEPTED:
+            previous = PreviousAnswer.NEXT_REQUEST
+        elif previous is PreviousAnswer.DIFFERENT:
+            previous = PreviousAnswer.NEXT_REQUEST_AFTER_DIFFERENT
     return AnswerRequest(number, _answer_digest(json.dumps(last, sort_keys=True)), question, previous)
 
 
@@ -2802,25 +2818,26 @@ def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staf
         return _refuse_answer(name, request.value, ExitCode.UNCERTAIN)
     if owner is None:
         return _refuse_answer(name, "the owner is unavailable")
-    artifacts = CompletionArtifacts(owner, run)
-    if isinstance(request, QuestionAnsweredByAnother):
-        artifacts.unlink(path)
-        return _refuse_answer(name, request.value)
+    box = request.input_path
+    if isinstance(box, ManualQuestionBox):
+        return _refuse_answer(name, f"call {box.call}: the question needs a manual answer")
+    if request.previous is PreviousAnswer.DIFFERENT:
+        return _refuse_answer(name, f"answer delivery unknown: {request.previous.value}", ExitCode.UNCERTAIN)
     if request.previous in (PreviousAnswer.UNCONFIRMED, PreviousAnswer.ACCEPTED):
         return _refuse_answer(name, "an answer is pending for this input request", ExitCode.BUSY)
-    box = request.input_path
     submitted = text + "\n" + _done_instruction(completion_id) if ask_for_done and isinstance(box, AnswerPrompt) else text
     target = str(row.current_session)
-    answer_text = submitted.strip() if isinstance(box, CodexQuestionBox) else submitted
+    answer_text = submitted.strip() if isinstance(box, FreeTextQuestionBox) else submitted
     pending = PendingAnswer(target, request.record_number, request.request_digest, _answer_digest(script_prompt(answer_text)),
-                            box.call if isinstance(box, CodexQuestionBox) else "")
+                            box.call if isinstance(box, FreeTextQuestionBox) else "")
+    artifacts = CompletionArtifacts(owner, run)
     artifacts.write(path, json.dumps(asdict(pending)))
-    if isinstance(box, CodexQuestionBox):
+    if isinstance(box, FreeTextQuestionBox):
         def require_open_question() -> None:
             current = _answer_request(path, row, backend)
             if isinstance(current, AnswerTranscriptUnavailable):
                 raise herdr_types.HerdrFailure("the transcript cannot verify the selected Codex question")
-            if isinstance(current, QuestionAnsweredByAnother) or current.input_path != box:
+            if current.input_path != box:
                 raise herdr_types.HerdrFailure("the selected Codex question is no longer open")
 
         transport = client.answer_question(state.pane, submitted, target=target, require_open=require_open_question)
@@ -2833,12 +2850,12 @@ def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staf
         receipt = _answer_request(path, row, backend)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return _refuse_answer(name, f"answer delivery unknown: {error}", ExitCode.UNCERTAIN)
-    if isinstance(receipt, QuestionAnsweredByAnother):
-        artifacts.unlink(path)
-        return _refuse_answer(name, receipt.value)
-    if isinstance(receipt, AnswerRequest) and receipt.previous in (PreviousAnswer.ACCEPTED, PreviousAnswer.NEXT_REQUEST):
-        return ExitCode.OK
     reason = transport.reason if isinstance(transport, herdr.AnswerDeliveryUnknown) else "no receipt in the transcript"
+    if isinstance(receipt, AnswerRequest):
+        if receipt.previous in (PreviousAnswer.ACCEPTED, PreviousAnswer.NEXT_REQUEST):
+            return ExitCode.OK
+        if receipt.previous in (PreviousAnswer.DIFFERENT, PreviousAnswer.NEXT_REQUEST_AFTER_DIFFERENT):
+            reason = PreviousAnswer.DIFFERENT.value
     return _refuse_answer(name, f"answer delivery unknown: {reason}", ExitCode.UNCERTAIN)
 
 

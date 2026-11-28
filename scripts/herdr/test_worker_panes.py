@@ -4196,16 +4196,20 @@ class WorkerPaneTests(StaffTestCase):
                               "terminal may be held by editor because its stdin is unavailable")
                     self.assertEqual(send.body_text(options), f"Worker {row.name}: anomaly: {reason}\n{body}")
 
-    def test_unclaimed_unknown_pane_affects_only_the_worker_it_names(self) -> None:
-        absent = self.worker("absent")
-        named = self.worker("named")
+    def test_unreadable_pane_with_a_siblings_label_keeps_unproved_workers_uncertain(self) -> None:
+        proved = self.worker("proved")
+        sibling = self.worker("sibling")
+        unreadable = self.worker("unreadable")
         pane = "w1:p9"
-        self.world.add(self.parent, pane, live=False, label=worker_panes.agent_name(self.parent, named.name))
+        self.world.add(proved, "w1:p1")
+        self.world.add(unreadable, pane, label=worker_panes.agent_name(self.parent, sibling.name))
+        (pane_launch.record_directory() / "agents.json").unlink()
+        _ = self.world.locations[pane].pop("agent_session", None)
         self.world.unknown[pane] = "unreadable pane in the parent's tab"
         found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
-        self.assertEqual(found[absent.id], worker_panes.ClosedWorker(absent))
-        self.assertEqual(found[named.id], worker_panes.ProcessUnknownWorker(
-            named, pane, "terminal-w1:p9", "unreadable pane in the parent's tab"))
+        self.assertIsInstance(found[proved.id], worker_panes.OpenWorker)
+        self.assertIsInstance(found[unreadable.id], worker_panes.UncertainWorker)
+        self.assertIsInstance(found[sibling.id], worker_panes.UncertainWorker)
 
     def test_unreadable_worker_pane_does_not_hide_an_absent_sibling(self) -> None:
         absent = self.worker("absent")

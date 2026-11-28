@@ -614,15 +614,15 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
     parent_unreadable = not scan.found.get(parent) and any(
         launch_owners.get(item.pane) == parent for item, _ in unknown_here)
     owner = record.by_id(parent)
-    labels = {row.id: (row.name,) if owner is None else (row.name, agent_name(owner, row.name)) for row in workers}
+    names = {row.id: (row.name,) if owner is None else (row.name, agent_name(owner, row.name)) for row in workers}
     unknown_workers: dict[StaffId, ProcessUnknownWorker] = {}
     unclaimed_unreadable = False
     for item, pane in unknown_here:
         launch_owner = launch_owners.get(item.pane)
         session = _text(pane, "session_id")
-        names = (_text(pane, "label"), read.agent_names.get(item.pane, ""))
+        reported_name = read.agent_names.get(item.pane, "")
         candidates = [row for row in workers if launch_owner == row.id or session == row.current_session
-                      or (launch_owner is None and any(name in labels[row.id] for name in names))]
+                      or (launch_owner is None and not session and reported_name in names[row.id])]
         for row in candidates:
             _ = unknown_workers.setdefault(row.id, ProcessUnknownWorker(
                 row, item.pane, _text(pane, "terminal_id"), item.reason))

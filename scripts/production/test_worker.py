@@ -190,7 +190,6 @@ class DispatchAgent:
         self.question_calls: dict[str, str] = {}
         self.answers: list[tuple[str, str]] = []
         self.answer_inputs: dict[str, str] = {}
-        self.answer_enters: dict[str, int] = {}
         self.waited: list[str] = []
         self.defer_prompt_transcript = False
         self.finish_after = 0
@@ -255,9 +254,11 @@ class DispatchAgent:
         self.fixture.world.locations[pane]["agent_status"] = "done"
         self.after_complete(pane)
 
-    def question_record(self, pane: str, call: str) -> None:
+    def question_record(self, pane: str, call: str, *questions: dict[str, object]) -> None:
         self.question_calls[pane] = call
-        payload = {"type": "function_call", "call_id": call, "name": "request_user_input", "arguments": "{}"}
+        arguments = {"questions": questions or ({"id": "question", "header": "Format", "question": "Which format?"},)}
+        payload = {"type": "function_call", "call_id": call, "name": "request_user_input",
+                   "arguments": json.dumps(arguments)}
         self.append_transcript(pane, json.dumps({"type": "response_item", "payload": payload}) + "\n")
 
     def question_output(self, pane: str, answers: list[str]) -> None:
@@ -292,7 +293,6 @@ class DispatchAgent:
         def accept(pane: str, text: str, *, box: bool = False) -> None:
             del self.questions[pane]
             _ = self.answer_inputs.pop(pane, None)
-            _ = self.answer_enters.pop(pane, None)
             self.answers.append((pane, text))
             if box and pane in self.question_calls:
                 self.question_output(pane, [f"user_note: {text.strip()}"])
@@ -315,15 +315,9 @@ class DispatchAgent:
                 accept(*arguments[2:4])
             elif arguments[:2] == ("pane", "send-text") and arguments[2] in self.questions:
                 self.answer_inputs[arguments[2]] = arguments[3]
-            elif arguments[:2] == ("pane", "send-keys") and arguments[2] in self.questions:
-                pane, key = arguments[2:4]
-                if key == "shift+left":
-                    self.answer_inputs[pane] = ""
-                    self.answer_enters[pane] = 0
-                elif key == "enter":
-                    self.answer_enters[pane] += 1
-                    if self.answer_enters[pane] == 2:
-                        accept(pane, self.answer_inputs[pane], box=True)
+            elif arguments[:2] == ("pane", "send-keys") and arguments[2] in self.questions and arguments[3] == "enter":
+                pane = arguments[2]
+                accept(pane, self.answer_inputs[pane], box=True)
             return result
 
         _ = case.enterContext(patch.object(self.fixture.world, "run", side_effect=command))
@@ -4268,9 +4262,8 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
         answer_commands = [command for command in self.fixture.world.commands
                            if command[:2] in (("pane", "send-keys"), ("pane", "send-text"))]
-        self.assertEqual(answer_commands, [("pane", "send-keys", opened.pane, "shift+left"),
-            ("pane", "send-text", opened.pane, answer_text), ("pane", "send-keys", opened.pane, "enter"),
-            ("pane", "send-keys", opened.pane, "enter")] * 2)
+        self.assertEqual(answer_commands, [("pane", "send-text", opened.pane, answer_text),
+                                          ("pane", "send-keys", opened.pane, "enter")] * 2)
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.agent.waited, [])
@@ -4804,7 +4797,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command(*answer), (0, "done\n", ""))
         self.assertEqual([pane for pane, _ in self.agent.answers], [opened.pane])
 
-    def test_answer_retries_when_only_the_question_selection_key_reached_the_pane(self) -> None:
+    def test_answer_retries_when_the_question_text_command_cannot_start(self) -> None:
         opened = self.answerable_worker()
         self.agent.question_record(opened.pane, "format")
         answer = ("answer", "impl", "--text", "Use JSON.")
@@ -4821,8 +4814,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
         self.assertIn("did not submit: the text command could not start", error)
         self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
-        self.assertEqual([command for command in world.commands if command[:2] in (
-            ("pane", "send-keys"), ("pane", "send-text"))], [("pane", "send-keys", opened.pane, "shift+left")])
+        self.assertFalse(any(command[:2] in (("pane", "send-keys"), ("pane", "send-text"))
+                             for command in world.commands))
         self.assertEqual(self.command(*answer), (0, "done\n", ""))
         self.assertEqual(self.agent.answers, [(opened.pane, "Use JSON.")])
 
@@ -4869,26 +4862,37 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(("pane", "send-keys", opened.pane, "enter"), world.commands)
         self.assertEqual(len(list(self.run_dir.glob(".*.pending-answer.json"))), 1)
 
-    def test_answer_reports_a_different_answer_to_the_same_call_and_clears_the_record(self) -> None:
+    def test_answer_keeps_the_pending_record_after_a_different_answer(self) -> None:
         opened = self.answerable_worker()
         self.agent.question_record(opened.pane, "format")
         world = self.fixture.world
-        send_keys = world._send_keys  # pyright: ignore[reportPrivateUsage]
+        transport = world.run
+        queued: list[tuple[str, ...]] = []
 
-        def replace_answer(pane: str, *keys: str, **checks: Callable[[], None]) -> None:
-            if keys == ("enter",) and self.agent.answer_enters[pane] == 0:
-                self.agent.question_output(pane, ["Use JSON.", "user_note: Use Markdown."])
-            send_keys(pane, *keys, **checks)
+        def queue_enter(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments == ("pane", "send-keys", opened.pane, "enter"):
+                queued.append(arguments)
+                self.agent.question_output(opened.pane, ["user_note: Use Markdown."])
+                raise subprocess.TimeoutExpired(arguments, 1)
+            return transport(*arguments, deadline=deadline)
 
-        with patch.object(world, "_send_keys", side_effect=replace_answer):
+        with patch.object(world, "run", side_effect=queue_enter):
             code, output, error = self.command("answer", "impl", "--text", "Use JSON.")
-        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-        self.assertIn("answered by another", error)
-        self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
-        self.assertNotIn(("pane", "send-keys", opened.pane, "enter"), world.commands)
+        self.assertEqual(queued, [("pane", "send-keys", opened.pane, "enter")])
+        self.assertEqual((code, output), (worker.ExitCode.UNCERTAIN, ""))
+        self.assertIn("delivery unknown: the transcript shows a different answer", error)
+        (pending,) = self.run_dir.glob(".*.pending-answer.json")
+        saved = pending.read_bytes()
+        with (patch.object(world, "answer_question", wraps=world.answer_question) as box,
+              patch.object(world, "answer_prompt", wraps=world.answer_prompt) as prompt):
+            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON.")[0], worker.ExitCode.UNCERTAIN)
+        box.assert_not_called()
+        prompt.assert_not_called()
+        self.assertEqual(pending.read_bytes(), saved)
         _ = self.agent.answer_inputs.pop(opened.pane)
         self.agent.question_record(opened.pane, "indent")
         self.assertEqual(self.command("answer", "impl", "--text", "Use two spaces."), (0, "done\n", ""))
+        self.assertNotEqual(pending.read_bytes(), saved)
 
     def test_answer_checks_a_late_call_output_before_sending_again(self) -> None:
         opened = self.answerable_worker()
@@ -4905,13 +4909,50 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.command(*answer)[0], worker.ExitCode.UNCERTAIN)
         self.agent.append(opened.pane, "user", "Use JSON.")
         self.assertEqual(self.command(*answer)[0], worker.ExitCode.BUSY)
+        (pending,) = self.run_dir.glob(".*.pending-answer.json")
+        saved = pending.read_bytes()
         self.agent.question_output(opened.pane, ["user_note: Use Markdown."])
         with (patch.object(world, "answer_question", wraps=world.answer_question) as box,
               patch.object(world, "answer_prompt", wraps=world.answer_prompt) as prompt):
             code, output, error = self.command(*answer)
-        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
-        self.assertIn("answered by another", error)
+        self.assertEqual((code, output), (worker.ExitCode.UNCERTAIN, ""))
+        self.assertIn("delivery unknown", error)
+        self.assertEqual(pending.read_bytes(), saved)
+        box.assert_not_called()
+        prompt.assert_not_called()
+
+    def test_answer_leaves_an_option_question_for_manual_input(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "choose-format", {
+            "id": "format", "header": "Format", "question": "Which format?",
+            "options": [{"label": "Use JSON.", "description": "Send structured data."}],
+        })
+        self.assert_manual_answer("choose-format")
         self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+
+    def test_answer_leaves_a_call_with_two_questions_for_manual_input(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "format")
+        self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        (pending,) = self.run_dir.glob(".*.pending-answer.json")
+        saved = pending.read_bytes()
+        self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
+        self.agent.questions[opened.pane] = "How do I format the file?"
+        self.agent.question_record(opened.pane, "format-details",
+            {"id": "format", "header": "Format", "question": "Which format?"},
+            {"id": "indent", "header": "Indent", "question": "Which indent?",
+             "options": [{"label": "Two spaces", "description": "Indent with two spaces."}]})
+        self.assert_manual_answer("format-details")
+        self.assertEqual(pending.read_bytes(), saved)
+
+    def assert_manual_answer(self, call: str) -> None:
+        world = self.fixture.world
+        with (patch.object(world, "answer_question", wraps=world.answer_question) as box,
+              patch.object(world, "answer_prompt", wraps=world.answer_prompt) as prompt):
+            code, output, error = self.command("answer", "impl", "--text", "Use JSON.")
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("the question needs a manual answer", error)
+        self.assertIn(call, error)
         box.assert_not_called()
         prompt.assert_not_called()
 

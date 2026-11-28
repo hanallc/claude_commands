@@ -3615,29 +3615,27 @@ class Herdr:
 
     def answer_question(self, pane: str, text: str, *, target: str,
                         require_open: Callable[[], None]) -> AnswerTransport:
-        """Answer a Codex question through the selected session's input box."""
+        """Answer one free-text question in the selected Codex session."""
         if not target:
             return AnswerDidNotSubmit(f"{pane}: would send keys without a named target session")
+
+        def require_target(expected: str) -> None:
+            if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
+                                pane_info=self.pane_row(pane), client=self):
+                raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+
         may_have_typed = False
         try:
-            for index, key in enumerate(("shift+left", "enter", "enter")):
-                expected = "" if index == 0 else text
-                if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
-                                    pane_info=self.pane_row(pane), client=self):
-                    raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-                require_open()
-                if index:
-                    self._send_keys(pane, key, before_send=require_open)
-                else:
-                    self._send_keys(pane, key)
-                    script_prompts.record(pane, text)
-                    require_open()
-                    may_have_typed = True
-                    try:
-                        _ = self.run("pane", "send-text", pane, text)
-                    except HerdrCommandNotStarted:
-                        may_have_typed = False
-                        raise
+            require_target("")
+            script_prompts.record(pane, text)
+            require_open()
+            may_have_typed = True
+            try:
+                _ = self.run("pane", "send-text", pane, text)
+            except HerdrCommandNotStarted as error:
+                return AnswerDidNotSubmit(str(error))
+            require_target(text)
+            self._send_keys(pane, "enter", before_send=require_open)
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             if may_have_typed:
                 return AnswerDeliveryUnknown(str(error))
