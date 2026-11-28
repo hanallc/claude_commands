@@ -58,6 +58,7 @@ from scripts.agents.remote import local_machine
 from scripts.build_queue import admission_wire, kill_action, memory_feed, memory_files
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result, session_send
+from scripts.review_links.test_for_you import comparison_cache_details
 from scripts.review_links.test_page_question import question_outcome
 from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
@@ -7056,17 +7057,167 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"available": False, "partial": True, "other_count": 1,
                                            "rebuild_machines": ["mac"], "rebuild_reasons": reasons})
 
+    def test_for_you_routes_keep_action_count_when_the_observed_needs_lock_path_is_invalid(self) -> None:
+        _ = write_config_fixture(conf.path("statusline"), "rebuild.cache=/\n")
+        for machine in rebuild_row.MACHINES:
+            with self.subTest(machine=machine):
+                with patch.dict(os.environ, {"FOR_YOU_ACTIONS_DIR": str(self.root.parent / f"actions-{machine}")}):
+                    action = ActionStore().add(
+                        title="Restore access", command="github-warmup", machine=machine, cwd="/fixture",
+                        requested_by="staff-fixture", reason="Access is required.", waits="Release",
+                        concerns="console", dedupe_key="restore-access")
+                    with redirect_stderr(StringIO()) as log:
+                        reply = self.request("/console/for-you.json")
+                        count = self.request("/console/for-you.json?view=count")
+                self.assertEqual((reply.status, count.status), (200, 200))
+                payload = cast(console.ForYouPayload, json.loads(reply.body))
+                self.assertIs(payload["available"], True)
+                assert payload["available"] is True
+                self.assertEqual((payload["count"], payload.get("partial")), (1, True))
+                self.assertEqual([entry["key"] for entry in payload["entries"]], [action.key])
+                self.assertEqual(json.loads(count.body),
+                                 {"available": True, "count": 1, "other_count": 1, "rebuild_machines": []})
+                self.assertIn("rebuild observed needs:", log.getvalue())
+
+    def test_for_you_routes_keep_the_other_machines_count_when_a_lock_close_fails(self) -> None:
+        config = conf.path("statusline")
+        cache = self.root.parent / "rebuild-cache"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        expected = rebuild_row.ExpectedSystems("a" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                                               "/nix/store/expected-natedev", "/nix/store/expected-mac")
+        open_path = Path.open
+        for machine, other in (("mac", "natedev"), ("natedev", "mac")):
+            with self.subTest(machine=machine):
+                observed = {machine: expected.path_for(machine), other: f"/nix/store/older-{other}"}
+                details = comparison_cache_details(expected, observed, rebuild_row.RunningSystemProbes(True, True))
+                _ = cache.write_text(f"rebuild {other}\n9999999999\n{config}\n{details}\n", encoding="utf-8")
+                lock_path = rebuild_row.observed_need_path(cache, machine).with_suffix(".lock")
+                closed = 0
+
+                def open_with_close_error(path: Path, mode: str = "r", buffering: int = -1,
+                                          encoding: str | None = None, errors: str | None = None,
+                                          newline: str | None = None) -> IO[str]:
+                    stream = open_path(path, mode, buffering, encoding, errors, newline)
+                    if path == lock_path:
+                        close = stream.close
+
+                        def fail_close() -> None:
+                            nonlocal closed
+                            close()
+                            closed += 1
+                            raise OSError(errno.EIO, "Fixture lock close failed.")
+
+                        setattr(stream, "close", fail_close)
+                    return stream
+
+                with (patch.object(Path, "open", autospec=True, side_effect=open_with_close_error),
+                      redirect_stderr(StringIO()) as log):
+                    reply = self.request("/console/for-you.json")
+                    count = self.request("/console/for-you.json?view=count")
+                self.assertEqual(closed, 2)
+                self.assertEqual((reply.status, count.status), (200, 200))
+                payload = cast(console.ForYouPayload, json.loads(reply.body))
+                self.assertIs(payload["available"], True)
+                assert payload["available"] is True
+                self.assertEqual((payload["count"], payload.get("partial")), (1, True))
+                self.assertEqual([entry["key"] for entry in payload["entries"]], [f"rebuild/{other}"])
+                count_payload = cast(dict[str, object], json.loads(count.body))
+                self.assertEqual((count_payload["available"], count_payload["count"], count_payload["rebuild_machines"]),
+                                 (True, 1, [other]))
+                self.assertEqual(log.getvalue().count(f"{cache}: {machine}: [Errno 5] Fixture lock close failed."), 2)
+                self.assertNotIn(f"{cache}: {other}:", log.getvalue())
+
+    def test_for_you_route_reports_the_last_observed_mac_system(self) -> None:
+        config = conf.path("statusline")
+        cache = self.root.parent / "rebuild-cache"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        expected = rebuild_row.ExpectedSystems("a" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                                               "/nix/store/current-natedev", "/nix/store/expected-mac")
+        details = comparison_cache_details(expected, {"natedev": expected.natedev},
+                                           rebuild_row.RunningSystemProbes(True, False))
+        saved = f"\n9999999999\n{config}\n{details}\n"
+        _ = cache.write_text(saved, encoding="utf-8")
+        mac = rebuild_row.ComparedChanges("/nix/store/older-mac", "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": asdict(mac)}), encoding="utf-8")
+        with (patch.object(subprocess, "run", side_effect=AssertionError("The count route ran a command.")),
+              redirect_stderr(StringIO()) as log):
+            reply = self.request("/console/for-you.json")
+            self.assertEqual(self.request("/console/for-you.json").body, reply.body)
+            status, _, body = self.head("/console/for-you.json?view=count")
+        self.assertNotIn("rebuild comparison", log.getvalue())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"available": True, "count": 1, "other_count": 0,
+                                           "rebuild_machines": ["mac"],
+                                           "rebuild_reasons": {"mac": rebuild_row.CHANGES_NOT_READ}})
+        self.assertEqual(cache.read_text(encoding="utf-8"), saved)
+        self.assertEqual(reply.status, 200)
+        payload = cast(dict[str, object], json.loads(reply.body))
+        self.assertEqual((payload.get("available"), payload.get("count"), payload.get("stale")), (True, 1, True))
+        entries = cast(list[dict[str, object]], payload["entries"])
+        self.assertEqual([entry["key"] for entry in entries], ["rebuild/mac"])
+
+    def test_review_has_the_rebuild_card_named_by_the_stale_for_you_route(self) -> None:
+        case = self.review_fixture()
+        config = conf.path("statusline")
+        cache = case.root.parent / "rebuild-comparison"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        expected = rebuild_row.ExpectedSystems("a" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                                               "/nix/store/current-natedev", "/nix/store/expected-mac")
+        details = comparison_cache_details(expected, {"natedev": expected.natedev},
+                                           rebuild_row.RunningSystemProbes(True, False))
+        _ = cache.write_text(f"\n9999999999\n{config}\n{details}\n", encoding="utf-8")
+        mac = rebuild_row.ComparedChanges("/nix/store/older-mac", "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": asdict(mac)}), encoding="utf-8")
+        with patch.object(subprocess, "run", side_effect=AssertionError("The reader ran a command.")):
+            reply = self.request("/console/for-you.json")
+            snapshot = review_page.build_snapshot(case.root)
+        self.assertEqual(reply.status, 200)
+        payload = cast(dict[str, object], json.loads(reply.body))
+        entries = cast(list[dict[str, str]], payload["entries"])
+        key = entries[0]["key"]
+        self.assertEqual((key, payload["stale"]), ("rebuild/mac", True))
+        self.assertIn(key, snapshot.records)
+        self.assertIn(b"Rebuild mac", snapshot.body(key))
+
+    def test_review_and_notifier_keep_the_same_actions_when_staff_is_unreadable(self) -> None:
+        case = self.review_fixture()
+        config = conf.path("statusline")
+        cache = case.root.parent / "rebuild-comparison"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        expected = rebuild_row.ExpectedSystems("a" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                                               "/nix/store/current-natedev", "/nix/store/expected-mac")
+        details = comparison_cache_details(expected, {"natedev": expected.natedev, "mac": "/nix/store/older-mac"},
+                                           rebuild_row.RunningSystemProbes(True, True))
+        _ = cache.write_text(f"rebuild mac\n9999999999\n{config}\n{details}\n", encoding="utf-8")
+        action = ActionStore().add(title="Restore access", command="github-warmup", machine="mac",
+                                   cwd="/fixture", requested_by="staff-fixture", reason="Access is required.",
+                                   waits="Release", concerns="console", dedupe_key="restore-access")
+        with (patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("Fixture staff failure.")),
+              patch.object(subprocess, "run", side_effect=AssertionError("The reader ran a command."))):
+            reply = self.request("/console/for-you.json")
+            snapshot = review_page.build_snapshot(case.root)
+        self.assertEqual(reply.status, 200)
+        payload = cast(dict[str, object], json.loads(reply.body))
+        entries = cast(list[dict[str, str]], payload["entries"])
+        keys = {entry["key"] for entry in entries}
+        self.assertEqual((payload["count"], keys), (2, {action.key, "rebuild/mac"}))
+        self.assertEqual({key for key, item in snapshot.records.items() if item.type == review_items.ReviewType.FOR_YOU},
+                         keys)
+        self.assertIn(b"Rebuild mac", snapshot.body("rebuild/mac"))
+        self.assertIn(b"Restore access", snapshot.body(action.key))
+        self.assertIn("staff: Fixture staff failure.", snapshot.action_notices)
+
     def test_mac_status_line_renders_the_cached_reason_from_the_count_route(self) -> None:
         configuration = conf.path("statusline")
         cache = self.root.parent / "rebuild-cache"
         _ = write_config_fixture(configuration, f"rebuild.cache={cache}\n")
         running = "/nix/store/running-mac"
         configured = "a" * 40
-        paths = {"natedev": "/nix/store/current-linux", "mac": "/nix/store/configured-mac"}
-        details = {"commit": configured, "source": ["/etc/nixos", "main", "natedev", "MacBook-Pro"], **paths,
-                   "running_system_probes": {"natedev": True, "mac": True},
-                   "running_system_paths": {**paths, "mac": running}}
-        _ = cache.write_text(f"rebuild mac\n9999999999\n{configuration}\n{json.dumps(details)}\n", encoding="utf-8")
+        systems = rebuild_row.ExpectedSystems(configured, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                                              "/nix/store/current-linux", "/nix/store/configured-mac")
+        details = comparison_cache_details(systems, {"natedev": systems.natedev, "mac": running},
+                                           rebuild_row.RunningSystemProbes(True, True))
+        _ = cache.write_text(f"rebuild mac\n9999999999\n{configuration}\n{details}\n", encoding="utf-8")
         at = "2026-11-21T12:00:00Z"
         subject = "Update the editor " + "x" * 65
         commits = (rebuild_row.Change(configured, at, subject, ""),
