@@ -9,10 +9,9 @@ except FileNotFoundError:
 
 import json
 import sys
-from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.hooks.hook_budget import pause_state_root, print_hook_error, run_hook_with_budget
+from scripts.hooks.hook_budget import print_hook_error, record_path, run_hook_with_budget, scheduled_prompts_path
 
 
 class ScheduledWakeup(TypedDict):
@@ -29,14 +28,6 @@ class StopPayload(TypedDict, total=False):
     session_crons: list[ScheduledWakeup]
 
 
-def pause_record_path(session_id: str) -> Path:
-    return pause_state_root() / f"{session_id}.json"
-
-
-def scheduled_prompts_path(session_id: str) -> Path:
-    return pause_record_path(session_id).parent / "scheduled-prompts" / f"{session_id}.json"
-
-
 def main(*, budgeted: bool = False) -> None:
     payload = cast(StopPayload, json.loads(sys.stdin.read()))
     if "agent_id" in payload:
@@ -50,24 +41,24 @@ def main(*, budgeted: bool = False) -> None:
     )
     marks_reply_ended = (
         not payload.get("stop_hook_active", False)
-        and pause_record_path(session_id).exists()
+        and record_path(session_id).exists()
     )
     if not records_scheduled_prompts and not marks_reply_ended:
         return
 
     def record_stop() -> None:
-        from scripts.hooks import conversation_pause
+        from scripts.hooks import pause_record
 
         if records_scheduled_prompts:
-            conversation_pause.record_scheduled_prompts(
+            pause_record.record_scheduled_prompts(
                 session_id,
-                tuple(conversation_pause.ScheduledTaskPrompt(
+                tuple(pause_record.ScheduledTaskPrompt(
                     wakeup["id"], wakeup["prompt"], wakeup["recurring"]
                 ) for wakeup in wakeups),
             )
         if marks_reply_ended:
-            conversation_pause.mark_reply_ended(
-                session_id, conversation_pause.now_epoch()
+            pause_record.mark_reply_ended(
+                session_id, pause_record.now_epoch()
             )
 
     if budgeted:
