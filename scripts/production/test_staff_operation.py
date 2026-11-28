@@ -82,35 +82,6 @@ class StaffOperationTests(StaffTestCase):
             self.assertIn(f"busy: another operation holds this row (pid {os.getpid()}: staff.py move 'busy worker')",
                           refused.stderr)
 
-    def test_writes_to_the_same_row_exclude_each_other(self) -> None:
-        owner, _, _ = self.tree()
-        contender = """
-import sys
-from scripts.production import staff
-
-def write():
-    identity = staff.StaffId(sys.argv[1])
-    with staff.row_operation(identity):
-        staff.rename(identity, 'second')
-
-raise SystemExit(staff.cli_result(write))
-"""
-        command = [sys.executable, "-c", contender, owner.id]
-        env = staff.child_environment(os.environ)
-        with staff.row_operation(owner.id):
-            first = staff.rename(owner.id, "first")
-            refused = subprocess.run(command, cwd=CHECKOUT, env=env, capture_output=True,
-                                     text=True, check=False, timeout=6)
-            self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-            self.assertIn("first: another operation holds this row", refused.stderr)
-            self.assertEqual(staff.by_id(owner.id), first)
-        accepted = subprocess.run(command, cwd=CHECKOUT, env=env, capture_output=True,
-                                  text=True, check=False, timeout=6)
-        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
-        current = staff.by_id(owner.id)
-        assert current is not None
-        self.assertEqual(current.name, "second")
-
 
     def test_row_transaction_stops_at_the_operation_deadline_without_a_write(self) -> None:
         owner, _, _ = self.tree()

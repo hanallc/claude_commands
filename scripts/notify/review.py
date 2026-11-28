@@ -29,7 +29,7 @@ import time
 import threading
 from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -251,11 +251,6 @@ Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 
 @dataclass(frozen=True)
-class QuestionTitleChange:
-    former_title: str
-
-
-@dataclass(frozen=True)
 class QuestionKey:
     name: str
     text: str
@@ -263,7 +258,6 @@ class QuestionKey:
     # The source draft selects an approval within the request's verdict record.
     console_draft_digest: str = field(default="", compare=False, repr=False)
     console_title: str = field(default="", compare=False, repr=False)
-    title_change: QuestionTitleChange | Literal["keep title"] = field(default="keep title", compare=False, repr=False)
 
     @property
     def digest(self) -> str:
@@ -1178,10 +1172,6 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
         scope = (*scope, context.console_kind)
     folder = state_path() / "question-verdicts"
     path = folder / f"{question_part_digest(scope)}.json"
-    former_path = path
-    if question and not key.request_key and isinstance(key.title_change, QuestionTitleChange):
-        former_scope = (key.name, "title", key.title_change.former_title)
-        former_path = folder / f"{question_part_digest(former_scope)}.json"
     rules = question_part_digest((prompt, fingerprint_schema, CODE_RULES, PART_RULES, review_date_and_zone))
     line_rules = question_part_digest((system_prompt, part_system_prompt, SCHEMA, LEGACY_PART_REVIEW_SCHEMA,
                                       CODE_RULES, PART_RULES, review_date_and_zone, context.caption_layout,
@@ -1193,14 +1183,7 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
                      for number, part in enumerate(parts, 1)} if question else {})
 
     try:
-        with ExitStack() as locks:
-            for record_path in sorted({path, former_path}):
-                locks.enter_context(lock_question_verdicts(record_path, deadline))
-            if former_path != path:
-                try:
-                    _ = former_path.replace(path)
-                except FileNotFoundError:
-                    pass
+        with lock_question_verdicts(path, deadline):
             try:
                 saved = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
             except FileNotFoundError:

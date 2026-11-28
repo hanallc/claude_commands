@@ -24,7 +24,7 @@ from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
-from scripts.review_links import images, list_draft, question_record, reply_proofs, review_events
+from scripts.review_links import list_draft, question_record, reply_proofs, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -160,25 +160,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
         self.assertEqual(code, 0, output)
         prompt = cast(str, runner.call_args.args[1])
-        checker_root = Path(behavior_review.__file__).resolve().parents[2]
-        self.assertEqual(runner.call_args.kwargs["cwd"], self.repo)
-        self.assertIn(f"The checker's code root is `{checker_root}`.", prompt)
-        self.assertIn(f"`{checker_root}/scripts/production/update_registration.py`", prompt)
-        self.assertIn(f"`{checker_root}/scripts/lib/transcripts.py`", prompt)
         self.assertIn("`with contextlib.closing(transcript_lines(Path(path))) as lines:`", prompt)
-
-        _ = self.write(self.repo / "scripts/__init__.py", 'raise ImportError("The checked repo supplied scripts.")\n')
-        temp = self.root / "read-only-temp"
-        temp.mkdir()
-        temp.chmod(0o555)
-        self.addCleanup(temp.chmod, 0o755)
-        command = prompt.split("```sh\n", 1)[1].split("\n```", 1)[0]
-        result = self.run_in_repo(
-            "env", f"TMPDIR={temp}", f"TMPPREFIX={temp / 'zsh'}", f"PYTHONPATH={self.repo}", "zsh", "-fc", command,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [str(checker_root / "scripts/lib/transcripts.py"),
-                                                      str(checker_root / "scripts/production/update_registration.py")])
+        self.assertIn("Import `transcript_lines` from `scripts.lib.transcripts`.", prompt)
 
     def test_reviewer_prompt_requires_a_quote_from_one_source_message(self) -> None:
         args, _ = self.changed_range()
@@ -194,9 +177,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)
-        review_root = self.root / "review-links"
-        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(review_root)}),
-              mock.patch.object(astra_review, "run_review", return_value=0) as runner):
+        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
             code, output = self.cli("run", *args)
             self.assertEqual(code, 0, output)
             self.assertEqual(self.cli("run", *args), (0, output))
@@ -209,12 +190,6 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Never call `write_stdin`.", prompt)
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
-        self.assertIn(f"Nate's Images page answers in {images.decision_root(review_root)}/*.json.", prompt)
-        self.assertIn('the source is "nate via Images" and `image_answer.signed` is true.', prompt)
-        self.assertIn("Use `image_text` for context. Quote only its approval line, `Image <id>: your image is approved.`", prompt)
-        self.assertNotIn("quote only Nate's feedback", prompt)
-        self.assertIn("Count only a decision whose `answer` is `approved`.", prompt)
-        self.assertIn("You can cite Nate's Images page answer from the store or the List log.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
         self.assertIn("saved question answer.", prompt)
         self.assertIn('Use "specified" when you find words to assess', prompt)
@@ -255,10 +230,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def split_range(self, shared_text: str) -> tuple[list[str], str]:
         config = self.root / "config"
         _ = self.write(config / "production.conf", "# whole: 1..\nreview_part_bytes=2400\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(config),
-            "REVIEW_LINKS_ROOT": str(self.root / "review-links"),
-        })))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
         first = f"def test_move():\n    assert 'old {'a' * 190}'\n\ndef test_stop():\n    assert 'old {'b' * 190}'\n"
         second = f"def test_start():\n    assert 'old {'c' * 310}'\n"
         _ = self.write(self.repo / "test_first.py", first)
@@ -414,41 +386,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         self.assertEqual(self.cli("status", "--key", key)[0], 1)
 
-    def test_split_review_reports_json_blockers_with_and_without_a_source(self) -> None:
-        args, key = self.split_range("VALUE = 'new'\n")
-        blockers = {
-            "test_first.py": {"blocker": "I could not read the transcript."},
-            "test_second.py": {"blocker": "The transcript reader raised ImportError.", "source": "/scripts/lib/transcripts.py"},
-        }
-
-        def review_part(reply: Path, _prompt: str, _log: Path, **_options: object) -> int:
-            test_file = self.part_tests(reply.parent)[0].split("::", 1)[0]
-            payload = json.dumps([blockers[test_file]])
-            _ = self.write(reply, f"```json\n{payload}\n```\nDONE fixture-pass\n")
-            return 0
-
-        with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
-              mock.patch.object(astra_review, "run_review", side_effect=review_part)):
-            code, output = self.cli("run", *args)
-
-        self.assertEqual(code, 1, output)
-        self.assertIn("The reviewer could not complete part 1: I could not read the transcript.\n", output)
-        self.assertIn("The reviewer could not complete part 2: The transcript reader raised ImportError.\n", output)
-        self.assertNotIn("Invalid reviewer reply", output)
-        self.assertIs(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
-
-    def test_json_blocker_rejects_fields_other_than_blocker_and_source(self) -> None:
-        for reply in ('[{"blocker":"cannot read","extra":"value"}]',
-                      '[{"blocker":"cannot read","test":"x","finding":"none"}]'):
-            with self.subTest(reply=reply), self.assertRaisesRegex(behavior_check.BehaviorCheckError, "Invalid reviewer reply"):
-                _ = behavior_review.read_findings(reply)
-
     def test_split_review_indexes_a_large_shared_diff(self) -> None:
         args, key = self.split_range(f"VALUE = '{'new' * 1500}'\n")
 
         def review_part(reply: Path, prompt: str, _log: Path, **_options: object) -> int:
             self.assertIn("Read the diffs for the listed tests and the files those tests exercise.", prompt)
-            self.assertIn(f"Nate's Images page answers in {images.decision_root(self.root / 'review-links')}/*.json.", prompt)
             folder = reply.parent
             index = folder / "diffs" / "index.json"
             paths = cast(dict[str, str], json.loads(index.read_text()))

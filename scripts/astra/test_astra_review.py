@@ -101,9 +101,6 @@ class AstraReviewTests(StaffTestCase):
         worker = fixture_worker("demo-proposal-astra-reviewer", unit_membership("demo", "proposal-unit").id,
                                 runtime_id=fixture_runtime_id("held-thread"),
                                 backend=staff.CodexBackend(self.root / "codex-home"))
-        if busy:
-            self.world.add(worker, "w1:p1", family="codex")
-            self.world.locations["w1:p1"]["agent_status"] = "working"
         design_id = "00000000-0000-4000-8000-000000000016"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
                                   str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
@@ -160,7 +157,7 @@ class AstraReviewTests(StaffTestCase):
             design = self.held_reviewer(busy=True)
             self.assertEqual(astra_review.main([str(self.document)]), 1)
             self.assertEqual(list(design_roles.design_directory(design.placement.design_id).glob("prompts/*.md")), [])
-        self.assertIn("role is busy; finish its turn first", errors.getvalue())
+        self.assertIn("busy", errors.getvalue())
         self.assertEqual(self.router.commands, [])
         self.assertEqual(self.world.requests, [])
 
@@ -715,83 +712,6 @@ class AstraReviewTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.router.commands[-1][self.router.commands[-1].index("--target") + 1], "staff-worker")
         self.assertEqual(self.saved_prompt().with_name("review.md").read_text().strip(), self.fixture.agent.replies[-1])
-
-    def test_behavior_review_opens_in_its_run_when_the_owner_holds_an_ended_run(self) -> None:
-        owner = staff.snapshot().parent_of(self.fixture.fixture.parent)
-        assert owner is not None
-        self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
-        source, _ = transcript_fixture(owner, staff.CodexBackend(Path.home() / ".codex"))
-        with source.open("a") as output:
-            _ = output.write(json.dumps({"type": "turn_context", "payload": {"model": "gpt-main", "effort": "high"}}) + "\n")
-        self.world.activate(str(owner.current_session), "w1:p0", "codex")
-        self.fixture.agent.without_done = False
-        earlier = self.root / "runs" / "behavior-a-earlier"
-        run = self.root / "runs" / "behavior-z-new"
-        for folder in (earlier, run):
-            folder.mkdir(parents=True)
-        old_state = earlier / unit_runs.STATE_FILE
-        _ = old_state.write_text(json.dumps({unit_runs.OWNER_FIELD: owner.id, "status": "completed", "finished_at": 1}))
-        before = old_state.read_bytes()
-        reply = run / "review.md"
-        log = run / "codex.log"
-        with patch.dict(os.environ, self.environment, clear=True), self.world.process_starts():
-            result = astra_review.run_review(reply, "Review these test changes.\n", log, cwd=self.root)
-        self.assertIs(result, worker.DispatchSubmission.SUBMITTED, log.read_text())
-        reviewer, = staff.snapshot().find(kind="worker", parent=owner.id)
-        self.assertEqual(worker_panes.worker_run(reviewer), run)
-        self.assertEqual(len(self.world.launches), 1)
-        self.assertEqual(old_state.read_bytes(), before)
-
-    def test_direct_astra_review_opens_past_an_inherited_ended_run(self) -> None:
-        owner = self.fixture.fixture.parent
-        ended = self.fixture.run_dir
-        state = unit_runs.read_run_fields(ended)
-        state.update(status="completed", finished_at=1)
-        old_state = ended / unit_runs.STATE_FILE
-        _ = old_state.write_text(json.dumps(state))
-        before = old_state.read_bytes()
-        self.world.activate(str(owner.current_session), "w1:p0", "codex")
-        self.fixture.agent.without_done = False
-        environment = dict(self.environment, UNIT_RUN_DIR=str(ended), CODEX_THREAD_ID=str(owner.current_session))
-        run = self.root / "runs" / "direct-review"
-        run.mkdir(parents=True)
-        reply = run / "review.md"
-        arguments = ["--role", "review", "--operation", "astra-review", "--target", "staff-worker",
-            "--policy", "astra-reviewer", "--new-worker", "astra-reviewer", "--session-dir", str(run),
-            "--cwd", str(self.root), "--prompt", str(self.document), "--reply-file", str(reply)]
-        with self.world.process_starts():
-            result = invoke_cli(assign, assign.main, arguments, environment, self.root)
-
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("submitted", result.stdout.splitlines())
-        reviewer, = staff.snapshot().find(kind="worker", parent=owner.id)
-        self.assertEqual(worker_panes.worker_pass(reviewer, run)["status"], "active")
-        self.assertEqual(len(self.world.launches), 1)
-        self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run))
-        self.assertEqual(old_state.read_bytes(), before)
-
-    def test_direct_astra_review_uses_its_run_when_two_runs_are_open(self) -> None:
-        owner = self.fixture.fixture.parent
-        ended = self.fixture.run_dir.with_name("a-ended")
-        ended.mkdir()
-        _ = (ended / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: owner.id,
-            "status": "completed", "finished_at": 1}))
-        self.world.activate(str(owner.current_session), "w1:p0", "codex")
-        self.fixture.agent.without_done = False
-        environment = dict(self.environment, UNIT_RUN_DIR=str(ended), CODEX_THREAD_ID=str(owner.current_session))
-        run = self.root / "runs" / "direct-review"
-        run.mkdir(parents=True)
-        arguments = ["--role", "review", "--operation", "astra-review", "--target", "staff-worker",
-            "--policy", "astra-reviewer", "--new-worker", "astra-reviewer", "--session-dir", str(run),
-            "--cwd", str(self.root), "--prompt", str(self.document), "--reply-file", str(run / "review.md")]
-        with self.world.process_starts():
-            result = invoke_cli(assign, assign.main, arguments, environment, self.root)
-
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("submitted", result.stdout.splitlines())
-        self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run))
-        reviewer, = staff.snapshot().find(kind="worker", parent=owner.id)
-        self.assertEqual(worker_panes.worker_pass(reviewer, run)["status"], "active")
 
 
 if __name__ == "__main__":

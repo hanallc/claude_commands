@@ -6,15 +6,13 @@ import hashlib
 import hmac
 import html
 import json
-import re
 import secrets
 import shutil
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum, auto
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast, override
@@ -25,7 +23,7 @@ from scripts.notify.review import CaptionLayout
 
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
-from scripts.production.delivery_state import QuestionSendState, read_fields
+from scripts.production.delivery_state import QuestionSendState
 from scripts.production import staff, the_list
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -41,8 +39,6 @@ ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", "retry", *ANSWERS))
 ANSWER_PREFIX = "From the user (via the Images page): "
-STALE_ANSWER = "This page is stale. Review the new answer and try again."
-_DECISION_FILE = re.compile(r"([0-9a-f]{12})-[0-9a-f]{64}\.json")
 
 
 NO_OPEN_QUESTIONS: Mapping[str, QuestionSendState] = MappingProxyType({})
@@ -72,143 +68,21 @@ class ImageAnswerSent:
     draft_confirmed: bool = False
 
 
-class _ImageAnswerOrigin(Enum):
-    DIRECT = auto()
-    SIGNED_FORM = auto()
-
-
-@dataclass(frozen=True)
-class ImageDecision:
-    image_id: str
-    answer: str
-    feedback: str
-    time: datetime
-
-
-@dataclass(frozen=True)
-class VerifiedImageApproval:
-    line: str
-    time: datetime
-
-
-class NoImageDecision(Enum):
-    OUTSIDE_STORE = auto()
-    UNVERIFIED = auto()
-
-
-class _AnswerAttemptLookup(Enum):
-    NEW = auto()
-    REFUSED = auto()
-
-
 @dataclass(frozen=True)
 class _AnswerDraft:
     action: str
     words: str
     round_id: str | None
-    request_id: str = ""
 
-    def request_key(self, folder: Path, saved: image_store.ImageAnswers) -> str:
-        return change_page.review_delivery_key(folder / image_store.RECORD, folder.name,
-                                               saved["registered_at"], purpose=f"images-form-id:{self.request_id}")
-
-    def form_attempt_key(self, folder: Path, saved: image_store.ImageAnswers) -> str | None:
-        request_key = self.request_key(folder, saved)
-        for key, attempt in saved["attempts"].items():
-            keys = attempt.get("form_request_keys", [])
-            if request_key in keys:
-                return key
-            if keys and (signed := attempt.get("signed_answer")) is not None:
-                # Old keys include the saved words and the round if the form sent it.
-                for round_id in (None, signed["round_id"]):
-                    original = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
-                    if original.delivery_key(folder, saved, round_id, purpose=f"images-form:{self.request_id}") in keys:
-                        return key
-        return None
-
-    def delivery_key(self, folder: Path, saved: image_store.ImageAnswers, round_id: str | None,
-                     *, purpose: str = "message") -> str:
-        parts = [saved["registered_at"], self.action, self.words]
-        if round_id is not None:
-            parts.append(round_id)
-        return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts), purpose=purpose)
-
-    def new_decision_key(self, folder: Path, saved: image_store.ImageAnswers, round_id: str, position: int) -> str:
-        return self.delivery_key(folder, saved, round_id, purpose=f"images-answer:{position}")
+    def key(self, folder: Path, registered_at: str) -> str:
+        parts = [registered_at, self.action, self.words]
+        if self.round_id is not None:
+            parts.append(self.round_id)
+        return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts))
 
 
 def images_root(root: Path) -> Path:
     return root / image_store.IMAGES_FOLDER
-
-
-def decision_root(root: Path) -> Path:
-    return root / ".review-link-image-decisions"
-
-
-def read_image_decision(root: Path, path: Path) -> ImageDecision | NoImageDecision:
-    folder = decision_root(root)
-    name = _DECISION_FILE.fullmatch(path.name)
-    if (name is None or folder.is_symlink() or path.is_symlink()
-            or path.parent.resolve() != folder.resolve()):
-        return NoImageDecision.OUTSIDE_STORE
-    fields = read_fields(path)
-    match fields:
-        case {"image_id": str(identity), "source": str(source), "answer": str(answer),
-              "feedback": str(feedback), "time": str(stamp)} if (
-                identity == name[1] and source == the_list.IMAGE_ANSWER_SOURCE and answer in ANSWERS):
-            time = datetime.fromisoformat(stamp)
-            if time.utcoffset() == UTC.utcoffset(time):
-                return ImageDecision(identity, answer, feedback, time)
-        case _:
-            pass
-    raise ValueError(f"{path}: Invalid Images answer record.")
-
-
-def _signed_answer_key(saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer) -> str:
-    fields = [saved["id"], saved["registered_at"], signed["round_id"], signed["answer"], signed["feedback"]]
-    if "previous_answer_key" in signed:
-        fields.append(signed["previous_answer_key"])
-    if "form_request_key" in signed:
-        fields.append(signed["form_request_key"])
-    return "review:" + hashlib.sha256(json.dumps(fields).encode()).hexdigest()
-
-
-def _legacy_decision_key(saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer) -> str:
-    fields = (saved["registered_at"], signed["round_id"])
-    return hashlib.sha256(json.dumps(fields).encode()).hexdigest()
-
-
-def _save_image_decision(root: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer) -> None:
-    """Save this distinct signed answer while the Images lock is held."""
-    folder = decision_root(root)
-    folder.mkdir(mode=0o700, exist_ok=True)
-    if folder.is_symlink():
-        raise OSError(f"{folder}: Expected an Images answer folder.")
-    identity = saved["id"]
-    key = _signed_answer_key(saved, signed).removeprefix("review:")
-    path = folder / f"{identity}-{key}.json"
-    if path.is_symlink():
-        raise OSError(f"{path}: Expected an Images answer file.")
-    if not path.exists() and "previous_answer_key" not in signed and "form_request_key" not in signed:
-        # Keep old evidence at the path that reviewers can already cite.
-        old_key = _legacy_decision_key(saved, signed)
-        old_path = folder / f"{identity}-{old_key}.json"
-        if old_path.is_file():
-            try:
-                old = read_image_decision(root, old_path)
-            except ValueError:
-                old = NoImageDecision.OUTSIDE_STORE
-            if isinstance(old, ImageDecision) and (old.answer, old.feedback) == (signed["answer"], signed["feedback"]):
-                path = old_path
-    if path.exists():
-        atomic_file.sync_folder(folder)
-    else:
-        heading = saved.get("heading")
-        image_text = "\n".join((heading["title"], *image_store.look_for_message_lines(heading))) if heading else ""
-        fields = {"image_id": identity, "source": the_list.IMAGE_ANSWER_SOURCE, "image_text": image_text,
-                  "answer": signed["answer"], "feedback": signed["feedback"], "time": signed["time"]}
-        atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
-    atomic_file.sync_folder(root)
 
 
 def page_url() -> str:
@@ -322,7 +196,6 @@ def delete(root: Path, identity: str) -> None:
             raise ValueError(f"no image {identity}")
         record = image_store.read_record(folder)
         saved = _image_answers(directory, record)
-        saved["deleted_feedback_round"] = feedback_round(answered_question_ids(record))
         if "list_item" in saved and "list_keeper" not in saved:
             saved["list_keeper"] = the_list.image_list_keeper(saved["list_item"])
         image_store.write_answers(directory, saved)
@@ -414,15 +287,9 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + '</article>')
 
 
-def _answer_delivered(answer: image_store.ImageAnswer) -> bool:
-    return bool(answer["recipients"]) and set(answer["recipients"]) <= set(answer["confirmed"])
-
-
-def _removed_image_reviews(root: Path, token: str) -> tuple[list[str], set[str]]:
-    """Return the pending cards and the images with confirmed feedback for the last round."""
+def _pending_answer_cards(root: Path, token: str) -> list[str]:
     directory = images_root(root)
     cards: list[str] = []
-    answered: set[str] = set()
     for identity in image_store.deleted_answer_ids(directory):
         try:
             saved = image_store.read_answers(directory, identity)
@@ -434,11 +301,7 @@ def _removed_image_reviews(root: Path, token: str) -> tuple[list[str], set[str]]
         details = (_card_heading(heading) + f'<p>{removed}</p>' if heading is not None
                    else _card_heading({"title": removed, "look_for": []}))
         for key, answer in saved["attempts"].items():
-            if _answer_delivered(answer):
-                proof = answer.get("signed_answer")
-                round_id = proof["round_id"] if proof is not None else feedback_round(set(answer["answered"]))
-                if round_id == saved.get("deleted_feedback_round"):
-                    answered.add(identity)
+            if answer["recipients"] and set(answer["recipients"]) <= set(answer["confirmed"]):
                 continue
             words = html.escape(answer.get("words", answer["message"]))
             cards.append(f'<article>{details}'
@@ -450,7 +313,7 @@ def _removed_image_reviews(root: Path, token: str) -> tuple[list[str], set[str]]
                          + '<span role="status" data-image-status>Not sent yet</span>'
                          + '<div><button type="submit" name="action" value="retry">Retry</button></div>'
                          + '</form></article>')
-    return cards, answered
+    return cards
 
 
 def render(status: change_page.DeliveryStatus) -> bytes:
@@ -463,41 +326,28 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     rows = settings.whole("feedback_rows")
     card_motion = page_frame.CardMotion.read(settings)
     waiting: list[str] = []
-    answered: set[str] = set()
     cards: list[str] = []
     refresh_needed = False
     for record in records(root):
         review = image_review(status, record)
         if review.visible():
             cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
-        else:
-            if review.open_questions:
-                waiting.append(record["id"])
-            if "feedback_at" in record:
-                answered.add(record["id"])
+        elif review.open_questions:
+            waiting.append(record['id'])
         refresh_needed |= review.refresh()
-    removed_cards, removed_answered = _removed_image_reviews(root, token)
-    cards.extend(removed_cards)
-    answered.update(removed_answered)
+    cards.extend(_pending_answer_cards(root, token))
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
     content = (STYLE + page_frame.title("Images", "images")
                + page_frame.action_failure("image-action-failure")
-               + '<div data-image-stale-drafts></div>'
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<p hidden data-image-notice role="status"></p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
                + f' {card_motion.attributes()}'
-               + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}"'
-               + f' data-answered-images="{" ".join(sorted(answered))}">'
+               + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
-               + '<template data-image-stale-draft><section><p data-draft-reason role="status"></p>'
-               + '<p class="image-answer-words" data-draft-words></p><div class="answer-actions">'
-               + '<button type="button" data-draft-copy>Copy</button>'
-               + '<button type="button" data-draft-dismiss>Dismiss</button>'
-               + '</div><span data-draft-copy-status role="status"></span></section></template>'
                + '<template data-image-draft-template><article><h2 class="image-title"></h2>'
                + _answer_form("", "", "", rows, question=False) + '</article></template>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
@@ -511,7 +361,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {
-            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action", "answer_request"} or any(
+            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -526,10 +376,6 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
-    request_id = fields.get("answer_request", [""])[0]
-    if "answer_request" in fields and (action not in (*ANSWERS, "retry")
-                                      or re.fullmatch(r"[0-9a-f]{32}", request_id) is None):
-        raise question_record.AnswerRefused("use the form on this page")
     if action == "retry":
         required = {"image", "token", "action", "retry_key"}
         if not required <= fields.keys() or not fields["retry_key"][0]:
@@ -538,21 +384,18 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         draft_action = fields.get("draft_action", [""])[0]
         draft = None
         if draft_fields:
-            if (not {"draft_action", "feedback"} <= draft_fields <= {
-                    "draft_action", "feedback", "feedback_round", "answer_request"}
+            if (not {"draft_action", "feedback"} <= draft_fields <= {"draft_action", "feedback", "feedback_round"}
                     or draft_action not in ANSWERS):
                 raise question_record.AnswerRefused("use the Retry button on this page")
-            draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0], request_id)
-        return _send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft,
-                            origin=_ImageAnswerOrigin.SIGNED_FORM)
+            draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0])
+        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft)
     if "retry_key" in fields or "draft_action" in fields:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
-        return _send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id,
-                            origin=_ImageAnswerOrigin.SIGNED_FORM, request_id=request_id)
+        return send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
     try:
         delete(root, identity)
     except ValueError as error:
@@ -615,142 +458,9 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
     return answers
 
 
-def _answer_words(identity: str, answer: str, feedback: str) -> str:
-    summary = f"Image {identity}: {ANSWERS[answer]}"
-    return summary + "\n" + feedback if feedback else summary
-
-
-def approval_line(identity: str) -> str:
-    return _answer_words(identity, "approved", "")
-
-
-def _signed_delivery_key_matches(folder: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer,
-                                 position: int, key: str) -> bool:
-    if key == signed.get("form_request_key"):
-        return True
-    # A signed form can reuse a delivery key from before the form request.
-    round_id = signed["round_id"]
-    draft = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
-    if key in (draft.new_decision_key(folder, saved, round_id, position),
-               draft.delivery_key(folder, saved, round_id, purpose="images-answer")):
-        return True
-    purposes = ("message", _signed_answer_key(saved, signed)) if "previous_answer_key" in signed else ("message",)
-    return any(key == draft.delivery_key(folder, saved, round_value, purpose=purpose)
-               for purpose in purposes for round_value in (round_id, None))
-
-
-def _completed_signed_approvals(directory: Path, saved: image_store.ImageAnswers, recipients: set[str]
-                                ) -> Iterator[tuple[str, image_store.SignedImageAnswer]]:
-    folder = directory / saved["id"]
-    for position, (key, attempt) in enumerate(saved["attempts"].items()):
-        signed = attempt.get("signed_answer")
-        if (signed is None or signed["answer"] != "approved" or set(attempt["recipients"]) != recipients
-                or not _answer_delivered(attempt)):
-            continue
-        if (attempt.get("words") == _answer_words(saved["id"], "approved", signed["feedback"])
-                and attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS["approved"]
-                and _signed_delivery_key_matches(folder, saved, signed, position, key)):
-            yield key, signed
-
-
-def matches_list_approval(root: Path, identity: str, item: str, keeper: staff.StaffId,
-                          event: the_list.ImageAnswerChange) -> bool:
-    """Check the List approval against its completed Images page delivery."""
-    directory = images_root(root)
-    saved = image_store.find_answers(directory, identity)
-    if (isinstance(saved, image_store.ImageAnswersUnavailable)
-            or saved.get("list_item") != item or saved.get("list_keeper") != keeper):
-        return False
-    for key, signed in _completed_signed_approvals(directory, saved, {saved["owner"], event.producer}):
-        if (event.what != _answer_words(identity, "approved", signed["feedback"])
-                or event.time != datetime.fromisoformat(signed["time"])):
-            continue
-        if event.key == _signed_answer_key(saved, signed):
-            return True
-        # The first signed List entries used the original delivery key.
-        if event.key == key and "form_request_key" not in signed and "previous_answer_key" not in signed:
-            folder = directory / identity
-            round_id = signed["round_id"]
-            draft = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
-            if any(key == draft.delivery_key(folder, saved, value) for value in (round_id, None)):
-                return True
-    return False
-
-
-def verified_image_approval(root: Path, path: Path) -> VerifiedImageApproval | NoImageDecision:
-    """Require a completed Images page delivery for the archived approval."""
-    decision = read_image_decision(root, path)
-    if isinstance(decision, NoImageDecision):
-        return decision
-    if decision.answer != "approved":
-        return NoImageDecision.UNVERIFIED
-    directory = images_root(root)
-    saved = image_store.find_answers(directory, decision.image_id)
-    if isinstance(saved, image_store.ImageAnswersUnavailable) or "list_item" in saved:
-        return NoImageDecision.UNVERIFIED
-    decision_key = path.stem.removeprefix(decision.image_id + "-")
-    for _, signed in _completed_signed_approvals(directory, saved, {saved["owner"]}):
-        if (decision.feedback, decision.time) != (signed["feedback"], datetime.fromisoformat(signed["time"])):
-            continue
-        if (decision_key == _signed_answer_key(saved, signed).removeprefix("review:")
-                or ("previous_answer_key" not in signed and "form_request_key" not in signed
-                    and decision_key == _legacy_decision_key(saved, signed))):
-            return VerifiedImageApproval(approval_line(decision.image_id), decision.time)
-    return NoImageDecision.UNVERIFIED
-
-
-def _legacy_answer_words(identity: str, item: str, message: str, answer: str) -> str:
-    _, _, body = message.partition("\n")
-    removed = f"Picture {identity} was removed.\n"
-    if body.startswith(removed):
-        feedback = body.removeprefix(removed).removesuffix(f"\nList item: {item}")
-    else:
-        link = re.search(rf"\n(?:Image|Before): https?://[^\n]+/images/{identity}/(?:image|before)\.[a-z]+\n", body)
-        feedback = body[:link.start()] if link is not None else ""
-    return _answer_words(identity, answer, feedback.removeprefix("Feedback: ") if feedback.startswith("Feedback: ") else "")
-
-
-def _existing_answer_attempt(folder: Path, saved: image_store.ImageAnswers, draft: _AnswerDraft,
-                             round_id: str, *, retry_key: str | None = None) -> str | _AnswerAttemptLookup:
-    """Find the saved request or match the newest attempt for this image."""
-    attempts = saved["attempts"]
-    if retry_key is not None:
-        return retry_key if retry_key in attempts else _AnswerAttemptLookup.REFUSED
-
-    bound_key = draft.form_attempt_key(folder, saved) if draft.request_id else None
-    if (bound_key is None and draft.request_id
-            and draft.request_key(folder, saved) in saved.get("stale_form_request_keys", [])):
-        return _AnswerAttemptLookup.REFUSED
-    key = bound_key if bound_key is not None else next(reversed(attempts), None)
-    if key is None:
-        return _AnswerAttemptLookup.NEW
-
-    attempt = attempts[key]
-    proof = attempt.get("signed_answer")
-    if proof is not None:
-        # A saved request ID selects its original round.
-        if bound_key is not None:
-            round_id = proof["round_id"]
-        if (proof["round_id"], proof["answer"], proof["feedback"]) == (round_id, draft.action, draft.words):
-            return key
-    if bound_key is not None:
-        return _AnswerAttemptLookup.REFUSED
-    if proof is not None:
-        return _AnswerAttemptLookup.NEW
-
-    if key in (draft.new_decision_key(folder, saved, round_id, len(attempts) - 1),
-               draft.delivery_key(folder, saved, round_id, purpose="images-answer")):
-        return key
-    # Older unsigned records can omit the round from the delivery key.
-    if feedback_round(set(attempt["answered"])) == round_id and key in (
-            draft.delivery_key(folder, saved, round_id), draft.delivery_key(folder, saved, None)):
-        return key
-    return _AnswerAttemptLookup.NEW
-
-
-def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_key: str | None,
-                    origin: _ImageAnswerOrigin) -> tuple[str, image_store.ImageAnswers]:
-    """Save the words, proof, and List recipient before the first send."""
+def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None,
+                    retry_key: str | None) -> tuple[str, image_store.ImageAnswers]:
+    """Save the words and the List recipient before the first send."""
     folder = directory / identity
     try:
         record = image_store.read_record(folder)
@@ -765,28 +475,18 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         saved = _image_answers(directory, record)
 
     attempts = saved["attempts"]
-    answer, feedback = draft.action, draft.words
-    signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
-    form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
-    answered: set[str] = answered_question_ids(record) if record is not None else set()
-    current_round = feedback_round(answered) if record is not None else saved.get("deleted_feedback_round")
-    round_id = draft.round_id if draft.round_id is not None else current_round or feedback_round(answered)
-    existing = _existing_answer_attempt(folder, saved, draft, round_id, retry_key=retry_key)
-    if retry_key is not None and (record is not None or existing is _AnswerAttemptLookup.REFUSED):
-        raise question_record.AnswerRefused("no saved answer for this removed picture")
-    if existing is _AnswerAttemptLookup.REFUSED:
-        raise question_record.AnswerRefused(STALE_ANSWER)
-    if isinstance(existing, str):
-        key = existing
-        attempt = attempts[key]
+    words = ""
+    if retry_key is not None:
+        if record is not None or retry_key not in attempts:
+            raise question_record.AnswerRefused("no saved answer for this removed picture")
+        key = retry_key
     else:
-        if signed_form and current_round is not None and round_id != current_round:
-            if form_key:
-                saved.setdefault("stale_form_request_keys", []).append(form_key)
-                image_store.write_answers(directory, saved)
-            raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_key or draft.new_decision_key(folder, saved, round_id, len(attempts))
-        previous = answered
+        key = _AnswerDraft(answer, feedback, round_id).key(folder, saved["registered_at"])
+        words = f"Image {identity}: {ANSWERS[answer]}"
+        if feedback:
+            words += "\n" + feedback
+    if key not in attempts:
+        previous: set[str] = set()
         if record is None:
             message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
             if feedback:
@@ -794,79 +494,38 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
             if "list_item" in saved:
                 message += "\nList item: " + saved["list_item"]
         else:
-            if not form_key:
-                legacy_key = draft.delivery_key(folder, saved, draft.round_id)
-                legacy = folder / (".review-link-feedback-" + legacy_key.removeprefix("review:"))
-                try:
-                    legacy_answered = set(legacy.read_text(encoding="utf-8").splitlines())
-                except FileNotFoundError:
-                    pass
-                else:
-                    if feedback_round(legacy_answered) == round_id and legacy_key not in attempts:
-                        key, previous = legacy_key, legacy_answered
-            if not signed_form and round_id != feedback_round(previous):
-                raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
+            # Keep the original question round when a request started before the store moved.
+            legacy = folder / (".review-link-feedback-" + key.removeprefix("review:"))
+            try:
+                previous = set(legacy.read_text(encoding="utf-8").splitlines())
+            except FileNotFoundError:
+                previous = answered_question_ids(record)
+                if round_id is not None and round_id != feedback_round(previous):
+                    raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.") from None
             message = answer_message(record, answer, feedback)
-        attempt: image_store.ImageAnswer = {"message": message, "words": _answer_words(identity, answer, feedback),
-                                             "answered": sorted(previous), "recipients": [], "confirmed": []}
-    new_proof = signed_form and retry_key is None and "signed_answer" not in attempt
-    if new_proof:
-        proof: image_store.SignedImageAnswer = {"answer": answer, "feedback": feedback,
-                                                "time": datetime.now(UTC).isoformat(), "round_id": round_id}
-        if form_key and not attempt["recipients"]:
-            proof["form_request_key"] = form_key
-        else:
-            # A renewed answer needs a separate signed record.
-            previous_proof = next((prior for entry in reversed(attempts.values())
-                                  if (prior := entry.get("signed_answer")) is not None), None)
-            if previous_proof is not None:
-                proof["previous_answer_key"] = _signed_answer_key(saved, previous_proof)
-        attempt["signed_answer"] = proof
-    new_attempt = key not in attempts
-    request_keys = attempt.get("form_request_keys", [])
-    new_request = bool(form_key) and form_key not in request_keys
-    if new_request:
-        attempt["form_request_keys"] = [*request_keys, form_key]
-    if new_attempt:
-        attempts[key] = attempt
-    if new_attempt or new_proof or new_request:
+        attempts[key] = {"message": message, "words": words, "answered": sorted(previous),
+                         "recipients": [], "confirmed": []}
         image_store.write_answers(directory, saved)
     else:
         atomic_file.sync_folder(directory)
 
-    signed = attempt.get("signed_answer") if signed_form else None
-    needs_recipients = not attempt["recipients"]
-    # A legacy attempt can have saved recipients before it has signed evidence.
-    needs_publication = needs_recipients or (signed is not None and "form_request_key" not in signed)
-    if signed is not None and "list_item" not in saved and needs_publication:
-        _save_image_decision(directory.parent, saved, signed)
-    recipients = [saved["owner"]]
-    if "list_item" in saved and needs_publication:
-        item = saved["list_item"]
-        if signed is not None:
-            approved = signed["answer"] == "approved"
-            words = _answer_words(identity, signed["answer"], signed["feedback"])
-            signed_at = datetime.fromisoformat(signed["time"])
-            list_key = _signed_answer_key(saved, signed)
-        else:
-            if "signed_answer" in attempt:
-                raise question_record.AnswerRefused("use the form on this page")
+    attempt = attempts[key]
+    if not attempt["recipients"]:
+        recipients = [saved["owner"]]
+        if "list_item" in saved:
+            item = saved["list_item"]
+            # Older attempts have the complete message in place of the List words.
+            words = attempt.get("words", words or attempt["message"])
             approved = attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS["approved"]
-            action = "approved" if approved else "feedback"
-            words = attempt.get("words") or _legacy_answer_words(identity, item, attempt["message"], action)
-            signed_at = the_list.NoTimestamp.UNSET
-            list_key = key
-        try:
-            keeper = staff.StaffId(saved["list_keeper"]) if "list_keeper" in saved else the_list.image_list_keeper(item)
-            producer = the_list.save_image_answer(keeper, item, list_key, words, image_id=identity,
-                                                  approved=approved, signed_at=signed_at)
-        except (the_list.ListError, OSError) as error:
-            raise AnswerNotSent(f"Could not save the answer on {item}: {error}. Try again.") from error
-        saved["list_keeper"] = keeper
-        attempt["words"] = words
-        if producer not in recipients:
-            recipients.append(producer)
-    if needs_recipients:
+            try:
+                keeper = staff.StaffId(saved["list_keeper"]) if "list_keeper" in saved else the_list.image_list_keeper(item)
+                producer = the_list.save_image_answer(keeper, item, key, words, image_id=identity,
+                                                      approved=approved)
+            except (the_list.ListError, OSError) as error:
+                raise AnswerNotSent(f"Could not save the answer on {item}: {error}. Try again.") from error
+            saved["list_keeper"] = keeper
+            if producer not in recipients:
+                recipients.append(producer)
         attempt["recipients"] = recipients
         image_store.write_answers(directory, saved)
     return key, saved
@@ -879,14 +538,6 @@ def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
 
 def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None,
                 retry_key: str | None = None, draft: _AnswerDraft | None = None) -> ImageAnswerSent:
-    """Send an answer without evidence from a signed form."""
-    return _send_answer(root, identity, answer, feedback, origin=_ImageAnswerOrigin.DIRECT,
-                        round_id=round_id, retry_key=retry_key, draft=draft)
-
-
-def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origin: _ImageAnswerOrigin,
-                 round_id: str | None = None, retry_key: str | None = None,
-                 draft: _AnswerDraft | None = None, request_id: str = "") -> ImageAnswerSent:
     """Send to each recipient that has yet to confirm this answer."""
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
@@ -899,8 +550,7 @@ def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origi
         raise question_record.AnswerRefused(f"no image {identity}")
     with file_lock.exclusive(lock):
         try:
-            submission = _AnswerDraft(answer, feedback, round_id, request_id)
-            key, saved = _picture_answer(directory, identity, submission, retry_key, origin)
+            key, saved = _picture_answer(directory, identity, answer, feedback, round_id, retry_key)
         except OSError as error:
             raise AnswerNotSent(f"Could not save the picture answer: {error}. Try again.") from error
     attempt = saved["attempts"][key]
@@ -925,13 +575,8 @@ def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origi
                 record = image_store.read_record(folder)
             except FileNotFoundError:
                 owner = _recipient_name(staff.snapshot(), saved["owner"])
-                draft_confirmed = False
-                if draft is not None:
-                    removed_round = current.get("deleted_feedback_round", feedback_round(set(delivery["answered"])))
-                    round_id = draft.round_id if draft.round_id is not None else removed_round
-                    draft_confirmed = _existing_answer_attempt(folder, current, draft, round_id) == key
                 return ImageAnswerSent(f"This picture was removed; your words went to {owner}.",
-                                       draft_confirmed=draft_confirmed)
+                                       draft_confirmed=draft is not None and draft.key(folder, saved["registered_at"]) == key)
             if (record["registered_at"] == saved["registered_at"] and record["owner"] == saved["owner"]
                     and "feedback_at" not in record and not answered_question_ids(record) - set(delivery["answered"])):
                 record["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
@@ -991,13 +636,9 @@ const groups = document.querySelector('[data-image-groups]');
 const layout = document.querySelector('[data-image-layout]');
 const waiting = document.querySelector('[data-image-waiting]');
 const notice = document.querySelector('[data-image-notice]');
-const staleDrafts = document.querySelector('[data-image-stale-drafts]');
-const staleDraftTemplate = document.querySelector('[data-image-stale-draft]');
 let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
 let refreshRequest = 0;
-const staleAnswerReason = __STALE_ANSWER__;
-const answeredRoundNotice = 'Feedback for this round was already sent.';
 const refreshSeconds = () => list.dataset.refreshSeconds;
 const imageLink = () => new URLSearchParams(location.hash.slice(1));
 function apply() {
@@ -1060,7 +701,7 @@ function preventDraftLoss(event) {
 function saveDrafts() {
   const drafts = [];
   for (const [image, {draft}] of pictureStates) {
-    if (draft && (draft.words || draft.retryAction || draft.needsCurrentForm)) drafts.push([image, draft]);
+    if (draft && (draft.words || draft.retryAction)) drafts.push([image, draft]);
   }
   try {
     if (drafts.length) sessionStorage.setItem(draftStorageKey, JSON.stringify(drafts));
@@ -1080,73 +721,30 @@ function readEdit(form, state, edited = false) {
   const {feedback, token, feedback_round: round} = form.elements;
   const changed = feedback.value !== (state.draft?.words ?? '');
   if (edited || changed) state.revision++;
-  const prior = changed ? {needsCurrentForm: state.draft?.needsCurrentForm} : state.draft;
-  state.draft = {...prior, words: feedback.value, token: token.value, round: round.value};
-}
-async function copyStaleDraft(words, status) {
-  try {
-    await navigator.clipboard.writeText(words.textContent);
-  } catch {
-    try {
-      const selection = getSelection(), range = new Range();
-      range.selectNodeContents(words);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      if (!document.execCommand('copy')) throw new Error('Copy failed.');
-      selection.removeAllRanges();
-    } catch {
-      status.textContent = 'Copy failed. Select and copy the feedback.';
-      return;
-    }
-  }
-  status.textContent = 'Copied.';
-}
-function showStaleNotice(state, reason) {
-  const draft = staleDraftTemplate.content.firstElementChild.cloneNode(true);
-  draft.querySelector('[data-draft-reason]').textContent = reason;
-  const words = draft.querySelector('[data-draft-words]');
-  words.textContent = state.draft.words;
-  words.hidden = !words.textContent;
-  const status = draft.querySelector('[data-draft-copy-status]');
-  const copy = draft.querySelector('[data-draft-copy]');
-  copy.hidden = words.hidden;
-  copy.addEventListener('click', () => void copyStaleDraft(words, status));
-  draft.querySelector('[data-draft-dismiss]').addEventListener('click', () => {
-    clearDraft(state);
-    draft.remove();
-  });
-  staleDrafts.append(draft);
+  state.draft = {...(changed ? null : state.draft), words: feedback.value, token: token.value, round: round.value};
 }
 function restoreForms(root, previous = []) {
-  const editable = new Map(), attempts = new Set(), previousEdits = new Map();
-  const answered = new Set(root.dataset.answeredImages.split(' '));
-  staleDrafts.replaceChildren();
+  const editable = new Map(), attempts = new Set();
   for (const form of forms(root)) {
     const image = imageId(form), key = attemptKey(form), state = pictureState(image);
     if (key) {
       attempts.add(key);
-      const failure = state.attempts.get(key);
-      if (failure) showActionFailure(formStatus(form), failure.message);
+      const error = state.attempts.get(key) || '';
+      state.attempts.set(key, error);
+      if (error) showActionFailure(formStatus(form), error);
     } else {
       editable.set(image, form);
     }
   }
-  for (const form of previous) {
-    const image = imageId(form), key = attemptKey(form);
-    if (!key) previousEdits.set(image, form);
-    else if (!attempts.has(key) && pictureState(image).attempts.get(key)?.replay) {
-      // Keep Retry available until the server confirms delivery.
-      root.append(form.closest('article').cloneNode(true));
-      attempts.add(key);
-    }
-  }
+  const previousEdits = new Map(previous.filter(form => !attemptKey(form)).map(form => [imageId(form), form]));
   for (const [image, state] of pictureStates) {
-    for (const key of state.attempts.keys()) {
-      if (!attempts.has(key)) state.attempts.delete(key);
+    for (const [key, error] of state.attempts) {
+      // A missing card does not confirm delivery.
+      if (!attempts.has(key) && !error) state.attempts.delete(key);
     }
     const draft = state.draft;
     let form = editable.get(image);
-    if (draft && !draft.needsCurrentForm && !form && (draft.words || draft.retryAction || state.draftError)) {
+    if (draft && !form && (draft.words || draft.retryAction || state.draftError)) {
       const template = document.querySelector('[data-image-draft-template]').content;
       const original = previousEdits.get(image)?.closest('article') ?? template.firstElementChild;
       const card = original.cloneNode(true);
@@ -1162,9 +760,7 @@ function restoreForms(root, previous = []) {
     }
     if (form) {
       if (draft) form.elements.feedback.value = draft.words;
-      showActionFailure(formStatus(form), draft?.needsCurrentForm ? 'Not sent: ' + staleAnswerReason : state.draftError);
-    } else if (draft?.needsCurrentForm) {
-      showStaleNotice(state, answered.has(image) ? answeredRoundNotice : 'This image has no feedback form.');
+      showActionFailure(formStatus(form), state.draftError);
     } else if (!state.attempts.size) {
       pictureStates.delete(image);
     }
@@ -1203,26 +799,17 @@ async function submit(event) {
     showActionFailure(status, state.draftError);
     return;
   }
-  const {retryAction, retryRound, requestId, retryDirect} = draft ?? {};
-  const replay = key ? state.attempts.get(key)?.replay : !question && retryAction === action && requestId && retryDirect;
+  const {retryAction, retryRound} = draft ?? {};
   const body = new URLSearchParams(new FormData(form, event.submitter));
   if (key) {
     if (draft?.retryAction) {
       body.set('draft_action', draft.retryAction);
       body.set('feedback', draft.words);
       if (draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
-      if (draft.requestId) body.set('answer_request', draft.requestId);
     }
   } else {
-    delete draft.needsCurrentForm;
     if (!question) {
-      const sameDraft = draft.retryAction === action;
-      if (sameDraft && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
-      if (!sameDraft || !draft.requestId) {
-        draft.requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
-        delete draft.retryDirect;
-      }
-      body.set('answer_request', draft.requestId);
+      if (draft.retryAction === action && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
       draft.retryAction = action;
       draft.retryRound = body.get('feedback_round') ?? undefined;
     }
@@ -1238,20 +825,15 @@ async function submit(event) {
   saveDrafts();
   const card = form.closest('article');
   const hold = holdCard(card, hidden => { if (hidden) apply(); });
-  let postFailed = false, refused = false, staleAnswer = false;
+  let postFailed = false, retryable = true;
   try {
-    const post = {method: 'POST', body};
-    // Replay the saved Images request when the hold result is unavailable.
-    const response = await (replay ? fetch(location.pathname, post)
-      : hold.post(location.pathname, post, card.dataset.sendReceiver));
+    const response = await hold.post(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
     if (!response.ok) {
-      const reason = await response.json().then(body => body?.reason, () => '');
-      refused = [400, 403, 409].includes(response.status) && typeof reason === 'string' && reason.length > 0;
-      staleAnswer = response.status === 400 && reason === staleAnswerReason;
+      retryable = response.status >= 500;
+      const reason = await response.json().then(body => body.reason, () => '');
       throw new Error(reason || 'HTTP ' + response.status);
     }
-    const result = question ? {} : await response.json().catch(() => null);
-    if (!question && result?.state !== 'done') throw new Error('The send result is unavailable. Try again.');
+    const result = question ? {} : await response.json().catch(() => ({}));
     if (edit && edit.elements.feedback.value !== (state.draft?.words ?? '')) {
       readEdit(edit, state);
       saveDrafts();
@@ -1283,23 +865,12 @@ async function submit(event) {
     postFailed = true;
     const undone = error instanceof SendUndone;
     const message = undone ? error.message : 'Not sent: ' + error.message;
-    if (staleAnswer && !request.key) {
-      state.draft = {words: field.value, needsCurrentForm: true};
-      saveDrafts();
-      card.remove();
-      showStaleNotice(state, 'This page is stale.');
-    } else if (request.key) state.attempts.set(request.key, {message, replay: !refused && !undone});
+    if (request.key) state.attempts.set(request.key, message);
     else {
       state.draftError = message;
-      if (!question && state.revision === request.revision) {
-        if (refused || undone) {
-          state.draft.retryAction = undone ? retryAction : undefined;
-          state.draft.retryRound = undone ? retryRound : undefined;
-          state.draft.requestId = undone ? requestId : undefined;
-          state.draft.retryDirect = undone ? retryDirect : undefined;
-        } else {
-          state.draft.retryDirect = true;
-        }
+      if ((!retryable || undone) && !question && state.revision === request.revision) {
+        state.draft.retryAction = undone ? retryAction : undefined;
+        state.draft.retryRound = undone ? retryRound : undefined;
         saveDrafts();
       }
     }
@@ -1378,7 +949,7 @@ bind(list);
 // An image link opens its image at once.
 apply();
 scrollToLinkedImage();
-})();""".replace('__STALE_ANSWER__', json.dumps(STALE_ANSWER))
+})();"""
 SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
 
 

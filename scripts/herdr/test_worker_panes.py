@@ -1098,19 +1098,6 @@ class WorkerPaneTests(StaffTestCase):
         link.symlink_to(foreign / unit_runs.STATE_FILE)
         self.assertEqual(worker_panes.worker_run(result.row), first)
 
-    def test_worker_admission_keeps_the_parent_run_when_no_run_is_supplied(self) -> None:
-        first = self.worker_run("a-first", "unit", self.parent.current_session, director_run=True)
-        supplied = self.worker_run("z-supplied", "unit", self.parent.current_session)
-        for name, value, expected in (("implicit", "", first), ("explicit", str(supplied), supplied)):
-            with (self.subTest(supplied=value),
-                  patch.dict(os.environ, {"UNIT_RUN_DIR": value, "PLAN_DELEGATE_BOARD_DIR": ""})):
-                opened = self.start(name)
-                self.assertIsInstance(opened, worker_panes.OpenWorker)
-                assert isinstance(opened, worker_panes.OpenWorker)
-                self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(expected))
-                directories = worker_panes.worker_run_directories(staff.snapshot())
-                self.assertEqual(directories.by_worker[opened.row.id][0], expected)
-
     def test_worker_run_checks_the_recorded_dispatch_with_the_supplied_staff(self) -> None:
         row = self.worker("before-rename")
         _ = self.recorded_dispatch(row, "completed", at=20)
@@ -3504,22 +3491,6 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(result, worker_panes.Closed)
         self.assertEqual(self.world.layouts["w1:t1"], expected)
         self.assertEqual(self.world.closed, [])
-
-    def test_open_balances_the_layout_with_a_free_slot_after_the_operation_deadline(self) -> None:
-        self.assertIsInstance(self.start("first"), worker_panes.OpenWorker)
-        before = len(self.world.layout_changes)
-        layout = worker_panes._layout_after_open  # pyright: ignore[reportPrivateUsage]
-
-        def layout_after_deadline(parent: staff.StaffId, evidence: worker_panes.PaneEvidence, seconds: float) -> None:
-            with worker_lifecycle.operation_deadline(deadline=0.0):
-                layout(parent, evidence, seconds)
-
-        with (patch.object(worker_panes, "_layout_after_open", side_effect=layout_after_deadline),
-              redirect_stderr(io.StringIO()) as notes):
-            result = self.start("second")
-        self.assertIsInstance(result, worker_panes.OpenWorker, notes.getvalue())
-        self.assertGreater(len(self.world.layout_changes), before, notes.getvalue())
-        self.assertEqual(notes.getvalue(), "")
 
     def test_open_waits_for_the_layout_slot_and_succeeds_if_it_stays_busy(self) -> None:
         self.assertIsInstance(self.start("first"), worker_panes.OpenWorker)

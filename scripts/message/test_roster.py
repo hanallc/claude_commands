@@ -885,32 +885,6 @@ class RosterTests(unittest.TestCase):
         self.assertNotEqual(entries[0].thread, roster.CodexThread(replacement.current_session))
         self.assertEqual(sum(entry.thread == roster.CodexThread(renamed.current_session) for entry in found.entries), 1)
 
-    def test_durable_role_roster_uses_its_snapshot_and_keeps_the_reviewer(self) -> None:
-        identifier = "00000000-0000-4000-8000-000000000048"
-        parent = unit_membership("alpha", "unit-one").id
-        claim = staff.DesignWorkerClaim(identifier, "designer")
-        designer = staff.ensure_worker(staff.native_id(fixture_runtime_id("pending-designer")), "pending-designer", parent,
-                                       design_claim=claim)
-        reviewer = designer_fixture(parent, "active-reviewer", self.root / "codex-home")
-        design = design_roles.HeldDesign(
-            design_roles.DesignPlacement(identifier, "fixture-host", 1), "fixture-repo",
-            str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", designer.name,
-                                       design_roles.RoleNotOpened("pane-start", "outcome_unknown"), parent=parent),
-             design_roles.RoleInstance("reviewer", reviewer.name, design_roles.RoleOpen(reviewer.id), parent=parent)))
-        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-        membership = staff.snapshot()
-        membership = replace(membership, rows=tuple(row for row in membership.rows if row.id != designer.id))
-        self.assertEqual(membership.design_workers[claim], designer.id)
-
-        with mock.patch.object(staff, "authority_snapshot", side_effect=AssertionError("read staff again")):
-            found = roster.roster(os.environ, roster.ThisMachine(), membership=membership)
-        self.assertEqual(found.warnings, [])
-        entries = [entry for entry in found.entries if isinstance(entry.assignment, roster.HeldDesignRole)]
-        self.assertEqual([(entry.role, entry.thread) for entry in entries],
-                         [("astra-reviewer", roster.CodexThread(reviewer.current_session))])
-
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
         entries = self._entries()
         machine = roster.machine_name()
@@ -1567,8 +1541,6 @@ class RosterTests(unittest.TestCase):
                     fields = cast(dict[str, object], json.loads(bad.read_text()))
                     del fields["repository"]
                     fields["repository_owner"] = "missing-owner"
-                    fields["document"] = "broken-design.md"
-                    fields["binding"] = {"kind": "DesignUnbound"}
                     _ = bad.write_text(json.dumps(fields))
                 code, output, errors = self._run_main('--json')
                 self.assertEqual(code, 0, errors)

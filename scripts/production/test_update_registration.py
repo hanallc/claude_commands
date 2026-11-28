@@ -8,7 +8,6 @@ import io
 import fcntl
 import os
 import shutil
-import subprocess
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
@@ -27,7 +26,6 @@ from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, registration
-from scripts.console_text.test_support import real_review_question
 
 from scripts.production import footer_counts
 from scripts.production import next_item
@@ -97,103 +95,6 @@ class ProducerQuestionTests(RegistrationFixture):
                                     environment, self.checkout, production_state=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn("pass --unit", result.stdout)
-
-    def use_console_verdicts(self, *failed_lines: tuple[str, ...]) -> None:
-        replies = iter(failed_lines)
-
-        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
-            request = cast(dict[str, object], json.loads(prompt.split("\n", 2)[2]))
-            pending = cast(dict[str, object], request["parts"])
-            parts: list[dict[str, object]] = [
-                {"number": int(number), "questions": [], "failed_rules": []} for number in pending
-            ]
-            return review.StructuredCall("sonnet", review.StructuredAnswer({
-                "draft": {"questions": [], "failed_rules": [
-                    {"rule": "console-standard-4", "quote": line} for line in next(replies)
-                ]},
-                "parts": parts,
-            }))
-
-        def runner(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            text = "Question rules" if argv[0] == "zsh" else "agent=sonnet effort=high"
-            return subprocess.CompletedProcess(argv, 0, text, "")
-
-        def question_review(key: review.QuestionKey, draft: str, *, console_kind: str) -> review.QuestionOutcome:
-            return real_review_question(key, draft, runner=runner, console_kind=console_kind)
-
-        self.env["NOTIFY_STATE_DIR"] = str(self.state / "notify")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
-        _ = self.enterContext(mock.patch.object(review, "GUIDE", self.root))
-        _ = self.enterContext(mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")))
-        _ = self.enterContext(mock.patch.object(review, "reviewer_binary",
-                                                return_value=review.ResolvedReviewerBinary(self.root / "claude")))
-        _ = self.enterContext(mock.patch.object(review, "structured_call", side_effect=judge))
-        _ = self.enterContext(mock.patch.object(review, "review_question", side_effect=question_review))
-
-    def ask_with_review(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return invoke_cli(registration, registration.main, ["ask", *args], self.env, self.checkout,
-                          production_state=True)
-
-    def test_ask_revision_preserves_passed_lines_and_rechecks_the_changed_title(self) -> None:
-        initial = "Try again?"
-        revised = "Retry the download?"
-        fact = "The download stopped."
-        self.use_console_verdicts((initial,), (revised, fact))
-
-        first = self.ask_with_review("--ask", initial, "--context", revised, "--item", fact)
-        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
-        self.assertIn(f"console-standard-4: {initial}", first.stdout)
-        second = self.ask_with_review("--revise-title", initial, "--ask", revised, "--item", fact)
-        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
-        self.assertIn(f"console-standard-4: {revised}", second.stdout)
-        self.assertNotIn(f"console-standard-4: {fact}", second.stdout)
-
-    def test_plain_ask_retry_preserves_passed_lines_with_the_same_title(self) -> None:
-        title = "Try again?"
-        fact = "The download stopped."
-        initial = "The first file is new."
-        revised = "The first file is incomplete."
-        self.use_console_verdicts((initial,), (revised, title, fact))
-
-        first = self.ask_with_review("--ask", title, "--context", fact, "--item", initial)
-        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
-        self.assertIn(f"console-standard-4: {initial}", first.stdout)
-        second = self.ask_with_review("--ask", title, "--context", fact, "--item", revised)
-        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
-        self.assertIn(f"console-standard-4: {revised}", second.stdout)
-        self.assertNotIn(f"console-standard-4: {title}", second.stdout)
-        self.assertNotIn(f"console-standard-4: {fact}", second.stdout)
-
-    def test_held_ask_names_the_current_title_in_the_retry_hint(self) -> None:
-        title = "Downloads"
-        asked = "Retry the download?"
-        self.use_console_verdicts((asked,))
-
-        result = self.ask_with_review("--text", title, "--ask", asked, "--item", "The download stopped.")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("To change the title on a retry, pass --revise-title 'Downloads'.", result.stdout)
-
-    def test_ask_moves_the_former_title_over_an_existing_record_once(self) -> None:
-        initial = "Try again?"
-        revised = "Retry the download?"
-        fact = "The download stopped."
-        self.use_console_verdicts((initial,), (fact,), (revised, fact), (revised, fact))
-        folder = review.state_path() / "question-verdicts"
-        first = self.ask_with_review("--ask", initial, "--item", fact)
-        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
-        former_path, = folder.glob("*.json")
-        new_title_args = ("--ask", revised, "--item", fact)
-        split = self.ask_with_review(*new_title_args)
-        self.assertEqual(split.returncode, 2, split.stdout + split.stderr)
-        self.assertIn(f"console-standard-4: {fact}", split.stdout)
-        new_path, = set(folder.glob("*.json")) - {former_path}
-
-        for _ in range(2):
-            result = self.ask_with_review("--revise-title", initial, *new_title_args)
-            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-            self.assertIn(f"console-standard-4: {revised}", result.stdout)
-            self.assertNotIn(f"console-standard-4: {fact}", result.stdout)
-            self.assertEqual(list(folder.glob("*.json")), [new_path])
 
     def test_the_producer_page_count_and_next_share_the_question_store(self) -> None:
         self.file_question()

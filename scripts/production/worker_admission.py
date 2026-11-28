@@ -76,7 +76,6 @@ class WorkerStartAllowed:
     parent: staff.StaffId
     run: Path
     slot: NewWorkerSlot | ExistingWorkerSlot
-    design_claim: staff.DesignWorkerClaim | staff.NoDesignWorkerClaim = staff.NO_DESIGN_WORKER_CLAIM
 
     @property
     def lock_reference(self) -> staff.StaffId:
@@ -541,8 +540,6 @@ def publish(allowed: WorkerStartAllowed, runtime_id: str, *,
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             if isinstance(allowed.slot, ExistingWorkerSlot):
                 row = staff.update_current_session(allowed.slot.row.current_session, identity)
-            elif isinstance(allowed.design_claim, staff.DesignWorkerClaim):
-                row = staff.ensure_worker(identity, allowed.name, allowed.parent, design_claim=allowed.design_claim)
             else:
                 row = staff.ensure_worker(identity, allowed.name, allowed.parent)
             if isinstance(launch_home, staff.SessionHome):

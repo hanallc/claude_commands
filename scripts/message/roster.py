@@ -1356,16 +1356,13 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
     threads: set[str] = set()
     for path in sorted(design_roles.state_root().glob('*/design.json')):
         try:
-            with staff.supplied_snapshot(membership):
-                design = design_roles.read_design(path.parent.name)
+            design = design_roles.read_design(path.parent.name)
             for instance in design.roles:
                 if isinstance(instance.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
                     continue
-                member = membership.by_id(instance.lifecycle.staff_id)
-                if member is None and isinstance(instance.lifecycle, design_roles.RoleWorkerPublished):
-                    continue
                 parent = design_roles.worker_parent(design, instance.role, membership)
                 showrunner, director = _held_location(parent, membership, claude)
+                member = membership.by_id(instance.lifecycle.staff_id)
                 evidence = session_staff.worker_backend(membership, member.id) if member is not None else session_staff.WorkerBackendUnavailable("worker is absent")
                 thread = (member.current_session if member is not None and isinstance(evidence, session_staff.RecordedWorker)
                           and isinstance(evidence.backend, staff.CodexBackend) else "")
