@@ -1124,7 +1124,8 @@ def _upkeep_pid(holder: lock_holder.HolderRecord) -> int | None:
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str, *, slot_key: str = "") -> None:
+def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Literal["no_wait"] = "no_wait",
+                  slot_key: str = "") -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1134,7 +1135,16 @@ def _acquire_slot(lock: IO[bytes], name: str, *, slot_key: str = "") -> None:
             return
         except BlockingIOError as error:
             holder = _slot_holder(lock)
-            if seconds is not None:
+            if layout_deadline != "no_wait":
+                from scripts.agents import worker_lifecycle
+
+                try:
+                    worker_lifecycle.acquire_flock(lock, deadline=layout_deadline)
+                except worker_lifecycle.OperationDeadlineExpired:
+                    holder = _slot_holder(lock) or holder
+                else:
+                    return
+            elif seconds is not None:
                 if holder is not None:
                     upkeep_pid = _upkeep_pid(holder)
                 if upkeep_pid is not None:
@@ -1188,15 +1198,16 @@ def session_operation(session: str, *, native_key: str, join_recovery: bool = Fa
 
 
 @contextmanager
-def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]:
-    """Lock a row or a named worker slot across inherited children."""
+def slot_operation(key: str, name: str, *, join: bool = True,
+                   layout_deadline: float | Literal["no_wait"] = "no_wait") -> Generator[None]:
+    """Lock a slot across inherited children. Only the layout slot can wait for any holder."""
     path, variable = _row_lock(key)
     if join and _joined_operation(path, variable):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name, slot_key=key)
+        _acquire_slot(lock, name, layout_deadline=layout_deadline, slot_key=key)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
