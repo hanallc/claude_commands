@@ -479,6 +479,16 @@ class SnapshotCodecTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 _ = codec.parse_snapshot_value(value, schema)
 
+    def test_mac_outage_reports_preserve_evidence_in_saved_state(self) -> None:
+        for evidence in placement.MacOutage:
+            report = placement.TerminalAttemptReport(placement.AttemptLost(evidence, 10.0),
+                placement.DispatchPathSettled(), 610.0)
+            self.assertEqual(codec.snapshot_value(evidence), evidence.name)
+            self.assertEqual(wire.parse_record(wire.encode_record(report), placement.TerminalAttemptReport), report)
+        for value in ("unknown", 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "invalid Mac outage evidence"):
+                _ = codec.parse_snapshot_value(value, placement.MacOutage)
+
     def test_nested_union_records_keep_tags_and_optional_fields(self) -> None:
         for record in (Ready(3), Unavailable("not read")):
             raw = {"state": "waiting", "value": codec.snapshot_value(record)}
