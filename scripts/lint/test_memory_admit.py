@@ -47,6 +47,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
 from scripts.build_queue import queue_place as shell_place
 from scripts.build_targets.target_config import MAC_ONLY, PinnedTarget
+from scripts.mac_test.claim_state import WholeMacScope
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
@@ -6432,6 +6433,31 @@ class QueueExplanationTests(MemoryQueueFixture):
             assert isinstance(counts, gate.PassedRows), owner
             self.assertEqual(counts.memory, 0, owner)
         return passed
+
+    def test_guest_reading_at_the_run_limit_matches_a_natedev_wait(self) -> None:
+        repo = "claude_commands"
+        _ = self.running(100, 2, age=30, fields={"repo": repo, "step": "gate"})
+        _ = self.waiting(300, 2 * GIB, 20, repository_name=repo, step="gate")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name=repo, step="test-affected")
+        self.processes[500] = "other"
+        _ = self.waiting(500, 2 * GIB, 5, repository_name="other", step="test-affected")
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({f"natedev.{repo}": 1}))
+        owner = admission_records.waiter_owner(inputs.ordered[0][1])
+        wait = placement.EvidenceNeeded("not read")
+        guest = placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", WholeMacScope())
+        guest_reading = replace(inputs, local_waits={owner: wait},
+            placement_candidates={owner: (placement.CandidateEligibility(guest, wait),)})
+
+        normal = gate.admission_pass(inputs, inputs.now, policy).rows
+        reading = gate.admission_pass(guest_reading, inputs.now, policy).rows
+        self.assertEqual(normal[0].decision.run_limit, admission_records.RunLimitWait(1, 1, repo, "natedev"))
+        self.assertIsInstance(normal[1].reason, admission_records.BehindHead)
+        self.assertIsInstance(normal[2].admission, gate.ProposedAdmission)
+        self.assertEqual([row.decision.run_limit for row in reading], [row.decision.run_limit for row in normal])
+        self.assertEqual(reading[1].reason, normal[1].reason)
+        self.assertEqual(reading[2].admission, normal[2].admission)
 
     def test_a_start_past_a_run_limit_head_counts_run_limit_rows(self) -> None:
         repo = "claude_commands"

@@ -674,6 +674,41 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertIsInstance(fixture.connect(younger).replies()[0], wire.PlacementWait)
             self.assertFalse(fixture.server.reservations)
 
+    def test_the_guest_reading_timer_starts_the_older_natedev_row_at_the_deadline(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request,
+        )
+        from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            gap = 0.25
+            fixture.configure(waiting_pass_seconds=1, min_pass_gap_seconds=gap)
+            _ = mac_linux_fixture(fixture)
+            fixture.free(60 * GIB)
+            guest, local = mac_linux_candidate(), local_candidate(fixture)
+            older = placement_request(fixture, since=fixture.clock.now() - 1)
+            older = replace(older, constraints=replace(older.constraints, candidates=(guest, local)))
+            fixture.clock.advance(gap)
+            self.assertIsInstance(fixture.connect(older).replies()[0], wire.PlacementWait)
+            deadline = fixture.clock.monotonic() + GUEST_REF_TIMEOUT_SECONDS
+            younger = placement_request(fixture)
+            younger = replace(younger, constraints=replace(younger.constraints, candidates=(local,)))
+            fixture.clock.advance(gap)
+            self.assertIsInstance(fixture.connect(younger).replies()[0], wire.PlacementWait)
+
+            fixture.clock.advance(deadline - fixture.clock.monotonic() - gap / 2)
+            fixture.server.run_once(0)
+            self.assertFalse(fixture.server.reservations)
+            fixture.clock.advance(gap / 2)
+            fixture.server.run_once(0)
+            self.assertIn(older.episode, fixture.server.reservations)
+            self.assertNotIn(younger.episode, fixture.server.reservations)
+            fixture.clock.advance(gap)
+            granted, = fixture.connect(older).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+
     def test_placement_uses_natedev_before_reading_a_blocked_guest(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request,
@@ -757,6 +792,7 @@ class PlacementStatusTests(unittest.TestCase):
 
             request = replace(request, route=older.route, constraints=replace(request.constraints,
                 candidates=(local, *request.constraints.candidates)))
+            # The older request keeps its natedev place until it leaves the queue.
             cancelled = wire.CancelPlacement("cancel-guest", older.episode, older.owner, "the caller left")
             self.assertEqual(fixture.connect(cancelled).replies(), [wire.Ok()])
             with mock.patch.object(fixture.server, "_aws_gate_spending", return_value=placement.AllowedHost()) as spending:
@@ -825,6 +861,39 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertNotIn(prior.reservation, fixture.server.slots)
             self.assertNotIn(younger.episode, fixture.server.reservations)
 
+    def test_a_memory_wait_returns_a_younger_guest_claim_behind_an_earlier_guest(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request,
+        )
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            _ = mac_linux_fixture(fixture)
+            now = fixture.clock.now()
+            run = fixture.run_owner()
+            prior = fixture.finish_step(fixture.request(run=run))
+            fixture.allow_next_start()
+            fixture.free(12 * GIB)
+            guest, local = mac_linux_candidate(), local_candidate(fixture)
+            middle = placement_request(fixture, since=now - 0.5)
+            middle = replace(middle, constraints=replace(middle.constraints, candidates=(local,)))
+            waiting, = fixture.connect(middle).replies()
+            assert isinstance(waiting, wire.PlacementWait) and isinstance(waiting.wait, wire.Wait), waiting
+            reason = waiting.wait.reason
+            self.assertIsInstance(reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason,
+                                  records.NeedsMemory)
+            self.assertIsInstance(fixture.server.slots[prior.reservation], records.BetweenStepsSlot)
+
+            oldest = placement_request(fixture, since=now - 1)
+            oldest = replace(oldest, constraints=replace(oldest.constraints, candidates=(guest, local)))
+            younger = placement_request(fixture)
+            younger = replace(younger, run=run, constraints=replace(younger.constraints, candidates=(guest, local)))
+            for request in (oldest, younger):
+                reply, = fixture.connect(request).replies()
+                assert isinstance(reply, wire.PlacementWait), reply
+                self.assertIsInstance(reply.eligibility[0].eligibility, placement.EvidenceNeeded)
+            self.assertNotIn(prior.reservation, fixture.server.slots)
+
     def test_two_guest_waits_keep_the_continuation_for_local_fallback(self) -> None:
         from scripts.build_queue.test_placement import (
             ManualEvidenceWorker, PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture,
@@ -853,6 +922,7 @@ class PlacementStatusTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertIsInstance(fixture.connect(younger).replies()[0], wire.PlacementWait)
             self.assertEqual(fixture.server.slots.get(prior.reservation), continuation)
+            # Remove the older natedev place to check that the younger request can reuse its claim.
             cancelled = wire.CancelPlacement("cancel-guest", older.episode, older.owner, "the caller left")
             self.assertEqual(fixture.connect(cancelled).replies(), [wire.Ok()])
             granted, = fixture.connect(younger).replies()
