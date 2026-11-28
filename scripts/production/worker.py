@@ -3685,7 +3685,7 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets, *,
     identity_pattern = re.compile(rb'"worker_id"\s*:\s*"([^"\\]*)"')
     bad_line_reported = False
     try:
-        limit = 0 if complete else conf.read("production").whole("worker.history_bytes")
+        limit = 0 if complete else conf.read("production").value("worker.history_bytes", conf.file_byte_count)
         with path.open("rb") as history:
             offset = 0 if complete else max(0, history.seek(0, os.SEEK_END) - limit)
             _ = history.seek(offset - 1 if offset else 0)
