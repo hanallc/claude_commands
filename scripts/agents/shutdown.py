@@ -24,7 +24,7 @@ def _usage() -> str:
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
-  agents clone NAME --as NEW
+  agents clone NAME NEW_NAME
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
@@ -765,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--account", dest="account")
     command = commands.add_parser("clone")
     _ = command.add_argument("session", metavar="NAME")
-    _ = command.add_argument("--as", dest="new", required=True, metavar="NEW")
+    _ = command.add_argument("new", metavar="NEW_NAME")
     command = commands.add_parser("remove-stray")
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("session", metavar="SESSION")
