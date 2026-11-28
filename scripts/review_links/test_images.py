@@ -3308,7 +3308,9 @@ class ImagePairTests(ImagesFixture):
         self.assertEqual(lines[1:4], ["Feedback: Good.",
                                       f"Before: http://127.0.0.1:8765/images/{record['id']}/before.png",
                                       f"After: http://127.0.0.1:8765/images/{record['id']}/after.webp"])
-        self.assertNotIn(record["id"], images.render(self.status).decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
+        path, = images.decision_root(self.root).glob(f"{record['id']}-*.json")
+        self.assertIsInstance(images.verified_image_decision(self.root, path), images.ImageDecision)
 
 
 class ImagesServerTests(ImagesFixture):
@@ -3482,6 +3484,9 @@ class ImagesServerTests(ImagesFixture):
                          [f"session:{self.owner.current_session}" if self.owner is not None else "",
                           f"session:{producer.current_session}"])
         self.assertTrue(all(words in message for _, _, message in self.sent))
+        entry = saved.log[-1]
+        assert isinstance(entry, the_list.ImageAnswerChange)
+        self.assertTrue(images.matches_list_answer(self.root, record["id"], item.id, keeper.id, entry))
 
     def test_held_linked_picture_answer_can_be_undone_or_released_once(self) -> None:
         keeper, _, item = self.list_item()

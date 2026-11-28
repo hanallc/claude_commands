@@ -614,6 +614,30 @@ def _answer_words(identity: str, answer: str, feedback: str) -> str:
     return summary + "\n" + feedback if feedback else summary
 
 
+def _removed_answer_message(saved: image_store.ImageAnswers, answer: str, feedback: str) -> str:
+    message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {saved['id']} was removed."
+    if feedback:
+        message += "\nFeedback: " + feedback
+    if "list_item" in saved:
+        message += "\nList item: " + saved["list_item"]
+    return message
+
+
+def _answer_message_matches(saved: image_store.ImageAnswers, message: str, answer: str, feedback: str) -> bool:
+    if message == _removed_answer_message(saved, answer, feedback):
+        return True
+    header = ANSWER_PREFIX + ANSWERS[answer]
+    if feedback:
+        header += "\nFeedback: " + feedback
+    if not message.startswith(header):
+        return False
+    link = rf"https?://[^/\n]+/{image_store.IMAGES_FOLDER}/{saved['id']}/"
+    pictures = re.compile(rf"\n(?:Image: {link}image\.[a-z]+|"
+                          + rf"Before: {link}before\.[a-z]+\nAfter: {link}after\.[a-z]+)\nTitle: ")
+    details = pictures.match(message, len(header))
+    return details is not None and pictures.search(message, details.end()) is None
+
+
 def _signed_delivery_key_matches(folder: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer,
                                  position: int, key: str) -> bool:
     if key == signed.get("form_request_key"):
@@ -638,7 +662,7 @@ def _completed_signed_answers(directory: Path, saved: image_store.ImageAnswers, 
             continue
         answer, feedback = signed["answer"], signed["feedback"]
         if (attempt.get("words") == _answer_words(saved["id"], answer, feedback)
-                and attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS[answer]
+                and _answer_message_matches(saved, attempt["message"], answer, feedback)
                 and _signed_delivery_key_matches(folder, saved, signed, position, key)):
             yield key, signed
 
@@ -777,11 +801,7 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         key = form_key or draft.new_decision_key(folder, saved, round_id, len(attempts))
         previous = answered
         if record is None:
-            message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
-            if feedback:
-                message += "\nFeedback: " + feedback
-            if "list_item" in saved:
-                message += "\nList item: " + saved["list_item"]
+            message = _removed_answer_message(saved, answer, feedback)
         else:
             if not form_key:
                 legacy_key = draft.delivery_key(folder, saved, draft.round_id)

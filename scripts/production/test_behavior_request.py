@@ -226,6 +226,23 @@ class BehaviorRequestImagesTests(TestCase):
         self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback, approval_note}),
                          {APPROVAL: MOMENT.date(), feedback: MOMENT.date()})
 
+    def test_images_requires_all_delivered_feedback_to_match(self) -> None:
+        keeper, item, source = self.new_list_item()
+        feedback = "Keep the second row.\nKeep the third row."
+        answers = self.signed_answer(keeper, item=item.id, feedback=feedback)
+        key, attempt = next(iter(answers["attempts"].items()))
+        directory = images.images_root(self.root)
+        quotes = {APPROVAL, "Keep the third row."}
+        expected = {quote: MOMENT.date() for quote in quotes}
+        self.assertEqual(behavior_request.verified_dates(source, quotes), expected)
+        _, _, details = attempt["message"].partition(feedback)
+        for changed in ("Keep the second row.", "Keep the second row.\nRemove the third row.",
+                        feedback + "\nRemove the last row.", feedback + details):
+            with self.subTest(changed=changed):
+                wrong: image_store.ImageAnswer = {**attempt, "message": attempt["message"].replace(feedback, changed, 1)}
+                image_store.write_answers(directory, {**answers, "attempts": {key: wrong}})
+                self.assertEqual(behavior_request.verified_dates(source, quotes), {})
+
     def test_signed_images_feedback_on_the_list_verifies_as_nates_words(self) -> None:
         keeper, item, source = self.new_list_item()
         feedback = "Keep the second row."
