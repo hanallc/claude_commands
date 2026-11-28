@@ -13,6 +13,7 @@ from enum import Enum
 import fcntl
 from functools import cache
 from hashlib import sha256
+from heapq import heapreplace
 from importlib.metadata import packages_distributions
 from io import BytesIO
 from itertools import chain
@@ -1102,36 +1103,45 @@ def extraction_time(run: SelectionRun | None) -> Generator[None]:
 
 
 type ExtractionResult = SourceFacts | Exception
+type IndexedSource = tuple[int, str, str]
 
 
-def extract_slice(sender: Connection, sources: list[tuple[str, str]]) -> None:
+def extraction_slices(sources: list[tuple[str, str]], processes: int) -> list[list[IndexedSource]]:
+    slices: list[list[IndexedSource]] = [[] for _ in range(processes)]
+    loads = [(0, 0, index) for index in range(processes)]
+    indexed = [(index, path, text) for index, (path, text) in enumerate(sources)]
+    for item in sorted(indexed, key=lambda source: len(source[2]), reverse=True):
+        length, count, index = loads[0]
+        slices[index].append(item)
+        _ = heapreplace(loads, (length + len(item[2]), count + 1, index))
+    return slices
+
+
+def extract_slice(sender: Connection, sources: list[IndexedSource]) -> None:
     # The parent blocks cancellation while it registers new workers.
     _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
     with sender:
-        results: list[ExtractionResult] = []
-        for path, source in sources:
+        results: list[tuple[int, ExtractionResult]] = []
+        for index, path, source in sources:
             try:
-                results.append(extract_facts(source, path))
+                result = extract_facts(source, path)
             except Exception as error:
-                results.append(error)
+                results.append((index, error))
+            else:
+                results.append((index, result))
         sender.send(results)
 
 
 def extract_slices(sources: list[tuple[str, str]], processes: int) -> dict[str, ExtractionResult]:
     context = get_context("spawn")
-    width, remainder = divmod(len(sources), processes)
     workers: list[BaseProcess] = []
-    pending: dict[Connection, list[tuple[str, str]]] = {}
-    results: dict[str, ExtractionResult] = {}
+    pending: dict[Connection, int] = {}
+    results: dict[int, ExtractionResult] = {}
     joined = False
     with ExitStack() as pipes:
         try:
             try:
-                start = 0
-                for index in range(processes):
-                    end = start + width + (index < remainder)
-                    batch = sources[start:end]
-                    start = end
+                for batch in extraction_slices(sources, processes):
                     with cancellation.defer_cleanup_signals():
                         receiver, sender = cast(tuple[Connection, Connection], context.Pipe(duplex=False))
                         with sender:
@@ -1139,20 +1149,21 @@ def extract_slices(sources: list[tuple[str, str]], processes: int) -> dict[str, 
                             worker = context.Process(target=extract_slice, args=(sender, batch))
                             worker.start()
                             workers.append(worker)
-                        pending[receiver] = batch
+                        pending[receiver] = len(batch)
             except OSError:
                 return {}
 
             while pending:
                 for receiver in cast(list[Connection], wait(pending)):
-                    batch = pending.pop(receiver)
+                    expected = pending.pop(receiver)
                     with receiver:
                         try:
-                            extracted = cast(list[ExtractionResult], receiver.recv())
+                            extracted = cast(list[tuple[int, ExtractionResult]], receiver.recv())
                         except (EOFError, OSError):
                             # Each pipe has one writer. A short result affects only this slice.
                             continue
-                    results.update((path, result) for (path, _), result in zip(batch, extracted, strict=True))
+                    if len(extracted) == expected:
+                        results.update(extracted)
             for worker in workers:
                 worker.join()
             joined = True
@@ -1165,7 +1176,7 @@ def extract_slices(sources: list[tuple[str, str]], processes: int) -> dict[str, 
                         worker.join()
                 for worker in workers:
                     worker.close()
-    return results
+    return {path: results[index] for index, (path, _) in enumerate(sources) if index in results}
 
 
 def pooled_fact_reader(paths: list[str], read_source: Callable[[str], str], processes: int,

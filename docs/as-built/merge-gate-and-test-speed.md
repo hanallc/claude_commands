@@ -654,9 +654,10 @@ Older files stay in the folder for manual removal.
 The selector keeps cached facts for the current tree and its base tree.
 The current and base graphs share one cache read and one cache update.
 The selector extracts missing base facts only when it builds the base graph for a removed Python file.
-The parent reads the missing source text and divides the paths into contiguous slices.
+The parent reads the missing source text and sorts it by length, longest first.
+The parent assigns each path to the slice with the lowest total text length.
 `affected.extract.processes` sets the worker count. `config/gate.conf` sets this value to eight.
-Each worker extracts one slice and sends one list of facts or exceptions through its own pipe.
+Each worker sends one list of facts or exceptions with their path indexes through its own pipe.
 The selector runs serially with one configured process, too few misses, or an OS error during pool startup.
 The pool needs at least twice the configured process count in misses.
 If a worker exits before it sends its complete list, the parent extracts that slice from the saved source text.

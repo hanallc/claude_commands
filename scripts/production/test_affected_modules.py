@@ -30,15 +30,15 @@ from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
 
-def block_extraction_worker(sender: Connection, _sources: list[tuple[str, str]]) -> None:
+def block_extraction_worker(sender: Connection, _sources: list[affected.IndexedSource]) -> None:
     with sender:
         sender.send(os.getpid())
         signal.pause()
 
 
-def kill_first_extraction_worker(sender: Connection, sources: list[tuple[str, str]], *,
-                                 partial_result: bool) -> None:
-    if sources[0][0] == "scripts/checks/test_new.py":
+def kill_extraction_worker_for_new_test(sender: Connection, sources: list[affected.IndexedSource], *,
+                                        partial_result: bool) -> None:
+    if any(path == "scripts/checks/test_new.py" for _, path, _ in sources):
         if partial_result:
             # Write a frame header and one byte before the worker dies.
             _ = os.write(sender.fileno(), b"\x00\x00\x00\x08\x00")
@@ -46,7 +46,7 @@ def kill_first_extraction_worker(sender: Connection, sources: list[tuple[str, st
     affected.extract_slice(sender, sources)
 
 
-def fail_extraction_worker(sender: Connection, sources: list[tuple[str, str]]) -> None:
+def fail_extraction_worker(sender: Connection, sources: list[affected.IndexedSource]) -> None:
     with mock.patch.object(affected, "extract_facts", side_effect=ValueError("unsupported operand type")):
         affected.extract_slice(sender, sources)
 
@@ -1034,6 +1034,19 @@ def shadow(root):
         for index in range(24):
             self.write(f"scripts/component/source_{index}.py", f"VALUE = {value!r}, {index}\n")
 
+    def test_extraction_balances_text_lengths_and_returns_facts_in_path_order(self) -> None:
+        sources: list[tuple[str, str]] = []
+        for index, length in enumerate((100, 80, 50, 90, 70, 60)):
+            text = f"import module_{index}\n#"
+            sources.append((f"scripts/source_{index}.py", text.ljust(length, "x")))
+
+        slices = affected.extraction_slices(sources, processes=3)
+        self.assertEqual([[index for index, _, _ in batch] for batch in slices], [[0, 2], [3, 5], [1, 4]])
+        self.assertEqual([sum(len(text) for _, _, text in batch) for batch in slices], [150, 150, 150])
+
+        expected = [(path, affected.extract_facts(text, path)) for path, text in sources]
+        self.assertEqual(list(affected.extract_slices(sources, processes=3).items()), expected)
+
     def test_pooled_extraction_preserves_selection_and_cached_facts(self) -> None:
         self.add_extraction_sources("base")
         self.write("scripts/component/removed.py", "REMOVED = True\n")
@@ -1166,11 +1179,14 @@ def shadow(root):
         with mock.patch.object(affected, "extract_facts", wraps=affected.extract_facts) as serial_extract:
             serial = affected.select_affected(self.repo, self.base, self.modules, set())
         assert isinstance(serial, affected.AffectedSelection) and isinstance(serial.run, affected.SelectionRun)
-        first_slice_size = (serial.run.extracted_files + 7) // 8
+        serial_sources = [(cast(str, call.args[1]), cast(str, call.args[0])) for call in serial_extract.call_args_list]
+        killed_slice = next(batch for batch in affected.extraction_slices(serial_sources, processes=8)
+                            if any(path == "scripts/checks/test_new.py" for _, path, _ in batch))
+        expected_retries = [serial_extract.call_args_list[index] for index, _, _ in sorted(killed_slice)]
         self.set_gate_config(processes=8)
 
         for partial_result in (False, True):
-            target = partial(kill_first_extraction_worker, partial_result=partial_result)
+            target = partial(kill_extraction_worker_for_new_test, partial_result=partial_result)
             with (self.subTest(partial_result=partial_result),
                   mock.patch.object(affected, "extract_slice", target),
                   mock.patch.object(affected, "extract_facts", wraps=affected.extract_facts) as retry):
@@ -1179,7 +1195,7 @@ def shadow(root):
             assert isinstance(pooled.run, affected.SelectionRun)
             self.assertEqual(pooled.run.cache_misses, serial.run.cache_misses)
             self.assertEqual(pooled.run.extracted_files, serial.run.extracted_files)
-            self.assertEqual(retry.call_args_list, serial_extract.call_args_list[:first_slice_size])
+            self.assertEqual(retry.call_args_list, expected_retries)
 
     def test_pooled_source_read_error_matches_serial_without_rereading(self) -> None:
         self.add_extraction_sources("base")
