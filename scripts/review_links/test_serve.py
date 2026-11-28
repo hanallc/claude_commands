@@ -6035,6 +6035,29 @@ class ReviewLinksServerTests(unittest.TestCase):
   check(wordsBox(504).value===words,'Closing the overlay keeps the Tell draft.');
 """), linked_items=True)
 
+    def test_version_notice_probe_closes_firefox_when_watcher_start_fails(self) -> None:
+        handler = self.server.RequestHandlerClass
+        failure = RuntimeError("The watcher did not start.")
+        close = Mock()
+        start = Mock(side_effect=failure)
+        join = Mock()
+        browser = Mock(spec=Firefox, close=close)
+        watcher = Mock(spec=threading.Thread, start=start, join=join)
+        with ExitStack() as patches:
+            def open_browser(*_args: object, **_kwargs: object) -> Mock:
+                _ = patches.enter_context(patch.object(threading, "Thread", return_value=watcher))
+                return browser
+
+            _ = patches.enter_context(patch.object(sys.modules[__name__], "Firefox", side_effect=open_browser))
+            with self.assertRaises(RuntimeError) as raised:
+                _ = self.check_version_notice_browser(b"")
+
+        self.assertIs(raised.exception, failure)
+        start.assert_called_once_with()
+        close.assert_called_once_with()
+        self.assertIs(self.server.RequestHandlerClass, handler)
+        join.assert_not_called()
+
     def check_version_notice_browser(self, probe: bytes, *, allow_proof: bool = False, hold_review: bool = False,
                                      linked_items: bool = False, setup: bytes = b"") -> tuple[version_notice.Notice, Path]:
         self.server.verified_tailscale_address = "127.0.0.1"
@@ -6112,35 +6135,39 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         origin = f"http://127.0.0.1:{self.port}"
         with tempfile.TemporaryDirectory(prefix="version-notice-browser-") as folder:
+            handler = self.server.RequestHandlerClass
+            started_watcher: threading.Thread | None = None
             browser = Firefox(Path(folder), timeout=TEST_HANG_GUARD_SECS)
-            exited = threading.Thread(target=lambda: results.put(browser.process.wait()), daemon=True)
-
-            def run(place: str, picture: Path | None = None) -> None:
-                nonlocal step
-                step = "Load the console."
-                with browser.page(origin + place, 1440, 900, dark=True, reduced_motion=True):
-                    try:
-                        result = results.get(timeout=TEST_HANG_GUARD_SECS)
-                    except queue.Empty:
-                        self.fail(f"The version notice probe stopped at this step. {step}")
-                    if isinstance(result, int):
-                        log = (Path(folder) / "firefox.log").read_text(errors="replace")
-                        self.fail(f"Firefox exited with status {result} during this step. {step}\n{log}")
-                    self.assertEqual(result, [])
-                    if picture is not None:
-                        browser.screenshot(picture)
-
-            self.server.RequestHandlerClass = VersionBrowser
-            exited.start()
             try:
+                watcher = threading.Thread(target=lambda: results.put(browser.process.wait()), daemon=True)
+
+                def run(place: str, picture: Path | None = None) -> None:
+                    nonlocal step
+                    step = "Load the console."
+                    with browser.page(origin + place, 1440, 900, dark=True, reduced_motion=True):
+                        try:
+                            result = results.get(timeout=TEST_HANG_GUARD_SECS)
+                        except queue.Empty:
+                            self.fail(f"The version notice probe stopped at this step. {step}")
+                        if isinstance(result, int):
+                            log = (Path(folder) / "firefox.log").read_text(errors="replace")
+                            self.fail(f"Firefox exited with status {result} during this step. {step}\n{log}")
+                        self.assertEqual(result, [])
+                        if picture is not None:
+                            browser.screenshot(picture)
+
+                self.server.RequestHandlerClass = VersionBrowser
+                watcher.start()
+                started_watcher = watcher
                 if proof:
                     run(route + "&shot=1", Path(proof))
                     state.unlink()
                 run(route)
             finally:
-                self.server.RequestHandlerClass = serve.ReviewLinksHandler
+                self.server.RequestHandlerClass = handler
                 browser.close()
-                exited.join(TEST_HANG_GUARD_SECS)
+                if started_watcher is not None:
+                    started_watcher.join(TEST_HANG_GUARD_SECS)
         return notice, root
 
     def test_console_page_gzip_matches_identity(self) -> None:
