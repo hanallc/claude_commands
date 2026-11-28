@@ -250,6 +250,23 @@ class TrackedPromptSubmission:
         self.check()
 
 
+class AnswerTransportCompleted(Enum):
+    SENT = "the transport finished sending the answer"
+
+
+@dataclass(frozen=True)
+class AnswerDidNotSubmit:
+    reason: str
+
+
+@dataclass(frozen=True)
+class AnswerDeliveryUnknown:
+    reason: str
+
+
+AnswerTransport = AnswerTransportCompleted | AnswerDidNotSubmit | AnswerDeliveryUnknown
+
+
 class _WrongNativeTarget(HerdrFailure):
     def __init__(self, reason: str, sessions: frozenset[str]) -> None:
         super().__init__(reason, "wrong_target")
@@ -3579,27 +3596,42 @@ class Herdr:
             script_prompts.mark_keys(pane)
         self._send_keys(pane, *keys)
 
-    def answer_question(self, pane: str, text: str, *, target: str) -> None:
+    def answer_prompt(self, pane: str, text: str, *, target: str) -> AnswerTransport:
+        """Send an answer through the normal composer."""
+        submission = TrackedPromptSubmission(lambda: None)
+        try:
+            self.prompt(pane, text, target=target, on_submission=submission)
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            if submission.may_have_submitted:
+                return AnswerDeliveryUnknown(str(error))
+            return AnswerDidNotSubmit(str(error))
+        return AnswerTransportCompleted.SENT
+
+    def answer_question(self, pane: str, text: str, *, target: str) -> AnswerTransport:
         """Answer a Codex question through the selected session's input box."""
         if not target:
-            raise HerdrFailure(f"{pane}: would send keys without a named target session")
-        for index, key in enumerate(("shift+left", "enter", "enter")):
-            expected = "" if index == 0 else text
-            if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
-                                pane_info=self.pane_row(pane), client=self):
-                raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-            try:
-                self._send_keys(pane, key)
-            except HerdrCommandNotStarted as error:
-                if index == 0:
-                    raise
-                raise HerdrFailure(f"{pane}: the answer may be partly typed: {error}") from error
-            if index == 0:
-                script_prompts.record(pane, text)
+            return AnswerDidNotSubmit(f"{pane}: would send keys without a named target session")
+        may_have_sent_keys = False
+        try:
+            for index, key in enumerate(("shift+left", "enter", "enter")):
+                expected = "" if index == 0 else text
+                if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
+                                    pane_info=self.pane_row(pane), client=self):
+                    raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+                may_have_sent_keys = True
                 try:
+                    self._send_keys(pane, key)
+                except HerdrCommandNotStarted:
+                    may_have_sent_keys = index != 0
+                    raise
+                if index == 0:
+                    script_prompts.record(pane, text)
                     _ = self.run("pane", "send-text", pane, text)
-                except HerdrCommandNotStarted as error:
-                    raise HerdrFailure(f"{pane}: the answer selection key was sent: {error}") from error
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            if may_have_sent_keys:
+                return AnswerDeliveryUnknown(str(error))
+            return AnswerDidNotSubmit(str(error))
+        return AnswerTransportCompleted.SENT
 
     def _send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)

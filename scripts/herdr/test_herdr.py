@@ -4384,7 +4384,7 @@ class HerdrTests(unittest.TestCase):
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
         with (self.question_box(client, pane, session) as commands,
               patch.object(herdr, "check_target", wraps=herdr.check_target) as checks):
-            client.answer_question(pane, text, target=session)
+            self.assertIs(client.answer_question(pane, text, target=session), herdr.AnswerTransportCompleted.SENT)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text),
                                     ("pane", "send-keys", pane, "enter"), ("pane", "send-keys", pane, "enter")])
         self.assertEqual([cast(str, entry.kwargs["text"]) for entry in checks.call_args_list], ["", text, text])
@@ -4403,7 +4403,7 @@ class HerdrTests(unittest.TestCase):
                 record(pane, text)
 
             with patch.object(script_prompts, "record", side_effect=record_before_send) as evidence:
-                client.answer_question(pane, text, target=session)
+                self.assertIs(client.answer_question(pane, text, target=session), herdr.AnswerTransportCompleted.SENT)
             evidence.assert_called_once_with(pane, text)
         self.assertIn(("pane", "send-text", pane, text), commands)
         self.assertTrue(script_prompts.typed_by_script(pane, text))
@@ -4442,7 +4442,7 @@ class HerdrTests(unittest.TestCase):
         client = self.herdr
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
         with self.question_box(client, pane, session, prompt_marker="›") as commands:
-            client.answer_question(pane, text, target=session)
+            self.assertIs(client.answer_question(pane, text, target=session), herdr.AnswerTransportCompleted.SENT)
             self.assertIsInstance(client.composer(pane), herdr.NoComposer)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text),
                                     ("pane", "send-keys", pane, "enter"), ("pane", "send-keys", pane, "enter")])
@@ -4456,9 +4456,31 @@ class HerdrTests(unittest.TestCase):
                 return herdr.NativeAgentProcess(herdr.PaneSessionReport(current), "fixture-start", {})
 
             with patch.object(herdr, "native_process", side_effect=native):
-                with self.assertRaisesRegex(herdr_types.HerdrFailure, "does not run session"):
-                    client.answer_question(pane, text, target=session)
+                result = client.answer_question(pane, text, target=session)
+                self.assertIsInstance(result, herdr.AnswerDeliveryUnknown)
+                assert isinstance(result, herdr.AnswerDeliveryUnknown)
+                self.assertIn("does not run session", result.reason)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text)])
+
+    def test_answer_question_reports_a_first_key_that_cannot_start(self) -> None:
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-question"
+        with (self.question_box(client, pane, session) as commands,
+              patch.object(client, "_send_keys", side_effect=herdr.HerdrCommandNotStarted("the command could not start"))):
+            result = client.answer_question(pane, "Use JSON.", target=session)
+        self.assertEqual(result, herdr.AnswerDidNotSubmit("the command could not start"))
+        self.assertEqual(commands, [])
+
+    def test_answer_prompt_distinguishes_unstarted_transport_from_uncertain_delivery(self) -> None:
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-question"
+        with self.prompt_target(client, pane, session):
+            with patch.object(client, "_prompt", side_effect=herdr.HerdrCommandNotStarted("the command could not start")):
+                result = client.answer_prompt(pane, "Use JSON.", target=session)
+            self.assertEqual(result, herdr.AnswerDidNotSubmit("the command could not start"))
+            with patch.object(client, "_prompt", side_effect=herdr_types.HerdrFailure("the command timed out")):
+                result = client.answer_prompt(pane, "Use JSON.", target=session)
+            self.assertEqual(result, herdr.AnswerDeliveryUnknown("the command timed out"))
 
     def test_failed_source_record_prevents_prompt_submission(self) -> None:
         from scripts.lib import script_prompts

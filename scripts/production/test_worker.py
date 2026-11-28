@@ -254,6 +254,15 @@ class DispatchAgent:
         self.fixture.world.locations[pane]["agent_status"] = "done"
         self.after_complete(pane)
 
+    def question_record(self, pane: str, call: str, *, answered: bool = False) -> None:
+        row = self.row(pane)
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        payload = ({"type": "function_call_output", "call_id": call, "output": "{}"} if answered else
+                   {"type": "function_call", "call_id": call, "name": "request_user_input", "arguments": "{}"})
+        with worker_admission.transcript_source(row, backend).open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps({"type": "response_item", "payload": payload}) + "\n")
+
     def pane_commands(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
         composer = self.fixture.world.composer
@@ -4230,7 +4239,9 @@ class WorkerCommandTests(unittest.TestCase):
         for index, reported in enumerate((True, False), start=1):
             with self.subTest(reported=reported):
                 if index == 2:
+                    self.agent.question_record(opened.pane, "question-1", answered=True)
                     self.agent.append(opened.pane, "assistant", "Which output format must I use?")
+                self.agent.question_record(opened.pane, f"question-{index}")
                 self.agent.questions[opened.pane] = "Which output format must I use?"
                 self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
                 if not reported:
@@ -4347,8 +4358,10 @@ class WorkerCommandTests(unittest.TestCase):
             with patch.object(self.fixture.world, "run", side_effect=accept_followup):
                 with self.subTest(sequence="holder fallback, answer, repeated answer before DONE"):
                     before = len(self.agent.submitted)
-                    with patch.object(self.fixture.world, "prompt", side_effect=herdr.HerdrCommandNotStarted("not started")):
-                        self.assertEqual(self.command("answer", row.name, "--text", text)[0], worker.ExitCode.UNCERTAIN)
+                    with patch.object(self.fixture.world, "_prompt", side_effect=herdr.HerdrCommandNotStarted("not started")):
+                        code, output, error = self.command("answer", row.name, "--text", text)
+                    self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+                    self.assertIn("did not submit", error)
                     self.assertEqual(self.command("answer", row.name, "--text", text), (0, "done\n", ""))
                     for state, code in (("working", worker.ExitCode.BUSY), ("unknown", worker.ExitCode.UNCERTAIN),
                                         ("idle", worker.ExitCode.BUSY)):
@@ -4699,6 +4712,82 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(error.splitlines()), 1)
         self.assertEqual(self.agent.answers, [])
         self.assertEqual(len(self.agent.submitted), 1)
+
+    def answerable_worker(self, *, status: str = "blocked") -> worker_panes.OpenWorker:
+        opened = self.opened()
+        self.agent.finish_after = 1
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.agent.append(opened.pane, "assistant", "Which format must I use?")
+        self.agent.questions[opened.pane] = "Which format must I use?"
+        self.fixture.world.locations[opened.pane]["agent_status"] = status
+        return opened
+
+    def test_answer_uses_an_open_question_box_when_status_is_idle(self) -> None:
+        opened = self.answerable_worker(status="idle")
+        self.agent.question_record(opened.pane, "format")
+        with patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt:
+            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        prompt.assert_not_called()
+        self.assertEqual(self.agent.answers, [(opened.pane, "Use JSON.")])
+
+    def test_answer_prompts_a_blocked_codex_worker_without_an_open_call(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "closed")
+        self.agent.question_record(opened.pane, "closed", answered=True)
+        with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as box:
+            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        box.assert_not_called()
+        (pane, text), = self.agent.answers
+        self.assertEqual(pane, opened.pane)
+        self.assertIn("Use JSON.", text)
+        self.assertIn("DONE ", text)
+
+    def test_answer_allows_retry_after_target_refusal_before_input(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "format")
+        answer = ("answer", "impl", "--text", "Use JSON.")
+        self.agent.answer_inputs[opened.pane] = "Unsent answer"
+        code, output, error = self.command(*answer)
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("did not submit", error)
+        self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+        self.assertEqual(self.agent.answers, [])
+        del self.agent.answer_inputs[opened.pane]
+        self.assertEqual(self.command(*answer), (0, "done\n", ""))
+        self.assertEqual(self.agent.answers, [(opened.pane, "Use JSON.")])
+
+    def test_answer_refuses_a_second_answer_when_delivery_is_unknown(self) -> None:
+        _ = self.answerable_worker()
+        answer = ("answer", "impl", "--text", "Use JSON.")
+        with patch.object(self.fixture.world, "_prompt", return_value=None) as transport:
+            code, output, error = self.command(*answer)
+            self.assertEqual((code, output), (worker.ExitCode.UNCERTAIN, ""))
+            self.assertIn("delivery unknown", error)
+            code, output, error = self.command(*answer)
+            self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+            self.assertIn("an answer is pending for this input request", error)
+        transport.assert_called_once()
+        self.assertEqual(self.agent.answers, [])
+
+    def test_answer_allows_a_new_box_after_the_transcript_accepts_the_first_answer(self) -> None:
+        opened = self.answerable_worker()
+        self.agent.question_record(opened.pane, "format")
+        append = self.agent.append
+
+        def record_tool_answer(pane: str, role: str, text: str) -> None:
+            if pane == opened.pane and role == "user":
+                self.agent.question_record(pane, "format", answered=True)
+            else:
+                append(pane, role, text)
+
+        with patch.object(self.agent, "append", side_effect=record_tool_answer):
+            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+        self.assertEqual(self.command("answer", "impl", "--text", "Use Markdown.")[0], worker.ExitCode.BUSY)
+        self.agent.question_record(opened.pane, "indent")
+        self.agent.questions[opened.pane] = "What indent must I use?"
+        self.assertEqual(self.command("answer", "impl", "--text", "Use two spaces."), (0, "done\n", ""))
+        self.assertEqual(self.agent.answers, [(opened.pane, "Use JSON."), (opened.pane, "Use two spaces.")])
 
     def test_answer_uses_prompt_for_an_idle_worker(self) -> None:
         opened = self.opened()
