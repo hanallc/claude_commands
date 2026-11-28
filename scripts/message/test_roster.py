@@ -1567,6 +1567,8 @@ class RosterTests(unittest.TestCase):
                     fields = cast(dict[str, object], json.loads(bad.read_text()))
                     del fields["repository"]
                     fields["repository_owner"] = "missing-owner"
+                    fields["document"] = "broken-design.md"
+                    fields["binding"] = {"kind": "DesignUnbound"}
                     _ = bad.write_text(json.dumps(fields))
                 code, output, errors = self._run_main('--json')
                 self.assertEqual(code, 0, errors)

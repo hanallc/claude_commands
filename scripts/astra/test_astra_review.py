@@ -101,6 +101,9 @@ class AstraReviewTests(StaffTestCase):
         worker = fixture_worker("demo-proposal-astra-reviewer", unit_membership("demo", "proposal-unit").id,
                                 runtime_id=fixture_runtime_id("held-thread"),
                                 backend=staff.CodexBackend(self.root / "codex-home"))
+        if busy:
+            self.world.add(worker, "w1:p1", family="codex")
+            self.world.locations["w1:p1"]["agent_status"] = "working"
         design_id = "00000000-0000-4000-8000-000000000016"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
                                   str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
@@ -157,7 +160,7 @@ class AstraReviewTests(StaffTestCase):
             design = self.held_reviewer(busy=True)
             self.assertEqual(astra_review.main([str(self.document)]), 1)
             self.assertEqual(list(design_roles.design_directory(design.placement.design_id).glob("prompts/*.md")), [])
-        self.assertIn("busy", errors.getvalue())
+        self.assertIn("role is busy; finish its turn first", errors.getvalue())
         self.assertEqual(self.router.commands, [])
         self.assertEqual(self.world.requests, [])
 
