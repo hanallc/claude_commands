@@ -44,6 +44,11 @@ checkpoint does, the phase's next edit acquires another, and drift must name tha
 (cargo-liner, 2026-10-21). `record-active` on an `Active` record reads the recorded reservation
 on berth's board, and a released one takes the phase's live reservation. Every other state is
 left as it is: the checkpoint's own states belong to <CheckpointCommit/>.
+
+`repair --to` points an open phase's Active record at a named Active reservation.
+The named reservation must belong to the recorded coordination run and phase worktree.
+Its scopes must cover a nonempty phase files list.
+The check publishes the phase session mapping. The record keeps the log entry so a retry can finish the switch.
 """
 from __future__ import annotations
 try:
@@ -62,10 +67,11 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple, cast, overload
+from typing import Literal, NamedTuple, TypedDict, cast, overload
+from uuid import uuid4
 
-from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import build_folders, copy_record, unit_runs
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_bytes_atomic, write_text_atomic
+from scripts.lib import berth_board, build_folders, copy_record, unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 from scripts.worktree import worktree_records
@@ -74,6 +80,7 @@ from scripts.direct import recorder_state  # noqa: E402
 
 PHASES_DIR = "phases"
 REPAIRS_FILE = "reservation_repairs.log"
+SWITCH_LOG_ENTRY = "reservation_switch_log_entry"
 RELEASED_FILE = "reservation_released"
 STATE_FILE = "delegated_phase_reservation_state.json"
 BASELINE_FILE = "phase_baseline"
@@ -113,6 +120,7 @@ LEFT_UNMAPPED = "left_unmapped"
 # harness session id to the reservation that session holds.
 LEDGER_DIRECTORY = "cargo-berth"
 SESSION_MAP_FILE = "session-identities.json"
+JOURNAL_FILE = "journal.ndjson"
 # A check over a phase's whole files list took 77 s on 2026-10-29, against a ten-second ledger deadline.
 CHECK_TIMEOUT_SECONDS = 90
 PATCH_PATH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
@@ -124,6 +132,11 @@ class Acquisition(NamedTuple):
     reservation_id: str
     coordination_run_id: str
     phase_start_head: str
+
+
+class ReservedScope(TypedDict):
+    kind: Literal["file", "tree"]
+    path: str
 
 
 class _UnownedAcquisition(Enum):
@@ -232,10 +245,14 @@ def parse_answer(stdout: str) -> CheckAnswer:
     )
 
 
+def _git_common_directory(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                          capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+
+
 def session_reservation(root: Path, session_id: str) -> tuple[str, str] | None:
     """The reservation and run cargo-berth's session map names for `session_id`, if any."""
-    result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                            capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+    result = _git_common_directory(root)
     if result.returncode != 0 or not session_id:
         return None
     path = Path(result.stdout.strip()) / LEDGER_DIRECTORY / SESSION_MAP_FILE
@@ -299,13 +316,18 @@ def _record_own_acquisition_locked(answer: CheckAnswer, root: Path, phases: list
 
 def check(root: Path, scopes: list[str], session_id: str) -> CheckAnswer:
     """Run `cargo-berth check <scopes> --json` from the repository root as `session_id`."""
+    return _check_berth(root, scopes, session_id)
+
+
+def _check_berth(root: Path, arguments: list[str], session_id: str) -> CheckAnswer:
+    """Run the berth check with the requested arguments and session."""
     environment = dict(os.environ)
     if session_id:
         environment[SESSION_ENVIRONMENT] = session_id
     else:
         _ = environment.pop(SESSION_ENVIRONMENT, None)
     try:
-        result = subprocess.run(["cargo-berth", "check", *scopes, "--json"], cwd=root, env=environment,
+        result = subprocess.run(["cargo-berth", "check", *arguments, "--json"], cwd=root, env=environment,
                                 capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
                                 timeout=CHECK_TIMEOUT_SECONDS)
     except FileNotFoundError:
@@ -666,8 +688,15 @@ def enrolled_phases(phases: list[OpenPhase], root: Path, session_id: str) -> lis
 
 def _phase_files(phase: OpenPhase | PhaseMissingRecord) -> list[str]:
     try:
-        lines = (phase.directory / FILES_FILE).read_text(encoding="utf-8").splitlines()
+        return _read_phase_files(phase.directory)
     except (OSError, UnicodeError):
+        return []
+
+
+def _read_phase_files(directory: Path) -> list[str]:
+    try:
+        lines = (directory / FILES_FILE).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
         return []
     return [line.strip().removeprefix("./") for line in lines if line.strip()]
 
@@ -735,6 +764,10 @@ def _write_state(phase_dir: Path, state: dict[str, object]) -> None:
 
 class StateRefused(ValueError):
     """A state change the phase's current state does not allow."""
+
+
+class RepairTargetMappedWithoutConfirmation(RuntimeError):
+    """The target mapping is visible. Berth did not confirm it."""
 
 
 def enroll(phase_dir: Path, phase: str, board: str) -> str:
@@ -865,14 +898,21 @@ def _record_active_locked(phase_dir: Path, acquisition: Acquisition) -> bool:
 
 
 def _write_active(phase_dir: Path, phase: str, acquisition: Acquisition) -> None:
-    """Publish the same Active shape for a check acquisition or a ledger-validated repair."""
-    active: dict[str, object] = {"kind": ACTIVE, "active_phase_reservation": {
+    _write_state(phase_dir, _active_state(phase, acquisition))
+
+
+def _active_state(phase: str, acquisition: Acquisition, *,
+                  scopes: tuple[ReservedScope, ...] = ()) -> dict[str, object]:
+    """Create the Active phase state with any scopes from the board."""
+    active: dict[str, object] = {
         "reservation_id": acquisition.reservation_id,
         "coordination_run_id": acquisition.coordination_run_id,
         "phase": phase,
         "phase_start_head": acquisition.phase_start_head,
-    }}
-    _write_state(phase_dir, active)
+    }
+    if scopes:
+        active["scopes"] = scopes
+    return {"kind": ACTIVE, "active_phase_reservation": active}
 
 
 def _berth(root: Path, *arguments: str) -> dict[str, object]:
@@ -885,9 +925,13 @@ def _berth(root: Path, *arguments: str) -> dict[str, object]:
         return {}
 
 
+def _reservation_board_data(root: Path, reservation_id: str) -> dict[str, object]:
+    answer = _berth(root, "board", "--reservation", reservation_id)
+    return _object(_object(answer.get("payload")).get("data"))
+
+
 def _lifecycle(root: Path, reservation_id: str) -> dict[str, object]:
-    return _object(_object(_object(_berth(root, "board", "--reservation", reservation_id).get("payload")).get("data"))
-                   .get("lifecycle"))
+    return _object(_reservation_board_data(root, reservation_id).get("lifecycle"))
 
 
 def lifecycle(root: Path, reservation_id: str) -> str:
@@ -993,6 +1037,19 @@ def _repair_command(args: argparse.Namespace) -> int:
     directory = phase_directory(session_dir, phase)
     requested_root = Path(cast(str, args.repo))
     root = repository_root(requested_root)
+    target = cast(str | None, args.to)
+    if target is not None:
+        try:
+            if root is None or not phase_directory_name(phase):
+                raise StateRefused("no repository or invalid phase")
+            with phase_lock(directory):
+                return _repair_to_reservation(session_dir, directory, root.resolve(), target)
+        except (ValueError, recorder_state.OldRecorderState) as refused:
+            print(f"phase reservation: {refused}; record unchanged", file=sys.stderr)
+            return 2
+        except OSError as error:
+            print(f"phase reservation: {error}", file=sys.stderr)
+            return 2
     if root is None or not phase_directory_name(phase):
         return _repair_refused(session_dir, phase, requested_root, "no repository or invalid phase")
     if (directory / RELEASED_FILE).is_file():
@@ -1007,6 +1064,178 @@ def _repair_command(args: argparse.Namespace) -> int:
         return 2
     with phase_lock(directory):
         return _repair_record(session_dir, phase, directory, root)
+
+
+def _reservation_claim_run(root: Path, reservation: str) -> str:
+    """Read the named reservation's run from its claim in the berth journal."""
+    result = _git_common_directory(root)
+    if result.returncode == 0 and result.stdout.strip():
+        journal = Path(result.stdout.strip()) / LEDGER_DIRECTORY / JOURNAL_FILE
+        try:
+            with journal.open(encoding="utf-8") as events:
+                for line in events:
+                    event = _object(cast(object, json.loads(line)))
+                    if event.get("op") == "claim" and event.get("reservation_id") == reservation:
+                        run = _string(_object(event.get("actor")).get("run"))
+                        if run:
+                            return run
+                        break
+        except (OSError, ValueError):
+            pass
+    raise StateRefused("reservation board is unreadable for the named coordination run")
+
+
+def _repair_target_scopes(root: Path, target: str) -> tuple[ReservedScope, ...]:
+    """Read the target's declared scopes with their file and tree kinds."""
+    snapshot = _reservation_board_data(root, target)
+    status = _string(_object(snapshot.get("lifecycle")).get("status"))
+    if status and status != ACTIVE:
+        raise StateRefused(f"reservation {target!r} is not active")
+    extent = _object(snapshot.get("race_extent"))
+    entries = extent.get("scopes")
+    unreadable = "reservation board is unreadable for the named scopes"
+    if (snapshot.get("reservation_id") != target or status != ACTIVE
+            or extent.get("status") != "editing" or not isinstance(entries, list) or not entries):
+        raise StateRefused(unreadable)
+    scopes: list[ReservedScope] = []
+    for entry in cast(list[object], entries):
+        fields = _object(entry)
+        kind = fields.get("kind")
+        path = _string(fields.get("path"))
+        if kind not in ("file", "tree") or not path:
+            raise StateRefused(unreadable)
+        scopes.append({"kind": kind, "path": path})
+    return tuple(scopes)
+
+
+def _map_repair_target(root: Path, phase_session: str, target: str, run: str,
+                       scope: ReservedScope) -> Acquisition:
+    """Select an exact path the target already protects and confirm the new mapping."""
+    answer = _check_berth(root, ["--reservation", target, "--path", "file:" + scope["path"]], phase_session)
+    expected = (target, run)
+    if session_reservation(root, phase_session) != expected:
+        raise StateRefused(f"could not map the phase session to reservation {target}")
+    acquisition = answer.acquisition
+    if (answer.status == CLEAR and answer.session_mapping == "published" and acquisition is not None
+            and (acquisition.reservation_id, acquisition.coordination_run_id) == expected):
+        return acquisition
+    raise RepairTargetMappedWithoutConfirmation(answer.message or "Berth did not confirm the target mapping.")
+
+
+def _scope_covers_phase_entry(scope: ReservedScope, entry: str) -> bool:
+    path = scope["path"]
+    if scope["kind"] == "file":
+        return entry == path
+    return entry == path or _covers(path + "/", entry)
+
+
+def _report_repair_record_pending(old: str, target: str, detail: str, retry_command: str) -> int:
+    print(f"phase reservation: session maps to {target}. The record still names {old}.", file=sys.stderr)
+    print(detail, file=sys.stderr)
+    _print_repair_retry(retry_command)
+    return 1
+
+
+def _print_repair_retry(retry_command: str) -> None:
+    print("Run the same command again to complete the repair.", file=sys.stderr)
+    print(retry_command, file=sys.stderr)
+
+
+def _complete_switch_log(directory: Path, entry: str, recorded: str, retry_command: str) -> bool:
+    """Add the saved entry once, even if a prior replacement failed to sync."""
+    if not entry:
+        return True
+    log = directory / REPAIRS_FILE
+    line = (entry + "\n").encode("utf-8")
+    try:
+        try:
+            contents = log.read_bytes()
+        except FileNotFoundError:
+            contents = b""
+        if line not in contents.splitlines(keepends=True):
+            separator = b"\n" if contents and not contents.endswith(b"\n") else b""
+            write_bytes_atomic(log, contents + separator + line)
+    except OSError as error:
+        print(f"phase reservation: record names {recorded}. Could not confirm the repair log. {error}",
+              file=sys.stderr)
+        _print_repair_retry(retry_command)
+        return False
+    return True
+
+
+def _repair_to_reservation(session_dir: Path, directory: Path, root: Path, target: str) -> int:
+    """Validate the named Active reservation and replace the record under the phase lock."""
+    phase = directory.name
+    if (directory / RELEASED_FILE).is_file():
+        raise StateRefused(f"phase {phase} checkpoint released its reservation")
+    if phase not in {phase_directory_name(each) for each in recorder_state.read_open_phase_ids(session_dir)}:
+        raise StateRefused(f"phase {phase} is finished or was never started")
+    state = read_state(directory)
+    if _string(state.get("kind")) == PENDING:
+        raise StateRefused("checkpoint release confirmation is pending")
+    old = _recorded(state)
+    active = _object(state.get("active_phase_reservation"))
+    recorded_phase = _string(active.get("phase"))
+    run = _string(active.get("coordination_run_id"))
+    if not old or not run or phase_directory_name(recorded_phase) != phase:
+        raise StateRefused(f"phase {phase} has no valid Active reservation record")
+    if phase_worktree(directory).root.resolve() != root:
+        raise StateRefused("--repo does not name the phase worktree")
+    board = berth_board.read_board(root)
+    if isinstance(board, berth_board.BoardUnavailable) or not board.configured:
+        raise StateRefused("reservation board is unreadable")
+    for reservation in board.reservations():
+        if reservation.reservation_id == target and reservation.lifecycle == ACTIVE:
+            break
+    else:
+        raise StateRefused(f"reservation {target!r} is not active")
+    if reservation.holder_worktree_root != root:
+        raise StateRefused(f"reservation {target} belongs to another worktree")
+    if _reservation_claim_run(root, target) != run:
+        raise StateRefused(f"reservation {target} belongs to another coordination run")
+    phase_session = phase_session_id(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), phase)
+    if not phase_session:
+        raise StateRefused("phase session id is unavailable")
+    files = _read_phase_files(directory)
+    if not files:
+        raise StateRefused(f"phase {phase} has no paths in its files list")
+    scopes = _repair_target_scopes(root, target)
+    for entry in files:
+        if not any(_scope_covers_phase_entry(scope, entry) for scope in scopes):
+            raise StateRefused(f"reservation {target} does not cover {entry!r} in the phase's files list")
+    retry_command = f"{repair_command(session_dir, phase, root)} --to {shlex.quote(target)}"
+    switch_entry = _string(state.get(SWITCH_LOG_ENTRY))
+    if old != target and not _complete_switch_log(directory, switch_entry, old, retry_command):
+        return 1
+    try:
+        acquisition = _map_repair_target(root, phase_session, target, run, scopes[0])
+    except RepairTargetMappedWithoutConfirmation as error:
+        return _report_repair_record_pending(old, target, str(error), retry_command)
+    replacement = _active_state(phase, acquisition, scopes=scopes)
+    if old != target:
+        switch_entry = (f"{datetime.now(timezone.utc).isoformat()} phase={phase} old_reservation_id={old} "
+                        + f"new_reservation_id={target} run_id={run} switch_id={uuid4()}")
+    if switch_entry:
+        replacement[SWITCH_LOG_ENTRY] = switch_entry
+    status = 0
+    try:
+        _write_state(directory, replacement)
+    except AtomicDurabilityUnconfirmed as error:
+        print(f"phase reservation: record names {target}, but directory sync failed: {error.__cause__ or error}",
+              file=sys.stderr)
+        status = 1
+    except OSError as error:
+        return _report_repair_record_pending(old, target, f"Could not replace the record. {error.__cause__ or error}",
+                                             retry_command)
+    if not _complete_switch_log(directory, switch_entry, target, retry_command):
+        return 1
+    if status:
+        return status
+    if old == target:
+        print(f"phase reservation: Active, reservation {target} already recorded")
+    else:
+        print(f"phase reservation: Active, changed reservation {old} to {target}")
+    return 0
 
 
 def _repair_record(session_dir: Path, phase: str, directory: Path, root: Path) -> int:
@@ -1244,10 +1473,11 @@ def main(argv: list[str]) -> int:
     checkout = claim.add_mutually_exclusive_group()
     _ = checkout.add_argument("--repo")
     _ = checkout.add_argument("--launch-cwd", help="use this checkout for the first launch")
-    repair = commands.add_parser("repair", help="restore a lost record from berth's live reservation")
+    repair = commands.add_parser("repair", help="restore or redirect a phase reservation record")
     _ = repair.add_argument("--session-dir", required=True)
     _ = repair.add_argument("--phase", required=True)
     _ = repair.add_argument("--repo", required=True)
+    _ = repair.add_argument("--to", metavar="RESERVATION_ID", help="point the phase record at a named Active reservation")
     enrolled = commands.add_parser("enroll", help="write a phase's first state from the /sync board answer")
     _ = enrolled.add_argument("--board", required=True, choices=tuple(BOARD_STATES))
     done = commands.add_parser("committed", help="replace Active with the pending release of a checkpoint commit")
