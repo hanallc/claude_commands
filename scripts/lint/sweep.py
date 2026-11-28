@@ -57,6 +57,7 @@ from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock, process_group
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import build_folders, conf, removal_guard
+from scripts.lib.display_text import display_field
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.lib.cargo_target_config import (
     NoCargoManifest,
@@ -2286,7 +2287,10 @@ def remove_checked_entry(checked: removal_guard.CheckedEntry,
         elif not lease.remove_tree(checked.path, checked.info, wait=False, delete=delete):
             failures = 1
     except (OSError, removal_guard.Refused) as error:
-        print(f"kept {checked.path}: {removal_guard.single_line(error)}")
+        if isinstance(lease, LeasedCargoGroup):
+            print(display_field(f"{error} (kept {checked.path})"))
+        else:
+            print(f"kept {checked.path}: {removal_guard.single_line(error)}")
         failures = 1
     return ConfirmedDeletion(freed, failures, removed, device_bytes)
 
@@ -4624,7 +4628,8 @@ def trim_mac_outputs(outputs: Mapping[MacBuildOutput, MacOutputObservation], bud
             continue
         result = remove_group(output, outputs[output], group, paths)
         if result is MacOutputRemoval.REPOSITORY_BUSY:
-            break
+            print(display_field(f"{result.value} (kept {output.path})"))
+            return MacTrimOutcome(ConfirmedDeletion(freed, failures, removed), left)
         if isinstance(result, MacOutputRemoval):
             continue
         freed += result.bytes
@@ -4633,7 +4638,7 @@ def trim_mac_outputs(outputs: Mapping[MacBuildOutput, MacOutputObservation], bud
         if result.failures:
             break
         left -= freed_by(group, scans[output], remaining[output]).bytes
-    if left > budget and not reached_floor:
+    if left > budget and not reached_floor and not failures:
         print(f"lint sweep: over budget: {left} bytes, budget {budget} bytes")
     return MacTrimOutcome(ConfirmedDeletion(freed, failures, removed), left)
 
@@ -4649,19 +4654,28 @@ def trim_mac_run(target: Path, budget: int, recent_minutes: float, *, lint_setti
             return 0
         marker = checkout / floor_claims.MIRROR_MARK
         if not marker.is_file() or marker.is_symlink():
+            print(display_field(f"missing or invalid mirror mark (kept {target})"))
             return 1
-        with build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.UPGRADE):
+        with ExitStack() as mirror_lease:
+            try:
+                _ = mirror_lease.enter_context(build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.UPGRADE))
+            except BlockingIOError:
+                print(display_field(f"repository lease is busy (kept {target})"))
+                return 1
             output = MacBuildOutput(target, checkout.name, MacOutputLocation.MIRROR, mirror)
             outputs = {output: observe_mac_output(output)}
             with mac_output_locks(outputs) as locks:
                 if isinstance(locks, MacOutputRemoval):
-                    print(f"kept {target}: output locks are busy")
+                    print(display_field(f"output locks are busy (kept {target})"))
                     return 1
                 result = trim_mac_outputs(outputs, budget, recent_minutes, lint_settings=lint_settings,
                                           stop=lambda: False)
         return int(bool(result.deletion.failures) or result.remaining_bytes > budget)
-    except (OSError, ValueError, conf.Unusable, removal_guard.Refused) as error:
-        print(f"kept {target}: {removal_guard.single_line(error)}")
+    except conf.Unusable as error:
+        print(display_field(f"cannot read Mac trim settings: {error} (kept {target})"))
+        return 1
+    except (OSError, ValueError, removal_guard.Refused) as error:
+        print(display_field(f"{error} (kept {target})"))
         return 1
 
 

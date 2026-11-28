@@ -125,6 +125,18 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 self.assertIsInstance(answer, offload.MissingMacStatus)
                 self.assertEqual(output.getvalue(), text)
 
+    def test_trim_detail_cannot_turn_a_missing_verdict_into_a_mirror_refusal(self) -> None:
+        controller = offload.ProcessController()
+        text = ("mac_trim=status=1 detail=trim failed; "
+                "copies: fixture-mirror: busy; held by session holder (mirror lease)\n"
+                "mac_cleanup=1\n")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            answer = self.stream_protocol(controller, ["/bin/sh", "-c", 'printf "%s" "$1"', "protocol", text])
+        self.assertIsInstance(answer, offload.MissingMacStatus)
+        self.assertIsInstance(controller.pending, offload.PendingStartOperation)
+        self.assertEqual(output.getvalue(), text.splitlines(keepends=True)[0])
+
     def test_stream_returns_cleanup_outcome_beside_the_reported_test_status(self) -> None:
         cases = (
             ("mac_cleanup=0 32715571 92\n", 0, offload.CleanupDone(offload.MeasuredCleanupSize(32715571), 92)),
@@ -132,8 +144,8 @@ class MacCleanupProtocolTests(unittest.TestCase):
             ("mac_cleanup=kept\n", 0, offload.CleanupKept()),
             ("mac_cleanup=7\n", 0, offload.CleanupFailed(7)),
             ("mac_cleanup=skipped\n", 0, offload.CleanupSkipped()),
-            ("mac_trim=status=0 elapsed_seconds=2 over_budget=yes\nmac_cleanup=kept\n",
-             0, offload.CleanupKept()),
+            ("mac_trim=status=1 elapsed_seconds=2 over_budget=yes detail=output locks are busy\nmac_cleanup=1\n",
+             0, offload.CleanupFailed(1)),
             ("", 255, offload.CleanupUnconfirmed()),
         )
         for marker, ssh_status, expected in cases:
@@ -146,7 +158,7 @@ class MacCleanupProtocolTests(unittest.TestCase):
                         "test output\nmac_exit=42\n" + marker, str(ssh_status),
                     ])
                 self.assertEqual(answer, offload.ReportedMacStatus(42, expected))
-                trim_output = "mac_trim=status=0 elapsed_seconds=2 over_budget=yes\n" if marker.startswith("mac_trim=") else ""
+                trim_output = marker.splitlines(keepends=True)[0] if marker.startswith("mac_trim=") else ""
                 self.assertEqual(output.getvalue(), "test output\n" + trim_output)
 
     def test_bare_success_confirms_cleanup_without_a_removal_line(self) -> None:
@@ -246,6 +258,11 @@ case ${2##*/} in
         [ "$1" = -B ] || exit 99
         case "$CLEANUP_TEST_TRIM" in
             run|refuse) ;;
+            report)
+                printf '%s\n' 'discard this line' 'mac_cleanup=kept'
+                printf 'refusal\t%s\033%s%0300d: output lock is busy\r\n\r\n \t\r\n' 'literal $() %s' 'x' 0 >&2
+                exit 7
+                ;;
             *) exit "$CLEANUP_TEST_TRIM" ;;
         esac
         shift 2
@@ -290,7 +307,8 @@ exit "$CLEANUP_TEST_STATUS"
         abandoned_session_minutes: int = 7,
         budget_gib: str = "24",
         budget_values: tuple[tuple[str, str], ...] = (),
-        trim: int | Literal["run", "refuse"] = 0,
+        trim: int | Literal["run", "refuse", "report"] = 0,
+        inherit_lease: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         settings = self.root / "command-mac.conf"
@@ -313,11 +331,13 @@ exit "$CLEANUP_TEST_STATUS"
                                            root=self.mirror.parent) as lease:
             assert isinstance(lease, int), lease
             return subprocess.run(
-                [*shell, "-c", text], cwd=self.home_directory, pass_fds=(lease,),
+                [*shell, "-c", text], cwd=self.home_directory, pass_fds=(lease,) if inherit_lease else (),
                 env={**shell_environment(self.root),
+                     "CONF_DIR": os.environ["CONF_DIR"],
                      "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
                      "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status),
-                     "CLEANUP_TEST_TRIM": str(trim), floor_claims.MIRROR_LEASE_FDS: str(lease)},
+                     "CLEANUP_TEST_TRIM": str(trim),
+                     floor_claims.MIRROR_LEASE_FDS: str(lease) if inherit_lease else ""},
                 capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
 
@@ -327,7 +347,7 @@ exit "$CLEANUP_TEST_STATUS"
         if lines[-1] == "mac_cleanup=skipped":
             return lines
         self.assertRegex(lines[2], rf"^mac_trim=status={trim_status} elapsed_seconds=[0-9]+ "
-                         + r"over_budget=(yes|no|unknown) size_kib=([0-9]+|unknown) budget_gib=\S+$")
+                         + r"over_budget=(yes|no|unknown) size_kib=([0-9]+|unknown) budget_gib=\S+ detail=[ -~]{0,240}$")
         return lines[:2] + lines[3:]
 
     def assert_guarded_paths(self, *paths: Path) -> None:
@@ -586,8 +606,12 @@ exit 1
                     self.assertRegex(answer.stdout,
                                      rf"mac_trim=status={trim_status} elapsed_seconds=[0-9]+ "
                                      + rf"over_budget=yes size_kib={size} budget_gib={budget}")
-                    self.assertNotIn("lint sweep:", answer.stdout)
-                    if not trim_fails:
+                    marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                    detail = marker.split(" detail=", 1)[1]
+                    if trim_fails:
+                        self.assertEqual(detail, "")
+                    else:
+                        self.assertTrue(detail.startswith("lint sweep: over budget: "), detail)
                         self.assert_guarded_paths()
 
         with self.subTest(user_zone="caller has no zone"):
@@ -646,15 +670,102 @@ exit 7
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 with self.subTest(shell=shell, status=status):
-                    old = self.incremental_output("old-session", time.time() - 7200)
+                    old = self.incremental_output("old-session-" + "x" * 230, time.time() - 7200)
+                    self.assertGreater(len(str(old.parent)), 240)
                     answer = self.run_remote(shell, status, budget_gib=str(32 / 1024 ** 2), trim="refuse")
                     self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
                     self.assertEqual(self.cleanup_lines(answer, trim_status=1),
                                      ["nextest finished", f"mac_exit={status}", "mac_cleanup=1"])
+                    marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                    detail = marker.split(" detail=", 1)[1]
+                    self.assertTrue(detail.startswith(removal_guard.RefusalReason.MOUNT.value), detail)
                     self.assert_guarded_paths(old.parent)
                     self.assertEqual(old.stat().st_size, 64 * 1024)
                     self.assertEqual((self.mirror / "target" / "nextest-output").read_text(), "built\n")
                     self.assertFalse((self.root / "remove-arguments.json").exists())
+
+    def test_remote_trim_reports_only_the_last_line_with_a_bounded_detail(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_remote(shell, 42, trim="report")
+                self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                self.assertEqual(self.cleanup_lines(answer, trim_status=7),
+                                 ["nextest finished", "mac_exit=42", "mac_cleanup=7"])
+                marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                detail = marker.split(" detail=", 1)[1]
+                prefix = "refusal literal $() %s x"
+                suffix = ": output lock is busy"
+                self.assertEqual(detail, prefix + "0" * (119 - len(prefix))
+                                 + "..." + "0" * (118 - len(suffix)) + suffix)
+
+    def test_remote_trim_names_the_invalid_recent_minutes_before_a_long_config_path(self) -> None:
+        config = self.root / ("c" * 125) / ("d" * 125)
+        config.parent.mkdir()
+        config.symlink_to(self.root / "config", target_is_directory=True)
+        settings = config / "lint.conf"
+        self.assertGreater(len(str(settings)), 240)
+        _ = settings.write_text(LINT_TRIM_CONFIG.replace("recent_minutes=60", "recent_minutes=invalid"))
+        old = self.incremental_output("old-session", time.time() - 7200)
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            for shell in (["/bin/sh"], ["zsh", "-f"]):
+                with self.subTest(shell=shell):
+                    answer = self.run_remote(shell, 42, budget_gib=str(32 / 1024 ** 2), trim="run")
+                    self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                    self.assertEqual(self.cleanup_lines(answer, trim_status=1),
+                                     ["nextest finished", "mac_exit=42", "mac_cleanup=1"])
+                    marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                    detail = marker.split(" detail=", 1)[1]
+                    self.assertTrue(detail.startswith("cannot read Mac trim settings: recent_minutes='invalid': "
+                                                      + "expected a finite number"), detail)
+                    self.assertTrue(detail.endswith("/lint.conf)"), detail)
+                    self.assertEqual(len(detail), 240)
+                    self.assert_guarded_paths()
+                    self.assertTrue(old.is_file())
+
+    def test_remote_trim_keeps_the_refusal_for_a_path_with_control_characters(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                old = self.incremental_output("newline\nfixture\x1bname", time.time() - 7200)
+                answer = self.run_remote(shell, 42, budget_gib=str(32 / 1024 ** 2), trim="refuse")
+                self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                self.assertEqual(self.cleanup_lines(answer, trim_status=1),
+                                 ["nextest finished", "mac_exit=42", "mac_cleanup=1"])
+                marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                detail = marker.split(" detail=", 1)[1]
+                self.assertTrue(detail.startswith(removal_guard.RefusalReason.MOUNT.value), detail)
+                self.assert_guarded_paths(old.parent)
+                self.assertTrue(old.is_file())
+
+    def test_remote_trim_names_the_missing_lease_under_a_long_mirror_root(self) -> None:
+        relative_root = "/".join(("m" * 125, "n" * 125))
+        mac_settings = self.root / "config/mac_test.conf"
+        _ = mac_settings.write_text(f"mirror_root=~/{relative_root}\n" + nextest_settings())
+        self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
+        self.mirror.mkdir(parents=True)
+        (self.mirror / floor_claims.MIRROR_MARK).touch()
+
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_remote(shell, 42, trim="run", inherit_lease=False)
+                self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                self.assertEqual(self.cleanup_lines(answer, trim_status=1),
+                                 ["nextest finished", "mac_exit=42", "mac_cleanup=1"])
+                marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                detail = marker.split(" detail=", 1)[1]
+                self.assertTrue(detail.startswith("no inherited Mac floor lease: "), detail)
+                self.assertEqual(len(detail), 240)
+                self.assertEqual((self.mirror / "target" / "nextest-output").read_text(), "built\n")
+
+    def test_remote_trim_names_an_over_budget_size_after_a_silent_success(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_remote(shell, 42, budget_gib="0", trim=0)
+                self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                self.assertEqual(self.cleanup_lines(answer, trim_status=1),
+                                 ["nextest finished", "mac_exit=42", "mac_cleanup=1"])
+                marker = next(line for line in answer.stdout.splitlines() if line.startswith("mac_trim="))
+                self.assertIn(" over_budget=yes ", marker)
+                self.assertTrue(marker.endswith(" detail=output above budget after trim"), marker)
 
 
 class MacActivityShellTests(unittest.TestCase):

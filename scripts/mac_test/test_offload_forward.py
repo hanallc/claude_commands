@@ -76,6 +76,21 @@ class OffloadForwardTests(OffloadCommandFixture):
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = eligibility.read_config(self.config_path)
+        expected_trim_program = """\
+import sys
+from scripts.lib import conf
+from scripts.lib.display_text import display_field
+from scripts.lint import sweep
+
+config = conf.read("lint")
+try:
+    recent_minutes = config.number(sweep.RECENT_KEY)
+except conf.Unusable as error:
+    reason = str(error).removeprefix(f"{config.source}: ")
+    sys.exit(display_field(f"cannot read Mac trim settings: {reason} ({config.source})"))
+sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, recent_minutes,
+                               mac_trim=sweep.MacRunTrim.LEASED_MIRROR))
+"""
         expected = (
             'cd .local/state/mac-test/test-mirror/hana && { find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
@@ -87,22 +102,27 @@ class OffloadForwardTests(OffloadCommandFixture):
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
             + """{ if cd "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'; then trim_started=$(date +%s); """
-            + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
-            + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
-                          + 'config = conf.read("lint"); '
-                          + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
-                          + 'config.number(sweep.RECENT_KEY), mac_trim=sweep.MacRunTrim.LEASED_MIRROR))')
-            + """ "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target' >/dev/null 2>&1; then """
+            + 'trim_report=$( { if PYTHONUNBUFFERED=1 LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
+            + shlex.quote(f"exec({expected_trim_program!r})")
+            + """ "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target'; then """
             + 'trim_status=0; else trim_status=$?; fi; '
+            + """printf '\\n%s\\n' "$trim_status"; } 2>&1 | LC_ALL=C awk '"""
+            + r'{ sub(/\r$/, "") } /[^[:space:]]/ { detail = last; last = $0 } '
+            + 'END { gsub(/[^ -~]+/, " ", detail); '
+            + 'if (length(detail) > 240) detail = substr(detail, 1, 119) "..." substr(detail, length(detail) - 117); '
+            + """printf "%s %s", last, detail }') """
+            + "|| trim_report='1 cannot read trim output'; "
+            + 'trim_status=${trim_report%% *}; trim_detail=${trim_report#* }; '
             + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
             + """if trim_size=$(du -sk "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target' 2>/dev/null); then """
             + 'trim_size=${trim_size%%[[:space:]]*}; '
             + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
             + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
             + 'else trim_size=unknown; over_budget=unknown; fi; '
-            + 'if [ "$over_budget" = yes ] && [ "$trim_status" -eq 0 ]; then trim_status=1; fi; '
-            + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s size_kib=%s budget_gib=%s\\n' "
-            + '"$trim_status" "$trim_elapsed" "$over_budget" "$trim_size" 64; '
+            + 'if [ "$over_budget" = yes ] && [ "$trim_status" -eq 0 ]; then trim_status=1; '
+            + 'trim_detail="${trim_detail:-output above budget after trim}"; fi; '
+            + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s size_kib=%s budget_gib=%s detail=%s\\n' "
+            + '"$trim_status" "$trim_elapsed" "$over_budget" "$trim_size" 64 "$trim_detail"; '
             + 'if [ "$trim_status" -eq 0 ]; then echo mac_cleanup=kept; '
             + 'else echo mac_cleanup="$trim_status"; fi; '
             + 'else echo mac_cleanup=$?; fi; } 2>/dev/null'

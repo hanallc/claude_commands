@@ -8120,7 +8120,10 @@ class MacCullTests(SweepCase):
             try:
                 self.assertTrue(select.select([stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                 self.assertEqual(stdout.readline(), b"ready\n")
-                self.assertEqual(self.trim(tree, budget), 1)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(self.trim(tree, budget), 1)
+                self.assertEqual(output.getvalue(), f"repository lease is busy (kept {tree.parent})\n")
                 self.assertTrue(older.is_file())
                 _ = queued.communicate(input=b"done\n", timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(queued.returncode, 0)
@@ -8129,6 +8132,25 @@ class MacCullTests(SweepCase):
                     queued.kill()
             self.assertEqual(self.trim(tree, budget), 0)
             self.assertFalse(older.exists())
+
+    def test_post_run_trim_reports_a_missing_mirror_mark(self) -> None:
+        tree, payload = self.output("sample", time.time() - DAY)
+        (tree.parents[1] / floor_claims.MIRROR_MARK).unlink()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(self.trim(tree, 0), 1)
+        self.assertEqual(output.getvalue(), f"missing or invalid mirror mark (kept {tree.parent})\n")
+        self.assertTrue(payload.is_file())
+
+    def test_post_run_trim_names_a_settings_error_before_its_path(self) -> None:
+        tree, payload = self.output("sample", time.time() - DAY)
+        settings = self.build_home / ("lint" * 55) / "lint.conf"
+        error = conf.Unusable(f"{settings}: sweep_max_tree_depth: expected a whole number")
+        output = io.StringIO()
+        with mock.patch.object(sweep, "scan_mac_trim", side_effect=error), redirect_stdout(output):
+            self.assertEqual(self.trim(tree, 0), 1)
+        self.assertEqual(output.getvalue(), f"cannot read Mac trim settings: {error} (kept {tree.parent})\n")
+        self.assertTrue(payload.is_file())
 
     def test_post_run_trim_requires_the_exact_mirror_lease_and_uses_atime(self) -> None:
         now = time.time()

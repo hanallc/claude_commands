@@ -1625,6 +1625,9 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                if marker.startswith("mac_trim="):
+                    print(line, end="", flush=True)
+                    continue
                 if origin is RunStream.SSH:
                     if disconnect is None and eligibility.ssh_transport_failed(marker):
                         disconnect = MacSshDisconnected(
@@ -1682,9 +1685,6 @@ class ProcessController:
                         held_status_line = ""
                         print(line, end="", flush=True)
                     cleanup = CleanupUnconfirmed()
-                    continue
-                if marker.startswith("mac_trim="):
-                    print(line, end="", flush=True)
                     continue
                 if marker.startswith("mac_cleanup="):
                     cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
@@ -2809,27 +2809,46 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     mirror = remote_mirror(repository, request.target, request.slot)
     mirror_word = copies.mac_mirror_shell_path(mirror)
     target = copies.mac_mirror_shell_path(f"{mirror}/target")
-    program = (
-        'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
-        'config = conf.read("lint"); '
-        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
-        'config.number(sweep.RECENT_KEY), mac_trim=sweep.MacRunTrim.LEASED_MIRROR))'
-    )
+    program = """\
+import sys
+from scripts.lib import conf
+from scripts.lib.display_text import display_field
+from scripts.lint import sweep
+
+config = conf.read("lint")
+try:
+    recent_minutes = config.number(sweep.RECENT_KEY)
+except conf.Unusable as error:
+    reason = str(error).removeprefix(f"{config.source}: ")
+    sys.exit(display_field(f"cannot read Mac trim settings: {reason} ({config.source})"))
+sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, recent_minutes,
+                               mac_trim=sweep.MacRunTrim.LEASED_MIRROR))
+"""
+    program_word = shlex.quote(f"exec({program!r})")
     return (
         f'{{ if cd {mirror_word}; then '
         + 'trim_started=$(date +%s); '
-        + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
-        + f'-B -c {shlex.quote(program)} {target} >/dev/null 2>&1; then '
+        + 'trim_report=$( { '
+        + f'if PYTHONUNBUFFERED=1 LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
+        + f'-B -c {program_word} {target}; then '
         + 'trim_status=0; else trim_status=$?; fi; '
+        + """printf '\\n%s\\n' "$trim_status"; } 2>&1 | LC_ALL=C awk '"""
+        + r'{ sub(/\r$/, "") } /[^[:space:]]/ { detail = last; last = $0 } '
+        + 'END { gsub(/[^ -~]+/, " ", detail); '
+        + 'if (length(detail) > 240) detail = substr(detail, 1, 119) "..." substr(detail, length(detail) - 117); '
+        + """printf "%s %s", last, detail }') """
+        + "|| trim_report='1 cannot read trim output'; "
+        + 'trim_status=${trim_report%% *}; trim_detail=${trim_report#* }; '
         + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
         + f'if trim_size=$(du -sk {target} 2>/dev/null); then '
         + 'trim_size=${trim_size%%[[:space:]]*}; '
         + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
         + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
         + 'else trim_size=unknown; over_budget=unknown; fi; '
-        + 'if [ "$over_budget" = yes ] && [ "$trim_status" -eq 0 ]; then trim_status=1; fi; '
-        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s size_kib=%s budget_gib=%s\\n' "
-        + f'"$trim_status" "$trim_elapsed" "$over_budget" "$trim_size" {shlex.quote(budget)}; '
+        + 'if [ "$over_budget" = yes ] && [ "$trim_status" -eq 0 ]; then trim_status=1; '
+        + 'trim_detail="${trim_detail:-output above budget after trim}"; fi; '
+        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s size_kib=%s budget_gib=%s detail=%s\\n' "
+        + f'"$trim_status" "$trim_elapsed" "$over_budget" "$trim_size" {shlex.quote(budget)} "$trim_detail"; '
         + 'if [ "$trim_status" -eq 0 ]; then echo mac_cleanup=kept; '
         + 'else echo mac_cleanup="$trim_status"; fi; '
         + "else echo mac_cleanup=$?; fi; } 2>/dev/null"

@@ -984,7 +984,7 @@ def _mac_floor_lease_file(mirror: Path, kind: MacFloorLeaseFile) -> Generator[in
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or not os.path.samestat(info, path.lstat()):
-            raise OSError(f"{path}: the Mac floor lease changed")
+            raise OSError(f"the Mac floor lease changed: {path}")
         yield descriptor
     finally:
         os.close(descriptor)
@@ -1028,7 +1028,7 @@ def _upgrade_mac_floor_lease(mirror: Path, descriptor: int) -> Generator[int]:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if not os.path.samestat(os.fstat(descriptor), _mac_floor_lease_path(mirror, MacFloorLeaseFile.GROUP).lstat()):
-                raise OSError(f"{mirror}: the Mac floor lease changed")
+                raise OSError(f"the Mac floor lease changed: {mirror}")
             yield descriptor
         finally:
             # A failed flock conversion can drop the shared hold.
@@ -1124,7 +1124,7 @@ def mac_mirror_hold(
     elif hold is MacMirrorHold.UPGRADE:
         held = shared if isinstance(shared, int) else inherited
         if isinstance(held, NoInheritedMacFloorLease):
-            raise OSError(f"{mirror}: {held.value}")
+            raise OSError(f"{held.value}: {mirror}")
         with _upgrade_mac_floor_lease(mirror, held) as group:
             yield group
     elif isinstance(inherited, int):

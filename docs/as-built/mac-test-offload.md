@@ -567,7 +567,22 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   A Linux step skips this removal when `--target-dir` selects another folder.
   A Linux step checks tool versions before this removal.
   A missing target or a failed removal does not stop the build.
-- **Cleanup.** The remote command trims the mirror target after it reports the verdict. A custom `--target-dir` produces `mac_cleanup=skipped`. A request that fetches output keeps the mirror target. The trim uses `mac_budget_gib.<repo>` or the default `mac_budget_gib`. It holds the exclusive mirror lease and uses the shared removal guard. It removes Cargo groups and loose files in `deps`, `build`, `.fingerprint`, and `incremental` by access time. It checks for open files before each removal. It removes the oldest output first and keeps the target directory. The `mac_trim` record gives the status, elapsed seconds, remaining size in KiB, and budget in GiB. The command reports a nonzero cleanup status if the output remains over budget.
+- **Cleanup.** The remote command trims the mirror target after it reports the verdict.
+  A custom `--target-dir` produces `mac_cleanup=skipped`. A request that fetches output keeps the mirror target.
+  The trim uses `mac_budget_gib.<repo>` or the default `mac_budget_gib`.
+  It holds the exclusive mirror lease and uses the shared removal guard.
+  It removes Cargo groups and loose files in `deps`, `build`, `.fingerprint`, and `incremental` by access time.
+  It checks for open files before each removal. It removes the oldest output first and keeps the target directory.
+  The `mac_trim` marker gives the status, elapsed seconds, budget result, remaining size in KiB, and budget in GiB.
+  The reader treats the marker as diagnostic text.
+  Its final `detail` field contains up to 240 printable ASCII bytes from the last nonblank trim output line.
+  The command removes a trailing carriage return before it selects that line.
+  The command replaces each run of nonprintable bytes with a space.
+  If the line exceeds 240 bytes, the command keeps the first 119 bytes and the last 118 bytes with `...` between them.
+  Refusals put the cause before the path and format both on one line.
+  A `recent_minutes` error starts with the setting and the cause, followed by the configuration path.
+  If the trim succeeds and the size exceeds the budget, the command sets status 1.
+  If the trim gave no detail, the new status has the detail `output above budget after trim`.
 - **Nextest output.** The Mac saves both output streams in a private file under `~/.local/state/mac-test/logs`.
   After success, the runner sends the full output and deletes the file.
   After failure, it reports the saved path and sends a tail of `nextest_failure_tail_bytes` bytes (65,536 by default).

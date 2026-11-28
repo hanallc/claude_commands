@@ -3518,9 +3518,10 @@ class MacMirrorHoldScanTests(unittest.TestCase):
             mirror.mkdir(parents=True)
             with (mock.patch.object(folders, "mac_mirror_folder", return_value=mirror),
                   mock.patch.dict(os.environ, {"COPIES_MIRROR_LEASE_FDS": ""})):
-                with self.assertRaisesRegex(OSError, "no inherited Mac floor lease"):
+                with self.assertRaisesRegex(OSError, "^no inherited Mac floor lease: ") as missing:
                     with folders.mac_mirror_hold(mirror, folders.MacMirrorHold.UPGRADE):
                         pass
+                self.assertEqual(str(missing.exception), f"no inherited Mac floor lease: {mirror}")
 
 
 if __name__ == "__main__":
