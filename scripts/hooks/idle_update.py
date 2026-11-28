@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.hooks import conversation_pause
+from scripts.hooks import hook_budget
 from scripts.lib import conf
 from scripts.production import staff
 
@@ -54,8 +54,8 @@ def has_role(record: staff.StaffSnapshot) -> bool:
 
 
 def state_dir() -> Path:
-    """Keep the records beside the conversation pause records, so one test override covers both."""
-    return conversation_pause.state_root() / "idle-update"
+    """Return the idle update directory under the conversation pause state root."""
+    return hook_budget.pause_state_root() / "idle-update"
 
 
 def _record_path(session_id: str) -> Path:

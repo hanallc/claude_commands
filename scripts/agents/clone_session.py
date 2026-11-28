@@ -1,7 +1,7 @@
-"""Fork a live conversation into a separate staff session."""
+"""Fork a live conversation into a separate staff row."""
 from __future__ import annotations
 
-import json
+import os
 import re
 import subprocess
 import sys
@@ -12,7 +12,7 @@ from typing import Literal, cast
 
 from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, set_model, stop_resume
 from scripts.herdr import herdr, herdr_types, pane_launch
-from scripts.lib import codex_models_cache
+from scripts.lib import codex_models_cache, models_registry
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
@@ -45,6 +45,7 @@ class CloneSource:
     pane: str
     kind: AgentKind
     launch: herdr.ForegroundLaunch
+    producer_clone: staff.ProducerClone | staff.NotAClone
 
     @property
     def identity(self) -> str:
@@ -107,17 +108,12 @@ def _source(reference: str, record: staff.StaffSnapshot) -> tuple[CloneSource, h
         raise ValueError(f"{reference}: the source pane changed sessions")
     member = record.by_current_session(identity)
     label = next((tab.label for tab in tabs if tab.pane_id == place.pane and tab.label), reference)
-    return CloneSource(member.name if member is not None else label, place.pane, live.kind, launch), client
+    producer_clone = staff.ProducerClone(member.id) if member is not None and member.kind == "producer" else staff.NotAClone()
+    return CloneSource(member.name if member is not None else label, place.pane, live.kind, launch, producer_clone), client
 
 
 _CODEX_MODEL = r"gpt-[a-z0-9][a-z0-9.-]*"
 _CODEX_MODEL_AND_EFFORT = re.compile(rf"(.+?) (none|minimal|{set_model.DISPLAY_EFFORT})(?: (?:fast|standard|flex))?")
-
-
-@dataclass(frozen=True)
-class LiveForkSettings:
-    model: str
-    effort: str
 
 
 def _codex_models(home: Path) -> dict[str, set[str]]:
@@ -146,7 +142,7 @@ def _codex_model(name: str, catalog: dict[str, set[str]]) -> str:
     return name if re.fullmatch(_CODEX_MODEL, name) else ""
 
 
-def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> LiveForkSettings:
+def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> models_registry.LaunchSettings:
     terminal = client.command_terminal(source.pane)
     footer = client.command_footer(source.pane, terminal, target=source.identity, codex=source.kind == "codex")
     if source.kind == "claude":
@@ -164,16 +160,20 @@ def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> Live
     if not model or not effort:
         missing = "model and effort" if not (model or effort) else "effort" if model else "model"
         raise ValueError(f"{source.name}: cannot prove the current {missing} from the live pane")
-    return LiveForkSettings(model, effort)
+    return models_registry.LaunchSettings(source.kind, model, effort, "")
 
 
-def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> list[str]:
-    prompt = (f"You are {name}, a clone of {source.name}. Use {name} as your session name. "
-              f"Messages to {source.name} are for the source session. "
-              "Wait for a request addressed to you.")
+def _arguments(source: CloneSource, settings: models_registry.LaunchSettings, name: str) -> list[str]:
+    if isinstance(source.producer_clone, staff.ProducerClone):
+        prompt = (f"You are {name}, a clone of {source.name}. "
+                  f"Do not continue the ongoing work of {source.name}. "
+                  "Do new actions that Nate gives you.")
+    else:
+        prompt = (f"You are {name}, a clone of {source.name}. Use {name} as your session name. "
+                  f"Messages to {source.name} are for the source session. "
+                  "Wait for a request addressed to you.")
     if source.kind == "codex":
-        return ["fork", source.identity, "--model", settings.model,
-                "-c", f"model_reasoning_effort={json.dumps(settings.effort)}", "--", prompt]
+        return ["fork", source.identity, *models_registry.codex_model_arguments(settings), "--", prompt]
     launched = pane_launch.parse_claude_arguments(source.launch.arguments)
     arguments = pane_record.claude_conversation_arguments(source.identity, name,
         pane_record.ClaudeResumeSettings(settings.model, settings.effort),
@@ -182,7 +182,8 @@ def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> li
 
 
 def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: herdr.ForkLaunched,
-                 prepared: herdr.PreparedAgentEnvironment, environment: dict[str, str], home: Path) -> str:
+                 prepared: herdr.PreparedAgentEnvironment, environment: dict[str, str], home: Path,
+                 profile: models_registry.ProducerProfile | staff.NotAClone) -> str:
     pane, terminal = launched.pane, launched.terminal
     try:
         native = stop_resume.wait_for_native_session(client, pane,
@@ -207,8 +208,15 @@ def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: 
         try:
             pane_record.write(client.session, entry)
             try:
-                row = staff.create_session(name, native, staff.SessionLaunchFolder(remote.local_machine(), prepared.directory),
-                                           staff.SessionHome(home))
+                machine = remote.local_machine()
+                if isinstance(source.producer_clone, staff.ProducerClone):
+                    assert isinstance(profile, models_registry.ProducerProfile)
+                    row = staff.create_producer_clone(
+                        name, native, source.producer_clone, staff.PresentWorktree(machine, prepared.directory),
+                        staff.SessionHome(home), profile=profile)
+                else:
+                    row = staff.create_session(name, native, staff.SessionLaunchFolder(machine, prepared.directory),
+                                               staff.SessionHome(home))
             except staff.StaffUnreadable as error:
                 # A lost reply can follow a committed staff write.
                 raise _AdmissionUnconfirmed(
@@ -250,7 +258,20 @@ def run(reference: str, name: str) -> int:
         prepared = replace(prepared, env={**{key: value for key, value in prepared.env.items() if key not in unset},
                                           **environment},
                            unset_environment=(prepared.unset_environment | unset).difference(environment))
-        settings = _live_settings(source, client, home)
+        profile: models_registry.ProducerProfile | staff.NotAClone = staff.NotAClone()
+        if isinstance(source.producer_clone, staff.ProducerClone):
+            configuration = models_registry.launch_configuration(os.environ)
+            profiles = models_registry.parse_registry(configuration.text).get("producers", {})
+            try:
+                profile = models_registry.parse_producer_profile(profiles.get(source.name, ""))
+            except ValueError as error:
+                raise ValueError(f"invalid launch settings for producers.{source.name}: {error}") from error
+            if profile.family != source.kind:
+                raise ValueError(f"{source.name}: the registered family differs from the live conversation")
+            settings = models_registry.producer_settings(name, *profile, configuration=configuration)
+            prepared = replace(prepared, env=configuration.environment(prepared.env))
+        else:
+            settings = _live_settings(source, client, home)
         if client.foreground_launch(source.pane, source.kind) != source.launch:
             raise ValueError(f"{reference}: source changed before the fork")
         arguments = _arguments(source, settings, name)
@@ -261,7 +282,7 @@ def run(reference: str, name: str) -> int:
         if not isinstance(launched, herdr.ForkLaunched):
             raise ValueError(f"{name}: cannot prove the fork terminal")
         try:
-            native = _admit_clone(name, source, client, launched, prepared, environment, home)
+            native = _admit_clone(name, source, client, launched, prepared, environment, home, profile)
         except _AdmissionUnconfirmed as error:
             raise ValueError(str(error)) from error
     print(f"{name}: cloned {source.name} as {native} in pane {launched.pane}")

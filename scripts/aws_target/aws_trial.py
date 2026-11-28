@@ -31,7 +31,7 @@ from scripts.aws_target.gate_box import (
     boot_trap as boot_trap, log_push_loop as log_push_loop,
     RUN_FIELDS as RUN_FIELDS, validate_paired_result as validate_paired_result,
 )
-from scripts.aws_target import ledger, cloud_gate
+from scripts.aws_target import cloud_gate, gate_source, ledger
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
@@ -283,6 +283,8 @@ def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
             due = [path for path, row in requests if ledger.text(row, 'attempt') in unresolved]
             if due:
                 _ = cloud_gate.cleanup_requests(due, worker)
+            if (previous / gate_source.SOURCE_ARCHIVE).is_file():
+                discard_unowned_trial_archive(previous, worker.book.directory)
 
 
 def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -541,9 +543,32 @@ def paired_service(command: Sequence[str], unit: str) -> int:
                 _ = subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
 
 
+def paired_unit(folder: Path) -> str:
+    return 'cloud-paired-trial-' + folder.name
+
+
+def discard_unowned_trial_archive(folder: Path, directory: Path) -> None:
+    """Remove the package after systemd and the ledger confirm that it has no owner."""
+    try:
+        reply = subprocess.run(['systemctl', '--user', 'show', paired_unit(folder),
+            '--property=LoadState,ActiveState,ControlGroup,Job'], capture_output=True, text=True,
+            timeout=cloud_gate.settings().number('api_timeout_s'), check=False)
+        fields = dict(line.split('=', 1) for line in reply.stdout.splitlines() if '=' in line)
+        if (reply.returncode or fields.get('LoadState') != 'not-found' or fields.get('ActiveState') != 'inactive'
+                or fields.get('ControlGroup') != '' or fields.get('Job') not in ('', '0')):
+            return
+        attempts = {path.parent.name for path in folder.glob('*/request.json')}
+        book = ledger.CostLedger(directory)
+        rows = book.read_snapshot().gate_reservations if book.path.exists() else ()
+        if not any(row.attempt in attempts and ledger.gate_is_open(row) for row in rows):
+            cloud_gate.discard_source_archive(folder)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f'Paired source archive cleanup could not confirm ownership. {error}', file=sys.stderr)
+
+
 def paired_main(argv: Sequence[str], directory: Path) -> int:
     parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes',
-                                     epilog='aws_trial.py pushes and deletes its own trial branches; never push or delete a trial branch by hand.')
+                                     epilog='Legacy deployments manage their own trial branches.')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)
@@ -560,6 +585,11 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
     prefix = ''
     clone_url = ''
     expires = 0
+    folder = directory / 'paired-trials' / uuid4().hex
+    unit = paired_unit(folder)
+    folder_created = False
+    submission_attempted = False
+    status = 1
     try:
         modules = args.modules
         if len(modules) > cloud_gate.settings().whole('slots'):
@@ -568,31 +598,45 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         home = conf.read(account_settings_path()).text('region')
         _ = gate_regions(home)
         deployment = gate_deployment(directory / 'gate-deployment.json', home)
-        clone_url = trial.clone_url
-        prefix = cloud_gate.settings().text('trial_branch_prefix')
-        sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+        source = gate_source.deployment_source(deployment)
         expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
-        folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
-        trial_id = folder.name
-        for variant, revision in (('base', trial.base), ('changed', trial.changed)):
-            branch = f'{prefix}-{expires}-{folder.name}-{variant}'
-            _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
-            _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
+        folder_created = True
+        source_fields: dict[str, object] = {}
+        if isinstance(source, gate_source.CurrentFilesSource):
+            origin_main = checked_git(args.repo, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}')
+            gate_source.archive(args.repo, folder, (trial.base.commit, trial.changed.commit, origin_main))
+            source_fields = {'source_form': gate_source.SOURCE_FORM, 'origin_main': origin_main,
+                             'origin_main_tree': gate_source.git(args.repo, 'rev-parse', origin_main + '^{tree}')}
+        else:
+            clone_url = trial.clone_url
+            prefix = cloud_gate.settings().text('trial_branch_prefix')
+            sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+            trial_id = folder.name
+            for variant, revision in (('base', trial.base), ('changed', trial.changed)):
+                branch = f'{prefix}-{expires}-{folder.name}-{variant}'
+                _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
+                _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
         for module in trial.modules:
             path = folder / uuid4().hex
             path.mkdir()
-            cloud_gate.save(path / 'request.json', module_request(trial, module, path.name, expires))
+            cloud_gate.save(path / 'request.json', {**module_request(trial, module, path.name, expires), **source_fields})
             cloud_gate.save(path / 'deployment.json', deployment)
-        command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(folder)],
-                                             'cloud-paired-trial-' + folder.name, paired=True)
-        return paired_service(command, 'cloud-paired-trial-' + folder.name)
+        command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(folder)], unit, paired=True)
+        submission_attempted = True
+        status = paired_service(command, unit)
+        return status
     except (OSError, ValueError, GateRefused, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True}))
         return 1
     finally:
         with cancellation.defer_cleanup_signals():
+            if folder_created and status and (folder / gate_source.SOURCE_ARCHIVE).is_file():
+                if submission_attempted:
+                    discard_unowned_trial_archive(folder, directory)
+                else:
+                    cloud_gate.discard_source_archive(folder)
             if trial_id:
                 delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
 
