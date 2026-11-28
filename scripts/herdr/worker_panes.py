@@ -148,6 +148,7 @@ class DurableDesignRole:
     parent: StaffId
     name: WorkerName
     role: WorkerRole
+    claim: staff.DesignWorkerClaim | staff.NoDesignWorkerClaim = staff.NO_DESIGN_WORKER_CLAIM
 
 
 PaneTarget = StaffWorker | ConsultationPane | DurableDesignRole
@@ -1718,6 +1719,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
                     phase: str | None = None,
+                    design_claim: staff.DesignWorkerClaim | staff.NoDesignWorkerClaim = staff.NO_DESIGN_WORKER_CLAIM,
                     ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
@@ -1742,6 +1744,9 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, held.blocker)
             record = staff.snapshot()
             existing = worker_admission.find_worker(record, parent, name.value)
+            if (isinstance(design_claim, staff.DesignWorkerClaim) and existing is not None
+                    and existing.design_claim != design_claim):
+                return AdmissionRefused("the worker belongs to another role")
             if (not held.active or held.parent != parent or held.name != name
                     or (existing is None and held.bound)
                     or (existing is not None and not held.owns(existing))
@@ -1781,7 +1786,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             berth_session = (phase_reservation.phase_session_id(owner.current_session, phase)
                              if phase and phase not in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE) else "")
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
-                worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
+                worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot(),
+                design_claim)
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,

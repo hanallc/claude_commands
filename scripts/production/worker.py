@@ -36,9 +36,9 @@ import uuid
 from typing import Literal, Protocol, TextIO, cast, final
 
 from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
-from scripts.astra import design_roles
 from scripts.herdr import herdr_types, pane_launch, pass_notices
 from scripts.accounts import accounts, session_state
+from scripts.astra import design_roles
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.herdr.worker_panes import (
@@ -57,6 +57,10 @@ from scripts.whoami import quota_state
 from scripts.herdr import herdr
 
 StaffId = staff.StaffId
+
+
+class WorkerIdAtUse(Enum):
+    BY_NAME = "use the worker name"
 WorkerName = staff.WorkerName
 WorkerRole = staff.WorkerRole
 ExitCode = worker_panes.ExitCode
@@ -2505,8 +2509,9 @@ def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
     else:
         dispatch_run = worker_panes.HolderRun.CURRENT
     with staff.row_operation(target.parent):
+        claim = target.claim if isinstance(target, worker_panes.DurableDesignRole) else staff.NO_DESIGN_WORKER_CLAIM
         return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock,
-                                            dispatch_run=dispatch_run, phase=phase)
+                                            dispatch_run=dispatch_run, phase=phase, design_claim=claim)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
@@ -2860,7 +2865,7 @@ def _end_refusal(row: staff.StaffRow, record: staff.StaffSnapshot, reason: str |
 
 def end(parent: StaffId, name: WorkerName, *,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
-        retire: bool = True) -> ExitCode:
+        retire: bool = True, expected_worker: StaffId | WorkerIdAtUse = WorkerIdAtUse.BY_NAME) -> ExitCode:
     expected = worker_admission.find_worker(staff.snapshot(), parent, name.value)
     with ExitStack() as operations:
         hold = operations.enter_context(worker_panes.worker_lock(parent, name, blocking=True)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
@@ -2870,6 +2875,7 @@ def end(parent: StaffId, name: WorkerName, *,
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         if (not hold.active or hold.parent != parent or hold.name != name
+                or (isinstance(expected_worker, str) and row != record.by_id(expected_worker))
                 or (row is None and (hold.bound or expected is not None))
                 or (row is not None and (expected is None or not hold.owns(row)
                     or row.id != expected.id or row.current_session != expected.current_session))):
@@ -4025,6 +4031,7 @@ def _launcher_arguments(text: str) -> list[str]:
 class Arguments(argparse.Namespace):
     command: str = ""
     parent: str = ""
+    design_role: str = ""
     role: str = ""
     name: str = ""
     prompt: str = ""
@@ -4064,13 +4071,15 @@ def main(arguments: list[str] | None = None) -> int:
             _ = child.add_argument("selection", nargs="?", type=WorkerFilter,
                                    choices=list(WorkerFilter), default=WorkerFilter.OPEN, metavar="open|closed|all")
             _ = child.add_argument("--all-parents", action="store_true", help="read saved dispatches for every parent")
+            _ = child.add_argument("--design-role", default="", help=argparse.SUPPRESS)
     answering = commands.add_parser("answer")
     _ = answering.add_argument("name")
     _ = answering.add_argument("--text", required=True)
     ending = commands.add_parser("end")
-    _ = ending.add_argument("name")
+    _ = ending.add_argument("name", nargs="?", default="")
     _ = ending.add_argument("--session-dir", default="")
     _ = ending.add_argument("--parent", default="")
+    _ = ending.add_argument("--design-role", default="", help=argparse.SUPPRESS)
     adding = commands.add_parser("add")
     _ = adding.add_argument("role", choices=staff.WORKER_ROLES)
     _ = adding.add_argument("--name", default="")
@@ -4094,6 +4103,8 @@ def main(arguments: list[str] | None = None) -> int:
     _ = finishing.add_argument("--lock-fd", type=int, default=-1)
     _ = finishing.add_argument("--started-fd", type=int, default=-1)
     args = parser.parse_args(arguments, namespace=Arguments())
+    if args.command == "end" and not (args.name or args.design_role):
+        parser.error("end requires a worker name")
     if args.command in ("add", "assign") and quota_state.no_worker_mode():
         print(f"worker.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
         return ExitCode.REFUSED
@@ -4106,7 +4117,21 @@ def main(arguments: list[str] | None = None) -> int:
             record = staff.local_snapshot()
             return _print_workers(list_all_workers(record, selection=args.selection, as_json=args.json), args.json, record)
         record = staff.snapshot()
-        owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
+        if args.design_role:
+            claim = staff.DesignWorkerClaim.parse(args.design_role)
+            instance = design_roles.end_role(claim) if args.command == "end" else design_roles.recorded_role(claim)
+            lifecycle = instance.lifecycle
+            row = record.by_id(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else None
+            if args.command == "end" and row is None:
+                return ExitCode.OK
+            if row is not None:
+                owner = record.parent_of(row)
+                if owner is not None and owner.kind in ("unit", "showrunner") and args.command == "end":
+                    return end(owner.id, WorkerName.parse(row.name), expected_worker=row.id)
+            else:
+                owner = record.by_id(instance.parent) if isinstance(instance.parent, str) else None
+        else:
+            owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
