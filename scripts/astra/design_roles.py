@@ -382,11 +382,15 @@ def _checkout_fields(repository: str, checkout: Checkout) -> dict[str, object]:
     return {'repository_owner': checkout.owner} if isinstance(checkout, UnitCheckout) else {'repository': repository}
 
 
-def _read_checkout(fields: dict[str, object]) -> tuple[str, Checkout]:
+def _saved_checkout(fields: dict[str, object]) -> tuple[str, Checkout]:
     if 'repository_owner' in fields:
-        checkout = UnitCheckout(staff.StaffId(_text(fields, 'repository_owner')))
-        return _checkout_path('', checkout), checkout
+        return '', UnitCheckout(staff.StaffId(_text(fields, 'repository_owner')))
     return _text(fields, 'repository'), INDEPENDENT_CHECKOUT
+
+
+def _read_checkout(fields: dict[str, object]) -> tuple[str, Checkout]:
+    repository, checkout = _saved_checkout(fields)
+    return _checkout_path(repository, checkout), checkout
 
 
 def _binding(fields: dict[str, object]) -> Binding:
@@ -397,7 +401,7 @@ def _binding(fields: dict[str, object]) -> Binding:
     paths = fields.get('output_paths')
     if not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in cast(list[object], paths)):
         raise RoleRefused('binding needs exact output paths')
-    repository, checkout = _read_checkout(fields)
+    repository, checkout = _saved_checkout(fields)
     return DesignBoundToPhase(_text(fields, 'run_directory'), _text(fields, 'phase'),
                               repository, tuple(cast(list[str], paths)), checkout=checkout)
 
@@ -443,6 +447,12 @@ def _load_design(design_id: str, *, repair_empty_repository: bool, local_staff: 
 
 def _decode_design(design_id: str, fields: dict[str, object], *,
                         repair_empty_repository: bool = False) -> HeldDesign:
+    return _parse_design(design_id, fields, repair_empty_repository=repair_empty_repository)()
+
+
+def _parse_design(design_id: str, fields: dict[str, object], *,
+                  repair_empty_repository: bool = False) -> Callable[[], HeldDesign]:
+    """Validate the saved fields and defer staff lookups."""
     path = design_directory(design_id) / 'design.json'
     if fields.get('schema') != 1:
         raise RoleRefused('unknown design schema')
@@ -466,29 +476,40 @@ def _decode_design(design_id: str, fields: dict[str, object], *,
         saved_parent = staff.StaffId(_text(entry, 'parent')) if 'parent' in entry else RoleParentUnrecorded()
         parent = (RoleIdentityUnresolved(_text(entry, 'identity_problem'), saved_parent)
                   if 'identity_problem' in entry else saved_parent)
-        instance = RoleInstance(role, name, lifecycle, claim, parent)
-        instances.append(replace(instance, name=instance_name(instance)))
+        instances.append(RoleInstance(role, name, lifecycle, claim, parent))
     if {instance.role for instance in instances} != {'designer', 'reviewer'}:
         raise RoleRefused('design must record both role slots')
-    repository, checkout = _read_checkout(fields)
+    repository, checkout = _saved_checkout(fields)
     document = _text(fields, 'document')
-    if isinstance(checkout, UnitCheckout):
-        document = str((Path(repository) / document).resolve())
-    for key, value in (('repository', repository), ('document', document)):
-        if not Path(value).is_absolute():
-            raise RoleRefused(key + ' must be absolute')
+    if isinstance(checkout, IndependentCheckout):
+        for key, value in (('repository', repository), ('document', document)):
+            if not Path(value).is_absolute():
+                raise RoleRefused(key + ' must be absolute')
     binding_fields = _object(fields.get('binding'))
     empty_repository = (binding_fields.get('kind') == 'DesignBoundToPhase'
                         and binding_fields.get('repository') == '')
     if empty_repository:
         binding_fields = {**binding_fields, **_checkout_fields(repository, checkout)}
-    design = HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
-                      _text(fields, 'repository_id'), repository, document,
-                      _text(fields, 'area'), _text(fields, 'created_at_utc'),
-                      _binding(binding_fields), tuple(instances), checkout=checkout)
+    design_placement = DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation'))
+    repository_id = _text(fields, 'repository_id')
+    area = _text(fields, 'area')
+    created = _text(fields, 'created_at_utc')
+    binding = _binding(binding_fields)
     if empty_repository and not repair_empty_repository:
         raise DamagedDesignRecord(path, 'binding.repository')
-    return design
+
+    def resolve() -> HeldDesign:
+        root = _checkout_path(repository, checkout)
+        if not Path(root).is_absolute():
+            raise RoleRefused('repository must be absolute')
+        resolved_document = str((Path(root) / document).resolve()) if isinstance(checkout, UnitCheckout) else document
+        resolved_binding = (replace(binding, repository=binding_repository(binding))
+                            if isinstance(binding, DesignBoundToPhase) else binding)
+        roles = tuple(replace(instance, name=instance_name(instance)) for instance in instances)
+        return HeldDesign(design_placement, repository_id, root, resolved_document, area, created,
+                          resolved_binding, roles, checkout=checkout)
+
+    return resolve
 
 
 def _design_fields(design: HeldDesign) -> dict[str, object]:
@@ -1398,7 +1419,7 @@ def record_operation() -> Generator[None]:
         yield
 
 
-def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
+def _read_designs(relevant: Callable[[Path, dict[str, object]], bool], *,
                   refuse_matching_damage: bool = False) -> Generator[HeldDesign]:
     """Skip broken records, but preserve a caller's matching live role for recovery."""
     with record_operation():
@@ -1407,20 +1428,19 @@ def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
             fields: dict[str, object] = {}
             try:
                 fields = _read(path)
-                design = _decode_design(path.parent.name, fields)
-            except staff.StaffUnreadable:
-                raise
+                resolve = _parse_design(path.parent.name, fields)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 reason = ' '.join(str(error).splitlines())
                 live_roles = _has_live_roles(fields)
-                if relevant(fields) and (refuse_matching_damage or live_roles):
+                if fields and (refuse_matching_damage or live_roles) and relevant(path, fields):
                     recovery = '; live held role needs recovery' if live_roles else ''
                     raise RoleRefused(f'{path}: {reason}{recovery}') from error
                 if path not in warned:
                     print(f'warning: {path}: {reason}', file=sys.stderr)
                     warned.add(path)
                 continue
-            yield _published_workers(design)
+            if relevant(path, fields):
+                yield _published_workers(resolve())
 
 
 @dataclass(frozen=True)
@@ -1431,7 +1451,7 @@ class NotHeldDocument:
 def held_document(document: Path) -> HeldDesign | NotHeldDocument:
     target = str(document.resolve())
 
-    def relevant(fields: dict[str, object]) -> bool:
+    def relevant(_path: Path, fields: dict[str, object]) -> bool:
         if 'repository_owner' not in fields:
             return fields.get('document') == target
         try:
@@ -1439,8 +1459,7 @@ def held_document(document: Path) -> HeldDesign | NotHeldDocument:
         except RoleRefused:
             return False
 
-    found = [design for design in _read_designs(relevant)
-             if design.document == target]
+    found = [design for design in _read_designs(relevant) if design.document == target]
     if len(found) > 1:
         raise RoleRefused('document has more than one held identity; recovery required')
     return found[0] if found else NotHeldDocument()
@@ -1453,17 +1472,17 @@ def unbind_run(run_directory: str) -> None:
         directory = cast(dict[str, object], binding).get('run_directory')
         return isinstance(directory, str) and Path(directory) == Path(run_directory)
 
-    def relevant(fields: dict[str, object]) -> bool:
-        return matches_run(fields.get('binding'))
+    def relevant(path: Path, fields: dict[str, object]) -> bool:
+        return (matches_run(fields.get('binding'))
+                or matches_run(_read_transition(path.parent).get('source_binding')))
 
     for design in _read_designs(relevant, refuse_matching_damage=True):
-        transition = design_directory(design.placement.design_id) / 'transition.json'
-        pending = _read(transition) if transition.exists() else {}
+        pending = _read_transition(design_directory(design.placement.design_id))
         source_binding = pending.get('source_binding')
         if (matches_run(source_binding)
                 and pending.get('target') == _design_fields(design)):
             _ = _finish_rebind(design)
-        if relevant(_design_fields(design)):
+        if matches_run(_tag(design.binding)):
             _ = rebind(design.placement.design_id, expected_generation=design.placement.generation,
                        reason='run ended after reservation release', binding=DesignUnbound())
 
@@ -1508,7 +1527,7 @@ def move_checkout(old_checkout: str, new_checkout: str, *,
         except ValueError:
             return value
 
-    for design in _read_designs(lambda fields: (
+    for design in _read_designs(lambda _path, fields: (
             _read_checkout(fields)[0] if 'repository_owner' in fields else fields.get('repository')) in (old_checkout, new_checkout),
             refuse_matching_damage=True):
         if design_repository(design) not in (old_checkout, new_checkout):
@@ -1566,7 +1585,7 @@ def checkout_failures(old_checkout: str) -> list[str]:
     """List live document paths that still use the old checkout."""
     failures: list[str] = []
     try:
-        for design in _read_designs(lambda fields: (
+        for design in _read_designs(lambda _path, fields: (
                 _read_checkout(fields)[0] if 'repository_owner' in fields else fields.get('repository')) == old_checkout):
             path = design_directory(design.placement.design_id) / 'design.json'
             try:

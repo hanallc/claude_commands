@@ -827,6 +827,22 @@ class DurableRolesTests(HeldRolePaneCase):
                       self.assertRaisesRegex(staff.StaffUnreadable, "staff is unavailable")):
                     _ = design_roles.held_document(document)
 
+    def test_held_document_skips_unrelated_pending_reviewer_when_staff_is_unreadable(self) -> None:
+        repository = "independent-review"
+        design_roles.register_repository(repository, {"natedev": str(self.repository)})
+        document = self.repository / "other-design.md"
+        _ = document.write_text("# Other design\n")
+        with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.open_role(repository, "design.md", "reviewer", "design")
+        with stop_once(design_roles, "_begin_creation", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.open_role(repository, document.name, "reviewer", "design")
+
+        with patch.object(staff, "authority_snapshot", side_effect=staff.StaffUnreadable("staff is unavailable")) as read:
+            held = design_roles.held_document(document)
+        read.assert_not_called()
+        assert isinstance(held, design_roles.HeldDesign)
+        self.assertEqual(held.document, str(document))
+
     def test_end_keeps_the_worker_id_when_staff_retires_it_before_role_open(self) -> None:
         world = self.pane_start()
         with stop_once(design_roles, "_assign_command"), self.assertRaises(InjectedStop):
