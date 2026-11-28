@@ -2893,6 +2893,9 @@ def _fire_scheduled_item(store: record_store.NumberedRecords, identity: str, mom
             with operation_deadline.within(monotonic() + _SCHEDULED_ITEM_SECONDS):
                 for delivery in prepared.run_deliveries:
                     for notice in delivery.notices:
+                        if (notice.state is NoticeState.READY
+                                and operation_deadline.remaining(_SCHEDULED_SEND_SECONDS) < _SCHEDULED_SEND_SECONDS):
+                            continue
                         if notice.needs_check():
                             _deliver_scheduled_notice(store, identity, delivery.key, notice.kind, wait)
         except TimeoutError:
