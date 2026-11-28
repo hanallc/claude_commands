@@ -9,6 +9,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
@@ -41,6 +42,13 @@ class NotRegistered:
 class UnreadableRecord:
     """The reason explains why the copy registration record cannot be read."""
     reason: str
+
+
+class RemovalIntentAccess(Enum):
+    """Select whether a stale removal intent may be cleared."""
+
+    RECOVER = "recover"
+    READ_ONLY = "read only"
 
 
 # A sweep asks for a root once per entry; a parse costs 0.35 ms, a stat a few microseconds.

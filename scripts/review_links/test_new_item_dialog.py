@@ -18,8 +18,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.process_group import run_process_group
-from scripts.production import investigation, staff
-from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
+from scripts.production import investigation, record_store, staff
+from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_proofs, reply_tokens, review_page,
                                   review_submissions)
 from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
@@ -2504,7 +2504,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             except new_item_dialog.SubmissionScreenshotExpired as error:
                 self.send_json(409, {"code": "screenshot_expired", "error": str(error)})
                 return
-            except review_submissions.SubmissionConflict as error:
+            except record_store.SubmissionConflict as error:
                 self.send_json(error.status, {"reason": str(error)})
                 return
             except (OSError, ValueError) as error:
@@ -2769,9 +2769,26 @@ window.fetch = (path, options) => {
         fields["reply_token"] = token
         fields["reply_token_sha256"] = proof.sha256
         restored = new_item_dialog.read_submission(fields)
-        with self.assertRaises(new_item_dialog.SubmissionError):
+        with self.assertRaises(record_store.SubmissionError):
             new_item_dialog.require_reply_token(restored, token)
         new_item_dialog.require_reply_token(restored.with_reply_proof(proof), token)
+
+    def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
+        token = reply_tokens.RawReplyToken("a" * 43)
+        proof = reply_tokens.LegacyReplyProof(reply_tokens.digest(token))
+        details = new_item_dialog.ReviewSubmission(
+            "fixture", "b" * 64, new_item_dialog.NoEvidence(), (), reply_proof=proof)
+        fields = new_item_dialog.stored_submission(details)
+        self.assertNotIn(token, json.dumps(fields))
+        for name, value in (("reply_token", token), ("reply_token_sha256", proof.sha256)):
+            with self.subTest(field=name):
+                remaining, moved, count = reply_proofs.extract_submission({**fields, name: value})
+                self.assertEqual((remaining, moved, count), (fields, proof, 1))
+                restored = new_item_dialog.read_submission(remaining).with_reply_proof(moved)
+                self.assertEqual(restored, details)
+                new_item_dialog.require_reply_token(restored, token)
+                with self.assertRaises(record_store.SubmissionError):
+                    new_item_dialog.require_reply_token(restored, "b" * 43)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_send_reports_when_only_the_review_item_is_saved(self) -> None:
@@ -3511,7 +3528,7 @@ window.fetch = (path, options = {}) => {
         self.assertEqual(new_item_dialog.read_page_capture(capture),
                          new_item_dialog.PageCaptureRequest("/console/list.html#show=open", 1137, 688, True))
         for bad in ({"width": True}, {"height": 2161}, {"place": "//other.invalid/"}, {"dark": "true"}):
-            with self.subTest(bad=bad), self.assertRaises(new_item_dialog.SubmissionError):
+            with self.subTest(bad=bad), self.assertRaises(record_store.SubmissionError):
                 _ = new_item_dialog.read_page_capture({**capture, **bad})
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")

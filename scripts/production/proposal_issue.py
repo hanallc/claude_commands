@@ -179,13 +179,13 @@ def _submission_reply_is_repeat(issue: Issue, key: new_item_dialog.ScopedSubmiss
     origin = review_submission(issue)
     if (proposal_owner(issue, issue.value("proposed_by")) != owner or issue.value(NUMBER_FIELD) != key.item_id
             or not isinstance(origin, new_item_dialog.ReviewSubmission) or origin.request_id != key.request_id):
-        raise new_item_dialog.SubmissionError("The selected Proposal changed.")
+        raise record_store.SubmissionError("The selected Proposal changed.")
     new_item_dialog.require_reply_token(origin, token)
     latest = next((entry.words for entry in reversed(events)
                    if entry.words.startswith(("Answer: ", "question: "))), "")
     repeated = not review_is_done(issue) and isinstance(review_mark(issue), NoMark) and latest == words
     if not repeated and not pending_review_reply(issue):
-        raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+        raise record_store.SubmissionError("This item no longer accepts this reply.")
     return repeated
 
 
@@ -223,11 +223,11 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
                                            submission_reply.token, submission_reply.owner, before):
                 return False
             if issue != submission_reply.selected:
-                raise new_item_dialog.SubmissionError("The selected Proposal changed.")
+                raise record_store.SubmissionError("The selected Proposal changed.")
         lines_to_append = (words,) if isinstance(words, str) else words
         if not isinstance(submission_reply, ProposalSubmissionReply) and issue.value("review_submission") and any(
                 line.startswith("Answer: ") for line in lines_to_append):
-            raise new_item_dialog.SubmissionError("Use the scoped reply from the Review item.")
+            raise record_store.SubmissionError("Use the scoped reply from the Review item.")
         events = before
         for line in lines_to_append:
             events = review_events.append(events, ReviewLog(datetime.now(timezone.utc), who, line))

@@ -154,8 +154,9 @@ class ProposalIssueTests(unittest.TestCase):
     def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
         folder = self.root / "issues"
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
+        token = reply_tokens.RawReplyToken("a" * 43)
         details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (),
-            reply_proof=reply_tokens.LegacyReplyProof(reply_tokens.digest(reply_tokens.RawReplyToken("a" * 43))))
+            reply_proof=reply_tokens.LegacyReplyProof(reply_tokens.digest(token)))
         today = date(2026, 11, 17)
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
@@ -167,8 +168,36 @@ class ProposalIssueTests(unittest.TestCase):
         key = new_item_dialog.ScopedSubmissionKey(new_item_dialog.SubmissionKind.PROPOSAL, recipient,
                                                    issue.value("proposal_id"), details.request_id)
         self.assertFalse(reply_tokens.path().exists())
-        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
-            _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", "a" * 43, owner=key.recipient_id)
+        with self.assertRaisesRegex(record_store.SubmissionError, "no longer accepts"):
+            _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", token, owner=key.recipient_id)
+
+    def test_number_replaces_a_legacy_reply_token_with_its_hash(self) -> None:
+        token = reply_tokens.RawReplyToken("r" + "b" * 42)
+        fields: dict[str, object] = {"request_id": "request-1", "request_digest": "a" * 64,
+                                     "evidence": {"kind": "none"}, "images": []}
+        clean, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": json.dumps(fields)}, self.issue)
+        _ = self.issue.write_text(clean)
+        today = date(2026, 11, 17)
+        self.assertEqual(proposal_issue.number([self.issue], today), ["number a proposal.md: P1"])
+        legacy = json.dumps({**fields, "reply_token": token})
+        numbered, _ = proposal_issue.set_fields(self.issue.read_text(), {"review_submission": legacy}, self.issue)
+        _ = self.issue.write_text(numbered)
+
+        move = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, run=move), 1)
+        self.assertEqual(proposal_issue.number([self.issue], today), ["number a proposal.md: P1"])
+        self.assertNotIn(token, self.issue.read_text())
+        origin = proposal_issue.review_submission(Issue(self.issue, frontmatter(self.issue)))
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        self.assertEqual(origin.reply_proof, reply_tokens.LegacyReplyProof(reply_tokens.digest(token)))
+        self.assertTrue(new_item_dialog.matches_reply_token(origin, token))
+
+        unnumbered = self.root / "unnumbered.md"
+        text, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": legacy}, unnumbered)
+        _ = unnumbered.write_text(text)
+        with self.assertRaisesRegex(proposal_issue.Refusal, "Move the reply proof before editing"):
+            _ = proposal_issue.number([unnumbered], today)
+        self.assertEqual(unnumbered.read_text(), text)
 
     def test_move_replaces_a_legacy_proposal_token_with_a_private_hash(self) -> None:
         token = "r" + "b" * 42
@@ -382,7 +411,7 @@ class ProposalIssueTests(unittest.TestCase):
 
         scoped, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": "{}"}, self.issue)
         _ = self.issue.write_text(scoped)
-        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "Use the scoped reply"):
+        with self.assertRaisesRegex(record_store.SubmissionError, "Use the scoped reply"):
             _ = proposal_issue.record_review(self.issue, "Answer: Use the new layout.", NoMark(), today,
                                              submission_reply=native)
         self.assertEqual(self.issue.read_text(), scoped)

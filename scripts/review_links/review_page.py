@@ -772,7 +772,7 @@ class ReviewSnapshotCache:
                         | review_submissions.ListDraftSend), *,
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
         capture_requested: bool = False,
-        refusal: new_item_dialog.SubmissionError | None = None,
+        refusal: record_store.SubmissionError | None = None,
         capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
         capture_target: new_item_dialog.ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
         = new_item_dialog.NoBoundCaptureTarget.UNBOUND,

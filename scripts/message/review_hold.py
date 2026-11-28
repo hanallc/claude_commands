@@ -13,13 +13,13 @@ import os
 import re
 import sys
 from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from time import time
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -42,6 +42,68 @@ class ReviewMessage:
 
 
 type RecordReleasedKeys = Callable[[tuple[ReviewMessage, ...], str, float], None]
+
+
+def message_state_directory() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
+
+
+@contextmanager
+def lock_message_state(directory: Path) -> Generator[None]:
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".lock").open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def read_message_keys(directory: Path) -> object:
+    try:
+        return cast(object, json.loads((directory / "keys.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_message_keys(directory: Path, keys: object) -> None:
+    write_text_atomic(directory / "keys.json", json.dumps(keys, indent=2, sort_keys=True) + "\n")
+
+
+@contextmanager
+def message_keys(directory: Path, lock: AbstractContextManager[None]) -> Generator[object]:
+    """Save changes to the message keys under the message state lock."""
+    with lock:
+        keys = read_message_keys(directory)
+        before = json.dumps(keys, sort_keys=True)
+        yield keys
+        if json.dumps(keys, sort_keys=True) != before:
+            write_message_keys(directory, keys)
+
+
+class _ReleaseKeyState(TypedDict):
+    last: dict[str, str]
+    once_accepted: NotRequired[bool]
+
+
+def record_released_acceptances(held: tuple[ReviewMessage, ...], fallback_recipient: str, at: float, *,
+                                directory: Path) -> None:
+    """Start the repeat window for each key when its message reaches the recipient."""
+    keyed = [(item.key, item.key_recipient or fallback_recipient) for item in held if item.key]
+    if not keyed:
+        return
+    accepted_at = datetime.fromtimestamp(at, timezone.utc)
+    with message_keys(directory, lock_message_state(directory)) as records:
+        states = cast(dict[str, _ReleaseKeyState], records)
+        for key, address in keyed:
+            state = states.setdefault(key, {"last": {}})
+            last = state["last"].get(address)
+            if last is None or datetime.fromisoformat(last) < accepted_at:
+                state["last"][address] = accepted_at.isoformat()
+        for item in held:
+            if item.key and item.once_per_key:
+                states[item.key]["once_accepted"] = True
+
+
+def record_keys(held: tuple[ReviewMessage, ...], fallback_recipient: str, at: float) -> None:
+    record_released_acceptances(held, fallback_recipient, at, directory=message_state_directory())
 
 
 class EndedReview(Enum):
@@ -604,8 +666,6 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
 
 
 def main(argv: list[str] | None = None) -> int:
-    from scripts.hooks import review_hold_delivery
-
     parser = argparse.ArgumentParser(description="End the current review hold and release its messages.")
     _ = parser.add_argument("command", choices=("end-now",))
     _ = parser.parse_args(argv)
@@ -614,7 +674,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("CLAUDE_CODE_SESSION_ID is required")
     try:
         _deliver_saved(session, time(), lambda notice: print(notice, flush=True),
-                       review_hold_delivery.record_keys, end_now=True)
+                       record_keys, end_now=True)
     except (OSError, ValueError) as error:
         print(f"review hold: {error}", file=sys.stderr)
         return 1
