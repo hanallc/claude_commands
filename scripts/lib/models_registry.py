@@ -12,7 +12,7 @@ import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
@@ -130,6 +130,15 @@ class LaunchSettings(NamedTuple):
     model: str
     effort: str
     service_tier: str
+
+
+def codex_model_arguments(settings: LaunchSettings) -> list[str]:
+    """Build the Codex arguments for model, effort, and service tier."""
+    arguments = ["--model", settings.model] if settings.model else []
+    arguments.extend(("-c", f"model_reasoning_effort={json.dumps(settings.effort)}"))
+    if settings.service_tier:
+        arguments.extend(("-c", f"service_tier={json.dumps(settings.service_tier)}"))
+    return arguments
 
 
 def claude_model(model: str, environment: Mapping[str, str], *, timeout: float | None = None) -> str:
@@ -448,7 +457,8 @@ def _catalog_replay(before: str, written: str, catalog: list[registry_rows.RowCh
     return replay
 
 
-def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_rows.RegistryReplay) -> bool:
+def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_rows.RegistryReplay, *,
+             edit_after_fetch: Callable[[str], str] | None = None) -> bool:
     head_and_branch = _git(repo, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").splitlines()
     if len(head_and_branch) != 2 or not head_and_branch[1].startswith("refs/heads/"):
         raise OSError("registry publication refused: HEAD is not on a branch")
@@ -471,6 +481,11 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
             journal.restore(repo, "HEAD")
             base = _git(repo, "rev-parse", "HEAD")
             contents = registry_text(path)
+            if edit_after_fetch is not None:
+                edited = edit_after_fetch(contents)
+                if edited != contents:
+                    write_text_atomic(path, edited)
+                    contents = edited
         previous = _git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n"
         if not registry_rows.changes(previous, contents):
             return False
@@ -617,18 +632,23 @@ def save_registry(registry: Path, before: str, after: str, description: str, *,
     return SavedRegistry(result, changed, RegistryPublication.SHARED)
 
 
-def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
-    path = registry_path()
-    before = registry_text(path)
+def _producer_candidate(name: str, family: str, model: str, effort: str, *,
+                        configuration: LaunchModelConfiguration | None = None) -> tuple[Path, str, str, LaunchSettings]:
+    if configuration is None:
+        path = registry_path()
+        before = registry_text(path)
+    else:
+        path, before = configuration.path, configuration.text
     after = registry_rows.replay(before, [registry_rows.RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
     settings = launch_settings("producers", name,
                                configuration=LaunchModelConfiguration(path, after, tuple(registry_rows.records(after))))
     return path, before, after, settings
 
 
-def producer_settings(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+def producer_settings(name: str, family: str, model: str, effort: str, *,
+                      configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
     """Validate one producer's candidate settings without a write."""
-    return _producer_candidate(name, family, model, effort)[3]
+    return _producer_candidate(name, family, model, effort, configuration=configuration)[3]
 
 
 def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSettings:
@@ -659,6 +679,37 @@ def remove_producer(name: str, profile: ProducerProfile) -> None:
         raise ValueError(f"{path}: producer settings changed during retirement")
     edits = [registry_rows.RowChange("producers", name, "")]
     _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"retire producer {name}")
+
+
+def remove_failed_clone_profile(name: str, profile: ProducerProfile) -> None:
+    """Remove a failed clone's profile from the registry that owns it."""
+    path = registry_path().resolve()
+    target = _publish_repository(path)
+    if not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve():
+        remove_producer(name, profile)
+        return
+    if os.environ.get("MODELS_CONFIG_PUBLISH") in ("0", "later"):
+        raise OSError(f"{name}: cannot confirm removal while registry publication is disabled or deferred")
+
+    def remove(text: str) -> str:
+        rows = parse_registry(text).get("producers", {})
+        if name not in rows:
+            return text
+        if rows[name] != profile.value():
+            raise ValueError(f"{path}: {name}'s producer profile changed")
+        return registry_rows.replay(text, [registry_rows.RowChange("producers", name, "")], False)
+
+    def replay(head: str, local: str, shared: str) -> str:
+        return registry_rows.replay_pending(head, remove(local), remove(shared))
+
+    with ExitStack() as locks:
+        if _on_main(target):
+            locks.enter_context(main_push_lock.main_push_lock(target.repository))
+        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _ = _publish(target.repository, path, f"remove failed producer clone {name}", replay, edit_after_fetch=remove)
+        if name in parse_registry(registry_text(path)).get("producers", {}):
+            raise OSError(f"{name}: the producer profile remains after publication")
 
 
 @final

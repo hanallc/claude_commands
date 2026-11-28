@@ -29,7 +29,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
+from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, gate_source, ledger
 from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, override_fixture_settings, text_setting
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
@@ -961,7 +961,8 @@ else:
         with self.assertRaises(ValueError):
             trial.validate_paired_result(row, request, 'i-other')
 
-    def guest(self, *, limit: float | None = None) -> tuple[dict[str, object], list[dict[str, object]]]:
+    def guest(self, *, limit: float | None = None, private: bool = False, missing_package: bool = False
+              ) -> tuple[dict[str, object], list[dict[str, object]]]:
         from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
         box.mkdir()
@@ -969,9 +970,23 @@ else:
         guest_delivery_margin_s = 60
         request = trial.module_request(self.request(), 'fixture/test_sample.py', 'attempt', int(time.time()) + guest_deadline_s)
         request['module_time_limit_s'] = guest_deadline_s if limit is None else limit
+        links: dict[str, object] = {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
+                                    'instance_type': 'm7a.8xlarge'}
+        if private:
+            request.update(source_form=gate_source.SOURCE_FORM, origin_main=self.base,
+                           origin_main_tree=gate_source.git(self.repo, 'rev-parse', self.base + '^{tree}'),
+                           clone_url='https://github.com/denied')
+            gate_source.archive(self.repo, box, (self.base, self.changed))
+            archive = box / gate_source.SOURCE_ARCHIVE
+            links.update(commit=request['commit'], tree=request['tree'],
+                         source='package', source_sha256=gate_source.archive_sha256(archive))
+            if missing_package:
+                archive.unlink()
+                links['boot_error'] = 'boot-error'
+            else:
+                _ = archive.rename(box / 'package')
         cloud_gate.save(box / 'request.json', request)
-        cloud_gate.save(box / 'links.json', {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
-                                           'instance_type': 'm7a.8xlarge'})
+        cloud_gate.save(box / 'links.json', links)
         tools = self.root / 'tools'
         tools.mkdir()
         curl = tools / 'curl'
@@ -979,10 +994,29 @@ else:
 import json, pathlib, sys
 config = pathlib.Path(sys.argv[sys.argv.index('--config') + 1])
 name = json.loads(config.read_text().partition('= ')[2])
-pathlib.Path({str(box)!r}, 'uploaded-' + name).write_bytes(sys.stdin.buffer.read())
+root = pathlib.Path({str(box)!r})
+if '--data-binary' in sys.argv:
+    (root / ('uploaded-' + name)).write_bytes(sys.stdin.buffer.read())
+else:
+    source = root / name
+    if not source.is_file():
+        print('404', end='')
+        raise SystemExit(22)
+    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(source.read_bytes())
 print('200', end='')
 ''')
         curl.chmod(0o755)
+        if private:
+            git_path = shutil.which('git')
+            assert git_path is not None
+            git = tools / 'git'
+            _ = git.write_text(f'''#!{sys.executable}
+import os, sys
+if any('github.com' in item or '://' in item for item in sys.argv[1:]):
+    raise SystemExit('The fixture denies network Git')
+os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
+''')
+            git.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)
         trace = self.root / 'trace.jsonl'
         # The guest selects the candidate checkout after it clones the source.
@@ -991,9 +1025,141 @@ print('200', end='')
             env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'HOME': str(box)})
         self.assertEqual(result.returncode, 0, result.stderr)
-        reply = cloud_gate.read(box / 'uploaded-result')
+        if missing_package:
+            self.assertFalse((box / 'uploaded-result').exists())
+        reply = cloud_gate.read(box / ('uploaded-boot-error' if missing_package else 'uploaded-result'))
         traces = [ledger.mapping(cast(object, json.loads(line))) for line in trace.read_text().splitlines()] if trace.exists() else []
         return reply, traces
+
+    def test_private_paired_guest_runs_both_revisions_without_network_git(self) -> None:
+        reply, traces = self.guest(private=True)
+        self.assertEqual(reply['verdict'], 'pass', reply)
+        self.assertEqual(len(traces), 8)
+        self.assertEqual(trial.checked_git(self.root / 'box/base', 'rev-parse', 'HEAD'), self.base)
+        self.assertEqual(trial.checked_git(self.root / 'box/changed', 'rev-parse', 'HEAD'), self.changed)
+        for variant in ('base', 'changed'):
+            checkout = self.root / 'box' / variant
+            self.assertTrue((checkout / '.git/index').is_file())
+            self.assertEqual(trial.checked_git(checkout, 'rev-parse', 'refs/remotes/origin/main'), self.base)
+
+    def test_private_guest_boot_error_names_the_missing_package_and_http_status(self) -> None:
+        reply, traces = self.guest(private=True, missing_package=True)
+        self.assertEqual(reply['verdict'], 'error')
+        self.assertEqual(reply['error'], 'GuestSourceRejected: GET source failed (curl exit 22, HTTP 404)')
+        self.assertEqual(traces, [])
+
+    def test_paired_trial_prepares_one_package_without_remote_branch_commands(self) -> None:
+        _ = trial.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)
+        previous = self.remote_branches()
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture',
+            'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture']})
+        with (mock.patch.object(trial, 'sweep_trial_branches', side_effect=AssertionError('remote branch sweep')),
+              mock.patch.object(trial, 'delete_trial_branches', side_effect=AssertionError('remote branch deletion')),
+              mock.patch.object(trial, 'paired_service', return_value=0) as service):
+            status = trial.paired_main(['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                                      '--modules', 'fixture/test_sample.py'], self.state)
+            self.assertEqual(status, 0)
+        service.assert_called_once()
+        self.assertEqual(self.remote_branches(), previous)
+        folder, = (self.state / 'paired-trials').iterdir()
+        request_path, = folder.glob('*/request.json')
+        request = cloud_gate.read(request_path)
+        self.assertEqual(request['source_form'], gate_source.SOURCE_FORM)
+        self.assertEqual(request['origin_main'], self.base)
+        archive = folder / gate_source.SOURCE_ARCHIVE
+        self.assertEqual(tuple(folder.rglob('*.pack')), (archive,))
+        self.assertEqual(archive.read_bytes()[:4], b'PACK')
+
+    def test_failed_paired_submission_discards_only_the_unowned_package(self) -> None:
+        _ = trial.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture',
+            'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture']})
+        tools = self.root / 'systemd-bin'
+        tools.mkdir()
+        systemctl = tools / 'systemctl'
+        _ = systemctl.write_text('''#!/bin/sh
+set -eu
+test "$1 $2" = '--user show'
+test "$3" = "$TRIAL_UNIT"
+test "$4" = '--property=LoadState,ActiveState,ControlGroup,Job'
+printf '%s\\n' "$TRIAL_SERVICE_STATE"
+''')
+        systemctl.chmod(0o700)
+        arguments = ['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                     '--modules', 'fixture/test_sample.py']
+        book = ledger.CostLedger(self.state)
+        now = 1700000000
+        for hold in ('unowned', 'service', 'booking'):
+            with self.subTest(hold=hold), mock.patch.dict(os.environ, {
+                    'PATH': str(tools) + os.pathsep + os.environ['PATH'],
+                    'TRIAL_SERVICE_STATE': ('LoadState=loaded\nActiveState=active\nControlGroup=/trial\nJob='
+                                            if hold == 'service' else 'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob='),
+            }):
+                def refuse(command: Sequence[str]) -> int:
+                    folder = Path(command[command.index('--paired-worker') + 1])
+                    self.assertTrue((folder / gate_source.SOURCE_ARCHIVE).is_file())
+                    os.environ['TRIAL_UNIT'] = 'cloud-paired-trial-' + folder.name
+                    if hold == 'booking':
+                        request, = folder.glob('*/request.json')
+                        book.record_inventory(ledger.ResourceInventory(now,
+                            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+                        book.observe(ledger.InstanceObservation(now, 'stopped', 'fixture'))
+                        reservation = ledger.GateReservation(request.parent.name, now, now + 60, Decimal('.8'), Decimal('.02'))
+                        self.assertIsInstance(book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+                    return 1
+
+                with mock.patch.object(subprocess, 'call', side_effect=refuse) as start:
+                    self.assertEqual(trial.paired_main(arguments, self.state), 1)
+                start.assert_called_once()
+                folder = self.state / 'paired-trials' / os.environ['TRIAL_UNIT'].removeprefix('cloud-paired-trial-')
+                self.assertEqual((folder / gate_source.SOURCE_ARCHIVE).is_file(), hold != 'unowned')
+                self.assertEqual(len(tuple(folder.glob('*/request.json'))), 1)
+
+    def test_sweep_removes_expired_unowned_pack_after_the_user_bus_returns(self) -> None:
+        now = 1700000000
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now, (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(now, 'stopped', 'fixture'))
+        reservation = ledger.GateReservation('booking', now, now + 120, Decimal('.8'), Decimal('.02'))
+        self.assertIsInstance(book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+        root = self.state / 'paired-trials'
+        current = root / 'current'
+        current.mkdir(parents=True)
+        packages: dict[str, Path] = {}
+        for state in ('unowned', 'active', 'booking', 'unexpired'):
+            folder = root / state
+            module = folder / state
+            module.mkdir(parents=True)
+            cloud_gate.save(module / 'request.json', {'attempt': state, 'expires': now + (1 if state == 'unexpired' else -1)})
+            packages[state] = folder / gate_source.SOURCE_ARCHIVE
+            _ = packages[state].write_bytes(b'PACK')
+
+        calls: list[str] = []
+        bus_available = False
+
+        def show(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(list(arguments[:3]), ['systemctl', '--user', 'show'])
+            unit = arguments[3]
+            calls.append(unit)
+            if not bus_available:
+                return subprocess.CompletedProcess(arguments, 1, '', 'Failed to connect to bus')
+            fields = ('LoadState=loaded\nActiveState=active\nControlGroup=/trial\nJob=\n'
+                      if unit == 'cloud-paired-trial-active' else
+                      'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=\n')
+            return subprocess.CompletedProcess(arguments, 0, fields, '')
+
+        aws = mock.Mock(side_effect=AssertionError('The sweep must use only local evidence'))
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=aws), book,
+            self.settings, current / 'reservation', clock=lambda: now)
+        with mock.patch.object(subprocess, 'run', side_effect=show):
+            trial.discard_unowned_trial_archive(root / 'unowned', self.state)
+            self.assertTrue(all(path.is_file() for path in packages.values()))
+            bus_available = True
+            trial.sweep_trial_resources(current, worker)
+        self.assertEqual(calls, ['cloud-paired-trial-' + name for name in ('unowned', 'active', 'booking', 'unowned')])
+        self.assertEqual({name for name, path in packages.items() if path.is_file()}, {'active', 'booking', 'unexpired'})
+        self.assertTrue((root / 'unowned' / 'unowned' / 'request.json').is_file())
+        aws.assert_not_called()
 
     def test_local_guest_uses_two_trees_alternating_isolated_processes(self) -> None:
         reply, traces = self.guest()

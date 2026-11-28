@@ -166,6 +166,55 @@ def claude_catalog_environment(directory: Path, targets: Mapping[str, str]) -> d
 
 
 class RegistryPublicationTests(ScriptRepositoryTestCase):
+    def test_failed_clone_removes_a_profile_already_on_the_remote(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+        registry = write_registry(self.repo / "config/models.conf", {"producers": {"morty": "claude:opus:high"}})
+        self.seed()
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        profile = models_registry.ProducerProfile("claude", "opus", "high")
+        identity = staff.native_id(fixture_runtime_id("fork"))
+        environment = {**self.environment, "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "1",
+                       "MODELS_CONFIG_TIER_ONLY": "1", "XDG_STATE_HOME": str(self.root / "state"),
+                       "CONF_DIR": str(registry.parent), "TMPDIR": str(self.root)}
+        check_move = waiting_rows.check_move
+        failed = False
+
+        def fail_first_reconciliation(checkout: Path, move: waiting_rows.CheckoutMove, pending: waiting_rows.LockedJournal,
+                                      *, replace_registry: bool = False, registry_move: bool = False,
+                                      replay_registry: waiting_rows.RegistryReplay = registry_rows.replay_pending
+                                      ) -> waiting_rows.WaitingRows:
+            nonlocal failed
+            if replace_registry and not failed:
+                shared = self.git("--git-dir", str(self.remote), "show", "main:config/models.conf").stdout
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), base)
+                self.assertEqual(models_registry.parse_registry(shared)["producers"]["morty-copy"], profile.value())
+                failed = True
+                raise OSError("fixture reconciliation failed")
+            return check_move(checkout, move, pending, replace_registry=replace_registry, registry_move=registry_move,
+                              replay_registry=replay_registry)
+
+        with (patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry),
+              isolated_staff_file(self.root / "staff.json", environment)):
+            source = fixture_member("producer", name="morty")
+
+            def admit() -> staff.StaffRow:
+                return staff.create_producer_clone("morty-copy", identity, staff.ProducerClone(source.id),
+                    staff.PresentWorktree("natedev", self.root / "launch"), staff.SessionHome(self.root / ".claude4"),
+                    profile=profile)
+
+            with (patch.object(waiting_rows, "check_move", side_effect=fail_first_reconciliation),
+                  self.assertRaisesRegex(staff.StaffRefused, "fixture reconciliation failed")):
+                _ = admit()
+            self.assertTrue(failed)
+            self.assertIsNone(staff.by_id(identity))
+            shared = self.git("--git-dir", str(self.remote), "show", "main:config/models.conf").stdout
+            for text in (registry.read_text(), shared):
+                self.assertEqual(models_registry.parse_registry(text)["producers"], {"morty": profile.value()})
+            clone = admit()
+            self.assertEqual(staff.by_id(identity), clone)
+
     def _save_during_registry_move(self, *values: str) -> tuple[str, list[str]]:
         registry = self.write(self.repo / "config/models.conf", "[fixture]\nmodel=old\n")
         colors = self.write(self.repo / "config/statusline.conf", "account.claude1=brown\n")
@@ -606,7 +655,8 @@ class LaunchSettingsTests(unittest.TestCase):
                          {"morty": "claude:sonnet:max", "brain": "codex:gpt-test:medium"})
         before = self.path.read_bytes(), self.path.stat().st_mtime_ns
         self.assertEqual(models_registry.store_producer("morty", "claude", "sonnet", "max"), stored)
-        for family, model, effort in (("claude", "missing-agent", "max"), ("claude", "sonnet", "invalid-effort"),
+        for family, model, effort in (("claude", "missing-agent", "max"), ("claude", "claude-opus-99999-99999", "high"),
+                                      ("claude", "sonnet", "invalid-effort"),
                                       ("unknown-family", "sonnet", "max"), ("claude", "sonnet", "")):
             with self.subTest(family=family, model=model, effort=effort), self.assertRaises(ValueError):
                 _ = models_registry.store_producer("morty", family, model, effort)

@@ -938,10 +938,7 @@ def producer_arguments(name: str, settings: models_registry.LaunchSettings,
                        configuration: models_registry.LaunchModelConfiguration) -> list[str]:
     """Build arguments for a producer from one launch configuration."""
     if settings.kind == "codex":
-        arguments = ["--model", settings.model,
-                     "-c", f'model_reasoning_effort="{settings.effort}"']
-        if settings.service_tier:
-            arguments.extend(("-c", f'service_tier="{settings.service_tier}"'))
+        arguments = models_registry.codex_model_arguments(settings)
     else:
         arguments = ["--name", name, "--remote-control", name,
                      "--model", settings.model, "--effort", settings.effort,

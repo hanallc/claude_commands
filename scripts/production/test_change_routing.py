@@ -47,6 +47,7 @@ class StaffRoutingTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             **fixture_git_environment(self.root), "STAFF_FILE": str(self.root / "staff.json"),
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
         }, clear=True))
         self.alert = cast(mock.Mock, self.enterContext(mock.patch.object(unrouted_alert, "notify")))
         self.top = fixture_member("showrunner", name="top")
