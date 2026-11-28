@@ -1563,6 +1563,17 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertEqual(self.post_undo_time("20", token="wrong")[0], 403)
             self.assertFalse((self.root / settings_page.SETTINGS_FILE).exists())
 
+    def test_studio_tag_undo_uses_the_saved_settings_time(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            status, held, saved = self.post_undo_time("30", token=self.server.new_item_token)
+            self.assertEqual((status, held, saved["seconds"], saved["previous"]), (200, "", 30, 10))
+            self.assertEqual(conf.read("review_links").whole("undo_seconds"), 10)
+            page = self.request(studio_page.PAGE_PATH)
+            self.assertEqual(page.status, 200)
+            self.assertIn(b'data-undo-enabled="true"', page.body)
+            self.assertIn(b'data-tag-undo-seconds="30"', page.body)
+
     def test_settings_undo_restores_the_previous_choice(self) -> None:
         with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
             token = self.server.new_item_token
@@ -6555,6 +6566,34 @@ addEventListener('DOMContentLoaded', async () => {
         send.assert_not_called()
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
+    def test_browser_version_notice_blocks_navigation_until_tag_undo_ends(self) -> None:
+        _ = self.check_version_notice_browser(version_card_probe(br"""
+  const details=()=>card.contentWindow.recordDetails(item(504));
+  const removeButton=()=>details()?.querySelector('[aria-label="Remove tag review flow"]');
+  const pending=()=>details().querySelector('[data-tag-pending]');
+  const undo=()=>card.contentDocument.querySelector('[aria-label="Undo removal of review flow"]');
+  const removeTag=async()=>{
+   removeButton().click();
+   await until(()=>!removeButton() && undo() && pending().hidden,'The tag removal did not finish.');
+   const before=card.src;
+   banner(499).click();
+   check(card.src===before && item(504) && undo(),'Tag Undo blocks the other notice link after the save.');
+  };
+  await removeTag();
+  undo().click();
+  await until(()=>removeButton() && !undo() && pending().hidden,'Undo did not restore the tag.');
+  banner(499).click();
+  await until(()=>item(499),'The other notice item did not open after Undo.');
+  banner(504).click();
+  await until(()=>item(504) && removeButton(),'The restored tag did not persist.');
+  await removeTag();
+  undo().closest('.list-tag-notice').getAnimations()[0].finish();
+  await until(()=>!undo(),'Tag Undo did not expire.');
+  banner(499).click();
+  await until(()=>item(499),'The other notice item did not open after expiry.');
+"""), item_tag=the_list.Tag("review flow"), undo_seconds=60)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
     def test_browser_version_notice_opens_related_and_blocking_items(self) -> None:
         _ = self.check_version_notice_browser(version_card_probe(br"""
   const list=()=>document.querySelector('iframe[data-console-page="studio"]');
@@ -6622,7 +6661,8 @@ addEventListener('DOMContentLoaded', async () => {
         join.assert_not_called()
 
     def check_version_notice_browser(self, probe: bytes, *, allow_proof: bool = False, hold_review: bool = False,
-                                     linked_items: bool = False, setup: bytes = b"") -> tuple[version_notice.Notice, Path]:
+                                     linked_items: bool = False, item_tag: the_list.Tag | None = None,
+                                     undo_seconds: int | None = None, setup: bytes = b"") -> tuple[version_notice.Notice, Path]:
         self.server.verified_tailscale_address = "127.0.0.1"
         case = self.review_fixture(changes=1)
         keeper = fixture_member("producer", name="morty")
@@ -6631,6 +6671,8 @@ addEventListener('DOMContentLoaded', async () => {
         _ = self.enterContext(patch.object(self.server, "root", case.root))
         _ = self.enterContext(patch.object(self.server, "review_cache", cache))
         _ = self.enterContext(patch.object(self.server, "delivery_status", case.status))
+        if undo_seconds is not None:
+            _ = write_config_fixture(conf.path("review_links"), f"undo_seconds={undo_seconds}\n")
         if hold_review:
             # Keep the server hold and its Undo toast active past the result deadline.
             _ = self.enterContext(patch.object(settings_page, "undo_seconds", return_value=2 * TEST_HANG_GUARD_SECS))
@@ -6653,6 +6695,8 @@ addEventListener('DOMContentLoaded', async () => {
                 _ = the_list.close(keeper.id, item.id, "The List item is closed.", source="nate")
             if number == 504:
                 _ = the_list.link(keeper.id, item.id, (change.key,), source="nate")
+                if item_tag is not None:
+                    _ = the_list.add_tag(keeper.id, item.id, item_tag, source="nate")
                 if linked_items:
                     _ = the_list.update(keeper.id, item.id, {"related_to": (492,)}, source="nate")
             changes.append(version_notice.Change(number, f"{keeper.id}/{item.id}", title))

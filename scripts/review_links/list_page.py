@@ -2696,7 +2696,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
-    undo_enabled = settings_page.undo_seconds(root, settings) > 0
+    undo_seconds = settings_page.undo_seconds(root, settings)
     delivery_window = record_table.delivery_window_seconds(settings)
     park_retry = settings.number("frame_retry_seconds")
     card_motion = page_frame.CardMotion.read(settings)
@@ -2717,8 +2717,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
-               + f' data-undo-enabled="{str(undo_enabled).lower()}"'
-               + f' data-tag-undo-seconds="{settings.whole("undo_seconds")}"'
+               + f' data-undo-enabled="{str(undo_seconds > 0).lower()}"'
+               + f' data-tag-undo-seconds="{undo_seconds}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
@@ -5151,7 +5151,7 @@ function reopenReturnedReview(){
  if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
 }
 function versionListBusy(){
- return Boolean(saving || reviewDialog.querySelector('iframe[data-saving]') ||
+ return Boolean(saving || tagUndos.size || reviewDialog.querySelector('iframe[data-saving]') ||
   document.querySelector('dialog[open]:not([data-version-list-dialog])'));
 }
 function closeReviewCard(){
