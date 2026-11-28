@@ -441,12 +441,13 @@ _VERSION_SCRIPT = r'''(() => {
  const frames=document.querySelector('.frame-area'),shell=document.querySelector('#console-shell');
  let current,visible='',reading=false,clearing=false,card,selected='',opener='',requested='',edit=0;
  const itemLink=key=>rows.querySelector('a[data-version-item="'+CSS.escape(key)+'"]');
+ const itemURL=key=>new URL('/console/list.html?'+new URLSearchParams({item:key,reveal:'1'}),location.href);
+ const cardBusy=()=>card?.contentDocument?.versionListBusy?.();
  function selectItem(key){
   if(key===selected) return;
   itemLink(selected)?.setAttribute('aria-expanded','false');
   selected=key;
   itemLink(selected)?.setAttribute('aria-expanded','true');
-  if(key) opener=key;
  }
  function closeCard(){
   card?.remove();card=null;
@@ -476,8 +477,7 @@ _VERSION_SCRIPT = r'''(() => {
   rows.replaceChildren(...changes.map(change=>{
    const row=document.createElement('li'),link=document.createElement('a');
    const title=document.createElement('span'),button=document.createElement('button');
-   const item=new URLSearchParams({item:change.key,reveal:'1'});
-   link.href='/console/list.html?'+item;
+   link.href=itemURL(change.key);
    link.textContent='#'+change.number;
    link.dataset.versionItem=change.key;
    link.setAttribute('aria-haspopup','dialog');
@@ -521,17 +521,16 @@ _VERSION_SCRIPT = r'''(() => {
    reportFailure(error instanceof SyntaxError ? 'The change could not clear. Try again.' : error.message);
   }finally{clearing=false;}
  });
- rows.addEventListener('click',event=>{
-  const link=event.target.closest('a');
-  if(!link || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  event.preventDefault();
-  const key=link.dataset.versionItem;
-  if(card?.contentDocument?.versionListBusy?.() || key===selected) return;
+ function openCard(key){
+  if(cardBusy() || key===requested) return false;
   if(!card){
    const frame=card=document.createElement('iframe');frame.title='List item';frame.dataset.versionCard='';
    frame.addEventListener('version-card-closed',()=>{if(card===frame) closeCard();});
    frame.addEventListener('version-card-item',event=>{
     if(card===frame && (!event.detail || event.detail===requested)) selectItem(event.detail);
+   });
+   frame.addEventListener('version-card-target',event=>{
+    if(card===frame) openCard(event.detail);
    });
    frame.addEventListener('load',()=>{
     if(card!==frame || frame.contentDocument?.versionListBusy) return;
@@ -541,13 +540,21 @@ _VERSION_SCRIPT = r'''(() => {
   }
   requested=key;
   selectItem('');
-  const url=new URL(link.href);
+  const url=itemURL(key);
   url.searchParams.set('version-card','1');
   card.src=url;
   if(!card.isConnected) frames.append(card);
+  return true;
+ }
+ rows.addEventListener('click',event=>{
+  const link=event.target.closest('a');
+  if(!link || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  const key=link.dataset.versionItem;
+  if(openCard(key)) opener=key;
  });
  document.addEventListener('keydown',event=>{
-  if(event.key==='Escape' && card && !event.defaultPrevented){event.preventDefault();closeCard();}
+  if(event.key==='Escape' && card && !event.defaultPrevented){event.preventDefault();if(!cardBusy()) closeCard();}
  });
  document.addEventListener('visibilitychange',refresh);
  window.addEventListener('focus',refresh);

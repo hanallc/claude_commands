@@ -2228,19 +2228,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.html_response(200, content, delivery_pending=delivery)
 
     def version_list_document(self, query: str, view: list_page.ListView, key: str, delivery: bool) -> None:
-        """Serve the List row named in the version notice."""
+        """Serve one List row for the version notice overlay."""
         if self.tailscale_refusal() or not self.same_origin():
             self.send_error(403)
             return
         server = cast(ReviewLinksServer, self.server)
-        if not key or not any(change.key == key for change in version_notice.read(server.root).changes):
+        keeper_id, _, identity = key.partition("/")
+        if not keeper_id or not identity:
             self.send_error(404)
             return
-        keeper_id, _, identity = key.partition("/")
         keeper = staff.StaffId(keeper_id)
         try:
             entry = list_page.ListRecord(keeper, the_list.load(keeper, identity))
-        except FileNotFoundError:
+        except (FileNotFoundError, the_list.ListError):
             self.send_error(404)
             return
         content = list_page.render(server.root, include_counts=False, status=server.delivery_status,

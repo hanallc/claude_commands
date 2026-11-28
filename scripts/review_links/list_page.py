@@ -3379,7 +3379,7 @@ async function refresh(_supersede=false,current=()=>true){
  const delivery=tableView.deliveryRequest();
  const params=new URLSearchParams();
  if(delivery) params.set('delivery',delivery.delivery);
- if(versionHost){params.set('item',versionItem);params.set('version-card','1');}
+ if(versionHost){params.set('item',versionItem);params.set('version-card','1');params.set('reveal','1');}
  const query=params.size ? '?'+params : '';
  const requestStarted=performance.now();
  const response=await fetch(location.pathname+query,{cache:'no-store',signal});
@@ -3511,6 +3511,10 @@ function hideReviewCard(card){
 function reopenReturnedReview(){
  if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
 }
+function versionListBusy(){
+ return Boolean(saving || reviewDialog.querySelector('iframe[data-saving]') ||
+  document.querySelector('dialog[open]:not([data-version-list-dialog])'));
+}
 function closeReviewCard(){
  const card=activeReview;
  if(!card || card.frame.hasAttribute('data-saving')) return;
@@ -3519,7 +3523,7 @@ function closeReviewCard(){
  card.frame.remove();
  reviewClose.disabled=false;
  reopenReturnedReview();
- if(!reviewDialog.open) versionHost?.dispatchEvent(new Event('version-card-closed'));
+ if(versionHost && !versionListBusy()) versionHost.dispatchEvent(new Event('version-card-closed'));
 }
 async function refreshSavedReview(){
  if(saving || refreshingReview || !savedReviews.size) return;
@@ -3600,12 +3604,20 @@ if(versionHost && tableView.openItem?.dataset.key===versionItem){
  dialog.setAttribute('aria-label','List item');
  close.type='button';close.className='list-review-close';close.dataset.close='';close.textContent='Close';
  header.append(close);content.before(dialog);dialog.append(header,content);
- const dismiss=()=>{if(!saving) versionHost.dispatchEvent(new Event('version-card-closed'));};
+ const dismiss=()=>{if(!versionListBusy()) versionHost.dispatchEvent(new Event('version-card-closed'));};
  bindConsoleDialog(dialog,dismiss);
  dialog.addEventListener('keydown',event=>{
   if(event.key==='Escape' && !event.defaultPrevented){event.preventDefault();dismiss();}
  });
- document.versionListBusy=()=>Boolean(saving || document.querySelector('dialog[open]:not([data-version-list-dialog])'));
+ dialog.addEventListener('click',event=>{
+  const link=event.target.closest('a[data-record-jump]');
+  if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  const key=new URLSearchParams(link.hash.slice(1)).get('item');
+  if(!key) return;
+  event.preventDefault();
+  versionHost.dispatchEvent(new CustomEvent('version-card-target',{detail:key}));
+ },{capture:true});
+ document.versionListBusy=versionListBusy;
  const publish=()=>versionHost.dispatchEvent(new CustomEvent('version-card-item',{
   detail:reviewDialog.open ? '' : versionItem}));
  new MutationObserver(publish).observe(reviewDialog,{attributes:true,attributeFilter:['open']});

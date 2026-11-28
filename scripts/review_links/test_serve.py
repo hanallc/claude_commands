@@ -204,6 +204,35 @@ VERSION_BROWSER_PROBE = br"""<script>
 </script><img hidden src="/version-complete">"""
 
 
+def version_card_probe(actions: bytes) -> bytes:
+    return br"""<script>
+(async()=>{
+ const failures=[];
+ const banner=number=>document.querySelector('.version-notice a[data-version-item$="/L'+number+'"]');
+ const frame=()=>document.querySelector('iframe[data-version-card]');
+ const item=number=>frame()?.contentDocument.querySelector('[data-version-list-dialog][open] [data-number="'+number+'"]');
+ const until=async(test,message)=>{
+  const end=performance.now()+6000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const check=(test,message)=>{if(!test) throw new Error(message);};
+ try{
+  check((await fetch('/version-publish')).ok,'The fixture publishes the notice.');
+  window.dispatchEvent(new Event('focus'));
+  await until(()=>banner(504),'The notice did not load.');
+  banner(504).click();
+  await until(()=>item(504),'The notice item did not open.');
+  const card=frame(),page=card.contentDocument;
+""" + actions + br"""
+ }catch(error){failures.push(String(error));}
+ finally{await fetch('/version-results',{method:'POST',body:JSON.stringify(failures)});}
+})();
+</script><img hidden src="/version-complete">"""
+
+
 def png_chunk(kind: bytes, data: bytes) -> bytes:
     chunk = kind + data
     return struct.pack(">I", len(data)) + chunk + struct.pack(">I", zlib.crc32(chunk))
@@ -5922,6 +5951,61 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
     def test_browser_version_notice_clears_lines_and_opens_the_shared_overlay(self) -> None:
+        notice, root = self.check_version_notice_browser(VERSION_BROWSER_PROBE, allow_proof=True)
+        cleared = replace(notice, changes=tuple(replace(change, cleared=True) for change in notice.changes))
+        self.assertEqual(version_notice.read(root), cleared)
+
+    def test_browser_version_notice_keeps_the_review_send_available_for_undo(self) -> None:
+        with capture_sender("send_message") as send:
+            _ = self.check_version_notice_browser(version_card_probe(br"""
+  const dialog=page.querySelector('dialog[aria-label="Review card"]');
+  item(504).querySelector('a[data-list-review-card]').click();
+  const review=()=>dialog.querySelector('iframe');
+  const form=()=>review()?.contentDocument.querySelector('[data-review-form]');
+  await until(form,'The linked Review card did not open.');
+  const words='Keep these words after Undo.';
+  form().elements.feedback.value=words;
+  form().requestSubmit(form().querySelector('[value="feedback"]'));
+  const undo=()=>document.querySelector('[data-send-undo] button');
+  await until(()=>!dialog.open && review()?.hasAttribute('data-saving') && undo(),'The Review send did not wait for Undo.');
+  const reviewFrame=review();
+  const before=card.src;
+  banner(499).click();
+  check(card.src===before,'A second notice link must keep the Review frame during Undo.');
+  document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  check(frame()===card,'Escape must keep the Review frame during Undo.');
+  undo().click();
+  await until(()=>dialog.open && !reviewFrame.hasAttribute('data-saving'),'Undo did not reopen the Review card.');
+  check(review()===reviewFrame && form().elements.feedback.value===words,'Undo restores the Review draft.');
+  dialog.querySelector('[data-close]').click();
+  await until(()=>!frame(),'Close did not close the Review card after Undo.');
+  banner(499).click();
+  await until(()=>item(499),'The other notice item did not open after Undo.');
+"""), hold_review=True)
+        send.assert_not_called()
+
+    def test_browser_version_notice_opens_related_and_blocking_items(self) -> None:
+        _ = self.check_version_notice_browser(version_card_probe(br"""
+  const list=()=>document.querySelector('iframe[data-console-page="list"]');
+  const underlying=list().contentDocument;
+  const follow=(source,target)=>frame().contentWindow.recordDetails(item(source))
+   .querySelector('a[data-record-jump][href$="L'+target+'"]').click();
+  check(!banner(492) && !banner(491),'Neither linked item is in the notice.');
+  follow(504,492);
+  check(new URL(card.src).searchParams.get('item')?.endsWith('/L492'),'The Related link requests List 492.');
+  await until(()=>item(492),'The Related link did not open List 492.');
+  check(frame()===card && list().contentDocument===underlying,'The Related link replaces the item in the same overlay.');
+  follow(492,491);
+  await until(()=>item(491),'The Blocked by link did not open closed List 491.');
+  check(frame()===card && card.contentDocument.querySelectorAll('[data-list-item]').length===1,
+        'The Blocked by link replaces the item in the same overlay.');
+  card.contentDocument.querySelector('[data-version-list-dialog] [data-close]').click();
+  await until(()=>!frame(),'Close did not close the linked item.');
+  check(list().contentDocument===underlying && document.activeElement===banner(504),'Close returns focus to the notice link.');
+"""), linked_items=True)
+
+    def check_version_notice_browser(self, probe: bytes, *, allow_proof: bool = False, hold_review: bool = False,
+                                     linked_items: bool = False) -> tuple[version_notice.Notice, Path]:
         firefox = shutil.which("firefox")
         assert firefox is not None
         self.server.verified_tailscale_address = "127.0.0.1"
@@ -5932,7 +6016,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(self.server, "root", case.root))
         _ = self.enterContext(patch.object(self.server, "review_cache", cache))
         _ = self.enterContext(patch.object(self.server, "delivery_status", case.status))
+        if hold_review:
+            _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
         change = next(item for item in cache.get().records.values() if item.type == review_items.ReviewType.CHANGE)
+        if linked_items:
+            blocker = the_list.add(keeper.id, "The closed blocker", number=491, owner=the_list.UnassignedOwner.NATE,
+                                   source="nate", changes={})
+            _ = the_list.close(keeper.id, blocker.id, "The blocker is closed.", source="nate")
+            _ = the_list.add(keeper.id, "The related item", number=492, owner=the_list.UnassignedOwner.NATE,
+                             source="nate", changes={"blocked_by": (the_list.ItemDependency(491, "Check the blocker."),)})
         changes: list[version_notice.Change] = []
         for number, title in (
             (493, "Umbrella items show their linked items and state."),
@@ -5945,6 +6037,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = the_list.close(keeper.id, item.id, "The List item is closed.", source="nate")
             if number == 504:
                 _ = the_list.link(keeper.id, item.id, (change.key,), source="nate")
+                if linked_items:
+                    _ = the_list.update(keeper.id, item.id, {"related_to": (492,)}, source="nate")
             changes.append(version_notice.Change(number, f"{keeper.id}/{item.id}", title))
         notice = version_notice.Notice("b" * 40, tuple(reversed(changes)))
         state = case.root / version_notice.FILE
@@ -5962,7 +6056,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     complete.clear()
                     if parse_qs(route.query).get("shot") == ["1"]:
                         atomic_file.write_text_atomic(state, json.dumps(asdict(notice)))
-                    self.html_response(200, shell.replace(b"</body>", VERSION_BROWSER_PROBE + b"</body>"))
+                    self.html_response(200, shell.replace(b"</body>", probe + b"</body>"))
                     return None
                 if route.path == "/version-publish":
                     atomic_file.write_text_atomic(state, json.dumps(asdict(notice)))
@@ -5983,7 +6077,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     return
                 super().do_POST()
 
-        proof = os.environ.get("VERSION_NOTICE_PROOF")
+        proof = os.environ.get("VERSION_NOTICE_PROOF") if allow_proof else None
         route = "/version-browser?page=list"
 
         def capture(place: str) -> bytes:
@@ -6002,8 +6096,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             self.server.RequestHandlerClass = serve.ReviewLinksHandler
         self.assertEqual(results, [[]])
-        cleared = replace(notice, changes=tuple(replace(change, cleared=True) for change in notice.changes))
-        self.assertEqual(version_notice.read(root), cleared)
+        return notice, root
 
     def test_console_page_gzip_matches_identity(self) -> None:
         page = b"<main><h1>The List</h1></main>"
