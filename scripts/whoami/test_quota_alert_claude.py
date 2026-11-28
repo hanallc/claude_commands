@@ -19,10 +19,28 @@ from scripts.whoami import note_file
 from scripts.whoami import account
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, next_moves
+from scripts.lib import conf
 from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes
 
 setUpModule = support.setUpModule
+
+
+class QuotaFixtureTests(unittest.TestCase):
+    def test_class_setup_uses_the_seed_config_folder(self) -> None:
+        class Fixture(support.SeededQuotaReminderFixture):
+            pass
+
+        paths: list[Path] = []
+
+        def record_config_path(_fixture: support.QuotaReminderFixture) -> None:
+            paths.append(conf.path("showrunners"))
+
+        self.addCleanup(Fixture.doClassCleanups)
+        with mock.patch.object(support.QuotaReminderFixture, "prepare_files", new=record_config_path):
+            Fixture.setUpClass()
+
+        self.assertEqual(paths, [Fixture.seed / "config" / "showrunners.conf"])
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
