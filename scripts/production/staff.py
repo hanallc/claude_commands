@@ -1688,6 +1688,12 @@ def _design_workers(fields: dict[str, object], rows: Sequence[StaffRow]) -> dict
         if not isinstance(identity, str) or not _valid_id(identity):
             raise StaffUnreadable("invalid design worker identity")
         workers[_read_design_claim(name)] = StaffId(identity)
+    return _retain_design_workers(workers, rows)
+
+
+def _retain_design_workers(saved: Mapping[DesignWorkerClaim, StaffId],
+                           rows: Sequence[StaffRow]) -> dict[DesignWorkerClaim, StaffId]:
+    workers = dict(saved)
     for row in rows:
         if isinstance(row.design_claim, DesignWorkerClaim) and workers.setdefault(row.design_claim, row.id) != row.id:
             raise StaffUnreadable(f"{row.design_claim}: conflicting design worker identities")
@@ -2020,7 +2026,7 @@ def _store(rows: list[StaffRow], pending: set[StaffId], previous: StaffSnapshot)
     unknown = [row for row in cast(list[dict[str, object]], retained.get("rows", [])) if row["kind"] not in _KINDS]
     _validate(rows, unknown)
     # Keep the design link when a staff transaction removes the worker row.
-    design_workers = _design_workers(retained, (*previous.all_rows, *rows))
+    design_workers = _retain_design_workers(previous.design_workers, rows)
     document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown,
                                    **_design_worker_fields(design_workers, previous.sealed_design_starts)}
     if pending:
@@ -2087,9 +2093,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result],
             proposed = list(original.all_rows)
             pending = set(original.pending_retire)
             result = edit(proposed, pending)
-            sealed = original.sealed_design_starts
-            if isinstance(seal_design_start, DesignWorkerClaim) and seal_design_start not in original.design_workers:
-                sealed = sealed | {seal_design_start}
+            updated = _seal_design_start(original, seal_design_start)
             if path.resolve() == _default_file().resolve():
                 previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
@@ -2102,12 +2106,12 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result],
                             raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
             if (original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows)
-                    and pending == set(original.pending_retire) and sealed == original.sealed_design_starts):
+                    and pending == set(original.pending_retire) and updated is original):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
             else:
-                _store(proposed, pending, replace(original, sealed_design_starts=sealed))
+                _store(proposed, pending, updated)
             return result
     except worker_lifecycle.OperationDeadlineExpired:
         raise
@@ -2268,6 +2272,12 @@ def ensure_worker(identity: StaffId, name: str, parent: StaffId, *,
         return published
 
     return _transaction(edit)
+
+
+def _seal_design_start(record: StaffSnapshot, claim: DesignWorkerClaim | NoDesignWorkerClaim) -> StaffSnapshot:
+    if isinstance(claim, DesignWorkerClaim) and claim not in record.design_workers and claim not in record.sealed_design_starts:
+        return replace(record, sealed_design_starts=record.sealed_design_starts | {claim})
+    return record
 
 
 def seal_design_worker_start(claim: DesignWorkerClaim) -> None:
@@ -3074,6 +3084,7 @@ def _parser() -> argparse.ArgumentParser:
     verbs = parser.add_subparsers(dest="verb", required=True)
     seal_design_start = verbs.add_parser("seal-design-start", help=argparse.SUPPRESS)
     _ = seal_design_start.add_argument("target")
+    _ = seal_design_start.add_argument("--json", action="store_true")
     lock_status = verbs.add_parser("worktree-write-lock-status", help=argparse.SUPPRESS)
     _ = lock_status.add_argument("--json", action="store_true")
     for command in ("set-worker-role", "set-home"):

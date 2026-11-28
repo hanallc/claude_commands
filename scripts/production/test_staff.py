@@ -2051,6 +2051,30 @@ class StaffTests(StaffCommandTestCase):
             _ = staff.ensure_worker(late_id, "reviewer", owner.id, design_claim=stopped)
         self.assertIsNone(staff.by_id(late_id))
 
+    def test_mac_seals_a_design_start_with_the_remote_argument_list(self) -> None:
+        claim = staff.DesignWorkerClaim("9a01e67d-6c33-4637-8fa8-2e760dfd9445", "reviewer")
+        with self.machine("mac"):
+            staff.seal_design_worker_start(claim)
+        self.assertEqual(self.ssh_commands(), [["seal-design-start", str(claim), "--json"]])
+        self.assertEqual(staff.authority_snapshot().sealed_design_starts, frozenset({claim}))
+
+    def test_staff_row_writes_preserve_live_and_retired_design_records(self) -> None:
+        owner = fixture_member("showrunner", name="designs")
+        design_id = "9a01e67d-6c33-4637-8fa8-2e760dfd9445"
+        designer = staff.DesignWorkerClaim(design_id, "designer")
+        reviewer = staff.DesignWorkerClaim(design_id, "reviewer")
+        worker = staff.ensure_worker(staff.native_id(fixture_runtime_id("design-worker")), "designer", owner.id,
+                                     design_claim=designer)
+        staff.seal_design_worker_start(reviewer)
+        _ = staff.rename(owner.id, "renamed-designs")
+        self.assertEqual(staff.authority_snapshot().design_workers, {designer: worker.id})
+        _ = staff.retire(worker.id)
+        _ = staff.rename(owner.id, "retired-designs")
+        saved = staff.authority_snapshot()
+        self.assertIsNone(saved.by_id(worker.id))
+        self.assertEqual(saved.design_workers, {designer: worker.id})
+        self.assertEqual(saved.sealed_design_starts, frozenset({reviewer}))
+
     def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
         runner, unit, ordinary = self.tree()
         designer = fixture_worker("sdlc-handler-astra-designer", runner.id)

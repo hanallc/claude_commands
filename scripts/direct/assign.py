@@ -981,12 +981,15 @@ def execute_durable(args: Arguments) -> int:
              else design_roles.claim_for_worker_name(name_arg))
     expected_worker: staff.StaffId | staff_worker.WorkerIdAtUse = staff_worker.WorkerIdAtUse.BY_NAME
     pane_launch: worker_panes.DesignPaneLaunch | worker_panes.NoDesignPaneLaunch = worker_panes.NoDesignPaneLaunch.UNRECORDED
+    prompt = Path(args.prompt).expanduser().resolve()
+    if args.prompt and (not prompt.is_file() or not args.session_dir or not args.phase):
+        refuse("durable dispatch requires --prompt, --session-dir, and --phase")
     with ExitStack() as locks:
         if isinstance(claim, staff.DesignWorkerClaim):
             if args.policy != f"astra-{claim.role}":
                 refuse("the design role differs from the launch policy")
-            instance = (design_roles.dispatch_role(claim) if args.prompt else
-                        locks.enter_context(design_roles.start_claim(claim)))
+            instance = locks.enter_context(design_roles.dispatch_claim(claim, prompt) if args.prompt else
+                                           design_roles.start_claim(claim))
             if not isinstance(instance.parent, str):
                 refuse("the design role has no recorded parent")
             parent, name_arg = instance.parent, instance.name
@@ -1016,15 +1019,11 @@ def execute_durable(args: Arguments) -> int:
                 return staff_worker.startup_result(name, current)
             print(json.dumps(current.row.to_json()))
             return 0
-    prompt = Path(args.prompt).expanduser().resolve()
-    if not prompt.is_file() or not args.session_dir or not args.phase:
-        refuse("durable dispatch requires --prompt, --session-dir, and --phase")
-    result = staff_worker.dispatch(parent, name, role, prompt, session_dir=Path(args.session_dir),
-        slot=name.value, phase=args.phase, kind="astra",
-        reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
-        completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
-        launcher_command=launcher_command(), expected_worker=expected_worker)
-    return result
+        return staff_worker.dispatch(parent, name, role, prompt, session_dir=Path(args.session_dir),
+            slot=name.value, phase=args.phase, kind="astra",
+            reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
+            completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
+            launcher_command=launcher_command(), expected_worker=expected_worker)
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,

@@ -4103,7 +4103,8 @@ def main(arguments: list[str] | None = None) -> int:
             return _print_workers(list_all_workers(record, selection=args.selection, as_json=args.json), args.json, record)
         record = staff.snapshot()
         if args.design_role:
-            instance = design_roles.recorded_role(staff.DesignWorkerClaim.parse(args.design_role))
+            claim = staff.DesignWorkerClaim.parse(args.design_role)
+            instance = design_roles.end_role(claim) if args.command == "end" else design_roles.recorded_role(claim)
             lifecycle = instance.lifecycle
             row = record.by_id(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else None
             if args.command == "end" and row is None:

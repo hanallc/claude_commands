@@ -1584,20 +1584,29 @@ def _design_launch_pane(client: herdr.Herdr, launch: DesignPaneLaunch) -> herdr.
     """Find the terminal from the marker set when herdr split its pane."""
     panes = client.panes()
     matches: list[herdr.ExistingPane] = []
+    unreadable = ""
     for row in panes:
         pane = row["pane_id"]
-        info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
-                                 "design pane process info")
-        shell = info.get("shell_pid")
-        if type(shell) is not int or shell <= 0:
-            raise herdr_types.HerdrFailure(f"{pane}: pane shell identity is unavailable")
-        if herdr.process_environment(shell).get(DESIGN_PANE_LAUNCH_ENV) == str(launch.token):
+        try:
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
+                                     "design pane process info")
+            shell = info.get("shell_pid")
+            if type(shell) is not int or shell <= 0:
+                raise herdr_types.HerdrFailure("pane shell identity is unavailable")
+            marker = herdr.process_environment(shell).get(DESIGN_PANE_LAUNCH_ENV)
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            if not unreadable:
+                unreadable = f"{pane}: {error}"
+            continue
+        if marker == str(launch.token):
             terminal = row.get("terminal_id", "")
             if not terminal or sum(item.get("terminal_id") == terminal for item in panes) != 1:
                 raise herdr_types.HerdrFailure(f"{pane}: pane terminal identity is unavailable or duplicated")
             matches.append(herdr.ExistingPane(pane, terminal))
     if len(matches) > 1:
         raise herdr_types.HerdrFailure("the design launch marker identifies more than one terminal")
+    if not matches and unreadable:
+        raise herdr_types.HerdrFailure(f"design pane absence is unproved: {unreadable}")
     return matches[0] if matches else herdr.NoPane(str(launch.token))
 
 
@@ -1656,7 +1665,7 @@ def close_design_launch(launch: DesignPaneLaunch) -> None:
         return
     owner = _design_launch_process(client, location, launch)
     if isinstance(owner, herdr.PaneAtShell):
-        closed = client.close_terminal_pane(location.pane, location.terminal)
+        closed = client.close_tab_confirmed(location.pane, terminal=location.terminal)
     else:
         process = client.pane_agent_process(location.pane, location.terminal)
         pane = client.pane_row(location.pane)
