@@ -35,15 +35,18 @@ A plan has no production-name header; its unit's staff parent selects the produc
 Callers share one staff snapshot within an operation.
 
 `agents retire NAME` finds the unit and its workers in one staff snapshot.
-It stops each row's `current_session` through `stop_resume.stop`.
-Uncommitted work and commits outside the merge branch prevent removal.
+Uncommitted work and commits outside the merge branch can prevent retirement.
 The recorder's only added `Project started` line does not count as uncommitted work.
-Retire releases build holds, berth reservations, and Mac claims.
-It reports other cleanup failures as anomalies.
-It removes the worktree and branch.
-Retire closes the tabs and removes the unit and worker records after cleanup.
+Retire removes the unit and worker records before it stops sessions and cleans up the checkout.
+It releases build holds, berth reservations, and Mac claims.
+It reports cleanup failures and preserved work after staff removal.
 Conversation files stay on disk for search.
-An old row for a removed worktree still supports retirement.
+
+Status, the board, status reports, waits, and the stall watch omit old retired units.
+`unit_lookup.doc_units(doc, record)` includes their rows for merge and production checks.
+Resume refuses an old retired unit.
+`agents retire STAFF_ID` checks the retired branch and removes the unit and worker records when the checks pass.
+The command keeps Git refs and folders.
 
 - **Merged work.** Git ancestry proves whether a checkpoint reached the merge branch. Git merge bases supply the last shared unit commit. Unit checkpoint records supply CI counts. Unit `phase_started` records supply phase starts. Commit subjects supply no state.
 
@@ -239,7 +242,7 @@ Each local Promote checkout must exist before the command pushes.
 For an enrolled production, use the exact staff document for live policy.
 The showrunner starts in the main checkout from `Repository`.
 The serving merge unit publishes from the integration worktree on `Merge branch`.
-Run the enrolled production's merge checks in item 143 test copies.
+Run the enrolled production's merge tests in item 143 test copies.
 Resolve the live LOG relative to the main checkout.
 Removal tools protect both checkouts and their branches.
 Sync refuses incoming paths that overlap the live document, LOG, or notes.
@@ -282,7 +285,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
   Publication records survive promotion failure.
   A style notice becomes complete only after successful delivery.
   A completed child handoff retry changes nothing and sends no second notice.
-  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductionmerge_gatepy).
+  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-script).
 - **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
   The checkpoint command passes `--phase-id <phase id>` for the phase it checkpoints.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
@@ -522,7 +525,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
 - **Unit targeted tests.** A `claude_commands` unit runs `gate.py --affected` through `copies.py run`.
   Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
   The gate uses the shared runner with affected-module selection.
-- **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
+- **The `~/.claude` repo's own gate.** `scripts/production/gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.

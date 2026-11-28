@@ -249,7 +249,6 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual([command for command in self.herdr_calls()[len(calls):]
                           if command[2:4] in (["agent", "start"], ["pane", "close"], ["tab", "create"])], [])
 
-
     def test_live_resumed_session_finishes_its_pending_opening_without_second_start(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()

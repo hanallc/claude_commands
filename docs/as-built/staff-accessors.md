@@ -98,11 +98,11 @@ These staff functions write the record. The `agents` program owns process contro
 Failed continuation delivery restores the pause. A failed start retains the exit record.
 The production forms use `--production SHOWRUNNER` and accept repeated `--except UNIT` values for pause and exit.
 An unmatched exclusion refuses the production command before any write.
-Repeated holds retain the original metadata. Rename, move, retire, and restore retain the hold fields.
+Repeated holds keep the original metadata. Rename, move, and retirement of a live unit keep the hold fields.
 
 Rows, locations, and hold records keep fields that the reader does not know in `unknown_fields`.
 Writes preserve these fields unchanged. Row changes also preserve them.
-The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
+The owner keeps an existing location's unknown fields when its path or state changes.
 Changes from the Mac use the same owner setters.
 A new hold record starts with no unknown fields.
 Staff storage uses schema 2.
@@ -295,7 +295,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
 | `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
-| `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/goal.py` | read | StaffId type for the producer and List owner |
 | `scripts/production/next_item.py` | read | snapshot |
@@ -312,7 +311,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/record_store.py` | read | none (StaffId type for the record owner folder) |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
-| `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, retire_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/shutdown.py` | write | by_id, cli_result, finish_unit_retirement, initial_snapshot, operation, operation_fds, remove_retired_unit, remove_unit_for_retirement, rename, retire_unit, row_operation, set_doc, set_worktree, snapshot |
 | `scripts/agents/producer_lifecycle.py` | read | initial_snapshot, slot_operation, validate_name; StaffRow, StaffSnapshot, LiveDoc and PresentWorktree types; add-producer checks the name and the free row before first start |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |

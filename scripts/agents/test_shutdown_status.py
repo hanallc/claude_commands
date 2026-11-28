@@ -195,7 +195,6 @@ class ShutdownStatusTests(ShutdownTestCase):
         self.assertEqual(stopped_again, [str(row.id)])
         self.assertEqual(shutdown_record.read(), [str(row.id)])
 
-
     def test_paused_resume_removes_the_row_only_after_a_delivered_continuation(self) -> None:
         from scripts.whoami import quota_state
 

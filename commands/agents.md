@@ -20,8 +20,9 @@ Use the `agents` program.
 - `agents resume NAME [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
 - Use `agents clone NAME NEW_NAME` to fork a live Claude or Codex session beside its source tab.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
-- `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
-- `agents retire NAME`: remove the staff record and tab. For a unit, also remove its worktree and branch. Keep conversation files.
+- Use `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` to move Claude sessions to a numbered account.
+- Use `agents retire NAME` to remove the staff record and tab. For an active unit, the command also starts checkout cleanup. It keeps conversation files.
+- Use `agents retire STAFF_ID` to remove an old retired unit record. The command checks each branch tip and keeps the Git refs and folders.
 - Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
@@ -112,6 +113,8 @@ Resume restores the saved folder and environment.
 Codex uses the `workers` account. Claude units, showrunners, and producers use their group accounts.
 Other Claude sessions use the units account; `--to ACCOUNT` overrides the account.
 The default reason is `resumed by name`.
+Retired units do not appear in active status or the board.
+Resume refuses a retired unit and gives the command to remove its record.
 When resume selects a running conversation, it prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.

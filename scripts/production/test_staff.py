@@ -33,7 +33,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
 from scripts.message import sessions, session_records
-from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, foreign_hostname, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
@@ -1332,10 +1332,28 @@ class StaffTests(StaffCommandTestCase):
                     self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteLockHeld(path))
             self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
 
-
-
-
-
+    def test_promote_and_demote_preserve_the_unit_identity(self) -> None:
+        parent = fixture_member("showrunner", name="sdlc")
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        unit = fixture_member("unit", name="models", parent=parent.id, worktree=location)
+        document = staff.LiveDoc("natedev", self.root / "child-production.md")
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=document)
+                self.assertEqual(promoted, replace(unit, kind="showrunner", unit_type=staff.NotUnit(),
+                                                   worktree=staff.WORKTREE_UNFILLED, doc=document))
+                child = fixture_member("unit", name="child-" + machine, parent=promoted.id)
+                retained = fixture_member("worker", name="worker-" + machine, parent=promoted.id)
+                destination = staff.UnitRole(unit.name, parent.id, location)
+                demoted = staff.change_director(unit.id, destination)
+                self.assertEqual(demoted, unit)
+                self.assertEqual(staff.by_id(child.id), replace(child, parent=staff.ReportsTo(parent.id)))
+                self.assertEqual(staff.by_id(retained.id), retained)
+                unchanged = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                self.assertEqual(staff.change_director(unit.id, destination), unit)
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
+                self.assert_refused(lambda: staff.change_director(retained.id, destination))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
 
     def test_admission_publishes_identity_and_location_once_without_a_setter_window(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
@@ -2890,7 +2908,8 @@ class StaffTests(StaffCommandTestCase):
         runner = self.retirement_document(runner, self.root / "sdlc.md")
         unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
         self.save_retirement_branch(unit)
-        with self.machine("mac"):
+        with (foreign_hostname(), mock.patch.dict(os.environ, {"GATE_TEST_HOST": "natedev"}),
+              self.machine("mac")):
             staff.defer_retire((runner.id, unit.id))
             self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
             self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))

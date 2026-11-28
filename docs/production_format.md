@@ -52,8 +52,7 @@ Launch, resume, account move, rename, and compaction select the command from thi
   Launchers use the run's existing transport pin.
   Pane assignments reuse an idle or resumable worker in role-number order.
   Dispatch reads the transcript before submission and completes on the matching `DONE <dispatch id>` reply.
-  Retire, wrap, and promote stop workers and retain their rows and conversations for restore.
-  Only worker end or permanent unit removal deletes worker rows.
+  Wrap and promote stop workers and keep their rows and conversations for restore.
 - **Reviewer** — a unit's read-only worker, role `review`.
   Its native conversation retains context across phases and plans.
   Its standing instructions are in `config/review/code.md`.
@@ -213,13 +212,25 @@ A showrunner rename with a document move preserves staged document bytes separat
 Recovery restores the staged destination entry before removing the source index entry.
 It completes the pending move without staging the working edits.
 
-Run `/agents retire NAME` to remove the unit worktree, branch, staff record, and tab.
-Uncommitted work or an unmerged checkpoint prevents removal.
+Use `/agents retire NAME` to retire an active unit.
+Uncommitted work or an unmerged checkpoint can prevent retirement.
 Retire releases holds, reservations, and Mac claims.
-It stops the workers and removes their records and panes.
+It removes the unit and worker rows before cleanup.
+The cleanup stops the sessions and closes their panes.
+It removes the checkout and branch after the Git checks pass.
 Conversation files stay on disk for search.
-A unit keeps its reviewer when its plan run ends.
+An origin mismatch keeps the branch and is reported.
+If cleanup fails, use the retry command in the report.
 
+For an old record, use `/agents retire STAFF_ID`.
+The command checks the recorded branch on the unit machine, in the production checkout, and on the fetch origin.
+It keeps the rows if a checkout remains or a branch tip is unmerged or unreadable.
+Under the staff operation lock, it rechecks checkout absence, then the origin tip, then writes the staff record.
+The two checks share a deadline of half the staff operation lock limit.
+The command keeps Git refs and folders.
+When the authority cannot confirm the result, run the retry command in the report.
+
+A unit keeps its reviewer when its plan run ends.
 
 ---
 

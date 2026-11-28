@@ -628,6 +628,11 @@ class ProducerLifecycleTests(unittest.TestCase):
         marked = legacy_producer_fixture(row.id, "claude:sonnet:high")
         self.assertTrue(marked.awaits_legacy_removal)
         self.assertEqual(staff.snapshot().by_id(row.id), marked)
+        with patch.object(stop_resume, "_resume_once") as launch:
+            resumed = stop_resume.resume(row.name)
+        self.assertEqual(resumed, stop_resume.ResumeFailed(
+            row.name, f"{row.name}: old retirement record. Use agents retire {row.id} to remove the record."))
+        launch.assert_not_called()
         with (patch.object(producer_lifecycle, "_machinery_stop") as stop,
               patch.object(staff, "require_stopped")):
             code, output, errors = command("retire", row.name)

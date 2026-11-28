@@ -130,8 +130,9 @@ def run_remote(
     limit: RemoteCallLimit = STANDARD_TIME_LIMIT,
     *,
     cancellation: RemoteCallCancellation | None = None,
+    propagate_timeout: bool = False,
 ) -> tuple[int, str]:
-    """Run shutdown.py remotely, trusting its explicit trailer rather than ssh's status."""
+    """Read the remote shutdown.py status from its trailer. Report a timeout as exit 255 by default."""
     arguments = " ".join(shlex.quote(argument) for argument in args)
     remote_command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/agents/shutdown.py"'
     if args[:1] == ["status"] and "--here" in args and stdin:
@@ -148,6 +149,8 @@ def run_remote(
         else:
             completed = cancellation.run(command, stdin, timeout)
     except subprocess.TimeoutExpired:
+        if propagate_timeout:
+            raise
         return 255, ""
     except OSError:
         return 255, ""

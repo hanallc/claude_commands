@@ -284,7 +284,7 @@ Exit codes are 0 for success, 1 for an absent unit, 2 for usage, and 3 for unava
 - The launcher uses the production workspace and the requested directory.
   `AgentExited` closes the new tab.
 
-Before starting the agent, add_unit saves its exact opening, conversation id, account directory and start time in `add-unit-openings/<unit>.json` in the checkout's Git directory. It clears this pending record only after prompt submission is proved. A rerun with that same marked conversation checks the live transcript and submits an absent opening to its existing pane, including a live `--resume`. A pending record for a closed conversation is removed; a different live conversation still refuses. It starts no second session. Brief stubs and unit configuration writes use the shared atomic writer.
+Before starting the agent, add_unit saves the exact opening, conversation ID, account directory, and start time. It saves them in `add-unit-openings/<unit>.json` in the checkout's Git directory. It clears the pending record after it confirms prompt submission. A repeat with the same live conversation checks its transcript and sends a missing opening to the existing pane. This applies to a live `--resume`. A repeat clears the pending record for a closed conversation and refuses a different live conversation. Brief stubs and unit configuration writes use the shared atomic writer.
 
 `add_unit.main` selects the account and runs preflight before it writes launch state.
 A running native session refuses a plain resume and names `--attach` as the next action.
@@ -519,8 +519,7 @@ Every pane keeps its shell when its agent ends.
 - `/tmp` is `/private/tmp`, so compare resolved paths.
 - Patching `sys.platform` after import does not change `herdr._PLATFORM`.
 - `test_support.py` sets the import path before importing `herdr`. Importing first breaks other suites.
-- `merge_gate.py` refuses on the Mac because `/dev/shm` is absent.
-  Run Mac suites from the clone root with `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
+- Run Mac suites from the clone root with `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
   Set no `PYTHONPATH`.
 - `list --on` runs the other machine's installed `~/.claude` code, so both machines need the promoted code before a remote list shows a change.
 
