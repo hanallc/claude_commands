@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 from functools import cache
 from importlib import import_module
+import math
 import os
 from pathlib import Path
 import select
@@ -196,6 +197,74 @@ def guest_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], boo
         if reconcile is not None and holds_slot():
             reconcile(episode, attempt)
     return placement.DispatchPathSettled() if isinstance(result, placement.Settled) else placement.DispatchPathPending(result.reason)
+
+
+@dataclass(frozen=True)
+class GuestNoStartSettled(placement.DispatchPathSettled):
+    """The journal proves that this guest claim never started."""
+
+
+def _guest_claim_rows(claim: placement.ProviderClaimReference) -> Generator[dict[str, object]]:
+    """Read complete journal rows for this attempt and claim."""
+    attempt = execution_identity.attempt_key(claim.episode, claim.attempt)
+    try:
+        with target_config.mac_linux_end_proof_journal().open("rb") as journal:
+            for line in journal:
+                if not line.endswith(b"\n"):
+                    continue
+                try:
+                    value = cast(object, json.loads(line))
+                    if not isinstance(value, dict):
+                        continue
+                    row = cast(dict[str, object], value)
+                    written_at = row.get("written_at")
+                    if (row.get("attempt") != attempt or row.get("claim") != claim.claim_id
+                            or not isinstance(row.get("detail"), str)
+                            or not isinstance(written_at, (int, float)) or isinstance(written_at, bool)
+                            or not math.isfinite(written_at)):
+                        continue
+                except (ValueError, OverflowError, RecursionError):
+                    continue
+                yield row
+    except FileNotFoundError:
+        return
+
+
+def _guest_no_start_proven(claim: placement.ProviderClaimReference) -> bool:
+    """Distinguish no start from a finished run in the guest settlement journal."""
+    no_start = False
+    for row in _guest_claim_rows(claim):
+        if row.get("result") == "proven":
+            return False
+        if row.get("result") == "not started":
+            no_start = True
+    return no_start
+
+
+@dataclass(frozen=True)
+class GuestProbeRoute:
+    ssh_hops: tuple[str, str]
+    guest_user: str
+
+
+def _guest_launch_route(claim: placement.ProviderClaimReference) -> GuestProbeRoute | None:
+    """Read the route if the launch records agree."""
+    routes: set[GuestProbeRoute] = set()
+    for row in _guest_claim_rows(claim):
+        if row.get("result") != "awaiting arm":
+            continue
+        mac, guest, user = row.get("mac_host"), row.get("guest_host"), row.get("guest_user")
+        if not (isinstance(mac, str) and mac and isinstance(guest, str) and guest and isinstance(user, str) and user):
+            return None
+        routes.add(GuestProbeRoute((mac, guest), user))
+    return routes.pop() if len(routes) == 1 else None
+
+
+@dataclass(frozen=True)
+class GuestDispatchPending(placement.DispatchPathPending):
+    """The launch journal identifies the route for this pending dispatch."""
+
+    route: GuestProbeRoute
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -504,6 +573,11 @@ class OrderNotStarted:
 
 
 @dataclass(frozen=True)
+class NoLostLaunch:
+    """The queue has no lost launch for this episode."""
+
+
+@dataclass(frozen=True)
 class TokenNotLeft:
     pass
 
@@ -528,6 +602,7 @@ class WaiterPlace:
     run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
     # The saved job start keeps the place of a CI step through a service restart.
     ci_job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
+    lost_launch_at: float | NoLostLaunch = field(default=NoLostLaunch(), kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -881,6 +956,14 @@ class VerifyRunSlot:
 
 
 @dataclass(frozen=True)
+class MacOutageFence:
+    """Require a probe answer from after the outage guard starts."""
+
+    reported_at: float
+    recovery_observed: bool = False
+
+
+@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -901,6 +984,7 @@ class ServiceState:
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
     held_places: tuple[records.HeldPlace, ...] = field(default=(), kw_only=True)
     placement_replacements: dict[str, ReplayEntry] = field(default_factory=dict, kw_only=True)
+    mac_outages: dict[str, MacOutageFence] = field(default_factory=dict, kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -1334,6 +1418,24 @@ class MacDiskRecoveryPendingEvidence(placement.FreshHostEvidence):
 
 
 @dataclass(frozen=True)
+class MacLinuxProbeEvidence(placement.FreshHostEvidence):
+    route: GuestProbeRoute = field(kw_only=True)
+
+
+@dataclass(frozen=True)
+class MacLinuxProbeFailureEvidence(MacLinuxProbeEvidence):
+    """The guest probe could not connect or timed out."""
+
+
+@dataclass(frozen=True)
+class GuestProbeOutage:
+    """Measure the grace period in the current service process."""
+
+    fence: MacOutageFence
+    started_monotonic: float
+
+
+@dataclass(frozen=True)
 class _MacHostExcluded:
     reason: str
 
@@ -1390,8 +1492,9 @@ class HostEvidenceWorker:
         self.clock: Clock = clock
         self.wake: int = wake
         self.interval: float = interval
-        self.lock: threading.Lock = threading.Lock()
+        self.lock: threading.RLock = threading.RLock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
+        self.guest_outages: dict[GuestProbeRoute, GuestProbeOutage] = {}
         self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
         self.dispatch_observations: dict[str, DispatchEvidence] = {}
         self.due: dict[placement.HostEvidenceKey, float] = {key: 0.0}
@@ -1406,16 +1509,42 @@ class HostEvidenceWorker:
         with self.lock:
             return self.observations.get(key, placement.HostEvidenceUnavailable(key, self.clock.now(), "not read"))
 
-    def publish(self, evidence: placement.HostEvidence) -> None:
+    def publish(self, evidence: placement.HostEvidence, observed_monotonic: float | None) -> None:
         with self.lock:
-            self.observations[evidence.key] = evidence
+            self._publish_evidence(evidence, observed_monotonic)
+
+    def _publish_evidence(self, evidence: placement.HostEvidence, observed_monotonic: float | None) -> None:
+        """Update the outage guard for each probe before the next probe can replace it."""
+        self.observations[evidence.key] = evidence
+        if observed_monotonic is None or not isinstance(evidence, MacLinuxProbeEvidence):
+            return
+        outage = self.guest_outages.get(evidence.route)
+        if outage is None and isinstance(evidence, MacLinuxProbeFailureEvidence):
+            self.guest_outages[evidence.route] = GuestProbeOutage(
+                MacOutageFence(self.clock.now()), self.clock.monotonic())
+        elif outage is not None and evidence.probe_answered and observed_monotonic > outage.started_monotonic:
+            del self.guest_outages[evidence.route]
+
+    def guest_outage(self, route: GuestProbeRoute) -> GuestProbeOutage | None:
+        with self.lock:
+            return self.guest_outages.get(route)
+
+    def guest_outage_for(self, saved: records.SavedPlacementAssignment) -> GuestProbeOutage | None:
+        """Use an outage only when its route matches the attempt's launch route."""
+        assignment = saved.assignment
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        with self.lock:
+            evidence = self.dispatch_observations.get(attempt)
+            if evidence is not None and evidence.saved == saved and isinstance(evidence.result, GuestDispatchPending):
+                return self.guest_outage(evidence.result.route)
+            return None
 
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Keep the attempt until the worker confirms settlement."""
-        return self.dispatch_settled_at(probe) is None
+        return self.dispatch_settlement(probe) is None
 
-    def dispatch_settled_at(self, probe: DispatchEvidenceProbe) -> float | None:
-        """Request a reading and return the time of exact settlement."""
+    def dispatch_settlement(self, probe: DispatchEvidenceProbe) -> DispatchEvidence | None:
+        """Request a reading and return the exact settlement evidence."""
         assignment = probe.saved.assignment
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         with self.lock:
@@ -1425,19 +1554,20 @@ class HostEvidenceWorker:
                 _ = self.dispatch_observations.pop(attempt, None)
                 self.due[probe.key] = float('-inf')
                 self.requested.set()
-            return self._settlement_time(probe.saved, attempt)
+            return self._settled_dispatch(probe.saved, attempt)
 
     def observed_settlement_time(self, saved: records.SavedPlacementAssignment, attempt: str) -> float | None:
         with self.lock:
-            return self._settlement_time(saved, attempt)
+            observed = self._settled_dispatch(saved, attempt)
+            return None if observed is None else observed.observed_at
 
-    def _settlement_time(self, saved: records.SavedPlacementAssignment, attempt: str) -> float | None:
+    def _settled_dispatch(self, saved: records.SavedPlacementAssignment, attempt: str) -> DispatchEvidence | None:
         observed = self.dispatch_observations.get(attempt)
         if (observed is not None and observed.saved == saved
                 and isinstance(observed.result, placement.DispatchPathSettled)
                 and (is_mac_linux_guest(saved.assignment.destination)
                      or time.monotonic() - observed.observed_monotonic <= self.interval)):
-            return observed.observed_at
+            return observed
         return None
 
     def recovered_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
@@ -1551,6 +1681,7 @@ class HostEvidenceWorker:
             refresh_generation = (cycle.refresh_generation if isinstance(cycle, _MacHostProbeCycle)
                                   else self.refresh_generation)
         observed_at = self.clock.now()
+        observed_monotonic = self.clock.monotonic()
         try:
             evidence = self.probe(key)
             if evidence.key != key:
@@ -1559,23 +1690,36 @@ class HostEvidenceWorker:
                 evidence = replace(evidence, observed_at=min(evidence.observed_at, observed_at))
         except Exception as error:
             evidence = placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
+        guest = is_mac_linux_guest(key.destination)
         with self.lock:
+            if self.subscriptions.get(key) is not subscription:
+                return True
+            if guest:
+                # Record the guest answer before settlement can delay it.
+                self._publish_evidence(evidence, observed_monotonic)
+            read_launch_route = guest and bool(self.guest_outages)
             dispatches = tuple((attempt, probe) for attempt, probe in self.dispatch_probes.items() if probe.key == key)
         dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
         for attempt, probe in dispatches:
             try:
                 result = probe.read()
+                claim = probe.saved.provider
+                if (read_launch_route and isinstance(result, placement.DispatchPathPending)
+                        and isinstance(claim, placement.ProviderClaimReference)
+                        and (route := _guest_launch_route(claim)) is not None):
+                    result = GuestDispatchPending(result.reason, route)
             except Exception:
                 result = placement.DispatchPathPending('The dispatch evidence is unavailable')
             dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, result, self.clock.now(), time.monotonic())))
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
-            self.observations[key] = evidence
+            if not guest:
+                self._publish_evidence(evidence, observed_monotonic)
             for attempt, probe, observed in dispatches_read:
                 if (self.dispatch_probes.get(attempt) is probe
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
-                             or self._settlement_time(probe.saved, attempt) is None)):
+                             or self._settled_dispatch(probe.saved, attempt) is None)):
                     self.dispatch_observations[attempt] = observed
             if refresh_generation == self.refresh_generation:
                 self.due[key] = time.monotonic() + self.interval
@@ -1628,7 +1772,7 @@ class HostEvidenceReader:
         return self.worker.thread
 
     def publish(self, evidence: placement.HostEvidence) -> None:
-        self.worker.publish(evidence)
+        self.worker.publish(evidence, self.worker.clock.monotonic())
 
     def close(self) -> None:
         self.worker.close()
@@ -2078,7 +2222,8 @@ class StateIntents:
                  advance_generation: Callable[[], None], episode: str,
                  persist: Callable[[], None], fault: Callable[[str], None],
                  places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites, *,
-                 retire_verify_grant: Callable[[str], None] | None = None) -> None:
+                 retire_verify_grant: Callable[[str], None] | None = None,
+                 forget_lost_move: Callable[[str], None] | None = None) -> None:
         boundary = writes.writes if isinstance(writes, RegisteredServiceWrites) else writes
         selected = (reservations[episode],) if isinstance(writes, RegisteredServiceWrites) else reservations.values()
         boundary.require(*(Path(record.path) for record in selected),
@@ -2091,6 +2236,7 @@ class StateIntents:
         self.persist: Callable[[], None] = persist
         self.fault: Callable[[str], None] = fault
         self.retire_verify_grant: Callable[[str], None] | None = retire_verify_grant
+        self.forget_lost_move: Callable[[str], None] | None = forget_lost_move
 
     def _require_record(self) -> None:
         record = self.reservations[self.episode]
@@ -2124,6 +2270,8 @@ class StateIntents:
                            and place.episode == self.episode and bool(place.move_id))
         if not isinstance(record.ending, TokenWaiting) and not awaiting_report:
             _ = self.places.pop(key, None)
+            if place is not None and isinstance(place.lost_launch_at, float) and self.forget_lost_move is not None:
+                self.forget_lost_move(place.move_id)
         del self.reservations[self.episode]
         if self.retire_verify_grant is not None:
             self.retire_verify_grant(record.reservation_id)
@@ -2212,6 +2360,7 @@ class AdmissionServer:
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
+        self.lost_move_ids: set[str] = set()
         self.run_places: dict[str, wire.RunPlace] = {}
         self.held_places: tuple[records.HeldPlace, ...] = ()
         self.build_history_generation: int = 0
@@ -2223,6 +2372,7 @@ class AdmissionServer:
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
+        self.mac_outages: dict[str, MacOutageFence] = {}
         self.mac_linux_state: MacLinuxStateReady | MacLinuxStateUnavailable = MacLinuxStateUnavailable(
             "The Mac Linux state root setup has not run.")
         self.manual_guest_settlement: set[str] = set()
@@ -2376,6 +2526,8 @@ class AdmissionServer:
                                              identity.get("unit", ""), members=members)
                 state.places[key] = replace(place, queue_identity={
                     **identity, "session_name": caller.name, "unit": caller.unit})
+                if place.move_id and isinstance(place.lost_launch_at, float):
+                    self.lost_move_ids.add(place.move_id)
             self.reservations, self.places = state.reservations, state.places
             self.queue_pins = state.queue_pins
             self.ledger = ReplayLedger(state.ledger)
@@ -2393,6 +2545,7 @@ class AdmissionServer:
                 for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
+            self.mac_outages = state.mac_outages
             self.pending_cloud_groups = state.pending_cloud_groups
             self._check_saved_remote_slots()
         self.persist()
@@ -2432,7 +2585,9 @@ class AdmissionServer:
         for key in sorted(self.manual_guest_settlement):
             saved = guests[key]
             assignment = saved.assignment
-            command = [python, "-m", "scripts.build_targets.mac_linux", "--reconcile-end",
+            root = target_config.build_targets_state_root().absolute()
+            command = ["env", f"BUILD_TARGETS_STATE_DIR={root}", python,
+                       "-m", "scripts.build_targets.mac_linux", "--reconcile-end",
                        assignment.episode, str(placement.scaler_attempt_number(assignment.attempt))]
             steps.append(f"{key!r} (queue unit: run {shlex.join(command)})")
         for key in sorted(scalers):
@@ -2514,7 +2669,8 @@ class AdmissionServer:
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
             queue_pins=self.queue_pins, bumps=self.bumps, verify_run_slots=self.verify_run_slots,
-            held_places=self.held_places, placement_replacements=self.placement_replacements)
+            held_places=self.held_places, placement_replacements=self.placement_replacements,
+            mac_outages=self.mac_outages)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2794,13 +2950,17 @@ class AdmissionServer:
         return self.move_line
 
     def _movable_wait_ids(self, *, check_owners: bool = False) -> set[str]:
-        return {waiting.row.get("move_id", "") for episode, waiting in self.waiters.items()
-            if episode not in self.current_assignments and waiting.row.get("move_id") and (not check_owners or
+        movable = {waiting.row.get("move_id", "") for episode, waiting in self.waiters.items()
+            if episode not in self.current_assignments and waiting.row.get("move_id")
+            and (not check_owners or
                 self.proc.owner_start(waiting.request.owner.pid) == LiveOwnerIdentity(waiting.request.owner.start_time))
             and ((request := self.placement_requests.get(episode)) is None
                  or (request.owner.host == self.host
                      and isinstance(self._local_placement_eligibility(request),
                                     (placement.AllowedHost, placement.EvidenceNeeded))))}
+        if self.lost_move_ids:
+            movable.difference_update(self.lost_move_ids)
+        return movable
 
     def _prune_runs(self) -> None:
         now = self.clock.now()
@@ -4029,7 +4189,9 @@ class AdmissionServer:
         remote: list[records.RunningStep] = []
         for key, saved in self.assignments.items():
             assignment = saved.assignment
-            if assignment.destination.provider == "local":
+            report = saved.terminal_report
+            if (assignment.destination.provider == "local"
+                    or isinstance(report, placement.TerminalAttemptReport) and isinstance(report.outcome, placement.AttemptLost)):
                 continue
             request = self.placement_requests.get(assignment.episode)
             if request is None:
@@ -4247,13 +4409,32 @@ class AdmissionServer:
         place = waiter_place(row, request.episode, run=run)
         if previous is not None:
             if previous.episode == request.episode:
-                place = replace(place, queue_identity=previous.queue_identity)
+                place = replace(place, queue_identity=previous.queue_identity, lost_launch_at=previous.lost_launch_at)
             elif previous.move_id:
                 self._depart_queue_id(previous.move_id)
         if not place.move_id:
             row["move_id"] = uuid.uuid4().hex
             place = replace(place, move_id=row["move_id"])
         self.places[key] = place
+        if isinstance(place.lost_launch_at, float):
+            self.lost_move_ids.add(place.move_id)
+
+    def _pin_lost_run(self, request: wire.PlacementRequest, consumed_at: float) -> None:
+        """Insert the existing move ID in the head chain by its first lost authorization."""
+        key = _place_key(request.owner, request.since)
+        place = self.places[key]
+        first_launch = place.lost_launch_at
+        if not isinstance(first_launch, float):
+            first_launch = float(consumed_at)
+        self.places[key] = replace(place, lost_launch_at=first_launch)
+        self.lost_move_ids.add(place.move_id)
+        order = [row["move_id"] for _, row in self._full_queue_order(self._ranked_waiters()) if "move_id" in row]
+        index = order.index(place.move_id)
+        rank = (first_launch, place.since, place.owner.pid)
+        earlier = {item.move_id for item in self.places.values() if item.move_id and isinstance(item.lost_launch_at, float)
+                   and (item.lost_launch_at, item.since, item.owner.pid) < rank}
+        destination = queue_anchor_at(order, len(earlier))
+        self._move_pin(place.move_id, destination, order, index, queue_anchor_at(order, index))
 
     def _set_queue_pins(self, pins: QueuePins) -> None:
         if pins != self.queue_pins:
@@ -4261,6 +4442,7 @@ class AdmissionServer:
             self.move_line = replace(self.move_line, revision=uuid.uuid4().hex)
 
     def _depart_queue_id(self, row_id: str) -> None:
+        self.lost_move_ids.discard(row_id)
         if not self.queue_pins:
             return
         pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
@@ -4536,13 +4718,17 @@ class AdmissionServer:
             row_waiter["token_left_at"] = ending.left_at
             key = _place_key(record.owner, row_waiter["since"])
             place = self.places.get(key)
-            if place is not None and place.episode == record.episode and place.move_id:
-                row_waiter["move_id"] = place.move_id
+            if place is not None:
+                if place.episode == record.episode and place.move_id:
+                    row_waiter["move_id"] = place.move_id
+                if isinstance(place.lost_launch_at, float):
+                    self.lost_move_ids.discard(place.move_id)
             self.places[key] = waiter_place(row_waiter, record.episode, run=record.run)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
                                 self.places, RegisteredServiceWrites(self.writes),
-                                retire_verify_grant=lambda reservation: self._finish_verify_grant(reservation, started=False)),
+                                retire_verify_grant=lambda reservation: self._finish_verify_grant(reservation, started=False),
+                                forget_lost_move=self.lost_move_ids.discard),
             end_kind=end_kind)
         if ((started or not isinstance(ending, LocalGrantReturned)) and record.step != "doc"
                 and isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
@@ -4764,7 +4950,8 @@ class AdmissionServer:
                     reader.request(key)
             self.host_readers[key] = HostEvidenceReader(key, reader, timeout)
             if previous is not None:
-                reader.publish(previous)
+                # A cached reading has no monotonic probe time.
+                reader.publish(previous, None)
         return self.host_readers[key]
 
     def read_provider_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -4874,7 +5061,9 @@ class AdmissionServer:
         from scripts.mac_test import eligibility, offload
 
         configuration = settings.configuration
-        if not configuration.value("offload", conf.on_off) and not mirrors:
+        outage = self.mac_outages.get(name)
+        awaiting_answer = outage is not None and not outage.recovery_observed
+        if not configuration.value("offload", conf.on_off) and not mirrors and not awaiting_answer:
             return _MacHostExcluded("off")
         recover = self._begin_mac_backoff_probe(name)
         try:
@@ -4940,7 +5129,7 @@ class AdmissionServer:
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets
-        from scripts.mac_test import claim_state, mac_test
+        from scripts.mac_test import claim_state, mac_test, offload
         from scripts.mac_test.eligibility import recorded_step_kind
         from scripts.build_hold import build_hold
 
@@ -4976,13 +5165,13 @@ class AdmissionServer:
                 mode = SuiteMode.TARGETED if SuiteMode.step(key.step) == SuiteMode.TARGETED.value else SuiteMode.GATE
                 eligibility = scaler_availability(mode)
             return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
+        if is_mac_linux_guest(destination):
+            return self._read_mac_linux_guest(key)
         request = self.host_requests.get(key)
         if request is None:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "the placement request is unavailable")
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
-        if destination.provider == "ssh" and destination.target == "mac-linux":
-            return self._read_mac_linux_guest(key)
         target = records.effective_target(destination.target, key.settings)
         if isinstance(target, records.UnregisteredTarget):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
@@ -5118,9 +5307,10 @@ class AdmissionServer:
         observed_at = shared.observed_at if isinstance(shared, _MacHostReading) else self.clock.now()
         evidence = (key, observed_at, generation, eligibility, tuple(adopted), tuple(cleanup),
                     tuple(executions), holder, diagnostic)
+        probe_answered = isinstance(shared, _MacHostReading) and isinstance(shared.probe, offload.MacHostProbeSnapshot)
         if isinstance(disk_recovery, build_targets.MacDiskRecoveryPending):
-            return MacDiskRecoveryPendingEvidence(*evidence, disk=disk_recovery.disk)
-        return placement.FreshHostEvidence(*evidence)
+            return MacDiskRecoveryPendingEvidence(*evidence, disk=disk_recovery.disk, probe_answered=probe_answered)
+        return placement.FreshHostEvidence(*evidence, probe_answered=probe_answered)
 
     def _read_mac_linux_guest(self, key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
         from scripts.build_targets import mac_linux
@@ -5133,12 +5323,32 @@ class AdmissionServer:
         block = mac_test.blocking_claim_block(mac_test.state_paths(), key.session)
         if not isinstance(block, mac_test.NoMacBlock):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("blocked"))
+        declined = placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
         try:
-            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry),
-                                        wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
-        except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
-            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
-        return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
+            settings = mac_linux.read_settings(backoff.registry)
+        except (OSError, ValueError, mac_linux.GuestUnavailable):
+            return placement.FreshHostEvidence(key, started_at, "", declined)
+        if settings.ssh_hops[1] != key.destination.host:
+            return placement.FreshHostEvidence(key, started_at, "",
+                placement.TemporaryExclusion("The configured SSH route names a different guest"))
+        route = GuestProbeRoute(settings.ssh_hops, settings.guest_user)
+        try:
+            _ = mac_linux.read_guest_main(settings, wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
+        except (mac_linux.GuestConnectionFailed, subprocess.TimeoutExpired):
+            return MacLinuxProbeFailureEvidence(key, started_at, "", declined, route=route)
+        except mac_linux.GuestUnavailable as error:
+            # A failed command can still prove that the guest answered. SSH exit 255 is ambiguous.
+            # Exit 127 for a missing SSH client also clears the guard and keeps the slot held.
+            message = str(error)
+            prefix = "guest main probe exited "
+            status, separator, _ = message.removeprefix(prefix).partition(":")
+            answered = (message == "the guest main probe returned an invalid commit ID"
+                        or message.startswith(prefix) and separator == ":"
+                        and status.isascii() and status.isdecimal() and 0 < int(status) < 255)
+            return MacLinuxProbeEvidence(key, started_at, "", declined, route=route, probe_answered=answered)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return placement.FreshHostEvidence(key, started_at, "", declined)
+        return MacLinuxProbeEvidence(key, started_at, "", placement.AllowedHost(), route=route, probe_answered=True)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     claim_path: Path, record: RemoteJobClaim,
@@ -5225,6 +5435,25 @@ done
         return self.assignments.get(execution_identity.attempt_key(episode, attempt),
             status_wire.UnknownPlacementStatus(episode, attempt))
 
+    def _awaits_mac_report(self, saved: records.SavedPlacementAssignment, *,
+                           settlement: DispatchEvidence | None = None) -> bool:
+        """Keep consumed Mac attempts open while their coordinator can report."""
+        assignment = saved.assignment
+        report = saved.terminal_report
+        # SettlementRequest, AttemptCompleted, and AttemptLost are reports from the coordinator.
+        if isinstance(report, placement.TerminalAttemptReport):
+            if report.outcome != GUEST_SETTLEMENT_REQUESTED:
+                return False
+            # An inferred request needs proof of no start before a retry.
+            if settlement is not None and (saved.guest_settlement_requested_by_coordinator
+                                           or isinstance(settlement.result, GuestNoStartSettled)):
+                return False
+        return (isinstance(saved.permission, placement.PermissionConsumed)
+                and (assignment.destination.provider == "mac" or is_mac_linux_guest(assignment.destination))
+                and self.current_assignments.get(assignment.episode) == execution_identity.attempt_key(
+                    assignment.episode, assignment.attempt)
+                and self._placement_owner_live(assignment.owner))
+
     def _provider_release_evidence(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None
                                    ) -> placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest:
         """Read evidence for the submitted request under the current configuration."""
@@ -5251,7 +5480,8 @@ done
                 return placement.ClosedAssignment("local run has ended")
             if isinstance(self._lifetime(reservation), gate.EndedStep):
                 return placement.ClosedAssignment("local execution has ended")
-        elif self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
+        elif (self._provider_claim_released(saved, self._provider_release_evidence(saved, keys))
+                and not self._awaits_mac_report(saved)):
             return placement.ClosedAssignment("provider claim released")
         return saved.state
 
@@ -5334,6 +5564,7 @@ done
                 and isinstance(saved.terminal_report, placement.NoTerminalReport)
                 and isinstance(saved.state, placement.CurrentAssignment)
                 and self._ended_claim_holder(saved) and self._next_claim_takes_over(saved)):
+            # The coordinator reports a verdict or loss before it resubmits.
             report = self._lost_report()
             self._close_for_report(replace(saved, terminal_report=report), report, persist_change=False)
 
@@ -5636,6 +5867,17 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+                fence = self.mac_outages.get(destination.target)
+                if fence is not None:
+                    after_outage = (evidence if isinstance(evidence, placement.FreshHostEvidence)
+                                    and evidence.observed_at > fence.reported_at else None)
+                    if not fence.recovery_observed:
+                        if after_outage is not None and after_outage.probe_answered:
+                            self.mac_outages[destination.target] = replace(fence, recovery_observed=True)
+                        elif not isinstance(permitted, placement.FixedExclusion):
+                            permitted = placement.TemporaryExclusion(placement.MAC_OUTAGE_WAIT)
+                    elif after_outage is None and isinstance(permitted, placement.AllowedHost):
+                        permitted = placement.EvidenceNeeded("the target reading predates the outage")
             if is_mac_linux_guest(destination):
                 pair = (request.episode, destination)
                 if isinstance(permitted, placement.EvidenceNeeded):
@@ -5814,6 +6056,12 @@ done
         self.assignments[key] = records.SavedPlacementAssignment(assignment, provider=claim,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
+        if self.lost_move_ids:
+            place_key = _place_key(request.owner, request.since)
+            place = self.places.get(place_key)
+            if place is not None and place.episode == request.episode and isinstance(place.lost_launch_at, float):
+                self._depart_queue_id(place.move_id)
+                self.places[place_key] = replace(place, lost_launch_at=NoLostLaunch())
         self.current_assignments[request.episode] = key
         return assignment
 
@@ -6011,7 +6259,7 @@ done
             refusal = next((candidate.eligibility.reason for candidate in candidates
                 if candidate.destination.target == "mac"
                 and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                and candidate.eligibility.reason != "busy"), "")
+                and candidate.eligibility.reason not in ("busy", placement.MAC_OUTAGE_WAIT)), "")
             if refusal:
                 return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
@@ -6044,7 +6292,7 @@ done
             return wire.PlacementWait(request.episode, request.since, position, candidates, provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
         blocked = [candidate for candidate in candidates
             if isinstance(candidate.eligibility, placement.TemporaryExclusion)
-            and candidate.eligibility.reason in ("blocked", "busy", "starting")]
+            and candidate.eligibility.reason in ("blocked", "busy", "starting", placement.MAC_OUTAGE_WAIT)]
         blocked.sort(key=lambda candidate: candidate.destination.provider != "local")
         local_possible = any(candidate.destination.provider == "local"
             and isinstance(candidate.eligibility, (placement.AllowedHost, placement.EvidenceNeeded))
@@ -6592,6 +6840,8 @@ done
                 if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
                     continue
             if isinstance(report, placement.NoTerminalReport):
+                if self._awaits_mac_report(saved):
+                    continue
                 report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
@@ -6680,19 +6930,24 @@ done
         if self.current_assignments.get(assignment.episode) != key:
             return wire.Refused("the attempt is not current")
         outcome = SCALER_SETTLEMENT_REQUESTED if scaler else GUEST_SETTLEMENT_REQUESTED
-        saved = self._record_settlement_request(key, saved, outcome)
+        saved = self._record_settlement_request(key, saved, outcome, guest_requested_by_coordinator=not scaler)
         if scaler:
             _ = self._settle_aws_dispatch(saved)
         self._schedule_pass()
         return wire.Ok()
 
     def _record_settlement_request(self, key: str, saved: records.SavedPlacementAssignment,
-                                   outcome: placement.AttemptDeclined) -> records.SavedPlacementAssignment:
-        if not isinstance(saved.terminal_report, placement.NoTerminalReport):
+                                   outcome: placement.AttemptDeclined, *,
+                                   guest_requested_by_coordinator: bool = False) -> records.SavedPlacementAssignment:
+        report = saved.terminal_report
+        if isinstance(report, placement.NoTerminalReport):
+            report = placement.TerminalAttemptReport(outcome,
+                placement.DispatchPathPending("launch settlement is pending"), self.clock.now())
+        elif not (guest_requested_by_coordinator and report.outcome == GUEST_SETTLEMENT_REQUESTED
+                  and not saved.guest_settlement_requested_by_coordinator):
             return saved
-        terminal = placement.TerminalAttemptReport(outcome,
-            placement.DispatchPathPending("launch settlement is pending"), self.clock.now())
-        saved = replace(saved, terminal_report=terminal)
+        saved = replace(saved, terminal_report=report,
+                        guest_settlement_requested_by_coordinator=guest_requested_by_coordinator)
         self.assignments[key] = saved
         self.persist()
         self._schedule_pass()
@@ -6702,6 +6957,10 @@ done
         assignment = saved.assignment
         episode = assignment.episode
         attempt_key = execution_identity.attempt_key(episode, assignment.attempt)
+        previous = saved.terminal_report
+        resubmitted = (isinstance(previous, placement.TerminalAttemptReport)
+                       and previous.outcome == GUEST_SETTLEMENT_REQUESTED
+                       and not saved.guest_settlement_requested_by_coordinator)
 
         def holds_slot() -> bool:
             active = self.assignments.get(attempt_key)
@@ -6714,27 +6973,35 @@ done
                 identity.host == self.host
                 and not owner_may_be_live(self.proc.owner_start(identity.pid), identity.start_time)
                 for identity in (holder, assignment.owner))
-            return guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
+            result = guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
                 holds_slot=holds_slot,
                 legacy_holder_ended=legacy_holder_ended)
+            if (resubmitted and isinstance(result, placement.DispatchPathSettled) and not _guest_start_observed(saved)
+                    and isinstance(saved.provider, placement.ProviderClaimReference)
+                    and _guest_no_start_proven(saved.provider)):
+                return GuestNoStartSettled()
+            return result
 
         probe = self._dispatch_settlement_probe(saved, read_dispatch)
-        proved_at = None if probe is None else probe[0].dispatch_settled_at(probe[1])
-        settled_at = self._guest_settlement_ready_at(saved, proved_at)
-        if settled_at is None:
+        settlement = None if probe is None else probe[0].dispatch_settlement(probe[1])
+        if (settlement is None
+                or (settled_at := self._guest_settlement_ready_at(saved, settlement.observed_at)) is None):
+            if probe is not None and not self._awaits_mac_report(saved) and self._close_guest_outage(saved, probe[0]):
+                return
             self.assignments[attempt_key] = self._expire_guest_replacement(saved)
+            return
+        if self._awaits_mac_report(saved, settlement=settlement):
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
-        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
+        # A resubmit without no-start proof cannot retry if the coordinator ends.
+        may_have_started = _guest_start_observed(saved) or (
+            resubmitted and not isinstance(settlement.result, GuestNoStartSettled))
+        if may_have_started and (isinstance(report, placement.NoTerminalReport)
                 or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             report = placement.TerminalAttemptReport(
                 placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),
                 placement.DispatchPathSettled(), self.clock.now())
-        if (isinstance(report, placement.NoTerminalReport) and saved.guest_proof_required
-                and self._placement_owner_live(assignment.owner)):
-            # The gate can report its failure after the settlement probe completes.
-            return
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
         # Keep the settlement time for a reused submission after the worker forgets the attempt.
@@ -6742,6 +7009,30 @@ done
         saved_terminal = (replace(terminal, received_at=settled_at) if submitted is not None
                           and (assignment.owner != submitted.owner or assignment.since != submitted.since) else terminal)
         self._close_for_report(replace(expired, terminal_report=saved_terminal), terminal, persist_change=False)
+
+    def _close_guest_outage(self, saved: records.SavedPlacementAssignment, worker: HostEvidenceWorker) -> bool:
+        """Require a full outage and a confirmed coordinator exit."""
+        assignment = saved.assignment
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        report = saved.terminal_report
+        if (self.current_assignments.get(assignment.episode) != attempt or attempt in self.manual_guest_settlement
+                or isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, placement.AttemptCompleted)):
+            return False
+        outage = worker.guest_outage_for(saved)
+        if outage is None:
+            return False
+        limit = _guest_wait_limit()
+        owner = assignment.owner
+        if (not isinstance(limit, int) or self.clock.monotonic() < outage.started_monotonic + limit
+                or owner.host != self.host or owner_may_be_live(self.proc.owner_start(owner.pid), owner.start_time)):
+            return False
+        with worker.lock:
+            if worker.guest_outage_for(saved) is not outage:
+                return False
+            loss = placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage.fence.reported_at)
+            self._close_lost_attempt(saved, loss, self.clock.now())
+        return True
 
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
@@ -6753,6 +7044,8 @@ done
         limit = _guest_wait_limit()
         now = self.clock.now() if checked_at is None else checked_at
         if isinstance(limit, int) and now < report.received_at + limit:
+            return saved
+        if checked_at is None and self._awaits_mac_report(saved):
             return saved
         reason = _guest_wait_timeout(saved.assignment.attempt, limit)
         return replace(saved, terminal_report=replace(report, outcome=placement.AttemptCancelled(reason)),
@@ -6806,17 +7099,72 @@ done
             self._close_placement(saved, outcome.reason,
                 placement.retry_decision(saved.assignment.destination, outcome, report.received_at),
                 persist_change=persist_change)
-        elif not self._settle_hana_prelaunch(saved, report):
+        elif (isinstance(outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))
+                and not self._settle_hana_prelaunch(saved, report)):
             self._close_placement(saved, outcome.reason,
                 saved.retry if isinstance(saved.retry, placement.RetryAt) else
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at),
                 persist_change=persist_change)
+
+    def _report_lost_attempt(self, request: wire.ExecutionReport, outcome: placement.AttemptLost) -> wire.DispatchStatus:
+        assignment = request.assignment
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        saved = self.assignments.get(key)
+        submitted = self.placement_requests.get(assignment.episode)
+        if (saved is None or saved.assignment != assignment or submitted is None
+                or (submitted.owner, submitted.since) != (assignment.owner, assignment.since)):
+            return self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)
+        if self.current_assignments.get(assignment.episode) != key or not isinstance(saved.state, placement.CurrentAssignment):
+            return self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)
+        destination = assignment.destination
+        target_matches = (destination.provider == "mac" if outcome.evidence is placement.MacOutage.MAC_STATUS_MISSING
+                          else is_mac_linux_guest(destination))
+        if (not target_matches or not isinstance(saved.permission, placement.PermissionConsumed)
+                or not isinstance(request.claim, placement.ProviderClaimReference) or request.claim != saved.provider):
+            return self._placement_status(assignment, "the outage does not match the authorized attempt",
+                                          check_lifetime=False)
+        previous = saved.terminal_report
+        if (isinstance(previous, placement.TerminalAttemptReport)
+                and previous.outcome != GUEST_SETTLEMENT_REQUESTED):
+            return self._placement_status(assignment, "the attempt already has a terminal report", check_lifetime=False)
+        now = self.clock.now()
+        limit = _guest_wait_limit()
+        if not isinstance(limit, int) or not now >= outcome.outage_since + limit:
+            return self._placement_status(assignment, "the Mac outage wait has not expired", check_lifetime=False)
+
+        self._close_lost_attempt(saved, outcome, now, submitted=submitted)
+        self.persist()
+        self._publish_replies(self._project_replies(self._queue_order()))
+        return self._placement_status(assignment, check_lifetime=False)
+
+    def _close_lost_attempt(self, saved: records.SavedPlacementAssignment, outcome: placement.AttemptLost,
+                            now: float, *, submitted: wire.PlacementRequest | None = None) -> None:
+        assignment = saved.assignment
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        destination = assignment.destination
+        self.mac_outages[destination.target] = MacOutageFence(now)
+        terminal = placement.TerminalAttemptReport(outcome, placement.DispatchPathSettled(), now)
+        self._close_placement(replace(saved, terminal_report=terminal), "lost", placement.RetryAt(0),
+                              persist_change=False)
+        _ = self.execution_evidence.pop(key, None)
+        if (submitted is not None and isinstance(saved.permission, placement.PermissionConsumed)
+                and self._placement_waiting(submitted)):
+            self._pin_lost_run(submitted, saved.permission.consumed_at)
+        # Offers made before the outage cannot authorize a start.
+        for offer in tuple(self.assignments.values()):
+            if (offer.assignment.destination.target == destination.target
+                    and isinstance(offer.state, placement.CurrentAssignment)
+                    and isinstance(offer.permission, placement.PermissionAvailable)
+                    and isinstance(offer.terminal_report, placement.NoTerminalReport)):
+                self._close_placement(offer, placement.MAC_OUTAGE_WAIT, placement.RetryAt(0), persist_change=False)
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
                           | wire.PrerequisiteReport | wire.CancelPlacement,
                           connection: Connection | NoConnection = NO_CONNECTION) -> list[wire.Reply]:
         if isinstance(request, wire.ConsumePermission):
             return [self._consume_permission(request)]
+        if isinstance(request, wire.ExecutionReport) and isinstance(request.outcome, placement.AttemptLost):
+            return [self._report_lost_attempt(request, request.outcome)]
         if isinstance(request, (wire.PrerequisiteReport, wire.CancelPlacement)):
             submitted = self.placement_requests.get(request.episode)
             if submitted is None:
@@ -7443,13 +7791,13 @@ done
                 return wire.QueueMoved(row_id, line, old_index + 1, old_index + 1), previous_anchor
             destination = QueueHeadAnchor() if place == 0 else drop
 
-        self._move_pin(row_id, destination, full_order, full_index, previous_anchor)
+        self._move_pin(row_id, destination, full_order, full_index, previous_anchor, after_lost_runs=True)
         updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id), line.kept_runs)
         new_index = next(index for index, member in enumerate(updated.members) if member.row_id == row_id)
         return wire.QueueMoved(row_id, updated, old_index + 1, new_index + 1), previous_anchor
 
     def _move_pin(self, row_id: str, destination: wire.QueueDrop | QueueAnchor, order: list[str],
-                  old_index: int, old_anchor: QueueAnchor) -> None:
+                  old_index: int, old_anchor: QueueAnchor, *, after_lost_runs: bool = False) -> None:
         pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
         moved = QueueRowAnchor(row_id)
         del order[old_index]
@@ -7462,6 +7810,8 @@ done
             index = order.index(destination.row_id) + 1
         else:
             index = order.index(destination.neighbor) + int(destination.side == "after")
+        if after_lost_runs:
+            index = max(index, len(self.lost_move_ids))
         anchor = queue_anchor_at(order, index)
         if index < len(order) and pins.get(order[index]) == anchor:
             pins[order[index]] = moved

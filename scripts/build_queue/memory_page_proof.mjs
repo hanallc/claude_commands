@@ -2164,16 +2164,30 @@ try {
         await start(27, 'end', edgeRow);
         const edge = {x:(await grip(edgeRow)).x, y:2};
         assert.ok(await evaluate(`document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null`));
-        const before = await evaluate('scrollY');
+        const {before, started} = await evaluate(`(() => {
+          const before = scrollY;
+          const now = performance.now.bind(performance);
+          const started = now();
+          // Simulate a slow first scroll frame without delaying the browser.
+          performance.now = () => now() + (scrollY < before ? 3000 : 0);
+          return {before, started};
+        })()`);
         await mouse('mouseMoved', edge);
         const edgePreview = await evaluate(`new Promise(resolve => {
-          const start = performance.now();
+          let scrollTop = ${before};
+          let lastProgress = ${started};
           function check() {
+            const now = performance.now();
+            if (scrollY < scrollTop) {
+              scrollTop = scrollY;
+              lastProgress = now;
+            }
             const destination = queueDrag.destination;
-            if (destination?.kind !== 'QueueHeadDrop' && performance.now() - start < 3000) {
+            if (destination?.kind !== 'QueueHeadDrop' && queueDrag.scrollFrame !== null && now - lastProgress < 3000) {
               requestAnimationFrame(check);
               return;
             }
+            delete performance.now;
             resolve({scrolled:scrollY < ${before}, destination,
               overHeader:document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null,
               place:document.querySelector(${JSON.stringify(placeCell(edgeRow))}).textContent});

@@ -1,7 +1,8 @@
 """Placement decisions keep submitting owners separate from remote executions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
@@ -116,7 +117,26 @@ class AttemptOutcomeUnavailable:
     reason: str
 
 
-TerminalAttemptOutcome = AttemptCompleted | PrelaunchRefused | AttemptDeclined | execution_identity.HanaCommandAdmissionRefused | AttemptCancelled
+class MacOutage(Enum):
+    """The outage evidence identifies the missing Mac or guest result."""
+
+    MAC_STATUS_MISSING = auto()
+    GUEST_END_UNPROVEN = auto()
+
+
+@dataclass(frozen=True)
+class AttemptLost:
+    """The attempt has no verdict after the Mac outage wait."""
+
+    evidence: MacOutage
+    outage_since: float
+
+
+MAC_OUTAGE_WAIT = "the Mac must answer before the run can start"
+
+
+TerminalAttemptOutcome = (AttemptCompleted | PrelaunchRefused | AttemptDeclined
+                          | execution_identity.HanaCommandAdmissionRefused | AttemptCancelled | AttemptLost)
 AttemptOutcome = AttemptRunning | TerminalAttemptOutcome | AttemptOutcomeUnavailable
 
 
@@ -498,6 +518,7 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
+    probe_answered: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
