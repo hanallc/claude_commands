@@ -615,6 +615,7 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(len(self.launches), 1)
 
     def test_checkout_move_before_save_resumes_its_transition_after_staff_moves(self) -> None:
+        self.run_a = self.run_a.rename(self.repository / "run-a")
         design = self.open_designer()
         identifier = design.placement.design_id
         directory = design_roles.design_directory(identifier)
@@ -628,6 +629,8 @@ class DurableRolesTests(HeldRolePaneCase):
         parent = staff.by_path("demo/design")
         assert parent is not None
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
+        self.assertEqual(design_roles.checkout_failures(str(self.repository)),
+                         [f"{directory / 'design.json'}: live binding still names old checkout"])
         design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
         moved = design_roles.read_design(identifier)
         self.assertEqual(moved.placement.generation, 2)
@@ -842,6 +845,23 @@ class DurableRolesTests(HeldRolePaneCase):
         read.assert_not_called()
         assert isinstance(held, design_roles.HeldDesign)
         self.assertEqual(held.document, str(document))
+
+    def test_held_document_skips_unrelated_owned_reviewer_after_transient_staff_failure(self) -> None:
+        with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.open_role("fixture-repo", "design.md", "reviewer", "design")
+        unrelated, = design_roles.state_root().glob("*/design.json")
+        design_roles.register_repository("independent-review", {"natedev": str(self.repository)})
+        document = self.repository / "other-design.md"
+        _ = document.write_text("# Other design\n")
+        with stop_once(design_roles, "_begin_creation", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.open_role("independent-review", document.name, "reviewer", "design")
+        errors = io.StringIO()
+        reads = [staff.StaffUnreadable("staff is unavailable"), staff.snapshot()]
+        with (patch.object(staff, "authority_snapshot", side_effect=reads), redirect_stderr(errors)):
+            held = design_roles.held_document(document)
+        assert isinstance(held, design_roles.HeldDesign)
+        self.assertEqual(held.document, str(document))
+        self.assertEqual(errors.getvalue().splitlines(), [f"warning: {unrelated}: staff is unavailable"])
 
     def test_end_keeps_the_worker_id_when_staff_retires_it_before_role_open(self) -> None:
         world = self.pane_start()

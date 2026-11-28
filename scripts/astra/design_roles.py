@@ -1419,11 +1419,17 @@ def record_operation() -> Generator[None]:
         yield
 
 
+def _warn_design_record(path: Path, reason: str) -> None:
+    warned = _record_warnings.get().paths
+    if path not in warned:
+        print(f'warning: {path}: {reason}', file=sys.stderr)
+        warned.add(path)
+
+
 def _read_designs(relevant: Callable[[Path, dict[str, object]], bool], *,
-                  refuse_matching_damage: bool = False) -> Generator[HeldDesign]:
+                  refuse_matching_damage: bool = False, audit_checkout_paths: bool = False) -> Generator[HeldDesign]:
     """Skip broken records, but preserve a caller's matching live role for recovery."""
     with record_operation():
-        warned = _record_warnings.get().paths
         for path in sorted(state_root().glob('*/design.json')):
             fields: dict[str, object] = {}
             try:
@@ -1435,11 +1441,11 @@ def _read_designs(relevant: Callable[[Path, dict[str, object]], bool], *,
                 if fields and (refuse_matching_damage or live_roles) and relevant(path, fields):
                     recovery = '; live held role needs recovery' if live_roles else ''
                     raise RoleRefused(f'{path}: {reason}{recovery}') from error
-                if path not in warned:
-                    print(f'warning: {path}: {reason}', file=sys.stderr)
-                    warned.add(path)
+                _warn_design_record(path, reason)
                 continue
-            if relevant(path, fields):
+            if audit_checkout_paths:
+                yield resolve()
+            elif relevant(path, fields):
                 yield _published_workers(resolve())
 
 
@@ -1451,12 +1457,22 @@ class NotHeldDocument:
 def held_document(document: Path) -> HeldDesign | NotHeldDocument:
     target = str(document.resolve())
 
-    def relevant(_path: Path, fields: dict[str, object]) -> bool:
-        if 'repository_owner' not in fields:
-            return fields.get('document') == target
+    def matches_owned_document(fields: dict[str, object]) -> bool:
         try:
             return str((Path(_read_checkout(fields)[0]) / _text(fields, 'document')).resolve()) == target
         except RoleRefused:
+            return False
+
+    def relevant(path: Path, fields: dict[str, object]) -> bool:
+        if 'repository_owner' not in fields:
+            return fields.get('document') == target
+        try:
+            return matches_owned_document(fields)
+        except staff.StaffUnreadable as error:
+            # Check the checkout again before skipping the record.
+            if matches_owned_document(fields):
+                raise
+            _warn_design_record(path, ' '.join(str(error).splitlines()))
             return False
 
     found = [design for design in _read_designs(relevant) if design.document == target]
@@ -1586,7 +1602,8 @@ def checkout_failures(old_checkout: str) -> list[str]:
     failures: list[str] = []
     try:
         for design in _read_designs(lambda _path, fields: (
-                _read_checkout(fields)[0] if 'repository_owner' in fields else fields.get('repository')) == old_checkout):
+                _read_checkout(fields)[0] if 'repository_owner' in fields else fields.get('repository')) == old_checkout,
+                audit_checkout_paths=True):
             path = design_directory(design.placement.design_id) / 'design.json'
             try:
                 if old_checkout:
