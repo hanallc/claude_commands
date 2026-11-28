@@ -30,7 +30,6 @@ from enum import Enum, IntEnum
 from functools import cache, partial
 from importlib import import_module
 from typing import TYPE_CHECKING, Protocol, Literal, cast, final
-from uuid import UUID
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
@@ -51,7 +50,6 @@ WorkerName = staff.WorkerName
 WorkerRole = staff.WorkerRole
 
 WORKER_SANDBOX = "danger-full-access"
-DESIGNER_SANDBOX = "danger-full-access"
 READ_ONLY_SANDBOX = "read-only"
 REVIEW_ROLES: frozenset[WorkerRole] = frozenset({"review", "astra-reviewer"})
 CLAUDE_REVIEW_TOOLS = "Read,Grep,Glob"
@@ -139,31 +137,12 @@ class ConsultationPane:
     delivery: ReplyToCaller | TranscriptReply = REPLY_TO_CALLER
 
 
-class NoDesignPaneLaunch(Enum):
-    UNRECORDED = "the role has no pane launch marker"
-    NOT_ISSUED = "the launcher has not started"
-
-
-@dataclass(frozen=True)
-class DesignPaneLaunch:
-    token: UUID
-
-
-@dataclass(frozen=True)
-class RetryDesignPaneLaunch(DesignPaneLaunch):
-    """Start only in the shell from the original launch."""
-
-
 @dataclass(frozen=True)
 class DurableDesignRole:
     parent: StaffId
     name: WorkerName
     role: WorkerRole
     claim: staff.DesignWorkerClaim | staff.NoDesignWorkerClaim = staff.NO_DESIGN_WORKER_CLAIM
-    pane_launch: DesignPaneLaunch | NoDesignPaneLaunch = NoDesignPaneLaunch.UNRECORDED
-
-
-DESIGN_PANE_LAUNCH_ENV = "UNIT_ASTRA_PANE_LAUNCH"
 
 
 PaneTarget = StaffWorker | ConsultationPane | DurableDesignRole
@@ -1311,11 +1290,12 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
 
 def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned"] = "assigned") -> LaunchPolicy:
     """Read the role's launch policy; a named family reads that family's row instead of the assigned one."""
+    from scripts.astra import design_roles
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
     settings = models_registry.launch_settings(section, key, family)
     sandbox = READ_ONLY_SANDBOX if role in REVIEW_ROLES else WORKER_SANDBOX
     if role == "astra-designer":
-        sandbox = DESIGNER_SANDBOX
+        sandbox = design_roles.DESIGNER_SANDBOX
     return _launch_policy(settings, sandbox)
 
 
@@ -1580,97 +1560,19 @@ def _interrupted_pane(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     return herdr.NoPane(name)
 
 
-def _design_launch_pane(client: herdr.Herdr, launch: DesignPaneLaunch) -> herdr.ExistingPane | herdr.NoPane:
-    """Find the terminal from the marker set when herdr split its pane."""
-    panes = client.panes()
-    matches: list[herdr.ExistingPane] = []
-    unreadable = ""
-    for row in panes:
-        pane = row["pane_id"]
-        try:
-            info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
-                                     "design pane process info")
-            shell = info.get("shell_pid")
-            if type(shell) is not int or shell <= 0:
-                raise herdr_types.HerdrFailure("pane shell identity is unavailable")
-            marker = herdr.process_environment(shell).get(DESIGN_PANE_LAUNCH_ENV)
-        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            if not unreadable:
-                unreadable = f"{pane}: {error}"
-            continue
-        if marker == str(launch.token):
-            terminal = row.get("terminal_id", "")
-            if not terminal or sum(item.get("terminal_id") == terminal for item in panes) != 1:
-                raise herdr_types.HerdrFailure(f"{pane}: pane terminal identity is unavailable or duplicated")
-            matches.append(herdr.ExistingPane(pane, terminal))
-    if len(matches) > 1:
-        raise herdr_types.HerdrFailure("the design launch marker identifies more than one terminal")
-    if not matches and unreadable:
-        raise herdr_types.HerdrFailure(f"design pane absence is unproved: {unreadable}")
-    return matches[0] if matches else herdr.NoPane(str(launch.token))
-
-
-def _design_launch_process(client: herdr.Herdr, location: herdr.ExistingPane, launch: DesignPaneLaunch,
-                           ) -> herdr.ForegroundPaneAgent | herdr.PaneAtShell:
-    observed = client.pane_row(location.pane)
-    if isinstance(observed, herdr.NoPane) or observed.get("terminal_id") != location.terminal:
-        raise herdr_types.HerdrFailure("the design launch terminal changed")
-    info = herdr.json_object(client.result("pane", "process-info", "--pane", location.pane).get("process_info"),
-                             "design pane process info")
-    owner = herdr.foreground_pane_owner(info)
-    if isinstance(owner, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground)):
-        if herdr.process_environment(owner.pid).get(DESIGN_PANE_LAUNCH_ENV) == str(launch.token):
-            return owner
-    elif isinstance(owner, herdr.NoForegroundAgent) and isinstance(client.pane_activity(location.pane), herdr.PaneAtShell):
-        return herdr.PaneAtShell()
-    raise herdr_types.HerdrFailure("the design launch does not prove the foreground process")
-
-
-def recover_design_launch(parent: StaffId, name: WorkerName, claim: staff.DesignWorkerClaim,
-                          launch: DesignPaneLaunch, run: Path) -> None:
-    """Publish the proved native worker from an interrupted launch."""
-    allowed = worker_admission.WorkerStartAllowed(name.value, parent, run, worker_admission.NewWorkerSlot(), claim)
-    with staff.row_operation(parent), worker_lock(parent, name, blocking=True) as lock:
-        if isinstance(lock, Kept):
-            raise worker_admission.AdmissionRefused(lock.blocker)
-        with worker_admission.worker_operation(allowed):
-            client = _client()
-            location = _design_launch_pane(client, launch)
-            if isinstance(location, herdr.NoPane):
-                raise worker_admission.AdmissionRefused("no recorded worker; replacement refused; run end to clear the claim")
-            owner = _design_launch_process(client, location, launch)
-            if isinstance(owner, herdr.PaneAtShell):
-                raise worker_admission.AdmissionRefused("the design pane has no agent; run end to close the pane")
-            process = client.pane_agent_process(location.pane, location.terminal)
-            if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable) or process.pid != owner.pid:
-                raise herdr_types.HerdrFailure("the design launch process changed")
-            if isinstance(owner, herdr.ProvedCodexForeground):
-                _ = _codex_start_session(client, location.pane)
-            native = client.native_pane_process(location.pane, owner.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
-            if (native.environment.get(DESIGN_PANE_LAUNCH_ENV) != str(launch.token)
-                    or client.pane_agent_process(location.pane, location.terminal) != process):
-                raise herdr_types.HerdrFailure("the design launch process changed")
-            codex_home = native.environment.get("CODEX_HOME", "") if owner.kind == "codex" else ""
-            home = staff.SessionHome(Path(codex_home)) if codex_home else staff.HomeUnknown()
-            row = worker_admission.publish(allowed, native.current_identity, launch_home=home).row
-            role: WorkerRole = "astra-designer" if claim.role == "designer" else "astra-reviewer"
-            _ = staff.set_worker_role(row.id, staff.KnownWorkerRole(role))
-
-
 def _parent_split(pane: str, ratio: float, label: str) -> herdr.SplitPane:
     return herdr.SplitPane(pane, "right", ratio, label)
 
 
 def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
-                 client: herdr.Herdr, *, split_only: bool = False,
-                 ) -> herdr.SplitPane | herdr.ExistingPane | StartRefused | UncertainWorker | ProcessUnknownWorker:
+                 client: herdr.Herdr) -> herdr.SplitPane | herdr.ExistingPane | StartRefused | UncertainWorker | ProcessUnknownWorker:
     parents = evidence.scan.found.get(parent.id, [])
     if len(parents) != 1:
         return _uncertain(parent, "parent pane is unavailable or duplicated")
     parent_pane = parents[0]
     tab = _text(parent_pane, "tab_id")
     label = agent_name(parent, name)
-    pane = herdr.NoPane(name) if split_only else _interrupted_pane(parent, name, evidence, client)
+    pane = _interrupted_pane(parent, name, evidence, client)
     if isinstance(pane, (StartRefused, UncertainWorker, ProcessUnknownWorker)):
         return pane
     if not isinstance(pane, herdr.NoPane):
@@ -1734,7 +1636,6 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
                     phase: str | None = None,
                     design_claim: staff.DesignWorkerClaim | staff.NoDesignWorkerClaim = staff.NO_DESIGN_WORKER_CLAIM,
-                    design_pane_launch: DesignPaneLaunch | NoDesignPaneLaunch = NoDesignPaneLaunch.UNRECORDED,
                     ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
@@ -1795,8 +1696,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
-                                       keep_model=keep_model, selection=target, berth_session=berth_session,
-                                       design_pane_launch=design_pane_launch)
+                                       keep_model=keep_model, selection=target, berth_session=berth_session)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1846,8 +1746,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows, berth_session: str,
-                  design_pane_launch: DesignPaneLaunch | NoDesignPaneLaunch) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows, berth_session: str) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1866,17 +1765,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     elif refreshed is not None:
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
-
-    retry_pane: herdr.ExistingPane | herdr.NoPane = herdr.NoPane(name.value)
-    if isinstance(design_pane_launch, RetryDesignPaneLaunch):
-        try:
-            retry_pane = _design_launch_pane(client, design_pane_launch)
-            if isinstance(retry_pane, herdr.NoPane):
-                return AdmissionRefused("the original design pane is missing")
-            if not isinstance(_design_launch_process(client, retry_pane, design_pane_launch), herdr.PaneAtShell):
-                return AdmissionRefused("the design pane already has an agent; run recover")
-        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-            return AdmissionRefused(str(error))
 
     def read_evidence(membership: staff.StaffSnapshot) -> PaneEvidence:
         herdr.refresh_restore_pane_evidence()
@@ -1901,7 +1789,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     return AdmissionRefused("the retained Codex worker launch does not prove read-only access")
         except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             return AdmissionRefused(str(error))
-    if current is None and isinstance(design_pane_launch, NoDesignPaneLaunch):
+    if current is None:
         pane = _interrupted_pane(owner, name.value, evidence, client)
         if isinstance(pane, (StartRefused, UncertainWorker, ProcessUnknownWorker)):
             return pane
@@ -2021,9 +1909,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                                                unset_environment)
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
-    if isinstance(design_pane_launch, DesignPaneLaunch):
-        prepared = replace(prepared, env={**prepared.env, DESIGN_PANE_LAUNCH_ENV: str(design_pane_launch.token)},
-                           unset_environment=prepared.unset_environment - {DESIGN_PANE_LAUNCH_ENV})
     if isinstance(current, OpenWorker) and not switching:
         herdr.forget_pane_evidence(client.session, current.pane)
         if not _stop_row(current.row, client, deadline=deadline):
@@ -2034,12 +1919,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     elif isinstance(current, StoppedWorker):
         _retire_launch(current.row, client, record)
         destination = herdr.ExistingPane(current.pane, current.terminal)
-    elif isinstance(retry_pane, herdr.ExistingPane):
-        destination = retry_pane
     else:
         try:
-            destination = _destination(owner, name.value, evidence, client,
-                                       split_only=isinstance(design_pane_launch, DesignPaneLaunch))
+            destination = _destination(owner, name.value, evidence, client)
         except conf.Unusable as error:
             return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
         if isinstance(destination, (StartRefused, UncertainWorker, ProcessUnknownWorker)):

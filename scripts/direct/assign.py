@@ -145,7 +145,7 @@ def parse_arguments() -> Arguments:
                             default=AssignmentOperation.DISPATCH)
     _ = parser.add_argument("--target", choices=("staff-worker", "consultation-pane", "durable-design-role"), default="staff-worker")
     _ = parser.add_argument("--policy", choices=("astra-reviewer", "astra-designer"), default="")
-    _ = parser.add_argument("--parent", help=argparse.SUPPRESS, default="")
+    _ = parser.add_argument("--parent", default="")
     _ = parser.add_argument("--design-role", default="")
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
@@ -171,8 +171,11 @@ def parse_arguments() -> Arguments:
         parser.error("--policy is required for this target")
     if args.target == "consultation-pane" and not args.new_worker:
         parser.error("consultation-pane requires --new-worker")
-    if args.target == "durable-design-role" and not (args.design_role or args.to or args.new_worker):
-        parser.error("durable-design-role requires --to or --new-worker")
+    if args.target == "durable-design-role":
+        if args.prompt and not args.parent:
+            parser.error("durable-design-role requires --parent and an Astra policy")
+        if not (args.to or args.new_worker or (args.design_role and not args.prompt)):
+            parser.error("durable-design-role requires --to or --new-worker")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
     if args.operation == AssignmentOperation.ASTRA_REVIEW and not args.new_worker:
@@ -976,28 +979,38 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
 
 def execute_durable(args: Arguments) -> int:
     """Start or dispatch a durable role through its explicit target."""
+    if not args.prompt:
+        try:
+            return start_durable(args)
+        except (OSError, ValueError) as error:
+            refuse(str(error))
+    name = staff.WorkerName.parse(args.to or args.new_worker)
+    role = cast(staff.WorkerRole, args.policy)
+    policy = pane_policy(args.policy, model=args.model, effort=args.effort)
+    prompt = Path(args.prompt).expanduser().resolve()
+    if not prompt.is_file() or not args.session_dir or not args.phase:
+        refuse("durable dispatch requires --prompt, --session-dir, and --phase")
+    result = staff_worker.dispatch(staff.StaffId(args.parent), name, role, prompt, session_dir=Path(args.session_dir),
+        slot=name.value, phase=args.phase, kind="astra",
+        reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
+        completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
+        launcher_command=launcher_command())
+    return result
+
+
+def start_durable(args: Arguments) -> int:
+    """Read the recorded parent before starting a held role."""
     name_arg = args.to or args.new_worker
     claim = (staff.DesignWorkerClaim.parse(args.design_role) if args.design_role
              else design_roles.claim_for_worker_name(name_arg))
-    expected_worker: staff.StaffId | staff_worker.WorkerIdAtUse = staff_worker.WorkerIdAtUse.BY_NAME
-    pane_launch: worker_panes.DesignPaneLaunch | worker_panes.NoDesignPaneLaunch = worker_panes.NoDesignPaneLaunch.UNRECORDED
-    prompt = Path(args.prompt).expanduser().resolve()
-    if args.prompt and (not prompt.is_file() or not args.session_dir or not args.phase):
-        refuse("durable dispatch requires --prompt, --session-dir, and --phase")
     with ExitStack() as locks:
         if isinstance(claim, staff.DesignWorkerClaim):
             if args.policy != f"astra-{claim.role}":
                 refuse("the design role differs from the launch policy")
-            instance = (design_roles.recorded_role(claim) if args.prompt else
-                        locks.enter_context(design_roles.start_claim(claim)))
+            instance = locks.enter_context(design_roles.start_claim(claim))
             if not isinstance(instance.parent, str):
                 refuse("the design role has no recorded parent")
             parent, name_arg = instance.parent, instance.name
-            pane_launch = instance.pane_launch
-            if args.prompt:
-                if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove)):
-                    refuse("the design role has no open worker")
-                expected_worker = instance.lifecycle.staff_id
         else:
             run = Path(args.session_dir) if args.session_dir else None
             record = staff.snapshot()
@@ -1011,18 +1024,11 @@ def execute_durable(args: Arguments) -> int:
         name = staff.WorkerName.parse(name_arg)
         role = cast(staff.WorkerRole, args.policy)
         policy = pane_policy(args.policy, model=args.model, effort=args.effort)
-        if not args.prompt:
-            current = launch(worker_panes.DurableDesignRole(parent, name, role, claim, pane_launch), policy,
-                             phase=args.phase or None)
-            if not isinstance(current, worker_panes.OpenWorker):
-                return staff_worker.startup_result(name, current)
-            print(json.dumps(current.row.to_json()))
-            return 0
-        return staff_worker.dispatch(parent, name, role, prompt, session_dir=Path(args.session_dir),
-            slot=name.value, phase=args.phase, kind="astra",
-            reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
-            completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
-            launcher_command=launcher_command(), expected_worker=expected_worker)
+        current = launch(worker_panes.DurableDesignRole(parent, name, role, claim), policy, phase=args.phase or None)
+        if not isinstance(current, worker_panes.OpenWorker):
+            return staff_worker.startup_result(name, current)
+        print(json.dumps(current.row.to_json()))
+        return 0
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
@@ -1124,10 +1130,7 @@ def main() -> int:
             refuse("--cwd must be a directory")
         return execute_consultation(args, cwd)
     if args.target == "durable-design-role":
-        try:
-            return submission_result(execute_durable(args))
-        except (OSError, ValueError) as error:
-            refuse(str(error))
+        return submission_result(execute_durable(args))
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
     if not cwd.is_dir() or not prompt.is_file():
         refuse("--cwd must be a directory and --prompt must be a readable file")

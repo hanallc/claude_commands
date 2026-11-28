@@ -401,11 +401,17 @@ class HeldRolePaneTests(HeldRolePaneCase):
         before_prompt: list[tuple[str, ...]] = []
         self.panes.command_case.agent.during_prompt = lambda: before_prompt.extend(self.panes.world.reads)
 
-        def assign_with_parent(arguments: list[str]) -> subprocess.CompletedProcess[str]:
-            return self.panes.assign([*arguments, "--parent", str(fixture_runtime_id("unrelated-parent"))])
-
-        with patch.object(design_roles, "_assign_command", side_effect=assign_with_parent):
-            reply = self.panes.resume(design, "designer")
+        reply = self.panes.root / "dispatch-review.md"
+        with patch.object(design_roles, "read_design", side_effect=AssertionError("prompt dispatch read the design record")):
+            result = self.panes.assign([
+                "--role", "implement", "--target", "durable-design-role", "--policy", "astra-designer",
+                "--parent", str(self.panes.command_case.fixture.parent.id), "--to", instance.name,
+                "--session-dir", str(self.panes.command_case.run_dir), "--phase", "8",
+                "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(reply),
+                "--cwd", str(self.panes.root),
+            ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.panes.finish(design, "designer")
         self.assertIn("The work is complete.", reply.read_text())
         self.assertEqual(staff.by_id(instance.lifecycle.staff_id), replace(row, role=staff.KnownWorkerRole("astra-designer")))
         self.assertEqual(len(self.panes.world.launches), launches)
@@ -806,27 +812,6 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(instance.lifecycle, design_roles.RoleWorkerPublished(row.id))
         self.assertEqual(row.design_claim, staff.DesignWorkerClaim(path.parent.name, "designer"))
 
-    def test_recover_publishes_the_native_worker_from_the_marked_pane(self) -> None:
-        world = self.pane_start()
-        with stop_once(worker_admission, "publish", when="before"), self.assertRaises(InjectedStop):
-            _ = self.open_designer()
-        path, = design_roles.state_root().glob("*/design.json")
-        identifier = path.parent.name + "/designer"
-        parent = self.panes.command_case.fixture.parent
-        owner = staff.snapshot().parent_of(parent)
-        assert owner is not None
-        other = fixture_member("unit", name="other-holder", parent=owner.id)
-        native = world.processes[world.foreground["w1:p1"][0]].identity.id
-        world.unknown["w1:p0"] = "unrelated process evidence is unreadable"
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": other.current_session}):
-            recovered = design_roles.recover(identifier)
-        instance = self.instance(recovered, "designer")
-        self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
-        self.assertEqual(instance.parent, parent.id)
-        self.assertEqual(len(world.launches), 1)
-        row, = staff.snapshot().find(kind="worker", parent=parent.id)
-        self.assertEqual(row.current_session, native)
-
     def test_end_keeps_the_worker_id_when_staff_retires_it_before_role_open(self) -> None:
         world = self.pane_start()
         with stop_once(design_roles, "_assign_command"), self.assertRaises(InjectedStop):
@@ -849,9 +834,27 @@ class DurableRolesTests(HeldRolePaneCase):
         fields = cast(dict[str, object], json.loads(path.read_text()))
         entry = next(item for item in cast(list[dict[str, object]], fields["roles"]) if item["role"] == role)
         _ = entry.pop("parent", None)
-        _ = entry.pop("pane_launch", None)
         write_text_atomic(path, json.dumps(fields))
         return path
+
+    def test_legacy_not_started_claim_can_open_again(self) -> None:
+        with stop_once(design_roles, "_begin_creation", when="before"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        path, = design_roles.state_root().glob("*/design.json")
+        _ = self.legacy_role_record(path.parent.name)
+        before = self.instance(design_roles.read_design(path.parent.name), "designer")
+        self.assertEqual(before.lifecycle, design_roles.RoleNotOpened("pane-start", "not_started"))
+        self.assertIsInstance(before.parent, design_roles.RoleParentUnrecorded)
+
+        opened = self.open_designer()
+        instance = self.instance(opened, "designer")
+        parent = self.panes.command_case.fixture.parent.id
+        row, = staff.snapshot().find(kind="worker", parent=parent)
+        self.assertEqual(opened.placement.design_id, path.parent.name)
+        self.assertEqual(instance.parent, parent)
+        self.assertEqual(instance.lifecycle, design_roles.RoleOpen(row.id))
+        self.assertEqual(row.design_claim, staff.DesignWorkerClaim(path.parent.name, "designer"))
+        self.assertEqual(len(self.launches), 1)
 
     def test_legacy_pending_start_keeps_an_unrelated_same_name_worker(self) -> None:
         with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
@@ -877,26 +880,7 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(staff.by_id(decoy.id), decoy)
         rendered = design_roles.render_roles(design_roles.list_roles())
         self.assertIn("RoleIdentityUnresolved", rendered)
-        self.assertIn("the legacy launch has no recorded worker ID or pane marker", rendered)
-
-    def test_legacy_pending_start_preserves_its_saved_parent(self) -> None:
-        with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
-            _ = self.open_designer()
-        path, = design_roles.state_root().glob("*/design.json")
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        entry = next(item for item in cast(list[dict[str, object]], fields["roles"]) if item["role"] == "designer")
-        parent = self.panes.command_case.fixture.parent.id
-        self.assertEqual(entry["parent"], parent)
-        del entry["pane_launch"]
-        write_text_atomic(path, json.dumps(fields))
-        with self.assertRaisesRegex(design_roles.RoleRefused, "legacy launch has no recorded worker ID"):
-            _ = design_roles.recover(path.parent.name + "/designer")
-        saved = self.instance(design_roles.read_design(path.parent.name), "designer").parent
-        self.assertIsInstance(saved, design_roles.RoleIdentityUnresolved)
-        self.assertEqual(cast(design_roles.RoleIdentityUnresolved, saved).saved_parent, parent)
-        updated = cast(dict[str, object], json.loads(path.read_text()))
-        entry = next(item for item in cast(list[dict[str, object]], updated["roles"]) if item["role"] == "designer")
-        self.assertEqual(entry["parent"], parent)
+        self.assertIn("the legacy launch has no recorded worker ID", rendered)
 
     def test_legacy_role_with_a_retired_worker_stays_unresolved(self) -> None:
         design = self.open_designer()
@@ -906,16 +890,14 @@ class DurableRolesTests(HeldRolePaneCase):
         identifier = path.parent.name + "/designer"
         self.panes.world.remove_pane("w1:p1")
         _ = staff.retire(role.lifecycle.staff_id)
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        entry = next(item for item in cast(list[dict[str, object]], fields["roles"]) if item["role"] == "designer")
-        del entry["pane_launch"]
-        write_text_atomic(path, json.dumps(fields))
+        _ = self.legacy_role_record(design.placement.design_id)
         with self.assertRaisesRegex(design_roles.RoleRefused, "the recorded worker has no proved staff parent"):
             _ = design_roles.end(identifier)
         saved = self.instance(design_roles.read_design(path.parent.name), "designer")
         self.assertEqual(saved.lifecycle, role.lifecycle)
         self.assertIsInstance(saved.parent, design_roles.RoleIdentityUnresolved)
-        self.assertEqual(cast(design_roles.RoleIdentityUnresolved, saved.parent).saved_parent, role.parent)
+        self.assertIsInstance(cast(design_roles.RoleIdentityUnresolved, saved.parent).saved_parent,
+                              design_roles.RoleParentUnrecorded)
         before = path.read_bytes()
         for operation in (design_roles.recover, design_roles.end):
             with self.assertRaisesRegex(design_roles.RoleRefused, "RoleIdentityUnresolved"):

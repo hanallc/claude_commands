@@ -1741,7 +1741,6 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
              new_pass_instance_id: uuid.UUID | None = None,
              availability: CheckAssignmentAvailability | AvailabilityAtUse = AvailabilityAtUse.DIRECT_DISPATCH,
-             expected_worker: StaffId | WorkerIdAtUse = WorkerIdAtUse.BY_NAME,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     record = staff.snapshot()
@@ -1775,7 +1774,6 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         if ((row is None and hold.bound) or (row is not None and not hold.owns(row))
-                or (isinstance(expected_worker, str) and (row is None or row.id != expected_worker))
                 or (expected is not None and (row is None or row.id != expected.id
                                              or row.current_session != expected.current_session))):
             return _busy_dispatch(f"{name.value}: the worker changed before dispatch")
@@ -2502,7 +2500,7 @@ def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
     with staff.row_operation(target.parent):
         if isinstance(target, worker_panes.DurableDesignRole):
             return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase,
-                                                design_claim=target.claim, design_pane_launch=target.pane_launch)
+                                                design_claim=target.claim)
         return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase)
 
 
