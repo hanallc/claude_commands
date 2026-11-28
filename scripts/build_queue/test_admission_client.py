@@ -46,7 +46,7 @@ from scripts.lib import process_start as process_identity
 from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
-    AdmissionFixture, Exchange, GIB, InjectedCrash, ScriptedSelector, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
+    AdmissionFixture, Exchange, FakeClock, GIB, InjectedCrash, ScriptedSelector, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.build_queue.test_snapshot_codec import service_snapshot
@@ -737,9 +737,14 @@ class ClientTests(unittest.TestCase):
         from scripts.build_queue import placement
 
         hold_seconds = 30
-        for execution_target in ("local", "mac", "mac-handoff", "mac-retry-notice", "mac-truncated-assignment", "mac-kept-claim"):
+        for execution_target, elapsed_seconds in (
+            ("local", 0), ("local", 1), ("mac", 0), ("mac-handoff", 0), ("mac-retry-notice", 0),
+            ("mac-truncated-assignment", 0), ("mac-kept-claim", 0),
+        ):
             with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
-                 AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+                 AdmissionFixture() as fixture:
+                client_clock = FakeClock() if execution_target == "local" else fixture.clock
+                _ = fixture.enter_context(mock.patch.object(client, "CLOCK", client_clock))
                 if execution_target == "mac-kept-claim":
                     fixture.configure(remote_start_hold_seconds=hold_seconds)
                 if execution_target != "local":
@@ -830,6 +835,7 @@ class ClientTests(unittest.TestCase):
                         _ = errors.truncate()
                         if execution_target == "local":
                             fixture.free(60 * GIB)
+                            client_clock.advance(elapsed_seconds)
                         else:
                             allowed: placement.HostEligibility = placement.AllowedHost()
                             if execution_target == "mac-kept-claim":
@@ -851,6 +857,9 @@ class ClientTests(unittest.TestCase):
                         self.assertEqual(client.main(arguments), 0)
                         lines = output.getvalue().splitlines()
                         if execution_target == "local":
+                            if elapsed_seconds:
+                                self.assertEqual(lines.pop(0), f"memory-seconds {elapsed_seconds}")
+                            self.assertEqual(len(lines), 2, lines)
                             self.assertEqual(lines[0], "done")
                             self.assertTrue(lines[1].startswith("local\tnatedev\t"), lines)
                             self.assertEqual(client.read_assignment(assignment_file).assignment.destination.provider, "local")
