@@ -1472,22 +1472,22 @@ class HostEvidenceWorker:
         with self.lock:
             return self.observations.get(key, placement.HostEvidenceUnavailable(key, self.clock.now(), "not read"))
 
-    def publish(self, evidence: placement.HostEvidence) -> None:
+    def publish(self, evidence: placement.HostEvidence, observed_monotonic: float | None) -> None:
         with self.lock:
-            self._publish_evidence(evidence)
+            self._publish_evidence(evidence, observed_monotonic)
 
-    def _publish_evidence(self, evidence: placement.HostEvidence) -> None:
+    def _publish_evidence(self, evidence: placement.HostEvidence, observed_monotonic: float | None) -> None:
         """Update the outage guard for each probe before the next probe can replace it."""
         self.observations[evidence.key] = evidence
         destination = evidence.key.destination
-        if not is_mac_linux_guest(destination):
+        if observed_monotonic is None or not is_mac_linux_guest(destination):
             return
         outage = self.guest_outages.get(destination.host)
         if outage is None and isinstance(evidence, MacLinuxProbeFailureEvidence):
             self.guest_outages[destination.host] = GuestProbeOutage(
                 MacOutageFence(self.clock.now()), self.clock.monotonic())
         elif (outage is not None and isinstance(evidence, placement.FreshHostEvidence)
-              and evidence.probe_answered and evidence.observed_at > outage.fence.reported_at):
+              and evidence.probe_answered and observed_monotonic > outage.started_monotonic):
             del self.guest_outages[destination.host]
 
     def guest_outage(self, host: str) -> GuestProbeOutage | None:
@@ -1636,6 +1636,7 @@ class HostEvidenceWorker:
             refresh_generation = (cycle.refresh_generation if isinstance(cycle, _MacHostProbeCycle)
                                   else self.refresh_generation)
         observed_at = self.clock.now()
+        observed_monotonic = self.clock.monotonic()
         try:
             evidence = self.probe(key)
             if evidence.key != key:
@@ -1650,7 +1651,7 @@ class HostEvidenceWorker:
                 return True
             if guest:
                 # Record the guest answer before settlement can delay it.
-                self._publish_evidence(evidence)
+                self._publish_evidence(evidence, observed_monotonic)
             dispatches = tuple((attempt, probe) for attempt, probe in self.dispatch_probes.items() if probe.key == key)
         dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
         for attempt, probe in dispatches:
@@ -1663,7 +1664,7 @@ class HostEvidenceWorker:
             if self.subscriptions.get(key) is not subscription:
                 return True
             if not guest:
-                self._publish_evidence(evidence)
+                self._publish_evidence(evidence, observed_monotonic)
             for attempt, probe, observed in dispatches_read:
                 if (self.dispatch_probes.get(attempt) is probe
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
@@ -1720,7 +1721,7 @@ class HostEvidenceReader:
         return self.worker.thread
 
     def publish(self, evidence: placement.HostEvidence) -> None:
-        self.worker.publish(evidence)
+        self.worker.publish(evidence, self.worker.clock.monotonic())
 
     def close(self) -> None:
         self.worker.close()
@@ -4898,7 +4899,8 @@ class AdmissionServer:
                     reader.request(key)
             self.host_readers[key] = HostEvidenceReader(key, reader, timeout)
             if previous is not None:
-                reader.publish(previous)
+                # A cached reading has no monotonic probe time.
+                reader.publish(previous, None)
         return self.host_readers[key]
 
     def read_provider_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -5273,12 +5275,16 @@ class AdmissionServer:
         declined = placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
         answered = False
         try:
-            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry),
-                                        wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
+            settings = mac_linux.read_settings(backoff.registry)
+            if settings.ssh_hops[1] != key.destination.host:
+                return placement.FreshHostEvidence(key, started_at, "",
+                    placement.TemporaryExclusion("The configured SSH route names a different guest"))
+            _ = mac_linux.read_guest_main(settings, wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
         except (mac_linux.GuestConnectionFailed, subprocess.TimeoutExpired):
             return MacLinuxProbeFailureEvidence(key, started_at, "", declined)
         except mac_linux.GuestUnavailable as error:
             # A failed command can still prove that the guest answered. SSH exit 255 is ambiguous.
+            # Exit 127 for a missing SSH client also clears the guard and keeps the slot held.
             message = str(error)
             prefix = "guest main probe exited "
             status, separator, _ = message.removeprefix(prefix).partition(":")

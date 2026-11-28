@@ -5441,6 +5441,71 @@ class LostMacPlacementTests(unittest.TestCase):
             self.assertTrue(evidence.probe_answered)
             self.assertIsNone(worker.guest_outage(key.destination.host))
 
+    def test_a_probe_for_another_guest_cannot_close_the_saved_attempt(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven"),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=mac_linux.GuestConnectionFailed("The guest did not answer")) as probe):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            self.assertIsInstance(consume_guest_permission(fixture, guest, holder, proof_required=True)[0],
+                                  wire.FirstAuthorization)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            settings = fixture.root / "mac_linux.conf"
+            _ = settings.write_text(settings.read_text().replace("fixture-guest", "other-guest"))
+
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            fixture.clock.advance(600)
+            _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertIsNone(worker.guest_outage(guest.destination.host))
+            probe.assert_not_called()
+
+    def test_a_guest_answer_after_a_wall_clock_step_prevents_loss(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven"),
+              mock.patch.object(mac_linux, "read_guest_main",
+                                side_effect=[mac_linux.GuestConnectionFailed("The guest did not answer"),
+                                             mac_linux.EmptyGuestMain()]) as probe):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = mac_linux_fixture(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            self.assertIsInstance(consume_guest_permission(fixture, guest, holder, proof_required=True)[0],
+                                  wire.FirstAuthorization)
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(guest.owner.pid, guest.owner.start_time))
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            outage = worker.guest_outage(guest.destination.host)
+            assert outage is not None
+
+            fixture.clock.advance(599)
+            fixture.clock.epoch -= 601
+            self.assertLess(fixture.clock.now(), outage.fence.reported_at)
+            self.assertEqual(worker.probe_next(), key)
+            self.assertEqual(probe.call_count, 2)
+            fixture.clock.advance(1)
+            _ = fixture.run_pass()
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            self.assertIsNone(worker.guest_outage(guest.destination.host))
+
     def test_after_replacement_and_restart_the_saved_guest_attempt_probes_without_a_request(self) -> None:
         from scripts.build_queue.test_place_take import UNIT, JOB, place_rules, run_since
 
