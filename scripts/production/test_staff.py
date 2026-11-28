@@ -31,11 +31,12 @@ from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import atomic_file, transcripts, unit_runs
+from scripts.lib import atomic_file, models_registry, transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_models_registry import write_registry
 from scripts.lib.transcript_test_support import compressed_copy
 
 
@@ -1784,6 +1785,120 @@ class StaffTests(StaffCommandTestCase):
         back = staff.transfer_producer(morty.id, morty.id, staff.SessionHome(self.root / ".codex2"), folder)
         self.assertEqual(back, replace(morty, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
 
+    def test_remote_producer_clone_records_the_source_and_launch_in_one_write(self) -> None:
+        source = fixture_member("producer", name="morty")
+        identity = staff.native_id(fixture_runtime_id("morty-copy"))
+        home = staff.SessionHome(self.root / "mac/.claude4")
+        folder = staff.PresentWorktree("mac", self.root / "mac/launch")
+        clone_of = staff.ProducerClone(source.id)
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"}})
+        profile = models_registry.ProducerProfile("claude", "sonnet", "medium")
+        with (self.machine("mac"),
+              mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                          "MODELS_CONFIG_TIER_ONLY": "1"})):
+            clone = staff.create_producer_clone("morty-copy", identity, clone_of, folder, home, profile=profile)
+        self.assertEqual([command[0] for command in self.ssh_commands()], ["create-producer-clone"])
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"][clone.name], profile.value())
+        expected = staff.StaffRow(identity, "producer", "morty-copy", staff.StaffRoot(),
+                                  worktree=folder, current_session=identity, home=home, clone_of=clone_of)
+        self.assertEqual(clone, expected)
+        self.assertEqual(staff.by_id(identity), expected)
+        self.assertEqual(clone.to_json()["clone_of"], source.id)
+        self.assertEqual(staff.StaffRow.from_json(clone.to_json()), expected)
+        legacy = source.to_json()
+        self.assertNotIn("clone_of", legacy)
+        self.assertEqual(staff.StaffRow.from_json(legacy).clone_of, staff.NotAClone())
+
+    def test_producer_clone_refuses_a_name_claimed_before_admission(self) -> None:
+        source = fixture_member("producer", name="morty")
+        _ = fixture_member("producer", name="MORTY-COPY")
+        folder = staff.PresentWorktree("natedev", self.root / "launch")
+        home = staff.SessionHome(self.root / ".claude4")
+        before = self.staff_state()
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"}})
+        profiles_before = registry.read_bytes()
+        with (mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                          "MODELS_CONFIG_TIER_ONLY": "1"}),
+              self.assertRaisesRegex(staff.StaffRefused, "another staff row has this name")):
+            _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"), staff.ProducerClone(source.id),
+                                           folder, home, profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(registry.read_bytes(), profiles_before)
+
+    def test_producer_clone_preserves_an_occupied_profile_key(self) -> None:
+        source = fixture_member("producer", name="morty")
+        registry = self.root / "models.conf"
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium", "MORTY-COPY": "claude:sonnet:low"}})
+        profiles_before = registry.read_bytes()
+        staff_before = self.staff_state()
+        folder = staff.PresentWorktree("natedev", self.root / "launch")
+        home = staff.SessionHome(self.root / ".claude4")
+        with (mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                          "MODELS_CONFIG_TIER_ONLY": "1"}),
+              self.assertRaisesRegex(staff.StaffRefused, "registry already has a producer key")):
+            _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"), staff.ProducerClone(source.id),
+                                           folder, home, profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
+        self.assertEqual(registry.read_bytes(), profiles_before)
+        self.assertEqual(self.staff_state(), staff_before)
+
+    def producer_clone_admission(self) -> tuple[Callable[[], staff.StaffRow], Path, staff.StaffId]:
+        source = fixture_member("producer", name="morty")
+        identity = staff.native_id(fixture_runtime_id("fork"))
+        registry = write_registry(self.root / "models.conf", {"producers": {"morty": "claude:sonnet:medium"}})
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "1",
+        })))
+
+        def admit() -> staff.StaffRow:
+            return staff.create_producer_clone("morty-copy", identity, staff.ProducerClone(source.id),
+                staff.PresentWorktree("natedev", self.root / "launch"), staff.SessionHome(self.root / ".claude4"),
+                profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
+
+        return admit, registry, identity
+
+    def assert_producer_clone_retry(self, admit: Callable[[], staff.StaffRow], registry: Path, identity: staff.StaffId) -> None:
+        self.assertIsNone(staff.by_id(identity))
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"], {"morty": "claude:sonnet:medium"})
+        clone = admit()
+        self.assertEqual(staff.by_id(identity), clone)
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:sonnet:medium")
+
+    def test_producer_clone_retries_after_a_staff_write_failure(self) -> None:
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch("scripts.production.staff._store", side_effect=OSError("staff write failed")),
+              self.assertRaisesRegex((staff.StaffUnreadable, staff.StaffRefused), "staff write failed")):
+            _ = admit()
+        self.assert_producer_clone_retry(admit, registry, identity)
+
+    def test_producer_clone_retries_after_a_registry_publish_failure(self) -> None:
+        save = models_registry.save_registry
+
+        def fail_publication(path: Path, before: str, after: str, description: str, *, additive_catalog: bool = False,
+                             preserve_producer_rows: bool = False) -> models_registry.SavedRegistry:
+            saved = save(path, before, after, description, additive_catalog=additive_catalog,
+                         preserve_producer_rows=preserve_producer_rows)
+            if description.startswith("morty-copy producer uses "):
+                return saved._replace(publication=models_registry.RegistryPublication.UNCONFIRMED,
+                                      detail="registry publish failed")
+            return saved
+
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch.object(models_registry, "save_registry", side_effect=fail_publication),
+              self.assertRaisesRegex((staff.StaffUnreadable, staff.StaffRefused), "registry publish failed")):
+            _ = admit()
+        self.assert_producer_clone_retry(admit, registry, identity)
+
+    def test_producer_clone_reports_unconfirmed_profile_removal(self) -> None:
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch("scripts.production.staff._store", side_effect=OSError("staff write failed")),
+              mock.patch.object(models_registry, "remove_failed_clone_profile", side_effect=OSError("remote unavailable")),
+              self.assertRaisesRegex(staff.StaffUnreadable, "Cannot confirm removal of the clone profile: remote unavailable")):
+            _ = admit()
+        self.assertIsNone(staff.by_id(identity))
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:sonnet:medium")
+
     def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
         morty = fixture_member("producer", name="morty")
         session = staff.native_id(fixture_runtime_id("morty-claude"))
@@ -2026,6 +2141,79 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent", "current_session"})
         _ = staff.retire(worker.id)
         self.assertIsNone(staff.by_id(worker.id))
+
+    def test_ensure_worker_commits_the_design_claim_with_the_row(self) -> None:
+        runner = fixture_member("showrunner", name="designs")
+        claim = staff.DesignWorkerClaim("9a01e67d-6c33-4637-8fa8-2e760dfd9445", "designer")
+        worker_id = staff.native_id(fixture_runtime_id("published-design-worker"))
+        original = self.staff_file.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("staff publish interrupted")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "staff publish interrupted"):
+                _ = staff.ensure_worker(worker_id, "design-worker", runner.id, design_claim=claim)
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        self.assertIsNone(staff.by_id(worker_id))
+        result = self.cli("ensure-worker", worker_id, "--name", "design-worker", "--parent", runner.id,
+                          "--design-role", str(claim), "--json", "--row-write")
+        worker = staff.StaffRow.from_json(cast(object, json.loads(result.stdout)))
+        self.assertEqual((worker.id, worker.design_claim), (worker_id, claim))
+        self.assertEqual(staff.by_id(worker_id), worker)
+        self.assertEqual(staff.authority_snapshot().design_workers, {claim: worker_id})
+        fields = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertEqual(fields["design_workers"], {str(claim): worker_id})
+        self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
+        with (mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote_row", return_value=worker) as remote_row):
+            self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
+        remote_row.assert_called_once_with(["ensure-worker", worker_id, "--name", worker.name,
+                                            "--parent", runner.id, "--design-role", str(claim)])
+        with self.assertRaisesRegex(staff.StaffRefused, "the design role already has a worker"):
+            another = staff.native_id(fixture_runtime_id("another-worker"))
+            _ = staff.ensure_worker(another, "other-worker", runner.id, design_claim=claim)
+
+    def test_seal_design_start_preserves_an_admission_and_blocks_late_publication(self) -> None:
+        owner = fixture_member("showrunner", name="designs")
+        design_id = "9a01e67d-6c33-4637-8fa8-2e760dfd9445"
+        opened = staff.DesignWorkerClaim(design_id, "designer")
+        stopped = staff.DesignWorkerClaim(design_id, "reviewer")
+        identity = staff.native_id(fixture_runtime_id("design-worker"))
+        worker = staff.ensure_worker(identity, "designer", owner.id, design_claim=opened)
+        staff.seal_design_worker_start(opened)
+        _ = self.cli("seal-design-start", str(stopped))
+        saved = staff.StaffSnapshot.decode(staff.authority_snapshot().encode())
+        self.assertEqual(saved.design_workers, {opened: worker.id})
+        self.assertEqual(saved.sealed_design_starts, frozenset({stopped}))
+        with (mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote", return_value=None) as transport):
+            staff.seal_design_worker_start(stopped)
+        transport.assert_called_once_with(["seal-design-start", str(stopped)])
+        late_id = staff.native_id(fixture_runtime_id("late-design-worker"))
+        with self.assertRaisesRegex(staff.StaffRefused, "the design startup has ended"):
+            _ = staff.ensure_worker(late_id, "reviewer", owner.id, design_claim=stopped)
+        self.assertIsNone(staff.by_id(late_id))
+
+    def test_mac_seals_a_design_start_with_the_remote_argument_list(self) -> None:
+        claim = staff.DesignWorkerClaim("9a01e67d-6c33-4637-8fa8-2e760dfd9445", "reviewer")
+        with self.machine("mac"):
+            staff.seal_design_worker_start(claim)
+        self.assertEqual(self.ssh_commands(), [["seal-design-start", str(claim), "--json"]])
+        self.assertEqual(staff.authority_snapshot().sealed_design_starts, frozenset({claim}))
+
+    def test_staff_row_writes_preserve_live_and_retired_design_records(self) -> None:
+        owner = fixture_member("showrunner", name="designs")
+        design_id = "9a01e67d-6c33-4637-8fa8-2e760dfd9445"
+        designer = staff.DesignWorkerClaim(design_id, "designer")
+        reviewer = staff.DesignWorkerClaim(design_id, "reviewer")
+        worker = staff.ensure_worker(staff.native_id(fixture_runtime_id("design-worker")), "designer", owner.id,
+                                     design_claim=designer)
+        staff.seal_design_worker_start(reviewer)
+        _ = staff.rename(owner.id, "renamed-designs")
+        self.assertEqual(staff.authority_snapshot().design_workers, {designer: worker.id})
+        _ = staff.retire(worker.id)
+        _ = staff.rename(owner.id, "retired-designs")
+        saved = staff.authority_snapshot()
+        self.assertIsNone(saved.by_id(worker.id))
+        self.assertEqual(saved.design_workers, {designer: worker.id})
+        self.assertEqual(saved.sealed_design_starts, frozenset({reviewer}))
 
     def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
         runner, unit, ordinary = self.tree()

@@ -386,7 +386,7 @@ class SeededQuotaReminderFixture(QuotaReminderFixture):
         root = Path(directory.name).resolve()
         cls.seed, cls.case = root / "seed", root / "case"
         cls.seed.mkdir()
-        _ = fixture_configuration(cls.seed)
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, fixture_configuration(cls.seed))))
         builder = cls()
         builder.root = cls.seed
         QuotaReminderFixture.prepare_files(builder)
