@@ -204,10 +204,9 @@ class GuestNoStartSettled(placement.DispatchPathSettled):
     """The journal proves that this guest claim never started."""
 
 
-def _guest_no_start_proven(claim: placement.ProviderClaimReference) -> bool:
-    """Distinguish no start from a finished run in the guest settlement journal."""
+def _guest_claim_rows(claim: placement.ProviderClaimReference) -> Generator[dict[str, object]]:
+    """Read complete journal rows for this attempt and claim."""
     attempt = execution_identity.attempt_key(claim.episode, claim.attempt)
-    no_start = False
     try:
         with target_config.mac_linux_end_proof_journal().open("rb") as journal:
             for line in journal:
@@ -226,13 +225,46 @@ def _guest_no_start_proven(claim: placement.ProviderClaimReference) -> bool:
                         continue
                 except (ValueError, OverflowError, RecursionError):
                     continue
-                if row.get("result") == "proven":
-                    return False
-                if row.get("result") == "not started":
-                    no_start = True
+                yield row
     except FileNotFoundError:
-        return False
+        return
+
+
+def _guest_no_start_proven(claim: placement.ProviderClaimReference) -> bool:
+    """Distinguish no start from a finished run in the guest settlement journal."""
+    no_start = False
+    for row in _guest_claim_rows(claim):
+        if row.get("result") == "proven":
+            return False
+        if row.get("result") == "not started":
+            no_start = True
     return no_start
+
+
+@dataclass(frozen=True)
+class GuestProbeRoute:
+    ssh_hops: tuple[str, str]
+    guest_user: str
+
+
+def _guest_launch_route(claim: placement.ProviderClaimReference) -> GuestProbeRoute | None:
+    """Read the route if the launch records agree."""
+    routes: set[GuestProbeRoute] = set()
+    for row in _guest_claim_rows(claim):
+        if row.get("result") != "awaiting arm":
+            continue
+        mac, guest, user = row.get("mac_host"), row.get("guest_host"), row.get("guest_user")
+        if not (isinstance(mac, str) and mac and isinstance(guest, str) and guest and isinstance(user, str) and user):
+            return None
+        routes.add(GuestProbeRoute((mac, guest), user))
+    return routes.pop() if len(routes) == 1 else None
+
+
+@dataclass(frozen=True)
+class GuestDispatchPending(placement.DispatchPathPending):
+    """The launch journal identifies the route for this pending dispatch."""
+
+    route: GuestProbeRoute
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -1386,7 +1418,12 @@ class MacDiskRecoveryPendingEvidence(placement.FreshHostEvidence):
 
 
 @dataclass(frozen=True)
-class MacLinuxProbeFailureEvidence(placement.FreshHostEvidence):
+class MacLinuxProbeEvidence(placement.FreshHostEvidence):
+    route: GuestProbeRoute = field(kw_only=True)
+
+
+@dataclass(frozen=True)
+class MacLinuxProbeFailureEvidence(MacLinuxProbeEvidence):
     """The guest probe could not connect or timed out."""
 
 
@@ -1457,7 +1494,7 @@ class HostEvidenceWorker:
         self.interval: float = interval
         self.lock: threading.RLock = threading.RLock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
-        self.guest_outages: dict[str, GuestProbeOutage] = {}
+        self.guest_outages: dict[GuestProbeRoute, GuestProbeOutage] = {}
         self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
         self.dispatch_observations: dict[str, DispatchEvidence] = {}
         self.due: dict[placement.HostEvidenceKey, float] = {key: 0.0}
@@ -1479,20 +1516,28 @@ class HostEvidenceWorker:
     def _publish_evidence(self, evidence: placement.HostEvidence, observed_monotonic: float | None) -> None:
         """Update the outage guard for each probe before the next probe can replace it."""
         self.observations[evidence.key] = evidence
-        destination = evidence.key.destination
-        if observed_monotonic is None or not is_mac_linux_guest(destination):
+        if observed_monotonic is None or not isinstance(evidence, MacLinuxProbeEvidence):
             return
-        outage = self.guest_outages.get(destination.host)
+        outage = self.guest_outages.get(evidence.route)
         if outage is None and isinstance(evidence, MacLinuxProbeFailureEvidence):
-            self.guest_outages[destination.host] = GuestProbeOutage(
+            self.guest_outages[evidence.route] = GuestProbeOutage(
                 MacOutageFence(self.clock.now()), self.clock.monotonic())
-        elif (outage is not None and isinstance(evidence, placement.FreshHostEvidence)
-              and evidence.probe_answered and observed_monotonic > outage.started_monotonic):
-            del self.guest_outages[destination.host]
+        elif outage is not None and evidence.probe_answered and observed_monotonic > outage.started_monotonic:
+            del self.guest_outages[evidence.route]
 
-    def guest_outage(self, host: str) -> GuestProbeOutage | None:
+    def guest_outage(self, route: GuestProbeRoute) -> GuestProbeOutage | None:
         with self.lock:
-            return self.guest_outages.get(host)
+            return self.guest_outages.get(route)
+
+    def guest_outage_for(self, saved: records.SavedPlacementAssignment) -> GuestProbeOutage | None:
+        """Use an outage only when its route matches the attempt's launch route."""
+        assignment = saved.assignment
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        with self.lock:
+            evidence = self.dispatch_observations.get(attempt)
+            if evidence is not None and evidence.saved == saved and isinstance(evidence.result, GuestDispatchPending):
+                return self.guest_outage(evidence.result.route)
+            return None
 
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Keep the attempt until the worker confirms settlement."""
@@ -1652,11 +1697,17 @@ class HostEvidenceWorker:
             if guest:
                 # Record the guest answer before settlement can delay it.
                 self._publish_evidence(evidence, observed_monotonic)
+            read_launch_route = guest and bool(self.guest_outages)
             dispatches = tuple((attempt, probe) for attempt, probe in self.dispatch_probes.items() if probe.key == key)
         dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
         for attempt, probe in dispatches:
             try:
                 result = probe.read()
+                claim = probe.saved.provider
+                if (read_launch_route and isinstance(result, placement.DispatchPathPending)
+                        and isinstance(claim, placement.ProviderClaimReference)
+                        and (route := _guest_launch_route(claim)) is not None):
+                    result = GuestDispatchPending(result.reason, route)
             except Exception:
                 result = placement.DispatchPathPending('The dispatch evidence is unavailable')
             dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, result, self.clock.now(), time.monotonic())))
@@ -5273,15 +5324,18 @@ class AdmissionServer:
         if not isinstance(block, mac_test.NoMacBlock):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("blocked"))
         declined = placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
-        answered = False
         try:
             settings = mac_linux.read_settings(backoff.registry)
-            if settings.ssh_hops[1] != key.destination.host:
-                return placement.FreshHostEvidence(key, started_at, "",
-                    placement.TemporaryExclusion("The configured SSH route names a different guest"))
+        except (OSError, ValueError, mac_linux.GuestUnavailable):
+            return placement.FreshHostEvidence(key, started_at, "", declined)
+        if settings.ssh_hops[1] != key.destination.host:
+            return placement.FreshHostEvidence(key, started_at, "",
+                placement.TemporaryExclusion("The configured SSH route names a different guest"))
+        route = GuestProbeRoute(settings.ssh_hops, settings.guest_user)
+        try:
             _ = mac_linux.read_guest_main(settings, wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
         except (mac_linux.GuestConnectionFailed, subprocess.TimeoutExpired):
-            return MacLinuxProbeFailureEvidence(key, started_at, "", declined)
+            return MacLinuxProbeFailureEvidence(key, started_at, "", declined, route=route)
         except mac_linux.GuestUnavailable as error:
             # A failed command can still prove that the guest answered. SSH exit 255 is ambiguous.
             # Exit 127 for a missing SSH client also clears the guard and keeps the slot held.
@@ -5291,11 +5345,10 @@ class AdmissionServer:
             answered = (message == "the guest main probe returned an invalid commit ID"
                         or message.startswith(prefix) and separator == ":"
                         and status.isascii() and status.isdecimal() and 0 < int(status) < 255)
+            return MacLinuxProbeEvidence(key, started_at, "", declined, route=route, probe_answered=answered)
         except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-        else:
-            return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost(), probe_answered=True)
-        return placement.FreshHostEvidence(key, started_at, "", declined, probe_answered=answered)
+            return placement.FreshHostEvidence(key, started_at, "", declined)
+        return MacLinuxProbeEvidence(key, started_at, "", placement.AllowedHost(), route=route, probe_answered=True)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     claim_path: Path, record: RemoteJobClaim,
@@ -6966,8 +7019,7 @@ done
                 or isinstance(report, placement.TerminalAttemptReport)
                 and isinstance(report.outcome, placement.AttemptCompleted)):
             return False
-        host = assignment.destination.host
-        outage = worker.guest_outage(host)
+        outage = worker.guest_outage_for(saved)
         if outage is None:
             return False
         limit = _guest_wait_limit()
@@ -6976,7 +7028,7 @@ done
                 or owner.host != self.host or owner_may_be_live(self.proc.owner_start(owner.pid), owner.start_time)):
             return False
         with worker.lock:
-            if worker.guest_outage(host) is not outage:
+            if worker.guest_outage_for(saved) is not outage:
                 return False
             loss = placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage.fence.reported_at)
             self._close_lost_attempt(saved, loss, self.clock.now())
