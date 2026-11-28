@@ -2110,7 +2110,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         server.attach_page_screenshot(saved, screenshot.png)
                 if saved.kind == new_item_dialog.SubmissionKind.BUG and (
                         details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
-                    server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
+                    server.finish_bug_evidence(created, main_request, screenshot)
             if not respond_first:
                 self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
         finally:
@@ -3425,12 +3425,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             except (OSError, ValueError, RuntimeError) as error:
                 print(f"review-links screenshot for {target.item_id}: {error}", file=sys.stderr)
 
-    # Keep the Host argument from main. This path uses the staged screenshot.
-    def finish_bug_evidence(
-        self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
-        host: str,  # pyright: ignore[reportUnusedParameter]
-        screenshot: new_item_dialog.SubmissionScreenshot,
-    ) -> None:
+    def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
+                            screenshot: new_item_dialog.SubmissionScreenshot) -> None:
         """Save evidence before delivery and after the response when Send replies first."""
         saved = created.saved
         if (request is not None and request.page_state is not None
