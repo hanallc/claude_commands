@@ -654,6 +654,19 @@ Older files stay in the folder for manual removal.
 The selector keeps cached facts for the current tree and its base tree.
 The current and base graphs share one cache read and one cache update.
 The selector extracts missing base facts only when it builds the base graph for a removed Python file.
+The parent reads the missing source text and sorts it by length, longest first.
+The parent assigns each path to the slice with the lowest total text length.
+`affected.extract.processes` sets the worker count. `config/gate.conf` sets this value to eight.
+The parent starts all workers before it sends any source text.
+Each worker receives its slice and sends one list of indexed results through its own pipe.
+The selector runs serially with one configured process, too few misses, or an OS error during pool startup.
+The pool needs at least twice the configured process count in misses.
+If a worker exits before it sends its complete list, the parent extracts that slice from the saved source text.
+A source read failure ends selection when the graph reaches that path. The parent reports the saved error.
+Spawn keeps the parent’s cache lock and database state out of the workers.
+If the parent exits extraction with an exception, it stops and reaps the workers before it releases the cache lock.
+The parent uses each result or raises its exception in path order.
+The parent builds the graph and publishes the cache.
 Dirty sources never enter the cache or cause cache writes.
 A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
 The nightly-red marker requires the full suite for integrate and test all jobs. Targeted tests keep their selection and reuse rules.
@@ -670,11 +683,13 @@ Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its
 
 Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files, selected in S s`.
 The same line gives cache hits, cache misses, part times, and the cache lock result.
-A hit uses cached facts. A miss counts before the source read.
-The extraction count records each source file that starts extraction.
+A hit uses cached facts. A miss requires a source read.
+The extraction count includes paths that reach extraction after a successful read.
 The counts include current and base graph lookups when selection builds both graphs.
 The times show cache read, extraction, graph build, and other work in seconds to one decimal place.
-Extraction time includes source reads for both graphs.
+Extraction time includes serial reads and extraction in both graphs.
+In pool mode, it includes the wall time of the pool phase once, from startup through worker exit.
+It also includes the wall time of serial reads before the pool and serial extraction for slices that need a retry.
 The lock result shows when selection publishes facts or reads the old snapshot with the lock busy.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.

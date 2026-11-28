@@ -6,22 +6,27 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 import fcntl
 from functools import cache
 from hashlib import sha256
+from heapq import heapreplace
 from importlib.metadata import packages_distributions
 from io import BytesIO
 from itertools import chain
+from multiprocessing import get_context
+from multiprocessing.connection import Connection, wait
+from multiprocessing.process import BaseProcess
 from pathlib import Path, PurePosixPath
 import json
 import os
 import posixpath
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -29,7 +34,7 @@ import tempfile
 from time import monotonic
 from typing import cast
 
-from scripts.lib import conf
+from scripts.lib import cancellation, conf
 from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.test_times.gate_record import (
     ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
@@ -1072,8 +1077,158 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
     return graph
 
 
+def pool_fact_paths(sources: list[str], blobs: dict[str, str], dirty: set[str],
+                    cached: dict[str, SourceFacts]) -> list[str]:
+    """Keep the first path for each uncached blob and every dirty path."""
+    seen: set[str] = set()
+    missing: list[str] = []
+    for path in sources:
+        blob = blobs.get(path) if path not in dirty else None
+        if blob is not None:
+            if blob in cached or blob in seen:
+                continue
+            seen.add(blob)
+        missing.append(path)
+    return missing
+
+
+@contextmanager
+def extraction_time(run: SelectionRun | None) -> Generator[None]:
+    started = monotonic()
+    try:
+        yield
+    finally:
+        if run is not None:
+            run.extraction_s += monotonic() - started
+
+
+type ExtractionResult = SourceFacts | Exception
+type IndexedSource = tuple[int, str, str]
+
+
+def extraction_slices(sources: list[tuple[str, str]], processes: int) -> list[list[IndexedSource]]:
+    slices: list[list[IndexedSource]] = [[] for _ in range(processes)]
+    loads = [(0, 0, index) for index in range(processes)]
+    indexed = [(index, path, text) for index, (path, text) in enumerate(sources)]
+    for item in sorted(indexed, key=lambda source: len(source[2]), reverse=True):
+        length, count, index = loads[0]
+        slices[index].append(item)
+        _ = heapreplace(loads, (length + len(item[2]), count + 1, index))
+    return slices
+
+
+def extract_slice_results(sources: list[IndexedSource]) -> list[tuple[int, ExtractionResult]]:
+    results: list[tuple[int, ExtractionResult]] = []
+    for index, path, source in sources:
+        try:
+            result = extract_facts(source, path)
+        except Exception as error:
+            results.append((index, error))
+        else:
+            results.append((index, result))
+    return results
+
+
+def extract_slice(connection: Connection) -> None:
+    # The parent blocks cancellation while it registers new workers.
+    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
+    with connection:
+        try:
+            sources = cast(list[IndexedSource], connection.recv())
+        except (EOFError, OSError):
+            return
+        connection.send(extract_slice_results(sources))
+
+
+def extract_slices(sources: list[tuple[str, str]], processes: int) -> dict[str, ExtractionResult]:
+    context = get_context("spawn")
+    workers: list[BaseProcess] = []
+    pending: dict[Connection, list[IndexedSource]] = {}
+    results: dict[int, ExtractionResult] = {}
+    joined = False
+    with ExitStack() as pipes:
+        try:
+            try:
+                for batch in extraction_slices(sources, processes):
+                    with cancellation.defer_cleanup_signals():
+                        parent, child = cast(tuple[Connection, Connection], context.Pipe())
+                        with child:
+                            _ = pipes.enter_context(parent)
+                            worker = context.Process(target=extract_slice, args=(child,))
+                            worker.start()
+                            workers.append(worker)
+                        pending[parent] = batch
+            except OSError:
+                return {}
+
+            for connection, batch in list(pending.items()):
+                try:
+                    connection.send(batch)
+                except OSError:
+                    connection.close()
+                    del pending[connection]
+
+            while pending:
+                for connection in cast(list[Connection], wait(pending)):
+                    batch = pending.pop(connection)
+                    with connection:
+                        try:
+                            extracted = cast(list[tuple[int, ExtractionResult]], connection.recv())
+                        except (EOFError, OSError):
+                            # Each pipe has one writer. A short result affects only this slice.
+                            continue
+                    if len(extracted) == len(batch):
+                        results.update(extracted)
+            for worker in workers:
+                worker.join()
+            joined = True
+        finally:
+            with cancellation.defer_cleanup_signals():
+                if not joined:
+                    for worker in workers:
+                        worker.kill()
+                    for worker in workers:
+                        worker.join()
+                for worker in workers:
+                    worker.close()
+    return {path: results[index] for index, (path, _) in enumerate(sources) if index in results}
+
+
+def pooled_fact_reader(paths: list[str], read_source: Callable[[str], str], processes: int,
+                       run: SelectionRun | None) -> Callable[[str], SourceFacts]:
+    prepared: dict[str, str | OSError | UnicodeError] = {}
+    sources: list[tuple[str, str]] = []
+    with extraction_time(run):
+        for path in paths:
+            try:
+                source = read_source(path)
+            except (OSError, UnicodeError) as error:
+                prepared[path] = error
+                break
+            prepared[path] = source
+            sources.append((path, source))
+        results = extract_slices(sources, processes) if len(sources) >= processes * 2 else {}
+
+    def read_facts(path: str) -> SourceFacts:
+        source = prepared[path]
+        if not isinstance(source, str):
+            raise source
+        if run is not None:
+            run.extracted_files += 1
+        result = results.pop(path, None)
+        if isinstance(result, Exception):
+            raise result
+        if result is not None:
+            return result
+        with extraction_time(run):
+            return extract_facts(source, path)
+
+    return read_facts
+
+
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                    cached: dict[str, SourceFacts], *, worktree: bool, run: SelectionRun | None = None
+                    cached: dict[str, SourceFacts], *, worktree: bool, run: SelectionRun | None = None,
+                    processes: int = 1,
                     ) -> SourceGraph:
     bare_modules: dict[str, set[str]] = defaultdict(set)
     for path in paths:
@@ -1084,34 +1239,42 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     if not worktree:
         missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
         if missing:
+            with extraction_time(run):
+                try:
+                    texts = blob_texts(repo, missing)
+                except (GraphError, OSError, ValueError):
+                    if run is not None:
+                        run.cache_misses += len(missing)
+                    raise
+
+    def read_source(path: str) -> str:
+        return (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
+
+    def read_facts(path: str) -> SourceFacts:
+        with extraction_time(run):
+            text = read_source(path)
             if run is not None:
-                run.cache_misses += len(missing)
-            started = monotonic()
-            try:
-                texts = blob_texts(repo, missing)
-            finally:
-                if run is not None:
-                    run.extraction_s += monotonic() - started
+                run.extracted_files += 1
+            return extract_facts(text, path)
+
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
     tokens: dict[str, frozenset[str]] = {}
     config_reads: dict[str, frozenset[str]] = {}
     scan_facts: dict[str, SourceFacts] = {}
+    facts_for_path = read_facts
+    minimum_pool_misses = processes * 2
+    if processes > 1 and len(sources) >= minimum_pool_misses:
+        missing_paths = pool_fact_paths(sources, blobs, dirty, cached)
+        if len(missing_paths) >= minimum_pool_misses:
+            facts_for_path = pooled_fact_reader(missing_paths, read_source, processes, run)
     for path in sources:
         blob = blobs.get(path) if path not in dirty else None
         facts = cached.get(blob) if blob is not None else None
         if facts is None:
-            if worktree and run is not None:
+            if run is not None:
                 run.cache_misses += 1
-            started = monotonic()
-            try:
-                text = (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
-                if run is not None:
-                    run.extracted_files += 1
-                facts = extract_facts(text, path)
-            finally:
-                if run is not None:
-                    run.extraction_s += monotonic() - started
+            facts = facts_for_path(path)
             if blob is not None:
                 cached[blob] = facts
         elif run is not None:
@@ -1393,9 +1556,10 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
+        processes = settings.value("affected.extract.processes", conf.positive_whole)
         with fact_cache(state_dir, run) as cached:
             with run.graph_build():
-                graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True, run=run)
+                graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True, run=run, processes=processes)
             config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
             configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
             recorded = latest_module_reads() if changed else {}
@@ -1417,7 +1581,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             old_graph: dict[str, set[str]] = {}
             if removed:
                 with run.graph_build():
-                    old_graph = graph_for_files(repo, base_paths, base_blobs, set(), cached.facts, worktree=False, run=run).imports
+                    old_graph = graph_for_files(repo, base_paths, base_blobs, set(), cached.facts,
+                                                worktree=False, run=run, processes=processes).imports
             cached.retain(source_blobs(paths | dirty, blobs) | source_blobs(base_paths, base_blobs))
         folder_stems: dict[str, set[str]] = defaultdict(set)
         for source in python:
