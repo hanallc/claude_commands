@@ -276,21 +276,18 @@ def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
                                 settings: models_registry.LaunchSettings) -> list[str]:
     """Apply current model settings and retain the saved resume options."""
     current = resume_launch(entry) if "session_id" not in entry else cast(pane_launch.CurrentLaunch, entry.copy())
-    current.update(kind=settings.kind, session_id=identity, name=name, model=settings.model)
     if settings.kind == "codex":
-        policy = ["-c", f'model_reasoning_effort="{settings.effort}"']
-        if settings.service_tier:
-            policy.extend(("-c", f'service_tier="{settings.service_tier}"'))
+        arguments = ["resume", identity, *models_registry.codex_model_arguments(settings)]
         saved = iter(entry.get("codex_policy", []))
         for option in saved:
             value = next(saved, "")
             if option == "-c" and value.partition("=")[0].strip() in ("model_reasoning_effort", "service_tier"):
                 continue
-            policy.extend((option, value))
-        current["codex_policy"] = policy
+            arguments.extend((option, value))
+        return arguments
+    current.update(kind=settings.kind, session_id=identity, name=name, model=settings.model)
     arguments = _resume_arguments(current, claude_settings=ClaudeResumeSettings(model=settings.model))
-    if settings.kind == "claude":
-        arguments.extend(("--effort", settings.effort))
+    arguments.extend(("--effort", settings.effort))
     return arguments
 
 
