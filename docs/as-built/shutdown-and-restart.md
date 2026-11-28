@@ -261,8 +261,6 @@ Each move and unit attachment acquires the native session lock first.
 If the session has a staff row, the operation also acquires that row lock.
 The move holds both locks through its stop and resume.
 Attachment refuses while a move holds either lock.
-Retired unit recovery holds both locks in the same order before it starts `add_unit --resume`.
-The child verifies both inherited lock descriptors in native-first order.
 The batch verifies each reference and reads the current conversation while it holds the locks.
 References to the same member share one move and receive the same result.
 Only a user command sets the user-command flag:
@@ -397,6 +395,16 @@ Retirement, checkout moves, running-session attach and nix-shell healing use thi
 Retirement reads process facts with the reader for the host that owns the worktree.
 Retirement keeps the recorded pane address and its terminal identity before cleanup.
 The remote retirement journal keeps both identities for completion retries.
+Removal of the retired staff rows permits deletion of the journal.
+If retirement cannot confirm the staff write, it prints a retry command with the staff ID.
+A caller timeout leaves the result unknown. The staff authority can still finish the removal.
+A retry by staff ID reports when the rows are gone and deletes a remaining journal.
+Retirement checks that the checkout is absent before the final origin read.
+One deadline covers both final checks. It uses half the staff operation lock wait limit.
+The deadline applies only to these final checks.
+If a final check times out, retirement keeps the rows and prints the check name and retry command.
+A later change to the checkout folder can escape that check.
+Removal of the staff record preserves the checkout files and Git refs.
 Cleanup excludes only that pane's proved idle shell from the remaining processes.
 After successful retirement, it closes that pane as its last step on the pane's machine.
 It sends no signal to that shell.
@@ -404,8 +412,8 @@ A pane already gone needs no second close.
 Foreground work inside the worktree keeps the process refusal.
 Foreground work outside the worktree keeps the pane open and produces one anomaly line.
 A failed retirement closes no pane.
-Herdr refuses a changed terminal and keeps the new pane and its launch record.
-Retirement reports that mismatch without changing its result.
+If another terminal uses the saved pane ID, retirement keeps that terminal and its launch record.
+Retirement continues cleanup after it detects the replacement terminal.
 The confirmed close retires the pane launch record.
 Unit rename closes the unit's own pane after its ownership checks.
 A pane already gone counts as closed.
@@ -541,7 +549,7 @@ The command removes the producer key after a final read confirms that no open Li
 The staff row keeps the profile in `retired_producer`.
 Active staff lookups omit retired producers.
 The fixed-id lookup supplies their names for closed List items.
-`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+`agents resume NAME` refuses a retired producer.
 
 ### First start
 
@@ -963,9 +971,8 @@ A row leaves the saved list when it starts or already runs.
 `stop_resume.resume` removes a row after a confirmed start while it holds the row lock.
 Upkeep, account moves, watchdog recovery, and named resume share this removal.
 Named resume also removes a row after a successful continuation message.
-Retired recovery removes a row after it proves the resumed native session.
 These removals and restart cleanup occur before the row locks release.
-Native resume, continuation messages, restart, retired recovery, and pruning use `shutdown_record.remove_started`.
+Native resume, continuation messages, restart, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
@@ -983,7 +990,7 @@ The record holds only rows that a restart starts:
 - `restart` removes a saved id with no staff row or a saved worker that `worker.not_restored` names.
 - The report names the removed entry and gives the reason.
 - `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
-- `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
+- Staff removal, `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove IDs with `shutdown_record.forget`.
 - An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.
 `shutdown_record.update` holds the record lock for each change.
 Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.

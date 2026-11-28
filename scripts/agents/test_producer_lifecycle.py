@@ -479,7 +479,7 @@ class ProducerLifecycleTests(unittest.TestCase):
                 self.assertIn("handoff.md exists", output)
             self.assertEqual(send.call_count, 1)
 
-    def test_retirement_requests_handoff_once_moves_open_items_and_restores_the_same_session(self) -> None:
+    def test_retirement_requests_handoff_once_and_moves_open_items(self) -> None:
         row, morty = self.producer("dwight"), self.producer("morty")
         owner = fixture_member("showrunner", name="show")
         destination = self.producer("director")
@@ -622,12 +622,8 @@ class ProducerLifecycleTests(unittest.TestCase):
         self.assertEqual(the_list.load(morty.id, closed.id), closed)
         self.assertIn("dwight | Closed work", the_list.table(morty.id, include_closed=True))
 
-        def resume(identity: str, *, why: str, to: str | None) -> stop_resume.ClaudeUp:
-            del why, to
-            self.assertEqual(staff.snapshot().by_path(row.name), row)
-            self.assertEqual(self.profile(row.name), "claude:sonnet:high")
-            return stop_resume.ClaudeUp(identity, "restored-tab", "claude3")
-
-        with patch.object(stop_resume, "resume", side_effect=resume) as launch:
-            self.assertEqual(command("resume", row.name, "--retired")[0], 0)
-        launch.assert_called_once_with(row.id, why="resumed by name", to=None)
+        with patch.object(stop_resume, "_resume_once") as launch:
+            code, _, errors = command("resume", row.name)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{row.name}: producer is retired", errors)
+        launch.assert_not_called()

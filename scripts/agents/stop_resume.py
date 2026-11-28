@@ -1705,7 +1705,7 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
     record = names.tab_record
     retired = next((row for row in record.retired_producers if session in (row.name, row.id, row.current_session)), None)
     if retired is not None:
-        return ResumeFailed(session, f"{retired.name}: retired; use agents resume {retired.name} --retired")
+        return ResumeFailed(session, f"{retired.name}: producer is retired")
     member = record.by_member_reference(session)
     matches = [row for row in record.rows if row.name == session or row == member]
     candidates = ", ".join(f"{row.name} ({row.id})" for row in matches[:5])
@@ -1713,6 +1713,8 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
         member = matches[0]
+        if isinstance(member.worktree, staff.RemovedWorktree):
+            return ResumeFailed(session, f"{member.name} is retired. Use agents retire {member.id} to remove the record.")
         machine = member_machine(member)
         if machine and machine != remote.local_machine():
             route = remote.machine_alias(machine)

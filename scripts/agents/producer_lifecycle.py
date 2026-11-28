@@ -444,25 +444,3 @@ def _retire(row: staff.StaffRow, record: staff.StaffSnapshot, path: Path, to: st
     _clear_retirement_state(row.id)
     print(f"{row.name}: retired")
     return 0
-
-
-def restore(reference: str, *, to: str | None, why: str) -> stop_resume.ResumeResult:
-    """Restore the saved profile before the conversation resumes."""
-    with staff.slot_operation("producer-lifecycle", reference):
-        record = staff.initial_snapshot()
-        row = lookup(reference, record)
-        if row is None:
-            raise ValueError(f"{reference}: no producer row")
-        _require_local(row)
-        with staff.slot_operation(row.id, row.name):
-            if isinstance(row.retirement, staff.RetiredProducer):
-                _clear_retirement_state(row.id)
-                profile = models_registry.parse_producer_profile(row.retirement.profile)
-                profiles = _profiles()
-                _check_key(row.name, profiles, own=row.name)
-                if row.name in profiles and profiles[row.name] != profile.value():
-                    raise ValueError(f"{row.name}: its producer key has another profile")
-                _ = models_registry.store_producer(row.name, *profile)
-                _ = staff.set_producer_retirement(row.id, staff.Active())
-            _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
-            return stop_resume.resume(row.id, why=why, to=to)

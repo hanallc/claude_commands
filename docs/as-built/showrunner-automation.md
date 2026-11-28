@@ -39,9 +39,10 @@ Callers share one staff snapshot within an operation.
   Status, the board, status reports, waits, and the stall watch exclude retired units.
   `unit_lookup.doc_units(doc, record)` returns every recorded unit in staff order.
   `merge_checkpoint.py`, `ci_points.py`, and `production_lifecycle.py` retain access to retired rows.
-  `agents resume NAME` refuses a retired unit and names `--retired`.
-  `agents resume NAME --retired` restores the worktree, director, and retained workers.
-  The showrunner asks the user yes or no before it runs `--retired`.
+  `agents resume NAME` refuses a retired unit and gives the command to remove its record.
+  For a retired unit, `agents retire NAME` checks the recorded branch in the production checkout and on the fetch origin.
+  It removes the unit and worker rows when both tips are merged or absent.
+  It leaves Git refs and folders in place.
 
 `agents retire NAME` finds the unit and its workers in one staff snapshot.
 It stops each row's `current_session` through `stop_resume.stop`.

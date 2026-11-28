@@ -245,7 +245,7 @@ else:
         def server(log: reboot.RunLog) -> None:
             self.assertEqual(self.events, ["check"])
             commands = (["resume", "alpha"], ["resume", "--production", "alpha"],
-                        ["resume", "alpha", "--retired"], ["resume", "alpha", "--resend-opening-prompt"],
+                        ["resume", "alpha", "--resend-opening-prompt"],
                         ["restart"], ["restart", "--all"], ["restart", "--only", "alpha"],
                         ["add-producer", "alpha"], ["transfer", "alpha"], ["move", "alpha", "claude2"])
             with patch.object(os, "getpid", return_value=os.getpid() + 1):
@@ -260,7 +260,6 @@ else:
 
         with (patch.object(reboot, "stop_server", side_effect=server),
               patch.object(shutdown, "_lifecycle", side_effect=AssertionError("Resume passed the lock")),
-              patch.object(shutdown, "recover_named_unit", side_effect=AssertionError("Recovery passed the lock")),
               patch.object(stop_resume, "_resume", side_effect=AssertionError("Resume passed the lock")),
               patch.object(stop_resume, "resend_producer_opening", side_effect=AssertionError("Resend passed the lock")),
               patch.object(producer_transfer, "transfer", side_effect=AssertionError("Transfer passed the lock")),

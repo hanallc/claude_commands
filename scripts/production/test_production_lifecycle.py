@@ -904,7 +904,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("smoke-launch: ok", passed.stdout)
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
 
-    def test_showrunner_instructions_explain_stop_resume_and_account_move(self) -> None:
+    def test_showrunner_instructions_explain_session_lifecycle(self) -> None:
         commands = Path(__file__).parents[2] / "commands"
         for name in ("showrunner/produce.md", "agents.md"):
             with self.subTest(command=name):
@@ -913,6 +913,13 @@ class LifecycleTests(LifecycleFixture):
                     self.assertIn(command, text)
                 self.assertIn("--why", text)
                 self.assertNotIn("<PauseForMove>", text)
+
+        docs = commands.parent / "docs"
+        restart = (docs / "as-built/shutdown-and-restart.md").read_text(encoding="utf-8")
+        self.assertNotIn("Retired unit recovery holds both locks", restart)
+        self.assertNotIn("Retired recovery removes a row", restart)
+        production = (docs / "production_format.md").read_text(encoding="utf-8")
+        self.assertIn("Removing a retired unit record also removes its worker rows.", production)
 
     def test_produce_names_live_ci_and_smoke_steps(self) -> None:
         command = Path(__file__).parents[2] / "commands/showrunner/produce.md"

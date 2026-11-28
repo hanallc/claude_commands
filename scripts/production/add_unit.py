@@ -1352,7 +1352,7 @@ def checked_unit_member(production: Production, unit: str,
             raise Refusal(f"{unit}: native session conflicts with retained staff identity")
     if isinstance(found, staff_sources.MemberFound):
         if isinstance(found.row.worktree, staff.RemovedWorktree):
-            raise Refusal(f"unit {unit} is retired; resume that unit, or remove it for good to free the name")
+            raise Refusal(f"unit {unit} is retired. Use agents retire {found.row.id} to remove the record.")
         if found.row.parent != staff.ReportsTo(production.owner.id):
             owner = record.by_id(found.row.parent.id) if isinstance(found.row.parent, staff.ReportsTo) else None
             if owner is None or owner.kind != "showrunner":
@@ -1367,7 +1367,7 @@ def ensure_staff_unit(production: Production, unit: str, *,
                       runtime_id: str = "",
                       record: staff.StaffSnapshot | None = None,
                       unit_type: staff.UnitType | None = None) -> staff.StaffRow:
-    """Admit a unit with its location; only agents resume --retired reactivates a removed row."""
+    """Admit a unit with its location."""
     record = staff.initial_snapshot() if record is None else record
     found = checked_unit_member(production, unit, record,
                                 identity=session_staff.LiveSession(runtime_id) if runtime_id else session_staff.NO_SESSION)
@@ -1406,7 +1406,6 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--model", default="")
     _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
-    _ = parser.add_argument("--join-recovery-locks", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
@@ -1416,8 +1415,7 @@ def _main(argv: list[str]) -> int:
 
         request = launch_request(args)
         session = request.session
-        with (staff.session_operation(session.session_id, native_key=moves.native_row_key(session.session_id),
-                                      join_recovery=cast(bool, args.join_recovery_locks))
+        with (staff.session_operation(session.session_id, native_key=moves.native_row_key(session.session_id))
               if isinstance(session, ResumedSession) else staff.row_operation(request.unit_id)) as locked:
             identity_record = locked if isinstance(locked, staff.StaffSnapshot) else staff.initial_snapshot()
             request = launch_request(args, record=identity_record)

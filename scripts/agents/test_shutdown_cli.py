@@ -5,7 +5,6 @@ import fcntl
 import io
 import json
 import math
-import multiprocessing
 import os
 import re
 import shlex
@@ -16,12 +15,11 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
 from enum import Enum
-from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest import mock
@@ -51,10 +49,10 @@ from scripts.lib.git_test_support import fixture_git_environment as shared_fixtu
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.message import session_records, sessions, session_send
+from scripts.message import roster, session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import (
-    unit_lookup, unit_move, staff, staff_test_support, unit_config, add_unit, completion_receipt, worker,
+    unit_lookup, unit_move, staff, staff_test_support, unit_config, worker,
     production_admission, production_doc, production_lifecycle, rename_unit_test_support, update_registration,
 )
 from scripts.production.production_doc import Production, Refusal, read_production
@@ -69,7 +67,6 @@ from scripts.production.staff_test_support import (
     SharedStaffOwner, StaffTestCase,
     fixture_runtime_id,
     CHECKOUT,
-    unit_membership,
 )
 from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
@@ -925,17 +922,23 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             self.assertTrue(tree.exists())
         self.assertTrue(self.worktree.is_dir())
 
-    def test_retirement_retry_removes_a_tree_kept_while_busy(self) -> None:
+    def test_retired_record_removal_preserves_a_tree_kept_while_busy(self) -> None:
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
-        code, output = self.retire()
+        with mock.patch.object(copies, "remove_trees") as remove_trees:
+            code, output = self.retire()
+            self.assertEqual(code, 1, output)
+            self.assertIn(f"checkout {self.worktree} still exists", output)
+            self.assertIsInstance(self.unit_worktree(), staff.RemovedWorktree)
+            _ = git(self.checkout, "worktree", "remove", "--force", str(self.worktree))
+            code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn("unchanged", output)
+        self.assertIn("retired record removed", output)
+        remove_trees.assert_not_called()
         self.assertTrue(tree.exists())
-        self.assertEqual(build_folders.build_folder_state(tree), "free")
 
     def park_without_worktree(self) -> None:
         row = staff.by_id(self.unit_staff_id)
@@ -944,31 +947,35 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree,
             staff.ParkedBranch("alpha-branch")), expected=row.worktree)
 
-    def test_recovery_recreates_the_checkout_after_manual_removal(self) -> None:
-        base = git(self.checkout, "rev-parse", "main")
-        record = worktrees.new_record(self.worktree, "alpha-branch", self.checkout, base, "alpha", "main")
-        record_path = worktree_records.record_file(self.worktree)
-        worktrees.write_record(record)
-        code, output = self.retire()
-        self.assertEqual(code, 0, output)
-        self.assertTrue(self.worktree.is_dir())
-        _ = git(self.checkout, "worktree", "remove", "--force", str(self.worktree))
-        code, output = self.retire()
-        self.assertEqual(code, 0, output)
-        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(worktree_records.read_record(record_path), record)
-
-        unit = shutdown.recovery_find_unit("alpha", str(self.unit_staff_id))
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        self.assertEqual(shutdown.recovery_refusals(unit), [])
-        with redirect_stdout(io.StringIO()):
-            shutdown.recovery_make_worktree(unit)
-
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), record.branch)
-        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), base)
-        layout = worktrees.output_record("origin", "alpha", "worktree")
-        self.assertEqual(worktree_records.read_record(record_path), replace(record, layout=layout))
-        self.assertEqual((self.worktree / "target").readlink(), layout.output)
+    def test_resume_of_a_retired_unit_names_retire_before_dispatch(self) -> None:
+        self.park_without_worktree()
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        before = self.staff.staff_file.read_bytes()
+        for name in (row.name, str(row.id), row.current_session):
+            with (self.subTest(name=name), mock.patch.object(stop_resume, "resume") as start,
+                  mock.patch.object(shutdown, "unit_machine_is_local", return_value=False),
+                  mock.patch.object(shutdown, "run_remote") as forward):
+                output = io.StringIO()
+                with redirect_stderr(output):
+                    code = shutdown.main(["resume", name])
+                self.assertEqual(code, 2)
+                self.assertIn(f"{row.name} is retired. Use agents retire {row.id} to remove the record.", output.getvalue())
+                start.assert_not_called()
+                forward.assert_not_called()
+        self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        self.assertEqual(self.calls, [])
+        hint = f"Use agents retire {row.id} to remove the record."
+        self.assertEqual(stop_resume.resume(row.id), stop_resume.ResumeFailed(row.id, f"{row.name} is retired. {hint}"))
+        producer = fixture_member("producer", name=row.name)
+        _ = self.stop_session(DIRECTOR)
+        _ = self.stop_session(SEAT)
+        command = output.getvalue().split("Use ", 1)[1].split(" to remove", 1)[0]
+        result = io.StringIO()
+        with redirect_stdout(result), redirect_stderr(result):
+            self.assertEqual(shutdown.main(command.split()[1:]), 0, result.getvalue())
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual(staff.by_id(producer.id), producer)
 
     def test_retirement_refuses_a_rebase_in_the_main_checkout(self) -> None:
         branch = "refs/heads/alpha-branch"
@@ -1010,16 +1017,333 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(code, 0, output)
         self.assertTrue(stale.is_dir())
 
-    def test_retirement_retry_preserves_the_remote_branch_if_local_deletion_fails(self) -> None:
-        self.park_without_worktree()
-        branch = "refs/heads/alpha-branch"
-        tip = git(self.checkout, "rev-parse", branch)
-        _ = git(self.checkout, "checkout", "alpha-branch")
-        code, output = self.retire()
+    def test_retired_record_removal_checks_each_branch_tip_and_preserves_refs(self) -> None:
+        cases = (
+            ("merged", ""),
+            ("absent", ""),
+            ("origin merge", ""),
+            ("squashed", ""),
+            ("local unmerged", "unmerged commits on alpha-branch (local)"),
+            ("origin unmerged", "unmerged commits on alpha-branch (origin)"),
+            ("local unreadable", "cannot read local branch alpha-branch"),
+            ("origin unreadable", "cannot read origin branch alpha-branch"),
+            ("local unmerged and origin unreadable", "unmerged commits on alpha-branch (local)"),
+            ("origin unmerged and local unreadable", "unmerged commits on alpha-branch (origin)"),
+            ("unrecorded", "the retired record has no branch"),
+            ("peer checkout remains", "still exists on mac"),
+            ("peer unreachable", "cannot reach mac"),
+            ("peer unmerged", "unmerged commits on alpha-branch (mac)"),
+            ("peer checkout record is missing", "no recorded repository for checkout"),
+            ("local checkout returns during liveness check", "still exists on"),
+            ("peer checkout returns during liveness check", "still exists on mac"),
+            ("peer checkout request changes the origin tip", "origin branch alpha-branch changed before record removal"),
+            ("origin changes during liveness check", "origin branch alpha-branch changed before record removal"),
+            ("local origin timeout keeps the rows", "Origin branch alpha-branch check did not finish in time"),
+            ("remote origin timeout keeps the rows", "Origin branch alpha-branch check did not finish in time"),
+            ("peer checkout timeout keeps the rows", "Checkout absence check did not finish in time"),
+            ("caller times out after record removal", ""),
+            ("caller loses SSH after record removal", ""),
+            ("caller receives invalid JSON after record removal", ""),
+            ("caller receives an invalid result after record removal", ""),
+            ("retry reaches the authority after record removal", ""),
+            ("record removal uses a ten second staff timeout", ""),
+        )
+        for scenario, refusal in cases:
+            with self.subTest(scenario=scenario):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    case.park_without_worktree()
+                    origin = case.root / "origin.git"
+                    ref = "refs/heads/alpha-branch"
+                    base = git(origin, "rev-parse", "main")
+                    tip = git(origin, "rev-parse", ref)
+                    checkout_returns = "checkout returns" in scenario
+                    missing_peer_record = scenario == "peer checkout record is missing"
+                    origin_changes_during_checkout = scenario == "peer checkout request changes the origin tip"
+                    unconfirmed_removal = scenario.startswith("caller ")
+                    already_removed = scenario == "retry reaches the authority after record removal"
+                    short_staff_timeout = scenario == "record removal uses a ten second staff timeout"
+                    slow_final_check = scenario.endswith("timeout keeps the rows")
+                    peer_checkout = scenario.startswith("peer") or scenario == "remote origin timeout keeps the rows"
+                    if peer_checkout:
+                        location = case.unit_worktree()
+                        assert isinstance(location, staff.RemovedWorktree)
+                        _ = staff.set_worktree(case.unit_staff_id, replace(location, machine="mac"), expected=location)
+                        if scenario == "peer checkout remains":
+                            case.worktree.mkdir()
+                        elif scenario == "peer unmerged":
+                            _ = git(case.checkout, "push", "-q", "origin", "main")
+                            peer = case.root / "mac-checkout"
+                            _ = git(case.root, "clone", "-q", "--branch", "alpha-branch", str(origin), str(peer))
+                            _ = (peer / "work.txt").write_text("Work only on the Mac\n")
+                            _ = git(peer, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                    "commit", "-qam", "Mac work")
+                            _ = git(case.checkout, "update-ref", "-d", ref, tip)
+                            _ = git(origin, "update-ref", "-d", ref, tip)
+                            worktrees.write_record(worktrees.new_record(
+                                case.worktree, "alpha-branch", peer, base, "alpha", "main"))
+                        elif checkout_returns or origin_changes_during_checkout or slow_final_check:
+                            worktrees.write_record(worktrees.new_record(
+                                case.worktree, "alpha-branch", case.checkout, base, "alpha", "main"))
+                        elif missing_peer_record:
+                            _ = git(case.checkout, "update-ref", "-d", ref, tip)
+                            _ = git(origin, "update-ref", "-d", ref, tip)
+                    if scenario == "merged":
+                        _ = git(case.checkout, "checkout", "alpha-branch")
+                    if scenario == "absent":
+                        _ = git(case.checkout, "update-ref", "-d", ref, tip)
+                        _ = git(origin, "update-ref", "-d", ref, tip)
+                        _ = git(origin, "update-ref", f"refs/heads/archive/{ref}", tip)
+                    if scenario == "origin merge":
+                        _ = git(case.checkout, "push", "-q", "origin", "main")
+                        _ = git(case.checkout, "reset", "--hard", base)
+                    if scenario == "squashed":
+                        _ = git(case.checkout, "reset", "--hard", base)
+                        _ = git(case.checkout, "merge", "--squash", "alpha-branch")
+                        _ = git(case.checkout, "commit", "-qm", "Squash alpha")
+                    if "local unmerged" in scenario:
+                        _ = git(case.checkout, "checkout", "alpha-branch")
+                        _ = (case.checkout / "work.txt").write_text("Unmerged local work\n")
+                        _ = git(case.checkout, "commit", "-qam", "Local work")
+                        _ = git(case.checkout, "checkout", "main")
+                    if "origin unmerged" in scenario:
+                        writer = case.root / "writer"
+                        _ = git(case.root, "clone", "-q", "--branch", "alpha-branch", str(origin), str(writer))
+                        _ = (writer / "work.txt").write_text("Unmerged origin work\n")
+                        _ = git(writer, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                "commit", "-qam", "Origin work")
+                        _ = git(writer, "push", "-q", "origin", "alpha-branch")
+                        _ = git(case.checkout, "remote", "set-url", "--push", "origin", str(case.root / "absent.git"))
+                    if "local unreadable" in scenario:
+                        write_text_atomic(case.checkout / ".git" / ref, "invalid reference\n")
+                    if scenario == "unrecorded":
+                        location = case.unit_worktree()
+                        assert isinstance(location, staff.RemovedWorktree)
+                        _ = staff.set_worktree(case.unit_staff_id, replace(location, branch=staff.BranchUnrecorded()),
+                                               expected=location)
+
+                    _ = git(case.checkout, "config", "fetch.prune", "true")
+                    _ = git(case.checkout, "update-ref", "refs/remotes/origin/stale", base)
+                    local_refs = git(case.checkout, "for-each-ref")
+                    origin_refs = git(origin, "for-each-ref")
+                    record = staff.snapshot()
+                    members = record.find(kind="worker", parent=case.unit_staff_id)
+                    staff.defer_retire((case.unit_staff_id,))
+                    _ = case.stop_session(DIRECTOR)
+                    _ = case.stop_session(SEAT)
+                    case.calls.clear()
+                    require_stopped = staff.require_stopped
+
+                    def change_origin() -> None:
+                        nonlocal origin_refs
+                        changed = git(origin, "commit-tree", "main^{tree}", "-p", tip, "-m", "New tip")
+                        _ = git(origin, "update-ref", ref, changed, tip)
+                        origin_refs = git(origin, "for-each-ref")
+
+                    def change_facts_after_stop_check(identity: staff.StaffId) -> None:
+                        require_stopped(identity)
+                        if identity == members[-1].id:
+                            if checkout_returns:
+                                case.worktree.mkdir()
+                            else:
+                                change_origin()
+
+                    def peer_request(args: list[str], stdin: str = "",
+                                     limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT, *,
+                                     propagate_timeout: bool = False) -> tuple[int, str]:
+                        del propagate_timeout
+                        result = case.remote_call(args, stdin=stdin, limit=limit)
+                        if origin_changes_during_checkout and args[0] == "_retired-checkout-absent":
+                            change_origin()
+                        return result
+
+                    def run(argv: list[str], cwd: Path | None = None, *,
+                            settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                            ) -> subprocess.CompletedProcess[str]:
+                        if "origin unreadable" in scenario and argv[3:] == [
+                            "ls-remote", "--exit-code", "--heads", "origin", ref,
+                        ]:
+                            return subprocess.CompletedProcess(argv, 128, "", "origin is unavailable")
+                        return case.fake_run(argv, cwd=cwd, settings=settings)
+
+                    with ExitStack() as checks:
+                        _ = checks.enter_context(mock.patch.object(shutdown, "retirement_run", side_effect=run))
+                        if peer_checkout:
+                            if scenario == "peer unreachable":
+                                _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", return_value=(255, "")))
+                            else:
+                                _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", side_effect=peer_request))
+                        guess_clone = checks.enter_context(mock.patch.object(worktree_records, "main_checkout_for_word",
+                            return_value=case.checkout))
+                        if scenario.endswith("during liveness check"):
+                            _ = checks.enter_context(mock.patch.object(staff, "require_stopped",
+                                side_effect=change_facts_after_stop_check))
+                        if peer_checkout and (
+                            checkout_returns or origin_changes_during_checkout or slow_final_check
+                        ):
+                            _ = checks.enter_context(mock.patch.object(roster, "peer_snapshot",
+                                return_value=roster.Roster([], [])))
+                        if unconfirmed_removal or already_removed or short_staff_timeout:
+                            code, output = case.retire_through_authority(tip, scenario)
+                        elif slow_final_check:
+                            code, output = case.retire_with_slow_final_check(tip, scenario)
+                        else:
+                            code, output = case.retire()
+                    authority_refusal = (scenario.endswith("during liveness check") or origin_changes_during_checkout
+                                         or slow_final_check)
+                    expected_code = 2 if authority_refusal else int(bool(refusal))
+                    case.assertEqual(code, expected_code, output)
+                    if missing_peer_record:
+                        guess_clone.assert_not_called()
+                    confirmed = "staff record is absent" if unconfirmed_removal or already_removed else "retired record removed"
+                    case.assertIn(refusal or confirmed, output)
+                    if slow_final_check:
+                        case.assertIn(f"{refusal}. Run agents retire {case.unit_staff_id} again.", output)
+                        case.assertNotIn("removal", output)
+                        case.assertNotIn("removed", output)
+                    if refusal.startswith("unmerged"):
+                        case.assertNotIn("cannot read", output)
+                    case.assertEqual(staff.by_id(case.unit_staff_id), record.by_id(case.unit_staff_id) if refusal else None)
+                    case.assertTrue(members)
+                    for member in members:
+                        case.assertEqual(staff.by_id(member.id), member if refusal else None)
+                    case.assertEqual(staff.snapshot().pending_retire, (case.unit_staff_id,) if refusal else ())
+                    case.assertEqual(git(case.checkout, "for-each-ref"), local_refs)
+                    case.assertEqual(git(origin, "for-each-ref"), origin_refs)
+                    case.assertEqual(case.worktree.exists(), scenario == "peer checkout remains" or checkout_returns)
+                    case.assertEqual(case.calls, [])
+                finally:
+                    case.doCleanups()
+
+        with self.subTest(scenario="unused staff id reports absence"):
+            unused = fixture_runtime_id("TEST-unused-retired-unit")
+            before = staff.snapshot().rows
+            with (mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                code = shutdown.main(["retire", unused])
+            self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                             (0, f"{unused}: staff record is absent\n", ""))
+            self.assertEqual(staff.snapshot().rows, before)
+
+    def retire_with_slow_final_check(self, tip: str, scenario: str) -> tuple[int, str]:
+        _ = self.staff.staff_config(lock_seconds=2)
+        remove = staff.remove_retired_unit
+        run = subprocess.run
+        read_origin = shutdown.retired_origin_tip_at
+        read_peer = shutdown.run_remote
+        writers: list[subprocess.Popen[str]] = []
+        writer_id = fixture_runtime_id("other-staff-writer")
+        local_origin = scenario.startswith("local")
+        remote_origin = scenario.startswith("remote")
+        peer_command = "_retired-checkout-absent" if scenario.startswith("peer") else "_retired-origin-tip"
+        peer_limits: dict[str, float] = {}
+
+        def slow_reply(argv: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            started = time.monotonic()
+            self.assertEqual(writers, [])
+            with self.staff.lock_notice(self.staff.staff_file.with_name("operation.lock")) as listener:
+                writer = self.staff.start_script(Path(staff.__file__), "ensure", "showrunner",
+                                                 "--name=other-writer", f"--runtime-id={writer_id}")
+                writers.append(writer)
+                self.staff.assert_operation_blocks(writer, listener)
+            _ = run([sys.executable, "-c", "import time; time.sleep(3)"],
+                    timeout=timeout - (time.monotonic() - started), check=True)
+            if local_origin:
+                output = f"{tip}\trefs/heads/alpha-branch\n"
+            else:
+                output = "rc=0\n" if scenario.startswith("peer") else f"{json.dumps(tip)}\nrc=0\n"
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+        def slow_origin(checkout: Path, branch: str) -> str | staff.OriginBranchAbsent:
+            with (mock.patch.object(subprocess, "run", side_effect=slow_reply),
+                  mock.patch.object(shutdown, "retirement_run", new=RUN_COMMAND)):
+                return read_origin(checkout, branch)
+
+        def slow_peer(args: list[str], stdin: str = "", limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT, *,
+                      propagate_timeout: bool = False) -> tuple[int, str]:
+            if args[0] in ("_retired-checkout-absent", "_retired-origin-tip") and limit["kind"] == "time limit":
+                peer_limits[args[0]] = limit["seconds"]
+            if args[0] != peer_command:
+                if args[0] == "_retired-checkout-absent":
+                    time.sleep(0.1)
+                return read_peer(args, stdin, limit)
+            with mock.patch.object(subprocess, "run", side_effect=slow_reply):
+                if propagate_timeout:
+                    return remote.run_remote(args, stdin, limit, propagate_timeout=True)
+                return remote.run_remote(args, stdin, limit)
+
+        def remove_on_authority(row: staff.StaffRow, origin: staff.RetiredUnitOrigin) -> staff.RetiredUnitRemoval:
+            if remote_origin:
+                origin = replace(origin, machine="mac")
+            return remove(row, origin)
+
+        check = (mock.patch.object(shutdown, "retired_origin_tip_at", side_effect=slow_origin) if local_origin
+                 else mock.patch.object(shutdown, "run_remote", side_effect=slow_peer))
+        with check, mock.patch.object(staff, "remove_retired_unit", side_effect=remove_on_authority):
+            code, output = self.retire()
+        self.assertEqual(len(writers), 1, output)
+        writer = writers[0]
+        written, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(writer.returncode, 0, written + errors)
+        self.assertIsNotNone(staff.by_current_session(writer_id))
+        if remote_origin:
+            self.assertLessEqual(peer_limits["_retired-origin-tip"], peer_limits["_retired-checkout-absent"] - 0.1)
+        return code, output
+
+    def retire_through_authority(self, tip: str, scenario: str) -> tuple[int, str]:
+        remove = staff.remove_retired_unit
+        short_timeout = scenario == "record removal uses a ten second staff timeout"
+
+        def authority_reply(argv: list[str], request: str) -> subprocess.CompletedProcess[str]:
+            with (mock.patch.object(staff, "is_owner", return_value=True),
+                  mock.patch.object(staff, "remove_retired_unit", new=remove),
+                  mock.patch.object(sys, "stdin", io.StringIO(request)),
+                  mock.patch.object(staff, "require_stopped"),
+                  mock.patch.object(shutdown, "retired_origin_tip_at", return_value=tip),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                code = staff.main(shlex.split(argv[-1])[2:])
+            return subprocess.CompletedProcess(argv, code, output.getvalue(), errors.getvalue())
+
+        def request(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+            self.assertEqual(timeout, 10.0 if short_timeout else 20.0)
+            reply = authority_reply(argv, input)
+            self.assertEqual(reply.returncode, 0, reply.stderr)
+            match scenario:
+                case "caller times out after record removal":
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                case "caller loses SSH after record removal":
+                    return subprocess.CompletedProcess(argv, 255, "", "Connection closed")
+                case "caller receives invalid JSON after record removal":
+                    return subprocess.CompletedProcess(argv, 0, "Incomplete reply", "")
+                case "caller receives an invalid result after record removal":
+                    return subprocess.CompletedProcess(argv, 0, "{}", "")
+                case "retry reaches the authority after record removal":
+                    return authority_reply(argv, input)
+                case _:
+                    return reply
+
+        def remove_through_authority(row: staff.StaffRow, origin: staff.RetiredUnitOrigin) -> staff.RetiredUnitRemoval:
+            with (mock.patch.object(staff, "is_owner", return_value=False),
+                  mock.patch.object(subprocess, "run", side_effect=request)):
+                return remove(row, origin)
+
+        environment: dict[str, str] = {}
+        if short_timeout:
+            config = self.root / "short-staff.conf"
+            write_text_atomic(config, SHUTDOWN_FIXTURE_SETTINGS["staff"].replace("remote_seconds=20", "remote_seconds=10"))
+            environment["STAFF_CONFIG"] = str(config)
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(staff, "remove_retired_unit", side_effect=remove_through_authority)):
+            code, output = self.retire()
+        if not scenario.startswith("caller "):
+            return code, output
         self.assertEqual(code, 1, output)
-        self.assertIn("cannot delete branch 'alpha-branch' used by worktree", output)
-        self.assertEqual(git(self.checkout, "rev-parse", branch), tip)
-        self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
+        self.assertIn(f"retired record removal result is not confirmed. Run agents retire {self.unit_staff_id} again.", output)
+        self.assertIsNone(staff.by_id(self.unit_staff_id))
+        with mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call):
+            return self.retire()
 
     def test_retirement_refuses_a_failed_worktree_scan_before_inspecting_git_files(self) -> None:
         def fail_scan(argv: list[str], cwd: Path | None = None, *,
@@ -1319,8 +1643,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             code = shutdown.main(["retire", str(self.unit_staff_id), *arguments])
         return code, output.getvalue()
 
-    def remote_call(self, args: list[str], stdin: str = "", limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
-        del limit
+    def remote_call(self, args: list[str], stdin: str = "", limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT, *,
+                    propagate_timeout: bool = False) -> tuple[int, str]:
+        del limit, propagate_timeout
         output = io.StringIO()
         receiver = "mac"
         row = staff.by_id(self.unit_staff_id)
@@ -1351,7 +1676,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         return row.worktree
 
 
-    def test_retirement_without_saved_work_still_records_the_staff_identity(self) -> None:
+    def test_retirement_keeps_the_staff_row_until_the_next_retire(self) -> None:
         for step, machine in (("complete", "natedev"), ("staff", "natedev"),
                               ("retention", "natedev"), ("retention", "mac")):
             with self.subTest(step=step, machine=machine):
@@ -1387,9 +1712,13 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             _ = case.retire()
                         self.assertEqual(stopped.exception.code, 91)
                     code, output = case.retire()
-                    self.assertEqual(code, 0, output)
-                    self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(
-                        remote.local_machine(), case.worktree, staff.ParkedBranch("alpha-branch"))))
+                    self.assertEqual(code, 0 if step == "complete" else 1, output)
+                    if step == "complete":
+                        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(
+                            remote.local_machine(), case.worktree, staff.ParkedBranch("alpha-branch"))))
+                    else:
+                        self.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                        self.assertIn("still exists", output)
                     self.assertIn(str(case.worktree), git(case.checkout, "worktree", "list", "--porcelain"))
                     self.assertIn("alpha-branch", git(case.checkout, "branch", "--list", "alpha-branch"))
                     published = git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch")
@@ -1532,12 +1861,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                           mock.patch.object(case.pane_world, "close_retained_pane", side_effect=close_last),
                           mock.patch.object(process_group, "send_process_group") as send):
                         code, output = case.retire()
-                        if succeeds:
-                            rerun_code, rerun_output = case.retire()
-                            case.assertEqual(rerun_code, 0, rerun_output)
-                            case.assertNotIn("pane close failed", rerun_output)
-                            if closes:
-                                case.assertNotIn("anomaly:", rerun_output)
                     send.assert_not_called()
                     case.assertEqual(case.pane_world.signals, [])
                     case.assertEqual(code, 0 if succeeds else 1, output)
@@ -1579,6 +1902,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     observed = pane_record.launch("w1:p1", other.current_session, str(case.root),
                                                  {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
                     replacement = pane_launch.retained_launch(observed, staff.snapshot())
+                    journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
                     remove = shutdown.retirement_remove
                     def replace_after_cleanup(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
                         result = remove(unit, settings=settings)
@@ -1588,6 +1912,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         pane_record.write("alpha", observed)
                         return result
                     with (mock.patch.object(shutdown, "retirement_remove", side_effect=replace_after_cleanup),
+                          mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], [])),
                           mock.patch.object(process_group, "send_process_group") as send):
                         if journal_retry:
                             unit = shutdown.retirement_find_unit("alpha", str(row.id))
@@ -1595,20 +1920,25 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                                                   merge_branch=unit.production.merge_branch,
                                                                   zone=unit.production.zone.key)
                             case.assertEqual(result["code"], 0, result["output"])
-                            _ = staff.set_worktree(row.id, staff.RemovedWorktree(machine, case.worktree), expected=row.worktree)
-                            journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                            _ = staff.set_worktree(row.id, staff.RemovedWorktree(
+                                machine, case.worktree, staff.ParkedBranch(result.get("branch", ""))), expected=row.worktree)
                             case.assertTrue(journal.exists())
+                            case.assertTrue(case.worktree.is_dir())
+                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
                         code, output = case.retire()
                     send.assert_not_called()
                     case.assertEqual(code, 0, output)
                     case.assertEqual(case.pane_world.closed, [])
                     case.assertEqual(pane_record.read("alpha").get("w1:p1"), replacement)
                     case.assertEqual(case.pane_world.locations["w1:p1"]["terminal_id"], "TEST-new-terminal")
-                    case.assertEqual(output.count("anomaly:"), 1, output)
-                    case.assertIn("alpha:w1:p1: pane close failed", output)
-                    case.assertIn("terminal identity changed", output)
-                    case.assertTrue(case.worktree.is_dir())
-                    case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                    case.assertIn("alpha:w1:p1: terminal identity changed. The replacement terminal stays open.", output)
+                    if journal_retry:
+                        case.assertFalse(journal.exists())
+                        case.assertIn("retired record removed", output)
+                        case.assertIsNone(staff.by_id(row.id))
+                    else:
+                        case.assertTrue(case.worktree.is_dir())
+                        case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                 finally:
                     case.doCleanups()
 
@@ -1930,7 +2260,8 @@ fi
 
 
     def test_remote_retirement_retries_failed_steps_without_retiring_the_staff_row(self) -> None:
-        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal", "journal removal"):
+        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal",
+                        "journal removal", "checkout remains before journal removal", "journal removal then retry"):
             with self.subTest(failure=failure):
                 case = RetireUnitTests()
                 case.setUp()
@@ -1975,24 +2306,48 @@ fi
                             case.assertEqual(case.stops()[:2], [["stop_resume.stop", DIRECTOR], ["stop_resume.stop", SEAT]])
                             case.assertNotEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
                             continue
-                        if failure == "journal removal":
+                        if failure in ("journal removal", "checkout remains before journal removal", "journal removal then retry"):
                             unlink = Path.unlink
                             journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                            journal_removal_fails = failure != "checkout remains before journal removal"
                             def refuse_journal(path: Path, missing_ok: bool = False) -> None:
                                 if path == journal:
-                                    case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
-                                    raise PermissionError("fixture journal removal failed")
+                                    case.assertIsNone(staff.by_id(row.id))
+                                    if journal_removal_fails:
+                                        raise PermissionError("fixture journal removal failed")
                                 unlink(path, missing_ok=missing_ok)
-                            with mock.patch.object(Path, "unlink", refuse_journal):
+                            check_branch = shutdown.check_peer_retired_branch
+                            def check_with_journal(location: staff.RemovedWorktree, saved: dict[str, object] | None,
+                                                   merge_tips: list[str]) -> None:
+                                case.assertTrue(journal.exists())
+                                check_branch(location, saved, merge_tips)
+                            with (mock.patch.object(Path, "unlink", refuse_journal),
+                                  mock.patch.object(shutdown, "check_peer_retired_branch", side_effect=check_with_journal),
+                                  mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], []))):
+                                code, output = case.retire()
+                                case.assertEqual(code, 0, output)
+                                case.assertNotIn("anomaly:", output)
+                                case.assertTrue(journal.exists())
+                                before = case.stops()
+                                code, output = case.retire()
+                                case.assertEqual(code, 1, output)
+                                case.assertIn("still exists on mac", output)
+                                case.assertTrue(journal.exists())
+                                _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
                                 code, output = case.retire()
                             case.assertEqual(code, 0, output)
-                            case.assertEqual(output.count("anomaly:"), 1, output)
-                            case.assertIn("fixture journal removal failed", output)
-                            case.assertTrue(journal.exists())
-                            before = case.stops()
-                            case.assertEqual(case.retire(), (0, "unchanged\n"))
+                            case.assertIn("retired record removed", output)
+                            case.assertEqual(journal.exists(), journal_removal_fails)
+                            if journal_removal_fails:
+                                case.assertEqual(output.count("anomaly:"), 1, output)
+                                case.assertIn("fixture journal removal failed", output)
                             case.assertEqual(case.stops(), before)
-                            case.assertFalse(journal.exists())
+                            case.assertIsNone(staff.by_id(row.id))
+                            if failure == "journal removal then retry":
+                                code, output = case.retire()
+                                case.assertEqual(code, 0, output)
+                                case.assertIn("retirement journal removed", output)
+                                case.assertFalse(journal.exists())
                             continue
                         code, output = case.retire()
                     case.assertNotEqual(code, 0, output)
@@ -2021,10 +2376,7 @@ fi
                     case.assertEqual(code, 0, output)
                     case.assertEqual(case.worktree.is_dir(), failure != "origin")
                     case.assertEqual(case.unit_worktree(), staff.RemovedWorktree("mac", case.worktree, staff.ParkedBranch("alpha-branch")))
-                    case.assertFalse(journal.exists())
-                    before = case.stops()
-                    case.assertEqual(case.retire(), (0, "unchanged\n"))
-                    case.assertEqual(case.stops(), before)
+                    case.assertTrue(journal.exists())
                 finally:
                     case.doCleanups()
 
@@ -2125,691 +2477,6 @@ fi
         self.assertFalse(copies.remote_record_path(mirror).exists())
 
 @final
-class ResumeUnitTests(ShutdownRepositoryFixture):
-    def test_retired_resume_passes_the_selected_account_to_the_launcher(self) -> None:
-        code, output = self.resume("--to", "claude3")
-        self.assertEqual(code, 0, output)
-        command = self.calls[-1]
-        self.assertIn("--account", command)
-        self.assertEqual(command[command.index("--account") + 1], "claude3")
-
-    def test_resume_of_a_retired_unit_requires_the_retired_option_before_dispatch(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        before = self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()
-        for name in (row.name, str(row.id), row.current_session):
-            with (self.subTest(name=name), mock.patch.object(stop_resume, "resume") as start,
-                  mock.patch.object(shutdown, "unit_machine_is_local", return_value=False),
-                  mock.patch.object(shutdown, "run_remote") as forward):
-                output = io.StringIO()
-                with redirect_stderr(output):
-                    code = shutdown.main(["resume", name])
-                self.assertEqual(code, 2)
-                self.assertIn(f"agents resume {row.name} --retired", output.getvalue())
-                start.assert_not_called()
-                forward.assert_not_called()
-        self.assertEqual((self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()), before)
-        self.assertEqual(self.calls, [])
-
-    def test_retired_resume_refuses_the_old_name_before_restoring_the_unit(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        legacy = fixture_unit_saved_name(row, "alpha-unit")
-        parked = unit_config.parked_path(row.id)
-        before = self.staff.staff_state(), parked.read_bytes()
-        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
-            code = shutdown.main(["resume", legacy.name, "--retired"])
-        self.assertEqual((code, output.getvalue(), error.getvalue()),
-                         (2, "", "StaffRefused: unit name 'alpha-unit' must not end in -unit\n"))
-        self.assertEqual((self.staff.staff_state(), parked.read_bytes()), before)
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(self.calls, [])
-
-    def test_retired_resume_accepts_an_underscore_in_the_unit_name(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        renamed = staff.rename(row.id, "alpha_unit")
-        record = staff.initial_snapshot()
-        unit = shutdown.recovery_find_unit("alpha", renamed.name, record=record)
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        unit = replace(unit, branch="alpha-alpha-unit")
-        with redirect_stdout(io.StringIO()) as output:
-            code = shutdown.recovery_resume(unit, record)
-        self.assertEqual(code, 0, output.getvalue())
-        self.assertIn("alpha_unit resumed", output.getvalue())
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), unit.branch)
-
-    def test_resume_restores_retained_workers(self) -> None:
-        from scripts.production import worker
-
-        with mock.patch.object(worker, "restore", return_value=worker.ExitCode.OK) as restore:
-            code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        restore.assert_called_once()
-
-    def test_uncertain_worker_restore_keeps_the_director_resume_complete(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        with mock.patch.object(worker, "restore", side_effect=[
-                worker.ExitCode.UNCERTAIN, worker.ExitCode.OK]) as restore:
-            code, output = self.resume()
-            self.assertEqual(code, 8, output)
-            self.assertIn("alpha resumed", output)
-            self.assertFalse(unit_config.parked_path(row.id).exists())
-            unit = shutdown.recovery_find_unit("alpha", "alpha")
-            self.assertIsInstance(unit, shutdown.NoRecoveryRequired)
-            receipt = completion_receipt.read_receipt(
-                shutdown.recovery_resume_record(unit.production, unit.name).with_suffix(".done"), staff.snapshot())
-            self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
-            assert isinstance(receipt, completion_receipt.OwnedReceipt)
-            self.assertEqual(receipt.owner.id, row.id)
-            self.assertEqual(receipt.fields["session_id"], row.current_session)
-            code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        self.assertEqual(output, "alpha already resumed\n")
-        self.assertEqual(restore.call_args_list, [mock.call(row.id), mock.call(row.id)])
-        self.assertEqual(len(self.calls), 1)
-
-
-    def test_resume_restores_the_staff_location(self) -> None:
-        code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        self.assertTrue((self.worktree / ".git").is_file())
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
-        row = unit_membership("alpha", "alpha")
-        self.assertEqual(row.worktree, staff.PresentWorktree(remote.local_machine(), self.worktree))
-        self.assertIsInstance(shutdown.recovery_find_unit("alpha", "alpha"), shutdown.NoRecoveryRequired)
-
-
-    staff: StaffTestCase = StaffTestCase()
-    root: Path = Path()
-    checkout: Path = Path()
-    worktree: Path = Path()
-    doc: Path = Path()
-    configs: list[Path] = []
-    calls: list[list[str]] = []
-    launch_code: int = 0
-
-    def test_resume_command_uses_the_row_name_and_current_native_session(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        self.assertNotEqual(row.id, row.current_session)
-        unit = shutdown.recovery_find_unit("alpha", "alpha")
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        self.assertEqual(unit.branch, row.name)
-        command = shutdown.recovery_launch_command(replace(unit, branch="parked-branch"))
-        self.assertEqual(command[command.index("--production") + 2], row.name)
-        self.assertEqual(command[command.index("--resume") + 1], row.current_session)
-        self.assertNotIn("STAFF_ID", " ".join(command))
-
-    def test_recovery_refuses_an_empty_session_id(self) -> None:
-        unit = shutdown.recovery_find_unit("alpha", "alpha")
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        with self.assertRaisesRegex(shutdown.RecoveryRefused, "^alpha: recovery requires a session id$"):
-            _ = replace(unit, session_id=" ")
-
-    def test_recovery_requires_each_retirement_fact(self) -> None:
-        unit = shutdown.recovery_find_unit("alpha", "alpha")
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        for fact in ("branch", "session_id", "plan"):
-            fields = dict(vars(unit))
-            del fields[fact]
-            with self.subTest(fact=fact), self.assertRaises(TypeError):
-                _ = cast(Callable[..., object], shutdown.RetiredUnitRecovery)(**fields)
-
-    def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
-        unit_config.discard_parked(row.id)
-        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")
-        for flags in ((),):
-            with self.subTest(flags=flags):
-                code, output = self.resume(*flags)
-                self.assertEqual(code, 1, output)
-                self.assertEqual(output, f"alpha: no .unit.toml in {self.worktree} or "
-                                 + f"{unit_config.parked_path(row.id)}; ask the showrunner\n")
-                self.assertFalse(self.worktree.exists())
-                self.assertEqual(unit_config.place(row.id, self.worktree), unit_config.Nowhere())
-                self.assertEqual(self.calls, [])
-                self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(),
-                                  git(self.checkout, "rev-parse", "HEAD")), before)
-
-
-    @override
-    def build_repository(self) -> None:
-        origin = self.root / "origin.git"
-        _ = git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
-        self.checkout = self.root / "checkout"
-        _ = git(self.root, "clone", "-q", str(origin), str(self.checkout))
-        for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
-            _ = git(self.checkout, "config", *setting)
-        self.worktree = self.root / "alpha-wt"
-        self.doc = self.checkout / "alpha-production.md"
-        _ = self.doc.write_text("# Production\n\n- **Merge branch:** main\n"
-                                + f"- **Showrunner checkout:** {self.checkout}\n- **Log:** log.md\n", encoding="utf-8")
-        _ = git(self.checkout, "add", "-A")
-        _ = git(self.checkout, "commit", "-q", "-m", "production")
-        _ = git(self.checkout, "push", "-q", "origin", "main")
-
-    @override
-    def setUp(self) -> None:
-        self.staff = ShutdownStaffFixture()
-        self.staff.setUp()
-        self.addCleanup(self.staff.doCleanups)
-        self.restore_repository()
-        self.enterContext(mock.patch.dict(os.environ, shutdown_fixture_configuration(self.root)))
-        _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "pane-launches"))
-        self.configs = [self.root / "claude1", self.root / "claude2"]
-        self.transcript(self.configs[0])
-
-        self.calls = []
-        self.launch_code = 0
-        _ = self.staff.record_production("alpha", self.doc)
-        production = read_production("alpha")
-
-        def production_of(_production_name: str, *, record: staff.StaffSnapshot) -> Production:
-            del record
-            return production
-
-        def not_marked(_production_name: str, _name: str) -> unit_lookup.LabeledSession | None:
-            # The real pane writer retains a fixed owner; the live process resumes
-            # that owner's current conversation, which can differ after /clear.
-            owner = staff.by_current_session(DIRECTOR)
-            entries = [entry for entry in pane_record.launches()
-                       if owner is not None and entry.get("staff_id") == owner.id]
-            return (unit_lookup.LabeledSession("alpha", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
-                                          HerdrPlace("agents", entries[-1]["pane_id"]))
-                    if entries else None)
-
-        _ = self.enterContext(mock.patch.object(shutdown, "retirement_production_of", production_of))
-        _ = self.enterContext(mock.patch.object(shutdown, "retirement_run", self.fake_run))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", not_marked))
-        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: self.configs))
-        _ = self.enterContext(mock.patch.object(session_records, "config_dirs", lambda: self.configs))
-        _ = cast(MutableMapping[str, str], self.enterContext(
-            mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
-                                       "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
-        _ = self.staff.record_production("alpha", self.doc)
-        row = unit_membership("alpha", "alpha")
-        row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree, staff.ParkedBranch(row.name)), expected=row.worktree)
-        self.retained_config()
-
-    def retained_config(self, *, plan: str = "docs/plans/alpha.md") -> None:
-        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        unit_config.discard_parked(row.id)
-        _ = unit_config.write_parked(row.id, unit_config.UnitConfig(unit_config.PlanFile(Path(plan)),
-            unit_config.AppPort(1), ("scripts",),
-            unit_config.RetiredSession("2026-10-20", row.current_session)))
-
-    def transcript(self, config: Path, cwd: Path | None = None) -> None:
-        cwd = self.worktree if cwd is None else cwd
-        folder = config / "projects" / unit_move.project_folder(str(cwd))
-        folder.mkdir(parents=True, exist_ok=True)
-        _ = (folder / f"{DIRECTOR}.jsonl").write_text(json.dumps({"entrypoint": "cli", "cwd": str(cwd)}) + "\n", encoding="utf-8")
-
-    def fake_run(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-        """Git runs for real; add_unit.py is recorded and answered."""
-        if argv[0] == "git":
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
-        self.calls.append([Path(argv[1]).name, *argv[2:]])
-        if self.launch_code == 0:
-            pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
-                {}, ["claude", "--resume", DIRECTOR]))
-        return subprocess.CompletedProcess(argv, self.launch_code, "", "launch failed" if self.launch_code else "")
-
-    def resume(self, *arguments: str) -> tuple[int, str]:
-        output = io.StringIO()
-        with redirect_stdout(output):
-            code = shutdown.main(["resume", "alpha", "--retired", *arguments])
-        return code, output.getvalue()
-
-    def assert_resumed(self, code: int, output: str) -> None:
-        self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls[-1], ["add_unit.py", "--production", "alpha", "alpha", "--resume", DIRECTOR,
-                                          "--cwd", str(self.worktree), "--join-recovery-locks",
-                                          "--plan", "docs/plans/alpha.md"])
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
-        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "main"))
-        self.assertIn("alpha resumed", output)
-
-    def test_retired_resume_rerun(self) -> None:
-        _ = self.staff.record_production("alpha", self.doc)
-        row = unit_membership("alpha", "alpha")
-        row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree, staff.ParkedBranch("alpha")), expected=row.worktree)
-        saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
-            unit_config.AppPort(1), ("scripts",),
-            unit_config.RetiredSession("2026-10-20", DIRECTOR))
-        _ = unit_config.write_parked(row.id, saved)
-        parked = unit_config.parked_path(row.id)
-        retained = parked.read_bytes(), parked.stat().st_mtime_ns
-        original = staff.restore_unit
-        for after in (False, True):
-            def interrupted(identity: staff.StaffId,
-                            worktree: staff.PresentWorktree) -> staff.StaffRow:
-                if after:
-                    _ = original(identity, worktree)
-                raise RuntimeError("stopped at staff step")
-            with mock.patch.object(staff, "restore_unit", side_effect=interrupted):
-                with self.assertRaisesRegex(RuntimeError, "stopped at staff step"):
-                    _ = self.resume()
-            self.assertTrue(self.worktree.is_dir())
-            self.assertEqual(unit_config.read(self.worktree),
-                             unit_config.UnitConfig(saved.plan, saved.port, saved.responsibilities))
-            self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), retained)
-            self.assertEqual(self.calls, [])
-        code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        rows = staff.find(kind="unit")
-        self.assertEqual([row.name for row in rows], ["alpha"])
-        data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
-        code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        self.assertIn("already resumed", output)
-        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
-        self.assertEqual(len(self.calls), 1)
-
-    def test_retire_then_resume_reuses_the_staff_identity_at_the_add_unit_boundary(self) -> None:
-        retirement = RetireUnitTests()
-        self.addCleanup(retirement.doCleanups)
-        retirement.setUp()
-        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [retirement.config]))
-        _ = self.enterContext(mock.patch.object(session_records, "config_dirs", lambda: [retirement.config]))
-        unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        tip = git(retirement.worktree, "rev-parse", "HEAD")
-        code, output = retirement.retire()
-        self.assertEqual(code, 0, output)
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(remote.local_machine(), retirement.worktree, staff.ParkedBranch("alpha-branch"))))
-        restore = self.enterContext(mock.patch.object(
-            worker, "restore", return_value=worker.ExitCode.OK))
-        launched_ids: list[staff.StaffId] = []
-        commands: list[list[str]] = []
-
-        def launch(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-            if len(argv) > 1 and Path(argv[1]).name == "add_unit.py":
-                commands.append(argv)
-                production = read_production(argv[argv.index("--production") + 1])
-                row = add_unit.ensure_staff_unit(production, argv[4])
-                launched_ids.append(row.id)
-                retirement.marked = unit_lookup.LabeledSession("alpha",
-                    unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
-                pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(retirement.worktree),
-                    {}, ["claude", "--resume", DIRECTOR]))
-                return subprocess.CompletedProcess(argv, 0, "", "")
-            return retirement.fake_run(argv, cwd)
-
-        resumed = io.StringIO()
-        with mock.patch.object(shutdown, "retirement_run", side_effect=launch), redirect_stdout(resumed):
-            code = shutdown.main(["resume", "alpha", "--retired"])
-        self.assertEqual(code, 0, resumed.getvalue())
-        restore.assert_called_once_with(unit.id)
-        self.assertEqual(launched_ids, [unit.id])
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
-        expected = replace(unit, home=staff.SessionHome(Path.home() / ".claude"))
-        self.assertEqual(staff.by_id(unit.id), expected)
-        assert isinstance(unit.parent, staff.ReportsTo)
-        self.assertEqual(staff.find(kind="unit", parent=unit.parent.id), [expected])
-        self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
-        before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
-                  git(retirement.checkout, "for-each-ref"))
-        with mock.patch.object(shutdown, "retirement_run", side_effect=launch), redirect_stdout(io.StringIO()):
-            code = shutdown.main(["resume", "alpha", "--retired"])
-        self.assertEqual(code, 0)
-        self.assertEqual(restore.call_args_list, [mock.call(unit.id), mock.call(unit.id)])
-        self.assertEqual(len(commands), 1)
-        self.assertEqual((retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
-                          git(retirement.checkout, "for-each-ref")), before)
-
-
-    def parked_facts(self) -> Path:
-        return unit_config.parked_path(next(row for row in staff.find(kind="unit") if row.name == "alpha").id)
-
-
-    def test_successful_launch_keeps_parked_facts_until_its_staff_pane_is_proven(self) -> None:
-        row = staff.find(kind="unit")[0]
-        saved = unit_config.parked_path(row.id).read_bytes()
-        document = self.doc.read_bytes()
-        with mock.patch.object(shutdown, "recovery_resumed_session_proven", return_value=False):
-            code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        self.assertIn("resumed native session identity is not proven", output)
-        self.assertEqual(unit_config.parked_path(row.id).read_bytes(), saved)
-        self.assertEqual(self.doc.read_bytes(), document)
-        self.assertEqual(len(self.calls), 1)
-        code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        self.assertEqual(len(self.calls), 1)
-        self.assertFalse(unit_config.parked_path(row.id).exists())
-
-    def test_resume_proof_requires_the_exact_pane_owner_and_current_conversation(self) -> None:
-        row = staff.find(kind="unit")[0]
-        pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
-            {}, ["claude", "--resume", DIRECTOR]))
-        before = (self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
-                  unit_config.parked_path(row.id).read_bytes())
-        with self.subTest(evidence="fixed owner for the live current conversation"):
-            self.assertTrue(shutdown.recovery_resumed_session_proven("alpha", "alpha", DIRECTOR, row))
-        current = unit_lookup.LabeledSession("alpha",
-            unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
-        other_session = fixture_runtime_id("unrelated-resume-conversation")
-        for marked, expected_session in (
-            (replace(current, place=HerdrPlace("agents", "w1:other")), DIRECTOR),
-            (replace(current, claude=unit_lookup.LiveClaude("alpha", other_session, "fixture", 123)), DIRECTOR),
-            (current, row.id),
-        ):
-            with self.subTest(marked=marked, expected_session=expected_session), mock.patch.object(
-                    unit_lookup, "labeled_session", return_value=marked):
-                self.assertFalse(shutdown.recovery_resumed_session_proven("alpha", "alpha", expected_session, row))
-        self.assertEqual((self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
-                          unit_config.parked_path(row.id).read_bytes()), before)
-
-    def test_retired_unit_receipt_cannot_complete_a_new_incarnation(self) -> None:
-        code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        unit = staff.find(kind="unit")[0]
-        self.staff.forget_rows(unit.id)
-        replacement = fixture_member("unit", name=unit.name, parent=unit.parent,
-                                     runtime_id=fixture_runtime_id("replacement-unit-backend"))
-        code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        self.assertNotIn("already resumed", output)
-        self.assertEqual(staff.by_id(replacement.id), replacement)
-        self.assertEqual(len(self.calls), 1)
-
-    def test_resume_child_joins_the_operation_until_the_parked_facts_are_discarded(self) -> None:
-        source = self.staff.production("alpha", "alpha")
-        source.unlink()
-        source.symlink_to(self.doc)
-        _ = self.staff.record_production("alpha", source)
-        row = unit_membership("alpha", "alpha")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
-        wrapper = self.root / "resume-launch.py"
-        # Run the add_unit entry point with a fixture pane and the real lock checks.
-        write_text_atomic(wrapper, "\n".join([
-            "import os, subprocess, sys", "from unittest.mock import patch",
-            "from datetime import datetime, timezone", "from pathlib import Path",
-            f'with open(Path({str(CHECKOUT)!r}) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {{"__file__": package_root.name}})',
-            "from scripts.production import add_unit", "from scripts.herdr import herdr", "from scripts.accounts import accounts",
-            "from scripts.agents import pane_record, remote",
-            "def preflight(request, selected, *, record):",
-            "    launch = add_unit.UnitLaunch(production=request.production, branch=request.branch, worktree=request.session.cwd,",
-            "        plan=request.plan, port=request.port, session=request.session, timeout=request.timeout,",
-            "        identity=add_unit.UnitIdentity(request.unit, request.requested_name))",
-            "    return add_unit.ReadyToLaunch(launch, add_unit.NoUnitRow(), add_unit.DirectorAgent('sonnet', add_unit.DefaultEffort()))",
-            "def publish(ready, *, record):",
-            "    launch = ready.launch",
-            "    return add_unit.ensure_staff_unit(launch.production, launch.unit_id,",
-            "                                      runtime_id=launch.session.session_id, record=record)",
-            "def launch(*args, **kwargs):",
-            "    competing = [arg for arg in sys.argv[1:] if arg != '--join-recovery-locks']",
-            "    competing[competing.index('--resume')] = '--attach'",
-            "    env = {key: val for key, val in os.environ.items() if not key.startswith('STAFF_ROW_FD_')}",
-            "    result = subprocess.run([sys.executable, __file__, *competing], text=True, capture_output=True,",
-            "        env=env, pass_fds=(int(env['STAFF_OPERATION_FD']),), timeout=10, check=False)",
-            "    assert result.returncode == 2 and 'another operation holds this row' in result.stderr, result.stderr",
-            f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
-            "    return herdr.PromptSubmitted(datetime.now(timezone.utc))",
-            "with (patch.object(accounts, 'check', return_value=[]),",
-            f"      patch.object(remote, 'local_machine', return_value={remote.local_machine()!r}),",
-            "      patch.object(add_unit, 'account_for_launch', return_value=accounts.NamedAccount('claude3', Path.home() / '.claude3')),",
-            "      patch.object(add_unit, 'model_for_resume', return_value=''),",
-            "      patch.object(add_unit, 'autocompact_for_resume', return_value=''),",
-            "      patch.object(add_unit, 'preflight', side_effect=preflight),",
-            "      patch.object(add_unit, 'publish_unit', side_effect=publish),",
-            "      patch.object(add_unit, 'launched_unit', return_value=add_unit.NoLabeledSession()),",
-            "      patch.object(add_unit, 'prompt_for', return_value='Fixture opening.'),",
-            "      patch.object(add_unit, 'launch_session', side_effect=launch),",
-            "      patch.object(add_unit, 'wait_for_remote_control'), patch.object(add_unit, 'record'),",
-            "      patch.object(add_unit, 'attach_hint', return_value='fixture pane')):",
-            "    raise SystemExit(add_unit.main(sys.argv[1:]))", "",
-        ]))
-        context = multiprocessing.get_context("fork")
-        first, second = context.Pipe()
-        parent = cast(Connection, cast(object, first))
-        child = cast(Connection, cast(object, second))
-        original_discard = unit_config.discard_parked
-        def finish(unit: staff.StaffId) -> None:
-            child.send((staff.snapshot().find(kind="unit")[0].id, bool(staff.operation_fds())))
-            _ = cast(object, child.recv())
-            original_discard(unit)
-        def run() -> None:
-            parent.close()
-            try:
-                with mock.patch.object(shutdown, "retirement_run", RUN_COMMAND), mock.patch.object(
-                        shutdown, "ADD_UNIT", wrapper), mock.patch.object(unit_config, "discard_parked", side_effect=finish):
-                    child.send(self.resume())
-            finally:
-                child.close()
-        process = context.Process(target=run)
-        writer: subprocess.Popen[str] | None = None
-        try:
-            with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
-                process.start()
-                child.close()
-                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "nested add_unit did not join resume's lock")
-                identity, lock_held = cast(tuple[str, bool], parent.recv())
-                self.assertIsInstance(identity, str, f"resume exited before discard: {(identity, lock_held)!r}")
-                self.assertIsInstance(lock_held, bool)
-                staff_id = staff.StaffId(identity)
-                self.assertTrue(lock_held, "resume released its operation lock before discarding the parked facts")
-                self.assertTrue(unit_config.parked_path(staff_id).exists())
-                writer = self.staff.start_script(CHECKOUT / "scripts/production/staff.py", "rename", identity, "--name", "alpha")
-                self.staff.assert_operation_blocks(writer, listener)
-                parent.send("finish")
-                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not discard the parked facts")
-                code, output = cast(tuple[int, str], parent.recv())
-                self.assertEqual(code, 0, output)
-                process.join(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(process.exitcode, 0)
-                output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(writer.returncode, 0, output + errors)
-            self.assertFalse(unit_config.parked_path(staff_id).exists())
-            row = staff.by_id(staff_id)
-            self.assertIsNotNone(row)
-            assert row is not None
-            self.assertEqual((row.kind, row.name), ("unit", "alpha"))
-            self.assertEqual(staff.find(kind="unit"), [row])
-        finally:
-            parent.close()
-            child.close()
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=TEST_HANG_GUARD_SECS)
-            process.close()
-            if writer is not None and writer.returncode is None:
-                writer.kill()
-                _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
-
-    def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
-        self.assert_resumed(*self.resume())
-        self.assertEqual(build_folders.build_folder_state(self.worktree), "free")
-
-    def test_recovery_worktree_uses_an_existing_branch_at_its_saved_tip(self) -> None:
-        _ = git(self.checkout, "branch", "alpha", "main")
-        unit = shutdown.recovery_find_unit("alpha", "alpha")
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        with redirect_stdout(io.StringIO()) as output:
-            shutdown.recovery_make_worktree(unit)
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
-        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "alpha"))
-        self.assertIn(f"made: worktree {self.worktree} on alpha", output.getvalue())
-        self.assertEqual(build_folders.build_folder_state(self.worktree), "free")
-
-    def test_recovery_retries_after_a_checkout_hook_fails(self) -> None:
-        hook = self.checkout / ".git/hooks/post-checkout"
-        hook.parent.mkdir(exist_ok=True)
-        _ = hook.write_text("#!/bin/sh\nprintf 'checkout failed' >&2\nexit 1\n")
-        hook.chmod(0o755)
-        code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        self.assertIn("checkout failed", output)
-        self.assertTrue(self.worktree.is_dir())
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
-        self.assertEqual(self.calls, [])
-        hook.unlink()
-        self.assert_resumed(*self.resume())
-        self.assertEqual(build_folders.build_folder_state(self.worktree), "free")
-
-    def test_retired_as_built_without_a_header_is_passed_to_the_resume_launch(self) -> None:
-        plan = "docs/as-built/alpha.md"
-        path = self.checkout / plan
-        path.parent.mkdir(parents=True)
-        _ = path.write_text("# Alpha as built\n\nThe plan is complete.\n", encoding="utf-8")
-        self.retained_config(plan=plan)
-        _ = git(self.checkout, "add", "-A")
-        _ = git(self.checkout, "commit", "-q", "-m", "condensed plan")
-
-        code, output = self.resume()
-
-        self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls, [["add_unit.py", "--production", "alpha", "alpha",
-                                      "--resume", DIRECTOR, "--cwd", str(self.worktree), "--join-recovery-locks",
-                                      "--plan", plan]])
-
-    def test_a_transcript_under_another_account_resumes(self) -> None:
-        # The units account moved since the retire: the transcript is under the other config dir.
-        self.configs.reverse()
-        self.assert_resumed(*self.resume())
-
-    def test_a_failed_launch_keeps_the_parked_facts_and_a_rerun_resumes(self) -> None:
-        document = self.doc.read_bytes()
-        head = git(self.checkout, "rev-parse", "HEAD")
-        self.launch_code = 1
-        code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        self.assertIn("refused: add_unit.py --resume: launch failed", output)
-        self.assertTrue(unit_config.parked_path(staff.find(kind="unit")[0].id).exists())
-        self.assertEqual(self.doc.read_bytes(), document)
-        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), head)
-        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
-        self.assertEqual(len(self.calls), 1)
-        worktree_head = git(self.worktree, "rev-parse", "HEAD")
-        self.launch_code = 0
-        code, output = self.resume()
-        self.assert_resumed(code, output)
-        self.assertEqual(len(self.calls), 2)
-        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), worktree_head)
-        self.assertNotIn("made: worktree", output)
-
-    def test_transcript_and_branch_refusals_change_nothing(self) -> None:
-        self.configs = [self.root / "claude3"]
-        _ = git(self.checkout, "branch", "alpha", "main")
-        code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        self.assertIn(f"refused: alpha: no account has the transcript of session {DIRECTOR}", output)
-        self.assertIn("refused: branch alpha still exists; retire did not finish", output)
-        self.assertEqual(self.calls, [])
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production")
-
-
-    def test_missing_session_refuses_launch_when_no_evidence_exists(self) -> None:
-        self.configs = [self.root / "empty-config"]
-        unit_config.discard_parked(staff.find(kind="unit")[0].id)
-        before = self.doc.read_bytes()
-        for flags in ((),):
-            with self.subTest(flags=flags):
-                code, output = self.resume(*flags)
-                self.assertEqual(code, 1, output)
-                self.assertIn("; ask the showrunner", output)
-                self.assertNotIn("would resume:", output)
-                self.assertNotIn("resumed:", output)
-                self.assertEqual(self.calls, [])
-                self.assertFalse(self.worktree.exists())
-                self.assertEqual(self.doc.read_bytes(), before)
-
-    def test_parked_session_survives_newer_worker_transcripts(self) -> None:
-        older = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / "older.jsonl"
-        _ = older.write_text(json.dumps({"entrypoint": "cli", "cwd": str(self.worktree)}) + "\n")
-        os.utime(older, (1, 1))
-        worker = older.with_name("worker.jsonl")
-        _ = worker.write_text(json.dumps({"entrypoint": "sdk-py", "cwd": str(self.worktree)}) + "\n")
-        self.assert_resumed(*self.resume())
-
-    def test_parked_session_survives_stale_retained_pane_launches(self) -> None:
-        for pane, identity, at in (("w1:p1", "older", "2026-10-27T23:00:00+00:00"),
-                                    ("w1:p2", DIRECTOR, "2026-10-28T23:00:00+00:00")):
-            launch = pane_record.launch(pane, identity, str(self.worktree),
-                {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
-            launch["written_at"] = at
-            pane_record.write("agents", launch)
-        current_backend = unit_lookup.labeled_session
-
-        def observed_backend(production_name: str, name: str) -> unit_lookup.LabeledSession | None:
-            # Retained pane files are historical evidence. Only the fake launch
-            # establishes a live backend for this test.
-            return current_backend(production_name, name) if self.calls else None
-
-        with mock.patch.object(unit_lookup, "labeled_session", side_effect=observed_backend):
-            self.assert_resumed(*self.resume())
-
-    def external_transcript(self) -> Path:
-        for transcript in (self.configs[0] / "projects").glob(f"*/{DIRECTOR}.jsonl"):
-            transcript.unlink()
-        folder = self.root / "original-checkout"
-        folder.mkdir()
-        self.transcript(self.configs[0], folder)
-        return folder
-
-    def test_resume_finds_the_session_transcript_outside_the_staff_worktree(self) -> None:
-        _ = self.external_transcript()
-        code, output = self.resume()
-        self.assertEqual(code, 0, output)
-        self.assertIn(["--cwd", str(self.worktree)], [call[index:index + 2] for call in self.calls for index in range(len(call) - 1)])
-        self.assertTrue(self.worktree.is_dir())
-
-    def test_renamed_transcript_keeps_the_staff_resume_folder(self) -> None:
-        transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
-        old = self.root / "alpha-old-wt"
-        _ = transcript.write_text("\n".join(json.dumps({"cwd": str(cwd)})
-                                            for cwd in (old, old, self.worktree, self.worktree)) + "\n")
-        unit = shutdown.recovery_find_unit("alpha", "alpha")
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        self.assertEqual(unit.worktree, self.worktree)
-        self.assertNotIn(str(old), shutdown.recovery_launch_command(unit))
-        self.assert_resumed(*self.resume())
-        self.assertEqual(len(self.calls), 1)
-
-    def test_resume_ignores_the_transcript_folder_and_recorded_cwd(self) -> None:
-        transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
-        _ = transcript.write_text(json.dumps({"cwd": str(self.root / "alpha-old-wt")}) + "\n")
-        before = transcript.read_bytes(), transcript.stat().st_mtime_ns
-        self.assert_resumed(*self.resume())
-        self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns), before)
-
-    def test_duplicate_transcript_locations_do_not_change_the_staff_resume_folder(self) -> None:
-        _ = self.external_transcript()
-        self.transcript(self.configs[1], self.root / "another-checkout")
-        self.assert_resumed(*self.resume())
-
-    def test_missing_session_transcript_keeps_the_retirement_record(self) -> None:
-        for config in self.configs:
-            for transcript in (config / "projects").glob(f"*/{DIRECTOR}.jsonl"):
-                transcript.unlink()
-        before = self.doc.read_bytes()
-        code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        self.assertIn(f"no account has the transcript of session {DIRECTOR}", output)
-        self.assertEqual(self.calls, [])
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(self.doc.read_bytes(), before)
-
-    def test_resume_uses_a_changed_staff_folder_without_rewriting_retirement_facts(self) -> None:
-        row = unit_membership("alpha", "alpha")
-        parked = unit_config.parked_path(row.id)
-        before = parked.read_bytes(), parked.stat().st_mtime_ns
-        destination = self.root / "changed-staff-folder"
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), destination), expected=row.worktree)
-        unit = shutdown.recovery_find_unit("alpha", "alpha")
-        assert isinstance(unit, shutdown.RetiredUnitRecovery)
-        command = shutdown.recovery_launch_command(unit)
-        self.assertEqual(command[command.index("--cwd") + 1], str(destination))
-        self.assertTrue(shutdown.recovery_has_transcript(unit))
-        self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), before)
-
-    def test_shared_projects_symlink_is_one_transcript_location(self) -> None:
-        self.configs[1].mkdir()
-        (self.configs[1] / "projects").symlink_to(self.configs[0] / "projects", target_is_directory=True)
-        self.assert_resumed(*self.resume())
-
-
 class WorkerRenameTests(StaffTestCase):
     @override
     def setUp(self) -> None:

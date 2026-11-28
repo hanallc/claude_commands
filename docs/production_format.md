@@ -52,8 +52,9 @@ Launch, resume, account move, rename, and compaction select the command from thi
   Launchers use the run's existing transport pin.
   Pane assignments reuse an idle or resumable worker in role-number order.
   Dispatch reads the transcript before submission and completes on the matching `DONE <dispatch id>` reply.
-  Retire, wrap, and promote stop workers and retain their rows and conversations for restore.
-  Only worker end or permanent unit removal deletes worker rows.
+  Retiring a live unit stops its workers and keeps their rows and conversations.
+  Removing a retired unit record also removes its worker rows.
+  Wrap and promote stop workers and keep their rows and conversations for restore.
 - **Reviewer** — a unit's read-only worker, role `review`.
   Its native conversation retains context across phases and plans.
   Its standing instructions are in `config/review/code.md`.
@@ -217,12 +218,15 @@ Run `/agents retire NAME` to remove the unit worktree and branch.
 Uncommitted work or an unmerged checkpoint prevents removal.
 Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
 It releases holds, reservations, and Mac claims.
-It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
-`/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
-The showrunner asks the user yes or no before it runs `--retired`.
+It stops worker agents and keeps their rows, native conversations, and stopped panes.
+To remove the retired unit and worker rows, run `/agents retire NAME` again.
+The command checks for the checkout and any pending retirement cleanup on the unit machine.
+It checks the branch on the unit machine, in the production checkout, and on the fetch origin.
+It keeps the rows if a checkout remains or a tip has unmerged work or cannot be read.
+It checks the fetch origin tip again before it removes the rows.
+This operation leaves all Git refs and folders in place.
 
-A retired unit keeps its staff row. The status script, the waits and the stall watch
-skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
+The status script, waits, and stall watch skip retired units. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
 reviewer.
 
 ---
