@@ -1,7 +1,7 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id, legacy_producer_fixture
 
 import fcntl
 import io
@@ -23,17 +23,17 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.production import demote_showrunner, promote_showrunner, staff
+from scripts.production import demote_showrunner, production_lifecycle, promote_showrunner, staff
 from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.accounts import role_map
-from scripts.agents import remote, shutdown, status_entry, stop_resume, restart_support
+from scripts.agents import remote, shutdown, status_entry, stop_resume, restart_support, worker_lifecycle
 from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
 from scripts.message import sessions, session_records
-from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, foreign_hostname, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
@@ -820,6 +820,18 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def retirement_document(self, runner: staff.StaffRow, document: Path) -> staff.StaffRow:
+        repository = ImmutableGitSeed.create(self.root / "retirement", "main", "Staff Test",
+                                             "staff@example.invalid", {"file": "merged\n"})
+        _ = document.write_text(f"# Production\n- **Merge branch:** main\n"
+                                + f"- **Showrunner checkout:** {repository.checkout}\n- **Log:** log.md\n")
+        return staff.set_doc(runner.id, staff.LiveDoc("natedev", document))
+
+    def save_retirement_branch(self, unit: staff.StaffRow, branch: str = "models") -> None:
+        path = production_lifecycle.wrap_branch_path(unit)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({**production_lifecycle.wrap_branch_facts(unit), "branch": branch}))
+
     def test_staff_row_without_pending_resume_uses_the_named_state(self) -> None:
         _, unit, _ = self.tree()
         encoded = unit.to_json()
@@ -865,19 +877,16 @@ class StaffTests(StaffCommandTestCase):
         self.assertNotIn("keep_workers", encoded)
         self.assertFalse(staff.Paused.from_json(encoded).keep_workers)
 
-    def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
+    def test_old_producer_mark_reads_and_stays_out_of_active_lookups(self) -> None:
         producer = fixture_member("producer", name="planner")
-        mark = staff.RetiredProducer("claude:sonnet:high")
-        stopped = staff.set_producer_retirement(producer.id, mark)
+        stopped = legacy_producer_fixture(producer.id, "claude:sonnet:high")
         _ = fixture_member("showrunner", name="another-production")
         record = staff.StaffSnapshot.decode(staff.snapshot().encode())
         self.assertEqual(record.by_id(producer.id), stopped)
         self.assertIsNone(record.by_path(producer.name))
         self.assertIsNone(record.by_current_session(producer.current_session))
         self.assertNotIn(producer, staff.active(record, "producer"))
-        restored = staff.set_producer_retirement(producer.id, staff.Active())
-        self.assertEqual(restored, producer)
-        self.assertEqual(staff.snapshot().by_path(producer.name), restored)
+        self.assertTrue(stopped.awaits_legacy_removal)
 
     def test_producer_top_item_round_trips_and_the_setter_replaces_it(self) -> None:
         producer = fixture_member("producer", name="planner")
@@ -896,7 +905,7 @@ class StaffTests(StaffCommandTestCase):
         for number in ("L1", ""):
             with self.subTest(number=number):
                 _ = self.cli("set-producer-top-item", producer.id, f"--number={number}", code=2)
-        _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("claude:sonnet:high"))
+        _ = legacy_producer_fixture(producer.id, "claude:sonnet:high")
         self.assert_refused(lambda: staff.set_producer_top_item(producer.id, staff.TopItem(1)))
 
     def test_remote_top_item_setter_uses_one_owner_write(self) -> None:
@@ -1323,36 +1332,10 @@ class StaffTests(StaffCommandTestCase):
                     self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteLockHeld(path))
             self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
 
-    def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
+    def test_promote_and_demote_preserve_the_unit_identity(self) -> None:
         parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
         unit = fixture_member("unit", name="models", parent=parent.id, worktree=location)
-        staff.defer_retire((unit.id,))
-        self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(location.machine, location.path)))
-        staff.defer_retire((unit.id,))
-        self.assertEqual(staff.snapshot().pending_retire, (unit.id,))
-
-        restored = staff.restore_unit(unit.id, location)
-        self.assertEqual(staff.snapshot().pending_retire, ())
-        self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(staff.by_id(unit.id), restored)
-        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
-                         (unit.id, "unit", unit.name, staff.ReportsTo(parent.id)))
-        self.assertEqual(restored.worktree, location)
-
-    def test_restore_unit_keeps_the_retained_id_and_parent_and_rerun_writes_nothing(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        location = staff.PresentWorktree("natedev", self.root / "models")
-        removed = fixture_member("unit", name="models", parent=parent.id,
-                               worktree=staff.RemovedWorktree(location.machine, location.path))
-        unit = staff.restore_unit(removed.id, location)
-        self.assertEqual((unit.id, unit.kind, unit.name, unit.parent), (removed.id, "unit", "models", staff.ReportsTo(parent.id)))
-        self.assertEqual(unit.worktree, location)
-        self.assertEqual(staff.by_id(removed.id), unit)
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        self.assertEqual(staff.restore_unit(removed.id, location), unit)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
         document = staff.LiveDoc("natedev", self.root / "child-production.md")
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
@@ -1371,55 +1354,6 @@ class StaffTests(StaffCommandTestCase):
                 self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
                 self.assert_refused(lambda: staff.change_director(retained.id, destination))
                 self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
-
-    def test_restore_unit_refuses_missing_identity_or_another_member_without_writing(self) -> None:
-        parent, unit, worker = self.tree()
-        location = staff.PresentWorktree("natedev", self.root / "models")
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        for held_id in (parent.id, worker.id, unit.id):
-            with self.subTest(held_id=held_id):
-                self.assert_refused(lambda: staff.restore_unit(held_id, location))
-        with self.assertRaises(staff.StaffNotFound):
-            _ = staff.restore_unit(MISSING_ID, location)
-        self.assertEqual(staff.by_id(unit.id), unit)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-
-    def test_restore_unit_refuses_a_different_retained_location_without_writing(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        removed = fixture_member("unit", name="models", parent=parent.id,
-                               worktree=staff.RemovedWorktree("natedev", self.root / "models"))
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        for proposed in (staff.PresentWorktree("mac", self.root / "models"),
-                         staff.PresentWorktree("natedev", self.root / "elsewhere")):
-            with self.subTest(proposed=proposed):
-                self.assert_refused(lambda: staff.restore_unit(removed.id, proposed))
-        self.assertEqual(staff.by_id(removed.id), removed)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-
-    def test_restore_unit_from_mac_uses_the_owner_and_is_idempotent_through_the_cli(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        location = staff.PresentWorktree("mac", self.root / "models")
-        removed = fixture_member("unit", name="models", parent=parent.id,
-                               worktree=staff.RemovedWorktree(location.machine, location.path))
-        with self.machine("mac"):
-            restored = staff.restore_unit(removed.id, location)
-            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-            self.assertEqual(staff.restore_unit(removed.id, location), restored)
-        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
-                         (removed.id, "unit", "models", staff.ReportsTo(parent.id)))
-        self.assertEqual(restored.worktree, location)
-        self.assertEqual(staff.by_id(removed.id), restored)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-        self.assertEqual(self.ssh_commands(), [
-            ["restore-unit", removed.id,
-             "--machine", location.machine, "--path", str(location.path), "--json"],
-            ["restore-unit", removed.id,
-             "--machine", location.machine, "--path", str(location.path), "--json"],
-        ])
-        self.assertFalse(self.mac_file.exists())
-        _ = self.assert_rerun("restore-unit", removed.id,
-                              "--machine", location.machine, "--path", str(location.path))
-        self.assertEqual(staff.by_id(removed.id), restored)
 
     def test_admission_publishes_identity_and_location_once_without_a_setter_window(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
@@ -1500,39 +1434,194 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(staff.by_id(unit.id), unit)
         self.assertEqual(staff.by_id(runner.id), runner)
 
+    def test_unit_retirement_checks_liveness_under_the_record_and_row_locks(self) -> None:
+        _, unit, worker = self.tree()
+        before = self.staff_file.read_bytes()
+        locked = False
+        acquire = worker_lifecycle.acquire_flock
+
+        def acquire_record(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
+                           deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            nonlocal locked
+            acquire(handle, mode=mode, deadline=deadline)
+            locked = True
+
+        def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            if locked and identity == worker.current_session:
+                for member in (unit, worker):
+                    with self.assertRaisesRegex(staff.StaffRefused, "another operation holds this row"):
+                        with staff.slot_operation(member.id, member.name, join=False):
+                            self.fail("retirement must hold the resume lock")
+                return sessions.LiveSessionProcess(os.getpid())
+            return sessions.SessionNotLive()
+
+        with (mock.patch.object(worker_lifecycle, "acquire_flock", side_effect=acquire_record),
+              mock.patch.object(session_records, "session_liveness", side_effect=liveness),
+              self.assertRaisesRegex(staff.StaffRefused, "native session is live")):
+            staff.retire_unit(unit)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_remote_retirement_removes_members_and_records_cleanup_in_one_write(self) -> None:
+        parent, unit, worker = self.tree()
+        token = "a" * 32
+        before = self.staff_file.read_bytes()
+        with self.machine("mac"):
+            with self.assertRaisesRegex(staff.StaffRefused, "workers changed"):
+                staff.remove_unit_for_retirement(unit, parent, [], token)
+            self.assertEqual(self.staff_file.read_bytes(), before)
+            staff.remove_unit_for_retirement(unit, parent, [worker], token)
+            current = staff.authority_snapshot()
+            self.assertIsNone(current.by_id(unit.id))
+            self.assertIsNone(current.by_id(worker.id))
+            self.assertEqual(current.by_id(parent.id), parent)
+            self.assertEqual(current.retirement_cleanup, {unit.id: token})
+            staff.finish_unit_retirement(unit.id, token)
+            self.assertEqual(staff.authority_snapshot().retirement_cleanup, {})
+        self.assertFalse(self.mac_file.exists())
+
     def test_pending_retirement_keeps_ids_and_edges_and_waits_for_workers_and_known_locations(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        runner = self.retirement_document(fixture_member("showrunner", name="sdlc"), self.root / "doc.md")
         child = fixture_member("showrunner", name="child", parent=runner.id)
         unit = fixture_member("unit", name="models", parent=runner.id,
                             worktree=staff.PresentWorktree("natedev", self.root / "models"))
+        self.save_retirement_branch(unit)
         worker = fixture_worker("impl1", unit.id)
         staff.defer_retire((runner.id, unit.id, child.id))
         self.assertCountEqual(staff.retire_pending(), (runner.id, unit.id, child.id))
         self.assertEqual(staff.by_id(worker.id), worker)
         _ = staff.retire(worker.id)
         self.assertEqual(staff.retire_pending(), (child.id,))
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")))
+        self.assertIsNone(staff.by_id(unit.id))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "doc.md")))
         self.assertEqual(staff.by_id(child.id), child)
         before = self.staff_file.read_bytes()
         self.assertEqual(staff.retire_pending(), (child.id,))
         self.assertEqual(self.staff_file.read_bytes(), before)
 
-    def test_seed_retirement_retains_the_removed_row_and_cannot_reactivate_it_from_stale_membership(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc")
+    def test_seed_retirement_removes_the_row_and_refuses_stale_membership(self) -> None:
+        runner = self.retirement_document(fixture_member("showrunner", name="sdlc"), self.root / "doc.md")
         unit = fixture_member("unit", name="models", parent=runner.id,
                             worktree=staff.PresentWorktree("natedev", self.root / "models"))
+        self.save_retirement_branch(unit)
         retirement = staff.SeedInput((), (staff.SeedRetirement(unit.id, runner.id),))
         record = staff.apply_seed(retirement)
-        removed = replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models"))
-        self.assertEqual(record.by_id(unit.id), removed)
+        self.assertIsNone(record.by_id(unit.id))
         self.assertEqual(record.by_id(runner.id), runner)
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        self.assertEqual(staff.apply_seed(retirement).by_id(unit.id), removed)
+        self.assertIsNone(staff.apply_seed(retirement).by_id(unit.id))
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
         stale = staff.SeedInput((staff.SeedMember("unit", "unit", unit.name, unit.id, staff.KeepSeedParent()),))
-        self.assertEqual(staff.apply_seed(stale).by_id(unit.id), removed)
+        with self.assertRaises(staff.StaffNotFound):
+            _ = staff.apply_seed(stale)
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_seed_and_pending_retirement_keep_a_unit_with_a_worktree(self) -> None:
+        runner = self.retirement_document(fixture_member("showrunner", name="sdlc"), self.root / "doc.md")
+        checkout = self.root / "retirement/checkout"
+        tree = self.root / "models"
+        tree.mkdir()
+        unit = fixture_member("unit", name="models", parent=runner.id,
+                            worktree=staff.PresentWorktree("natedev", tree))
+        seed = staff.SeedInput((), (staff.SeedRetirement(unit.id, runner.id),))
+        self.assertEqual(staff.apply_seed(seed).by_id(unit.id), unit)
+        self.assertEqual(staff.retire_pending(), (unit.id,))
+        tree.rmdir()
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.retire_pending(), (unit.id,))
+        self.assertIn("models", errors.getvalue())
+        self.assertEqual(staff.by_id(unit.id), unit)
+
+        unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree, staff.ParkedBranch("models")),
+                                  expected=unit.worktree)
+        self.save_retirement_branch(unit, "other-absent")
+
+        def git(*args: str) -> None:
+            _ = subprocess.run(["git", *args], cwd=checkout, check=True, capture_output=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+
+        git("switch", "-c", "models")
+        _ = (checkout / "file").write_text("unmerged\n")
+        git("add", "file")
+        git("commit", "-m", "Add work from the unit")
+        git("branch", "journal-only")
+        git("switch", "main")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.apply_seed(seed).by_id(unit.id), unit)
+        self.assertIn("unmerged commits on models", errors.getvalue())
+        for remote_only in (False, True):
+            with self.subTest(remote_only=remote_only):
+                if remote_only:
+                    git("push", "origin", "models")
+                    git("branch", "-D", "models")
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(staff.retire_pending(), (unit.id,))
+                self.assertIn("unmerged commits on models", errors.getvalue())
+                self.assertEqual(staff.by_id(unit.id), unit)
+        journal = shutdown.retirement_journal(unit)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "session": unit.current_session, "worktree": str(tree), "checkout": str(checkout),
+            "branch": "journal-only", "pane_id": "", "pane_session": "",
+        }))
+        git("push", "origin", "--delete", "models")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.retire_pending(), (unit.id,))
+        self.assertIn("unmerged commits on journal-only", errors.getvalue())
+        self.assertEqual(staff.by_id(unit.id), unit)
+        git("push", "origin", "journal-only:models")
+        git("merge", "--ff-only", "origin/models")
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertIsNone(staff.by_id(unit.id))
+
+        git("switch", "-c", "published-work")
+        _ = (checkout / "file").write_text("published work\n")
+        git("add", "file")
+        git("commit", "-m", "Add the published unit work")
+        git("push", "origin", "published-work:main")
+        for local_merge in ("behind", "absent"):
+            if local_merge == "absent":
+                git("branch", "-D", "main")
+            for operation in ("seed", "pending"):
+                with self.subTest(local_merge=local_merge, operation=operation):
+                    name = f"{operation}-{local_merge}"
+                    candidate = fixture_member("unit", name=name, parent=runner.id, worktree=staff.RemovedWorktree(
+                        "natedev", self.root / name, staff.ParkedBranch("published-work")))
+                    if operation == "seed":
+                        record = staff.apply_seed(staff.SeedInput((), (staff.SeedRetirement(candidate.id, runner.id),)))
+                    else:
+                        staff.defer_retire((candidate.id,))
+                        _ = staff.retire_pending()
+                        record = staff.authority_snapshot()
+                    self.assertIsNone(record.by_id(candidate.id))
+                    self.assertEqual(record.by_id(runner.id), runner)
+
+    def test_staff_accessors_list_the_current_shutdown_writes(self) -> None:
+        document = (CHECKOUT / "docs/as-built/staff-accessors.md").read_text(encoding="utf-8")
+        row = next(line for line in document.splitlines() if line.startswith("| `scripts/agents/shutdown.py`"))
+        self.assertIn("retire_unit", row)
+        self.assertNotIn("restore_unit", row)
+
+    def test_director_role_changes_keep_identity_workers_and_repeat_safety(self) -> None:
+        parent = fixture_member("showrunner", name="sdlc")
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        unit = fixture_member("unit", name="models", parent=parent.id, worktree=location)
+        document = staff.LiveDoc("natedev", self.root / "child-production.md")
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=document)
+                self.assertEqual(promoted, replace(unit, kind="showrunner", unit_type=staff.NotUnit(),
+                                                   worktree=staff.WORKTREE_UNFILLED, doc=document))
+                child = fixture_member("unit", name="child-" + machine, parent=promoted.id)
+                retained = fixture_member("worker", name="worker-" + machine, parent=promoted.id)
+                destination = staff.UnitRole(unit.name, parent.id, location)
+                self.assertEqual(staff.change_director(unit.id, destination), unit)
+                self.assertEqual(staff.by_id(child.id), replace(child, parent=staff.ReportsTo(parent.id)))
+                self.assertEqual(staff.by_id(retained.id), retained)
+                unchanged = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                self.assertEqual(staff.change_director(unit.id, destination), unit)
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
+                self.assert_refused(lambda: staff.change_director(retained.id, destination))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
 
     def test_schema_one_rewrites_as_three_without_inventing_worktrees_or_docs(self) -> None:
         runner, unit, worker = self.tree()
@@ -1587,11 +1676,12 @@ class StaffTests(StaffCommandTestCase):
 
     def test_owner_location_changes_keep_unknown_fields(self) -> None:
         runner, unit = self.tree()[:2]
+        runner = self.retirement_document(runner, self.root / "doc.md")
         kept = {"future_location": {"items": [False, None, 3]}}
-        for action in ("set_worktree", "set_doc", "restore", "retire_unit", "retire_showrunner"):
+        for action in ("set_worktree", "set_doc", "retire_unit", "retire_showrunner"):
             with self.subTest(action=action):
                 worktree = (staff.RemovedWorktree("natedev", self.root / "unit")
-                            if action in ("restore", "retire_showrunner") else
+                            if action == "retire_showrunner" else
                             staff.PresentWorktree("natedev", self.root / "unit"))
                 doc = staff.LiveDoc("natedev", self.root / "doc.md")
                 unit_value = replace(unit, worktree=worktree).to_json()
@@ -1606,14 +1696,16 @@ class StaffTests(StaffCommandTestCase):
                 elif action == "set_doc":
                     target, key, path, state = runner, "doc", self.root / "new-doc.md", "live"
                     _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
-                elif action == "restore":
-                    _ = staff.restore_unit(unit.id, staff.PresentWorktree("natedev", path))
+                elif action == "retire_unit":
+                    self.save_retirement_branch(staff.StaffRow.from_json(unit_value))
+                    staff.defer_retire((unit.id,))
+                    self.assertEqual(staff.retire_pending(), ())
+                    stored = cast(list[dict[str, object]], json.loads(self.staff_file.read_text())["rows"])
+                    self.assertEqual(stored, [runner_value])
+                    continue
                 else:
-                    if action == "retire_showrunner":
-                        target, key, path, state = runner, "doc", doc.path, "wrapped"
-                    else:
-                        state = "removed"
-                    staff.defer_retire((target.id,))
+                    target, key, path, state = runner, "doc", doc.path, "wrapped"
+                    staff.defer_retire((runner.id,))
                     self.assertEqual(staff.retire_pending(), ())
                 stored = cast(list[dict[str, object]], json.loads(self.staff_file.read_text())["rows"])
                 location = next(item for item in stored if item["id"] == target.id)[key]
@@ -2196,12 +2288,13 @@ class StaffTests(StaffCommandTestCase):
         self.assertIsNone(staff.by_path("sdlc/missing/impl1"))
         self.assert_refused(lambda: staff.retire(unit.id))
         location = staff.PresentWorktree("natedev", self.root / "models")
-        _ = staff.set_worktree(unit.id, location, expected=unit.worktree)
+        _ = self.retirement_document(showrunner, self.root / "doc.md")
+        self.save_retirement_branch(staff.set_worktree(unit.id, location, expected=unit.worktree))
         staff.defer_retire((unit.id,))
         self.assertEqual(staff.retire_pending(), (unit.id,))
         self.assertEqual(staff.retire(worker.id), worker)
         self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(location.machine, location.path)))
+        self.assertIsNone(staff.by_id(unit.id))
         self.assertIsNone(staff.by_id(worker.id))
         self.assertIsNone(staff.by_path("sdlc/models/impl1"))
         self.assertEqual(staff.by_id(other_worker.id), other_worker)
@@ -2789,8 +2882,9 @@ class StaffTests(StaffCommandTestCase):
 
     def test_pending_retirement_waits_for_workers_then_retires_units_before_showrunners(self) -> None:
         runner, unit, worker = self.tree()
-        runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
+        runner = self.retirement_document(runner, self.root / "sdlc.md")
         unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
+        self.save_retirement_branch(unit)
         child = fixture_member("showrunner", name="child", parent=runner.id)
         staff.defer_retire((runner.id, unit.id))
         original = self.staff_file.read_bytes()
@@ -2802,7 +2896,7 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
         _ = staff.retire(worker.id)
         self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")))
+        self.assertIsNone(staff.by_id(unit.id))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "sdlc.md")))
         self.assertEqual(staff.by_id(child.id), child)
         completed = self.staff_file.read_bytes()
@@ -2811,19 +2905,29 @@ class StaffTests(StaffCommandTestCase):
 
     def test_pending_retirement_round_trips_over_mac_transport(self) -> None:
         runner, unit, worker = self.tree()
-        runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
+        runner = self.retirement_document(runner, self.root / "sdlc.md")
         unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
-        with self.machine("mac"):
+        self.save_retirement_branch(unit)
+        with (foreign_hostname(), mock.patch.dict(os.environ, {"GATE_TEST_HOST": "natedev"}),
+              self.machine("mac")):
             staff.defer_retire((runner.id, unit.id))
             self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
             self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
             _ = staff.retire(worker.id)
-            self.assertEqual(staff.retire_pending(), ())
+            with redirect_stderr(io.StringIO()) as diagnostics:
+                remaining = staff.retire_pending()
+            self.assertEqual(remaining, (), diagnostics.getvalue())
         self.assertFalse(self.mac_file.exists())
         self.assertCountEqual(staff.snapshot().rows, (
             replace(runner, doc=staff.WrappedDoc("natedev", self.root / "sdlc.md")),
-            replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")),
         ))
+        mac_unit = fixture_member("unit", name="remote", parent=runner.id,
+                                  worktree=staff.RemovedWorktree("mac", self.root / "mac-models", staff.ParkedBranch("models")))
+        staff.defer_retire((mac_unit.id,))
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.retire_pending(), (mac_unit.id,))
+        self.assertEqual(errors.getvalue().count(f"keeping {mac_unit.id}: waiting on worktree host mac"), 1)
+        self.assertEqual(staff.by_id(mac_unit.id), mac_unit)
 
     def test_pending_retirement_drops_ids_already_retired(self) -> None:
         runner = fixture_member("showrunner", name="gone", doc=staff.WrappedDoc("natedev", self.root / "gone.md"))

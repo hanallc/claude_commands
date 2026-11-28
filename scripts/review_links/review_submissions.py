@@ -1478,7 +1478,8 @@ class PageOwners:
 
 
 def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> bool:
-    return (row.id not in members.pending_retire and not isinstance(row.exited, staff.Exited)
+    return (not row.awaits_legacy_removal and row.id not in members.pending_retire
+            and not isinstance(row.exited, staff.Exited)
             and not isinstance(row.doc, staff.WrappedDoc) and not isinstance(row.worktree, staff.RemovedWorktree)
             and (row.kind != "showrunner" or isinstance(row.doc, staff.LiveDoc)))
 

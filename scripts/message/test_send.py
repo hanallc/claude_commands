@@ -1864,7 +1864,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                                         current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct")) for identity in ("one", "two"))]
         retired = staff.StaffRow(staff.StaffId("producer-fixed"), "producer", "planner", staff.StaffRoot(),
                                  current_session=staff.StaffId("producer-current"),
-                                 retirement=staff.RetiredProducer("claude:sonnet:high"))
+                                 unknown_fields={staff.LEGACY_PRODUCER_MARK: "claude:sonnet:high"})
         self.session(retired.current_session, retired.name)
         self.staff_rows = {row.id: row for row in (*rows, retired)}
         cases = (
@@ -3027,7 +3027,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                    if line.startswith("- to: "))))
             payload = guarded_payload(command, destination, "Private")
-            self.staff_rows[producer.id] = replace(producer, retirement=staff.RetiredProducer("claude:sonnet:high"))
+            self.staff_rows[producer.id] = replace(producer, unknown_fields={staff.LEGACY_PRODUCER_MARK: "claude:sonnet:high"})
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(3)
                 client.connect(destination[4:])
@@ -3213,7 +3213,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                              ["Staff peer", "Staff explicit"])
 
         self.staff_rows = {"original": replace(member, kind="producer", name="Planner",
-                                              retirement=staff.RetiredProducer("claude:sonnet:high"))}
+                                              unknown_fields={staff.LEGACY_PRODUCER_MARK: "claude:sonnet:high"})}
         self.outcome = send.Result("sent", "ok")
         forwarded.clear()
         self.relayed.clear()
@@ -5761,7 +5761,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
         retired = staff.StaffRow(staff.StaffId("producer-fixed"), "producer", "planner", staff.StaffRoot(),
                                  current_session=staff.StaffId("producer-current"),
-                                 retirement=staff.RetiredProducer("claude:sonnet:high"))
+                                 unknown_fields={staff.LEGACY_PRODUCER_MARK: "claude:sonnet:high"})
         self.staff_rows[retired.id] = retired
         self.staff_member("verify-one", "verify")
         self.staff_member("verify-two", "verify")

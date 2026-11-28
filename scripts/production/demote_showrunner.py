@@ -20,7 +20,7 @@ from scripts.accounts import accounts
 from scripts.herdr import herdr_types
 from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
+from scripts.production import add_unit, production_lifecycle, promote_showrunner, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
 from scripts.production.production_doc import DEMOTED, EnrolledPaths, Production, Refusal, read_new_production, read_production
 from scripts.agents import pane_record, remote, stop_resume
 from scripts.whoami.account import named_account_environment
@@ -62,18 +62,16 @@ def check_units(child: Production, record: staff.StaffSnapshot) -> None:
     live = [row.name for row in rows if not isinstance(row.worktree, staff.RemovedWorktree)]
     if live:
         raise Refusal(f"{child.name}: live units: {', '.join(live)}")
-    resolver = session_staff.RowResolver(record)
     unmerged: list[str] = []
     for row in rows:
-        try:
-            branch = production_lifecycle.unit_branch(row, resolver)
-            if not isinstance(branch, session_staff.Branch):
-                print(f"anomaly: {row.name}: {' '.join(branch.reason.splitlines())}", file=sys.stderr)
-                continue
-            if production_lifecycle.branch_merge_state(child, branch.name) is production_lifecycle.BranchMergeState.UNMERGED:
-                unmerged.append(branch.name)
-        except (OSError, ValueError, production_lifecycle.LifecycleStop) as error:
-            print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        evidence = production_lifecycle.retirement_branches(child, row)
+        unmerged.extend(branch.name for branch in evidence.branches
+                        if branch.state is production_lifecycle.BranchMergeState.UNMERGED)
+        unknown = (*evidence.unreadable_records, *(branch.reason for branch in evidence.branches
+                   if branch.state is production_lifecycle.BranchMergeState.UNKNOWN))
+        if unknown:
+            reason = " ".join(". ".join(unknown).splitlines())
+            print(f"anomaly: {row.name}: {reason}", file=sys.stderr)
     if unmerged:
         raise Refusal(f"{child.name}: unmerged branches: {', '.join(unmerged)}")
 

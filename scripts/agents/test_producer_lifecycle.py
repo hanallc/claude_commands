@@ -25,7 +25,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import roster, sessions
 from scripts.production import staff, the_list, update_registration
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, legacy_producer_fixture
 
 SUBMIT_OPENING = herdr.Herdr.submit_opening_prompt
 OPENING_TEXT = script_prompt("Read ~/rust/hanadocs/dwight/README.md, then run /producer:produce.")
@@ -479,7 +479,7 @@ class ProducerLifecycleTests(unittest.TestCase):
                 self.assertIn("handoff.md exists", output)
             self.assertEqual(send.call_count, 1)
 
-    def test_retirement_requests_handoff_once_moves_open_items_and_restores_the_same_session(self) -> None:
+    def test_retirement_requests_handoff_once_moves_open_items_and_removes_the_record(self) -> None:
         row, morty = self.producer("dwight"), self.producer("morty")
         owner = fixture_member("showrunner", name="show")
         destination = self.producer("director")
@@ -537,7 +537,8 @@ class ProducerLifecycleTests(unittest.TestCase):
               patch.object(herdr.Herdr, "scan_row_panes", return_value=herdr.RowPaneScan({row.id: [pane]}, [])) as scan,
               patch.object(herdr, "shared_session", return_value="fixture"),
               patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close_tab,
-              patch.object(shutdown_record, "remove_started") as forget):
+              patch.object(shutdown_record, "remove_started") as forget,
+              patch.object(staff, "require_stopped")):
             send.side_effect = RuntimeError("fixture refused the handoff notice")
             self.assertIn("refused the handoff notice", command("retire", row.name, "--to", destination.name)[2])
             send.side_effect = None
@@ -598,15 +599,14 @@ class ProducerLifecycleTests(unittest.TestCase):
             self.assertEqual(staff.snapshot().by_path(row.name), row)
             self.assertEqual(self.profile(row.name), "claude:sonnet:high")
             send.side_effect = None
-            self.assertEqual(command("retire", row.name, "--to", destination.name)[0], 0)
-            self.assertEqual(command("retire", row.name, "--to", destination.name)[0], 0)
+            result = command("retire", row.name, "--to", destination.name)
+            self.assertEqual(result[0], 0, result)
             self.assertEqual(the_list.load(morty.id, opened.id), before_retry)
             self.assertEqual(stop.call_count, 4)
             self.assertEqual(close_tab.call_count, 1)
             self.assertEqual(send.call_count, 6)
         retired = staff.snapshot()
-        self.assertEqual(retired.by_id(row.id), staff.StaffRow.from_json({
-            **row.to_json(), "retired_producer": "claude:sonnet:high"}))
+        self.assertIsNone(retired.by_id(row.id))
         self.assertIsNone(retired.by_path(row.name))
         self.assertIsNone(retired.by_member_reference(row.id))
         self.assertIsNone(staff.local_by_current_session(row.current_session))
@@ -620,14 +620,66 @@ class ProducerLifecycleTests(unittest.TestCase):
             moved_late = the_list.load(morty.id, late.id)
             self.assertEqual((moved_late.producer, moved_late.log[-1].source), (destination.id, "agents retire"))
         self.assertEqual(the_list.load(morty.id, closed.id), closed)
-        self.assertIn("dwight | Closed work", the_list.table(morty.id, include_closed=True))
+        self.assertIn("Closed work", the_list.table(morty.id, include_closed=True))
 
-        def resume(identity: str, *, why: str, to: str | None) -> stop_resume.ClaudeUp:
-            del why, to
-            self.assertEqual(staff.snapshot().by_path(row.name), row)
-            self.assertEqual(self.profile(row.name), "claude:sonnet:high")
-            return stop_resume.ClaudeUp(identity, "restored-tab", "claude3")
 
-        with patch.object(stop_resume, "resume", side_effect=resume) as launch:
-            self.assertEqual(command("resume", row.name, "--retired")[0], 0)
-        launch.assert_called_once_with(row.id, why="resumed by name", to=None)
+    def test_retirement_removes_an_old_producer_record_without_a_handoff(self) -> None:
+        row = self.producer("dwight")
+        marked = legacy_producer_fixture(row.id, "claude:sonnet:high")
+        self.assertTrue(marked.awaits_legacy_removal)
+        self.assertEqual(staff.snapshot().by_id(row.id), marked)
+        with patch.object(stop_resume, "_resume_once") as launch:
+            resumed = stop_resume.resume(row.name)
+        self.assertEqual(resumed, stop_resume.ResumeFailed(
+            row.name, f"{row.name}: old retirement record. Use agents retire {row.id} to remove the record."))
+        launch.assert_not_called()
+        with (patch.object(producer_lifecycle, "_machinery_stop") as stop,
+              patch.object(staff, "require_stopped")):
+            code, output, errors = command("retire", row.name)
+        self.assertEqual((code, output, errors), (0, "dwight: retired\n", ""))
+        stop.assert_called_once_with(marked)
+        self.assertIsNone(staff.snapshot().by_id(row.id))
+        self.assertIsNone(self.profile(row.name))
+
+    def test_producer_retirement_retries_receipt_cleanup_after_staff_removal(self) -> None:
+        row = self.producer("dwight")
+        _ = legacy_producer_fixture(row.id, "claude:sonnet:high")
+        receipts = pane_record.record_directory()
+        receipt = receipts / f".producer-retire-{row.id}"
+        handoff = receipts / f".producer-handoff-{row.id}"
+        handoff.parent.mkdir(parents=True, exist_ok=True)
+        _ = handoff.write_text("{}\n", encoding="utf-8")
+        unlink = Path.unlink
+
+        def fail_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path == handoff:
+                raise PermissionError("fixture receipt unlink failed")
+            unlink(path, missing_ok=missing_ok)
+
+        with (patch.object(producer_lifecycle, "_machinery_stop"),
+              patch.object(staff, "require_stopped"),
+              patch.object(Path, "unlink", fail_unlink)):
+            code, output, errors = command("retire", row.name)
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("fixture receipt unlink failed", errors)
+        self.assertIsNone(staff.snapshot().by_id(row.id))
+        self.assertTrue(handoff.exists())
+        self.assertTrue(receipt.exists())
+        unrelated = receipts / ".producer-retire-unrelated"
+        _ = unrelated.write_text("{broken", encoding="utf-8")
+        self.assertEqual(command("retire", row.name), (0, "dwight: retired\n", ""))
+        self.assertFalse(handoff.exists())
+        self.assertFalse(receipt.exists())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "{broken")
+
+
+    def test_producer_retirement_can_skip_handoff_for_a_clone(self) -> None:
+        row = self.producer("dwight")
+        with (patch.object(producer_lifecycle, "requires_handoff", return_value=False) as requires,
+              patch.object(producer_lifecycle, "_machinery_stop") as stop,
+              patch.object(staff, "require_stopped")):
+            code, output, errors = command("retire", row.name)
+        self.assertEqual((code, output, errors), (0, "dwight: retired\n", ""))
+        requires.assert_called_once_with(row)
+        stop.assert_called_once_with(row)
+        self.assertIsNone(staff.snapshot().by_id(row.id))

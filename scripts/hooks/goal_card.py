@@ -52,7 +52,9 @@ def _session_fields(session_id: str) -> dict[str, object] | None:
         if isinstance(entry, dict):
             fields = cast(dict[str, object], entry)
             if fields.get("current_session", fields.get("id")) == session_id:
-                return fields if "retired_producer" not in fields else None
+                from scripts.production.staff import LEGACY_PRODUCER_MARK
+
+                return fields if LEGACY_PRODUCER_MARK not in fields else None
     return None
 
 

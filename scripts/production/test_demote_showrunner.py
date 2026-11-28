@@ -18,14 +18,15 @@ from unittest import mock
 
 from scripts.accounts import accounts
 from scripts.herdr import herdr
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.shell_test_support import fixture_zsh_environment
-from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
+from scripts.production import add_unit, demote_showrunner as demote, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
 from scripts.production.production_doc import Production, read_production
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-from scripts.agents import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, shutdown, stop_resume
 
 
 class DemoteShowrunnerTests(StaffTestCase):
@@ -529,12 +530,29 @@ class DemoteShowrunnerTests(StaffTestCase):
         code, _, errors = self.run_command("--check")
         self.assertEqual(code, 0, errors)
         self.assert_no_actions(before)
+        merged = self.retired_unit("merged", self.child_branch)
+        before = self.staff_file.read_bytes()
+        code, _, errors = self.run_command("--check")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(errors, "")
+        self.assertEqual(staff.by_id(merged.id), merged)
+        self.assert_no_actions(before)
 
     def test_refuses_unmerged_branches_and_accepts_merged_or_missing_branches(self) -> None:
         commit = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unmerged work")
         for name in ("handoff-a", "handoff-b"):
             _ = self.git("branch", name, commit)
-            _ = self.retired_unit(name, name)
+            row = self.retired_unit(name, name)
+            path = production_lifecycle.wrap_branch_path(row)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({**production_lifecycle.wrap_branch_facts(row), "branch": "absent"}))
+        journal = shutdown.retirement_journal(row)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "session": row.current_session, "worktree": str(self.root / row.name),
+            "checkout": str(self.checkout), "branch": "journal-work", "pane_id": "", "pane_session": "",
+        }))
+        _ = self.git("branch", "journal-work", commit)
         before = self.staff_file.read_bytes()
         for remote in (False, True):
             with self.subTest(remote=remote):
@@ -546,12 +564,53 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(code, 2, errors)
                 for name in ("handoff-a", "handoff-b"):
                     self.assertIn(name, errors)
+                self.assertIn("journal-work", errors)
                 self.assert_no_actions(before)
+        with self.subTest(remote="matching branch tips at different fetch and push destinations"):
+            other = self.root / "other-origin.git"
+            _ = self.git("clone", "--bare", str(self.root / "origin.git"), str(other))
+            for name in ("handoff-a", "handoff-b"):
+                self.assertEqual(self.git("-C", str(other), "rev-parse", name),
+                                 self.git("ls-remote", "origin", f"refs/heads/{name}").split()[0])
+            _ = self.git("remote", "set-url", "--push", "origin", str(other))
+            try:
+                code, _, errors = self.run_command("--check")
+                self.assertEqual(code, 2, errors)
+                unmerged = errors.partition("unmerged branches: ")[2].splitlines()
+                self.assertTrue(unmerged, errors)
+                self.assertCountEqual(unmerged[0].split(", "), ("handoff-a", "handoff-b", "journal-work"))
+                self.assert_no_actions(before)
+            finally:
+                _ = self.git("config", "--unset", "remote.origin.pushurl")
         _ = self.git("-C", str(self.child_tree), "merge", "--ff-only", commit)
         self.assertEqual(self.run_command("--check")[0], 0)
         _ = self.git("push", "origin", "--delete", "handoff-a", "handoff-b")
         self.assertEqual(self.run_command("--check")[0], 0)
         self.assert_no_actions(before)
+
+        with self.subTest(remote="origin moves before fetch while the local tip is unmerged"):
+            ref = "refs/heads/handoff-a"
+            origin = str(self.root / "origin.git")
+            local_tip = self.git("commit-tree", f"{commit}^{{tree}}", "-p", commit, "-m", "Unmerged local work")
+            advertised = self.git("-C", origin, "commit-tree", f"{commit}^{{tree}}", "-p", commit, "-m", "Origin work")
+            _ = self.git("update-ref", ref, local_tip)
+            _ = self.git("-C", origin, "update-ref", ref, advertised)
+            retirement_git = shutdown.retirement_git
+
+            def advance_origin(unit: shutdown.RetiringUnit, *args: str,
+                               settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
+                result = retirement_git(unit, *args, settings=settings)
+                if args[0] == "ls-remote" and args[-1] == ref:
+                    self.assertEqual(result.stdout.split()[0], advertised)
+                    _ = self.git("-C", origin, "update-ref", ref, commit, advertised)
+                return result
+
+            with mock.patch.object(shutdown, "retirement_git", side_effect=advance_origin):
+                code, _, errors = self.run_command("--check")
+            self.assertEqual(self.git("-C", origin, "rev-parse", ref), commit)
+            self.assertEqual(code, 2, errors)
+            self.assertIn("unmerged branches: handoff-a", errors)
+            self.assert_no_actions(before)
 
     def test_unknown_retirement_facts_print_one_anomaly_without_refusal(self) -> None:
         row = fixture_member("unit", name="unknown", parent=self.child.id,

@@ -28,6 +28,8 @@ from unittest import mock
 
 
 from scripts.production import fake_unit_host
+from scripts.copies import copies
+from scripts.production import investigation
 from scripts.production import merge_checkpoint, production_lifecycle, promotion as publication
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
@@ -37,6 +39,7 @@ from scripts.production.fake_unit_host import HostedUnit
 
 
 from scripts.production import log_backup, production_admission, production_doc, staff, unit_config, update_registration
+from scripts.production import tidy_wrapped
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import (
     BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
@@ -55,6 +58,7 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
+from scripts.message import session_records
 
 
 def setUpModule() -> None:
@@ -91,6 +95,20 @@ class LifecycleTests(LifecycleFixture):
             **fixture_git_environment(directory), "GIT_CONFIG_SYSTEM": os.devnull,
         }, clear=True)))
         super().setUpClass()
+
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        (self.state / "sessions").mkdir(exist_ok=True)
+
+    @override
+    def showrunner(self, production_name: str, *, live: bool = False) -> None:
+        super().showrunner(production_name, live=live)
+        if live:
+            path = self.state / "sessions" / f"{os.getpid()}.json"
+            fields = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+            fields.update(updatedAt=1, procStart=session_records.process_start(os.getpid()), tmux="", formerNames=[])
+            self.write(path, json.dumps(fields))
 
     def test_move_and_reverse_keep_the_original_cargo_liner_log_in_main(self) -> None:
         target = staff.rename(self.owner_id(), CARGO_LINER_PRODUCTION)
@@ -187,8 +205,8 @@ class LifecycleTests(LifecycleFixture):
             parked = unit_config.read_parked(alpha.id)
         assert isinstance(parked, unit_config.UnitConfig)
         self.assertEqual(replace(parked, retired=unit_config.NoRetiredSession()), expected)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch"))))
-        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta, staff.ParkedBranch("beta-branch"))))
+        self.assertIsNone(staff.by_id(alpha.id))
+        self.assertIsNone(staff.by_id(beta.id))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.by_id(child.id), child)
 
@@ -316,7 +334,7 @@ class LifecycleTests(LifecycleFixture):
     def finish_interrupted_wrap(self, retire_showrunner: bool) -> None:
         runner, alpha, beta, child = self.staff_tree()
         target = runner.id if retire_showrunner else alpha.id
-        original_doc, original_worktree = staff.set_doc, staff.set_worktree
+        original_doc, original_retire = staff.set_doc, staff.retire_unit
         def interrupted_doc(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc, *,
                             expected: staff.LiveDoc) -> staff.StaffRow:
             row = original_doc(staff_id, value, expected=expected)
@@ -324,28 +342,32 @@ class LifecycleTests(LifecycleFixture):
                 raise OSError("stopped after staff retirement")
             return row
 
-        def interrupted_worktree(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
-                                 expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
-            original = staff.by_id(staff_id)
-            assert original is not None
-            self.assertEqual(expected, original.worktree)
-            row = original_worktree(staff_id, value, expected=expected)
-            if staff_id == target:
+        def interrupted_retirement(expected: staff.StaffRow, *, expected_workers: tuple[staff.StaffRow, ...]) -> None:
+            self.assertEqual(staff.by_id(expected.id), expected)
+            original_retire(expected, expected_workers=expected_workers)
+            if expected.id == target:
                 raise OSError("stopped after staff retirement")
-            return row
 
-        with mock.patch.object(staff, "set_doc" if retire_showrunner else "set_worktree",
-                               side_effect=interrupted_doc if retire_showrunner else interrupted_worktree):
+        with mock.patch.object(staff, "set_doc" if retire_showrunner else "retire_unit",
+                               side_effect=interrupted_doc if retire_showrunner else interrupted_retirement):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
         self.assertTrue((self.state / "showrunner" / self.owner_id("example") / "wrap_release.json").exists())
-        with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
+        if not retire_showrunner:
+            self.assertIsNone(staff.by_id(alpha.id))
+        with (mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")),
+              mock.patch.object(investigation, "open_review_investigations",
+                                wraps=investigation.open_review_investigations) as reviews,
+              mock.patch.object(copies, "remove_trees", wraps=copies.remove_trees) as remove_trees):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for unit in (alpha, beta):
+            reviews.assert_any_call(unit.id)
+            remove_trees.assert_any_call(unit.id)
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         for row in (alpha, beta):
             assert isinstance(row.worktree, staff.PresentWorktree)
-            self.assertEqual(staff.by_id(row.id), replace(row, worktree=staff.RemovedWorktree(remote.local_machine(), row.worktree.path, staff.ParkedBranch(row.name + "-branch"))))
+            self.assertIsNone(staff.by_id(row.id))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(len(self.sent()), 1)
         data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
@@ -356,6 +378,19 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_rerun(self) -> None:
         self.finish_interrupted_wrap(False)
+
+    def test_wrap_resumes_after_checkout_removal_before_record_removal(self) -> None:
+        _, alpha, beta, _ = self.staff_tree()
+        with mock.patch.object(staff, "retire_unit", side_effect=OSError("stopped before staff retirement")):
+            failed = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
+        self.assertIn("stopped before staff retirement", failed.stdout)
+        self.assertFalse(self.alpha.exists())
+        self.assertEqual(staff.by_id(alpha.id), alpha)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(staff.by_id(alpha.id))
+        self.assertIsNone(staff.by_id(beta.id))
 
     def test_wrap_rerun_after_showrunner_retirement_keeps_the_release_capture(self) -> None:
         self.finish_interrupted_wrap(True)
@@ -369,16 +404,16 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertTrue(any(call.args[0] == alpha.id for call in stops.call_args_list))
         self.assertIn(worker.id, result.stdout)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch"))))
+        self.assertEqual(staff.by_id(alpha.id), alpha)
         self.assertEqual(staff.by_id(worker.id), worker)
-        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta, staff.ParkedBranch("beta-branch"))))
+        self.assertIsNone(staff.by_id(beta.id))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(staff.snapshot().pending_retire, (alpha.id,))
         self.assertIn("wrapped", self.doc.read_text())
         _ = staff.retire(worker.id)
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch"))))
+        self.assertIsNone(staff.by_id(alpha.id))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.snapshot().pending_retire, ())
 
@@ -904,7 +939,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("smoke-launch: ok", passed.stdout)
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
 
-    def test_showrunner_instructions_explain_stop_resume_and_account_move(self) -> None:
+    def test_showrunner_instructions_explain_session_lifecycle(self) -> None:
         commands = Path(__file__).parents[2] / "commands"
         for name in ("showrunner/produce.md", "agents.md"):
             with self.subTest(command=name):
@@ -913,6 +948,13 @@ class LifecycleTests(LifecycleFixture):
                     self.assertIn(command, text)
                 self.assertIn("--why", text)
                 self.assertNotIn("<PauseForMove>", text)
+
+        docs = commands.parent / "docs"
+        restart = (docs / "as-built/shutdown-and-restart.md").read_text(encoding="utf-8")
+        self.assertNotIn("Retired unit recovery holds both locks", restart)
+        self.assertNotIn("Retired recovery removes a row", restart)
+        production = (docs / "production_format.md").read_text(encoding="utf-8")
+        self.assertIn("Removing a retired unit record also removes its worker rows.", production)
 
     def test_produce_names_live_ci_and_smoke_steps(self) -> None:
         command = Path(__file__).parents[2] / "commands/showrunner/produce.md"
@@ -1261,11 +1303,38 @@ esac
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch")), expected=row.worktree)
         _ = self.git("worktree", "remove", str(self.alpha))
         _ = self.git("branch", "-D", "alpha-branch")
+        wrap_record = Path(self.env["SHOWRUNNER_STATE_DIR"]) / self.owner_id() / "wrap_units" / f"{row.id}.json"
+        self.write(wrap_record, json.dumps({**production_lifecycle.wrap_branch_facts(row), "branch": "absent"}))
+        before = self.staff.staff_file.read_bytes()
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "held")
         self.assertIn("alpha-branch", result.stdout)
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch").split()[1],
                          "refs/heads/alpha-branch")
+        self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        self.assertTrue(self.beta.is_dir())
+
+        published = self.promotion_checkout("published-merge")
+        _ = self.git("switch", "-c", "production", "origin/alpha-branch", cwd=published)
+        _ = self.git("commit", "--allow-empty", "-m", "Publish the merge tip", cwd=published)
+        _ = self.git("push", "origin", "production", cwd=published)
+        target = self.git("rev-parse", "HEAD", cwd=published)
+        object_check = subprocess.run(["git", "cat-file", "-e", target], cwd=self.checkout, env=self.env,
+                                      capture_output=True, check=False)
+        self.assertNotEqual(object_check.returncode, 0)
+        removed = unit_membership("example", "alpha")
+        owner = staff.snapshot().by_id(self.owner_id())
+        assert owner is not None
+        with (mock.patch.dict(os.environ, self.env, clear=True),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner")):
+            for local_merge in ("behind", "absent"):
+                with self.subTest(local_merge=local_merge):
+                    if local_merge == "absent":
+                        _ = self.git("switch", "--detach")
+                        _ = self.git("branch", "-D", "production")
+                    production_lifecycle.require_deferred_branch(removed.to_json(), owner.to_json())
+                    self.assertEqual(self.git("cat-file", "-t", target), "commit")
+                    self.assertEqual(self.staff.staff_file.read_bytes(), before)
 
     def test_wrap_reports_already_retired_unit_with_no_branches(self) -> None:
         self.running()
@@ -1515,8 +1584,7 @@ esac
                             "**Status: PRODUCTION — running.**".encode(),
                             "**Status: PRODUCTION — wrapped.**".encode(), 1) + edit)
                         self.assertFalse(staging.exists())
-                        self.assertEqual(staff.by_id(merge_unit.id), replace(merge_unit, worktree=staff.RemovedWorktree(
-                            remote.local_machine(), staging, staff.ParkedBranch("merge-staging"))))
+                        self.assertIsNone(staff.by_id(merge_unit.id))
                         self.assertTrue(integration.is_dir())
                         self.assertEqual(self.git("rev-parse", "production", "origin/production"), refs)
                         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), live)))
@@ -1908,7 +1976,8 @@ esac
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
-        note = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
+        alpha = unit_membership("example", "alpha")
+        note = self.write_phase_note("alpha", "example", alpha.id)
         archive = self.phase_table_vault.parent / "archive"
         self.write(archive, "blocks the archive directory\n")
 
@@ -1921,6 +1990,16 @@ esac
         self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
         self.assertNotIn("notifier.sh remove", self.calls())
         self.assertTrue((self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf").is_file())
+        self.assertEqual(staff.by_id(alpha.id), alpha)
+        self.assertFalse(self.alpha.exists())
+        archive.unlink()
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+
+        self.assert_step(result, "ok")
+        self.assertIn("phase-notes: ok — archived 1 phase note", result.stdout)
+        self.assertFalse(note.exists())
+        self.assertIsNone(staff.by_id(alpha.id))
 
 
 if __name__ == "__main__":

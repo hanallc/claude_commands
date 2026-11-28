@@ -4652,9 +4652,9 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             start.assert_not_called()
             self.assertEqual(shutdown_record.read(), [str(other.id)])
 
-    def test_restart_only_removes_a_retired_producer_from_the_record(self) -> None:
+    def test_restart_ignores_an_old_producer_mark(self) -> None:
         retired = replace(self.rows[0], id=staff.StaffId("alpha-id"), name="alpha", kind="producer",
-                          unit_type=staff.NotUnit(), retirement=staff.RetiredProducer("claude:sonnet:high"))
+                          unit_type=staff.NotUnit(), unknown_fields={staff.LEGACY_PRODUCER_MARK: "claude:sonnet:high"})
         record = staff.StaffSnapshot((retired, *self.rows[1:]))
         other = str(self.rows[1].id)
         shutdown_record.save([retired.id, other])

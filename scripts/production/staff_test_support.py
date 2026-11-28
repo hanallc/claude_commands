@@ -280,6 +280,22 @@ def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
     return replace(row, name=name)
 
 
+def legacy_producer_fixture(identity: staff.StaffId, profile: str) -> staff.StaffRow:
+    """Write a producer mark in the old fixture format."""
+    path = staff.record_path()
+    record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    for row in cast(list[dict[str, object]], record["rows"]):
+        if row["id"] == identity:
+            assert row["kind"] == "producer"
+            if profile:
+                row[staff.LEGACY_PRODUCER_MARK] = profile
+            else:
+                _ = row.pop(staff.LEGACY_PRODUCER_MARK, None)
+            write_text_atomic(path, json.dumps(record))
+            return staff.StaffRow.from_json(row)
+    raise AssertionError(f"no fixture producer {identity}")
+
+
 def fixture_member(kind: staff.Kind, *, name: str,
                    parent: staff.StaffId | staff.ReportsTo | staff.StaffRoot | None = None,
                    worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = UNFILLED_WORKTREE,

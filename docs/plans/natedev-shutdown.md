@@ -101,10 +101,11 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - Worker startup takes the shared run index and the shared Codex snapshot. Restore and stop find a worker's run through one resolver.
 - After a failed worker stop, a worker starts again only when the read proves its old process is gone.
 
-### Phase 12: retire, and resume of a retired unit — done
+### Phase 12: Retire a unit — done
 
-- `agents retire NAME` removes the unit from active staff. Its row stays only as a retired record, and the board does not show it.
-- `agents resume NAME` of a retired unit refuses and names `--retired`. The showrunner asks the user yes or no before it runs `--retired`.
+- `agents retire NAME` removes an active unit from the board and keeps its retired staff row.
+- For a retired unit, `agents retire NAME` removes the unit and worker rows when its local and origin branch tips are merged or absent.
+- `agents resume NAME` refuses a retired unit and gives the command to remove its record.
 - `retire_unit.py`, `resume_unit.py`, `/showrunner:retire_unit` and `/showrunner:resume_unit` are deleted.
 
 ### Phase 12a: a worker stopped in the middle of a turn gets a working resume step — done

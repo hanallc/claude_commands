@@ -98,11 +98,11 @@ These staff functions write the record. The `agents` program owns process contro
 Failed continuation delivery restores the pause. A failed start retains the exit record.
 The production forms use `--production SHOWRUNNER` and accept repeated `--except UNIT` values for pause and exit.
 An unmatched exclusion refuses the production command before any write.
-Repeated holds retain the original metadata. Rename, move, retire, and restore retain the hold fields.
+Repeated holds keep the original metadata. Rename, move, and retirement of a live unit keep the hold fields.
 
 Rows, locations, and hold records keep fields that the reader does not know in `unknown_fields`.
 Writes preserve these fields unchanged. Row changes also preserve them.
-The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
+The owner keeps an existing location's unknown fields when its path or state changes.
 Changes from the Mac use the same owner setters.
 A new hold record starts with no unknown fields.
 Staff storage uses schema 2.
@@ -300,7 +300,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_admission.py` | write | record_path, snapshot, authority_snapshot, set_doc; checks and records a change to the document binding |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
-| `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
+| `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, retire_unit, set_doc, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
 | `scripts/production/promotion.py` | read | snapshot, LiveDoc; identifies the owner of the live document |
@@ -311,7 +311,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/record_store.py` | read | none (StaffId type for the record owner folder) |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
-| `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/shutdown.py` | write | by_id, cli_result, finish_unit_retirement, initial_snapshot, operation, operation_fds, remove_retired_unit, remove_unit_for_retirement, rename, retire_unit, row_operation, set_doc, set_worktree, snapshot |
 | `scripts/agents/producer_lifecycle.py` | read | initial_snapshot, slot_operation, validate_name; StaffRow, StaffSnapshot, LiveDoc and PresentWorktree types; add-producer checks the name and the free row before first start |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
@@ -431,9 +431,19 @@ No other copy of the staff facts is allowed without the user's approval. Remake 
 Both `Herdr._codex_launch` and `pane_record.seed` use this method.
 `pane_record.py` still reads staff for saved launch references and resume operations.
 
-A removed worktree retains its branch in `rows[].worktree.branch`.
-`staff.RemovedWorktree.branch` uses `ParkedBranch` or `BranchUnrecorded`.
-The lifecycle writers retain the branch before they remove its last Git evidence.
+An old staff record can contain a removed worktree with a `ParkedBranch` or `BranchUnrecorded`.
+Production wrap saves the branch before it removes the worktree.
+Wrap, deferred retirement, and demotion read branch names from the staff row, the wrap record, and the retirement journal.
+Git checks the local ref and the fetch origin ref for each name.
+The local merge tip or the published merge tip can prove that a branch is merged.
+Wrap validates the push destination before cleanup and pins the exact push URL for branch deletion.
+Deferred retirement and wrap retain the row if any named branch is unmerged or its state is unknown.
+Demotion refuses known unmerged branches and reports unknown branch evidence.
+Wrap removes the unit row after cleanup and the phase note archive when no worker rows remain.
+Tidy uses the saved unit IDs to preserve open Review items and clean up copies after an interrupted wrap.
+Deferred retirement checks that the unit has stopped and has no worker rows.
+Deferred retirement removes the row when the checkout is absent and Git proves that all recorded branches are merged or absent.
+Deferred retirement reports remote units as waiting on their worktree host.
 Parked configuration files retain only the retirement date and session.
 Folder moves use the staff row lock.
 Git stores the move lock at `<git-common-dir>/worktrees/<worktree-id>/locked`.

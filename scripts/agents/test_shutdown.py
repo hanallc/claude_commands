@@ -79,7 +79,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         return subprocess.run(["git", "-C", str(self.repository), *arguments], env=self.environment, check=True,
                               text=True, capture_output=True).stdout
 
-    def test_retirement_preserves_integration_and_waits_for_worktree_removal(self) -> None:
+    def test_retirement_removes_unit_worktrees_and_preserves_protected_branches(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", str(origin)], env=self.environment, check=True)
         _ = self.git("remote", "add", "origin", str(origin))
@@ -108,19 +108,14 @@ class EnrolledProductionShutdownTests(StaffTestCase):
             with self.subTest(branch=branch):
                 retiring = shutdown.RetiringUnit(production, unit.name, target, branch, unit)
                 with redirect_stderr(io.StringIO()) as notices:
-                    result = shutdown.retirement_remove(retiring, settings=settings)
+                    checked = shutdown.retirement_check(retiring, settings=settings)
+                    if kept:
+                        with self.assertRaisesRegex(shutdown.RetirementKeptWork, "protected production"):
+                            _ = shutdown.retirement_remove(retiring, checked, settings=settings)
+                    else:
+                        self.assertEqual(shutdown.retirement_remove(retiring, checked, settings=settings), [])
                 if kept:
-                    self.assertIn("protected production", result[0])
                     self.assertEqual(notices.getvalue(), "")
-                else:
-                    self.assertEqual(result, [])
-                    self.assertIn(f"kept for a manual removal list: {target}", notices.getvalue())
-                self.assertTrue(target.is_dir())
-                self.assertTrue(self.git("branch", "--list", branch))
-                self.assertTrue(self.git("ls-remote", "--heads", "origin", branch))
-                if not kept:
-                    _ = self.git("worktree", "remove", str(target))
-                    self.assertEqual(shutdown.retirement_remove(retiring, settings=settings), [])
                 self.assertEqual(target.exists(), kept)
                 self.assertEqual(bool(self.git("branch", "--list", branch)), kept)
                 self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), keep_origin)
@@ -650,16 +645,26 @@ class ProducerCommandsTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         unit = shutdown.retirement_find_unit("alpha", "alpha")
+        parent = staff.snapshot().parent_of(unit.staff_member)
+        assert parent is not None
         member = replace(unit.staff_member, id=staff.StaffId(fixture_runtime_id("fixed-retiring-holder")))
         self.assertNotEqual(member.id, member.current_session)
         unit = replace(unit, staff_member=member)
+        record = staff.StaffSnapshot((parent, member))
         holds = Path(os.environ["BUILD_HOLD_DIR"])
         fixed_hold = (holds / DIRECTOR).rename(holds / member.id)
-        with patch.object(shutdown, "retirement_remove", return_value=[]) as remove, \
-             patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output:
-            code = shutdown.retirement_clear_worktree(unit, settings=conf.read("production"),
-                record=staff.StaffSnapshot((member,)), pane_workers=[], pane=herdr.NoPane("alpha"), require_cleanup=True)
-        self.assertEqual(code, 0, output.getvalue())
+        settings = conf.read("production")
+        token = "a" * 32
+        assert isinstance(member.worktree, staff.PresentWorktree)
+        claim = staff.RetirementCheckoutClaim(token, member.worktree.machine, unit.worktree.resolve(), unit.worktree)
+        authority = staff.StaffSnapshot((parent,), retirement_cleanup={member.id: claim})
+        with (patch.object(staff, "authority_snapshot", return_value=authority),
+              patch.object(staff, "require_stopped"),
+              patch.object(shutdown, "retirement_remove", return_value=[]) as remove,
+              patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output):
+            code = shutdown.retirement_clear_worktree(unit, settings=settings, record=record,
+                pane_workers=[], pane=herdr.NoPane("alpha"), cleanup_token=token)
+        self.assertIs(code, shutdown.RetirementResult.COMPLETE, output.getvalue())
         self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
         self.assertFalse(fixed_hold.exists())
         remove.assert_called_once()

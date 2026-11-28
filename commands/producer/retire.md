@@ -11,5 +11,5 @@ Run only on the user’s direct instruction. Verify that `NAME` identifies a pro
 The program refuses while the producer has an open question. If the producer's `handoff.md` is absent, the program asks the producer for it, exits 0 and does not retire. Run the command again after the file exists.
 Open List items move to morty by default. Use `--to PRODUCER` to move them to another live producer.
 
-Use `agents resume NAME --retired` to restore the producer after the user confirms.
+A producer clone needs no handoff. The command removes the producer record and tab and keeps the conversation files.
 See [agents.md](../agents.md#rename-or-retire-a-producer) in `~/.claude/commands`.

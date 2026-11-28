@@ -52,6 +52,10 @@ def owned_paths(owner: staff.StaffRow) -> tuple[Path, ...]:
             STATE_DIR / "reports" / f"{identity}.json", STATE_DIR / identity)
 
 
+def wrap_unit_records(owner: staff.StaffId) -> Path:
+    return showrunners.SHOWRUNNER_STATE_DIR / owner / "wrap_units"
+
+
 def can_hold_questions(document: Path) -> bool:
     """Check for question storage before reading the staff record."""
     folder = issues_folder(document)
@@ -276,7 +280,7 @@ def recover_review_moves(root: Path) -> None:
             print(f"Review move {journal}: {error}", file=sys.stderr)
 
 
-def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffRow, ...], document: Path,
+def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffId, ...], document: Path,
                            identities: QuestionStaff) -> None:
     """Move the open user filings before closing records or clearing state."""
     from scripts.production import update_registration as questions
@@ -289,20 +293,20 @@ def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffRow, .
     if parent is None and not units:
         return
     target = owner if parent is None else parent
-    sources = (*(() if parent is None else (owner,)), *units)
+    sources = (*(() if parent is None else (owner.id,)), *units)
     assert isinstance(target.doc, (staff.LiveDoc, staff.WrappedDoc))
     with (review_later.locked() as later,
-          investigation.recipient_locks(target.id, *(row.id for row in sources)),
-          questions.wrap_question_locks(target.id, *(row.id for row in sources))):
+          investigation.recipient_locks(target.id, *sources),
+          questions.wrap_question_locks(target.id, *sources)):
         moves: list[ReviewRecordMove] = []
-        for row in sources:
-            for path, item in investigation.open_review_investigations(row.id):
+        for source in sources:
+            for path, item in investigation.open_review_investigations(source):
                 assert isinstance(item.submission, new_item_dialog.ReviewSubmission)
                 moves.append(ReviewRecordMove.plan(path, investigation.folder(target.id) / f"{item.id}.md",
-                                                   row.id, target.id, item.id, new_item_dialog.SubmissionKind(item.kind.value),
+                                                   source, target.id, item.id, new_item_dialog.SubmissionKind(item.kind.value),
                                                    item.submission))
-            records = (questions.question_records_for_document(document, identities, strict=True) if row.id == owner.id
-                       else questions.question_records_for_owner(row.id, statuses=("open",), strict=True))
+            records = (questions.question_records_for_document(document, identities, strict=True) if source == owner.id
+                       else questions.question_records_for_owner(source, statuses=("open",), strict=True))
             for record in records:
                 if not questions.pending_review_reply(record):
                     continue
@@ -314,7 +318,7 @@ def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffRow, .
                 if re.fullmatch(r"Q[1-9][0-9]*", identity) is None:
                     raise TidyRefused(f"{record.path}: the sent Question has no stored ID")
                 moves.append(ReviewRecordMove.plan(record.path, questions.review_question_path(folder, details.request_id),
-                                                   row.id, target.id, identity, new_item_dialog.SubmissionKind.QUESTION, details))
+                                                   source, target.id, identity, new_item_dialog.SubmissionKind.QUESTION, details))
         if not moves:
             return
         apply_review_moves(moves, target.doc.path, identities, later)
@@ -360,10 +364,14 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
     except OSError as error:
         raise TidyRefused(f"cannot preserve legacy LOG backups: {error}") from error
     paths = owned_paths(row)
-    units = () if document is None else tuple(identities.record.find(kind="unit", parent=row.id))
+    units: set[staff.StaffId] = set()
     if document is not None:
+        units.update(unit.id for unit in identities.record.find(kind="unit", parent=row.id))
+        # The saved branch records also name units that wrap already removed.
+        units.update(identity for path in wrap_unit_records(row.id).glob("*.json")
+                     if identities.record.by_id(identity := staff.StaffId(path.stem)) is None)
         try:
-            keep_open_review_items(row, units, document, identities)
+            keep_open_review_items(row, tuple(sorted(units)), document, identities)
         except (investigation.InvestigationError, RegistrationFailure, record_store.SubmissionError) as error:
             raise TidyRefused(str(error)) from error
     if document is not None and can_hold_questions(document):
@@ -376,7 +384,7 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
                     paths = (*paths[:-1], *(path for path in directory.iterdir() if path != folder.path))
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
-    owners = {str(member.id) for member in (row, *units)}
+    owners = {row.id, *units}
     try:
         for owner in sorted(owners):
             copies.remove_trees(owner)

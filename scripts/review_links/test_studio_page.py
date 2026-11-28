@@ -23,7 +23,7 @@ def producer(identity: str, name: str) -> staff.StaffRow:
 MORTY = producer("01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a", "morty")
 DWIGHT = producer("920b0a64-6eee-479e-8c07-e03e4dcd4ef6", "dwight")
 BOB = producer("a898cb38-dbac-4751-b72b-d0b14ab9c38d", "bob")
-BRAIN = replace(producer("01a19d07-c162-7b43-bb48-3ee6c913b3f0", "brain"), retirement=staff.RetiredProducer("opus"))
+BRAIN = replace(producer("01a19d07-c162-7b43-bb48-3ee6c913b3f0", "brain"), unknown_fields={staff.LEGACY_PRODUCER_MARK: "opus"})
 SHOWRUNNER = staff.StaffRow(staff.StaffId("20b0427d-945b-4c40-bb24-a6bec83dd648"), "showrunner", "sdlc",
                             staff.StaffRoot(), current_session=staff.StaffId("20b0427d-945b-4c40-bb24-a6bec83dd648"))
 # A producer with List rows and no staff row.

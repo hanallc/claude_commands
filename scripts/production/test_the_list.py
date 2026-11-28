@@ -29,6 +29,7 @@ from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf, main_publish
 from scripts.message import send_result, session_send
 from scripts.notify import review
+from scripts.production.staff_test_support import legacy_producer_fixture
 from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, new_item_dialog, question_record, review_items, review_submissions
@@ -1667,13 +1668,13 @@ the_list.fire_scheduled(timedelta(minutes=2))
         self.assertIn("| 1 | show | dwight | Plan the year |", table)
         self.assertIn("| 2 | show | morty | Ship it |", table)
 
-    def test_open_saves_refuse_a_retired_producer_even_with_a_supplied_snapshot(self) -> None:
+    def test_open_saves_refuse_an_old_producer_mark_even_with_a_supplied_snapshot(self) -> None:
         open_item = self.add("Update this")
         old_item = self.add("Close this", changes={"producer": OTHER.id})
         closed_item = self.add("Keep closed", changes={"producer": OTHER.id})
         closed_item = the_list.close(MORTY.id, closed_item.id, "Done", source="fixture")
         with staff.supplied_snapshot(staff.snapshot()):
-            _ = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+            _ = legacy_producer_fixture(OTHER.id, "claude:sonnet:high")
             self.assertEqual(staff.snapshot().by_id(OTHER.id), OTHER)
             for arguments in (
                 ("add", "--title", "Add this", "--owner", RUNNER.id, "--producer", OTHER.id),
@@ -2030,9 +2031,9 @@ the_list.fire_scheduled(timedelta(minutes=2))
         self.assertEqual(saved.latest_status, "The plan is ready.")
         self.assertEqual(saved.log[-1].source, OTHER.name)
 
-    def test_producer_scoped_update_refuses_a_retired_producer(self) -> None:
+    def test_producer_scoped_update_refuses_an_old_producer_mark(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
-        retired = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+        retired = legacy_producer_fixture(OTHER.id, "claude:sonnet:high")
         with self.assertRaisesRegex(the_list.ListError, "dwight: retired producer"):
             _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING},
                               source=retired.name, assigned_to=retired, schedule_edits={})
@@ -4022,7 +4023,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
         with self.assertRaisesRegex(the_list.ListError, "item numbers must be unique"):
             the_list.create_records(MORTY.id, [typed, typed])
         self.assertEqual(the_list.records(MORTY.id), [])
-        _ = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+        _ = legacy_producer_fixture(OTHER.id, "claude:sonnet:high")
         with self.assertRaisesRegex(the_list.ListError, f"{OTHER.name}: retired producer"):
             the_list.create_records(MORTY.id, [typed, replace(dependent, producer=OTHER.id)])
         self.assertEqual(the_list.records(MORTY.id), [])

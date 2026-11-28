@@ -26,6 +26,8 @@ An addressed reviewer's lens comes from dispatch evidence.
 
 **Held design roles.** The Astra designer and reviewer per design are held design roles, in `scripts/astra/design_roles.py` and `scripts/astra/astra_work.py`. `docs/as-built/long-lived-workers.md` describes them.
 
+The retired-name check applies to role terms. `agents retire NAME` removes an individual staff record.
+
 **The retired-name check.** `scripts/production/roles_audit.py check` exits non-zero and names the file and line of each retired name outside a kept context. It also fails on a printed fixed-display label. On a clean tree it prints nothing and exits 0. `check --prose` also prints `role words in sentences: N` and the list.
 
 - `scripts/production/role_terms.toml` holds the terms: `name`, `kind`, `defined_in`, `other_names`, `kept`, `other_meaning_files` and each term's retired and inflected forms.

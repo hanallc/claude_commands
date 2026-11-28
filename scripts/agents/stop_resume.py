@@ -1258,7 +1258,8 @@ NO_WORKERS_TO_KEEP_RUNNING: frozenset[StaffId] = frozenset()
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       codex: herdr.CodexConversations | None = None,
                       keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
-                      failures: dict[StaffId, str] | None = None) -> list[str]:
+                      failures: dict[StaffId, str] | None = None,
+                      report_read_failure: bool = True) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.herdr import worker_panes
     from scripts.agents import restart
@@ -1286,7 +1287,8 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
         reason = " ".join(str(error).splitlines())
         unresolved = [f"{unit}: {reason}"]
         failed = {row.id: reason for row in members}
-        print(f"anomaly: {unresolved[0]}", file=sys.stderr)
+        if report_read_failure:
+            print(f"anomaly: {unresolved[0]}", file=sys.stderr)
     if failures is not None:
         failures.update(failed)
     return unresolved
@@ -1703,9 +1705,9 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
 def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
                        keep_workers: bool, client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
-    retired = next((row for row in record.retired_producers if session in (row.name, row.id, row.current_session)), None)
+    retired = next((row for row in record.rows if row.awaits_legacy_removal and session in (row.name, row.id, row.current_session)), None)
     if retired is not None:
-        return ResumeFailed(session, f"{retired.name}: retired; use agents resume {retired.name} --retired")
+        return ResumeFailed(session, f"{retired.name}: old retirement record. Use agents retire {retired.id} to remove the record.")
     member = record.by_member_reference(session)
     matches = [row for row in record.rows if row.name == session or row == member]
     candidates = ", ".join(f"{row.name} ({row.id})" for row in matches[:5])
@@ -1713,6 +1715,8 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
         member = matches[0]
+        if isinstance(member.worktree, staff.RemovedWorktree):
+            return ResumeFailed(session, f"{member.name} is retired. Use agents retire {member.id} to remove the record.")
         machine = member_machine(member)
         if machine and machine != remote.local_machine():
             route = remote.machine_alias(machine)
@@ -2324,7 +2328,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     notice = None
     if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
         unique = bool(session_name) and len(pane_launch.named_references(session_name, record, entries)) == 1
-        reserved = any(session_name == producer.name for producer in record.retired_producers)
+        reserved = any(row.awaits_legacy_removal and session_name == row.name for row in record.rows)
         reference = session_name if unique and not reserved else identity
         notice = unit_watchdog.RestartFailureNotice(account=account, generation=generation,
                                                     session=session_name, reference=reference)

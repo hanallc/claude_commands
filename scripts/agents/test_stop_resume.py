@@ -935,6 +935,16 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot((row,))), ["impl: not proved stopped"])
         self.assertEqual(errors.getvalue().splitlines(), ["warning: recovered shutdown configuration",
             "impl: restart anomaly: no shell proof"])
+        record = staff.StaffSnapshot((row,))
+        with patch.object(worker_panes, "observe", side_effect=PermissionError("pane session is unreadable")):
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(stop_resume.stop_unit_workers(parent, record),
+                                 ["holder: pane session is unreadable"])
+            self.assertEqual(errors.getvalue().splitlines(), ["anomaly: holder: pane session is unreadable"])
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(stop_resume.stop_unit_workers(parent, record, report_read_failure=False),
+                                 ["holder: pane session is unreadable"])
+            self.assertEqual(errors.getvalue(), "")
 
     def test_worker_stop_proves_the_retained_pane_without_a_director_tab(self) -> None:
         parent = staff.StaffId("holder")
