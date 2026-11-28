@@ -1407,7 +1407,9 @@ def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
             fields: dict[str, object] = {}
             try:
                 fields = _read(path)
-                design = _published_workers(_decode_design(path.parent.name, fields))
+                design = _decode_design(path.parent.name, fields)
+            except staff.StaffUnreadable:
+                raise
             except (OSError, ValueError, KeyError, TypeError) as error:
                 reason = ' '.join(str(error).splitlines())
                 live_roles = _has_live_roles(fields)
@@ -1418,7 +1420,7 @@ def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
                     print(f'warning: {path}: {reason}', file=sys.stderr)
                     warned.add(path)
                 continue
-            yield design
+            yield _published_workers(design)
 
 
 @dataclass(frozen=True)

@@ -815,6 +815,18 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(instance.lifecycle, design_roles.RoleWorkerPublished(row.id))
         self.assertEqual(row.design_claim, staff.DesignWorkerClaim(path.parent.name, "designer"))
 
+    def test_held_document_refuses_when_pending_reviewer_staff_is_unreadable(self) -> None:
+        design_roles.register_repository("independent-review", {"natedev": str(self.repository)})
+        document = self.repository / "design.md"
+        for repository in ("independent-review", "fixture-repo"):
+            with (self.subTest(repository=repository),
+                  patch.dict(os.environ, {"DESIGN_ROLES_STATE": str(self.root / repository)})):
+                with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
+                    _ = design_roles.open_role(repository, document.name, "reviewer", "design")
+                with (patch.object(staff, "authority_snapshot", side_effect=staff.StaffUnreadable("staff is unavailable")),
+                      self.assertRaisesRegex(staff.StaffUnreadable, "staff is unavailable")):
+                    _ = design_roles.held_document(document)
+
     def test_end_keeps_the_worker_id_when_staff_retires_it_before_role_open(self) -> None:
         world = self.pane_start()
         with stop_once(design_roles, "_assign_command"), self.assertRaises(InjectedStop):
