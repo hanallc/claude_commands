@@ -1066,14 +1066,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
                     return None
                 if 'filed' in fields:
-                    url = snapshot.filed_item_url(root, fields['filed'][0], include_done=True)
+                    url = snapshot.filed_item_url(root, fields['filed'][0], include_done=True,
+                                                  allow_shown_id=fields.get('item-kind') == ['id'])
                     self.json_response(200, {"url": url})
                     return None
                 if 'version' not in fields and 'index' not in fields:
                     key = next((fields[name][0] for name in ('jump', 'item', 'body') if name in fields), '')
                     include_done_link = 'body' not in fields or fields.get('view') == ['card']
+                    allow_shown_id = 'jump' not in fields and 'item' in fields and fields.get('item-kind') == ['id']
                     if key and fields.get('from') != ['studio-question']:
-                        if url := snapshot.filed_item_url(root, key, include_done=include_done_link):
+                        if url := snapshot.filed_item_url(root, key, include_done=include_done_link,
+                                                          allow_shown_id=allow_shown_id):
                             self.redirect(url)
                             return None
                 if 'body' in fields:

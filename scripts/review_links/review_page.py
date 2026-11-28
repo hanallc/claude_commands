@@ -285,13 +285,13 @@ class ReviewSnapshot:
             entry = card_entry(item, self.members, self.names, self.zone)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
-    def filed_item_url(self, root: Path, key: str, *, include_done: bool = False) -> str:
+    def filed_item_url(self, root: Path, key: str, *, include_done: bool = False, allow_shown_id: bool = False) -> str:
         """Find the Studio item that replaced a standalone Review card."""
         item = self.records.get(key)
         if item is None:
             def matches(record: ReviewItem) -> bool:
-                return key == record.key or key.casefold() == record.id.casefold()
-            found = [record for record in self.records.values() if matches(record)]
+                return key == record.key or (allow_shown_id and key.casefold() == record.id.casefold())
+            found = [record for record in self.records.values() if matches(record)] if allow_shown_id else []
             if not found and include_done:
                 found = [record for record in review_items.read(root, members=self.members, kinds=TYPES,
                                                                 show=ReviewState.DONE) if matches(record)]
@@ -2315,7 +2315,7 @@ setInterval(updateHandoffAges,5000);
 
 RECORD_LINK_SCRIPT = r'''
 const reviewRecordLinks={stableItemLinks:true,hasKey:key=>index.has(key),
- resolveItem:(value,kind)=>resolveShownRecordId(index,value,kind)};
+ resolveItem:value=>resolveShownRecordId(index,value)};
 '''
 
 CARD_REQUEST_SCRIPT = record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + RECORD_LINK_SCRIPT + r'''
@@ -3039,6 +3039,7 @@ function followItemLink(options){
  if(linkedItem && !index.has(recordItemLink(linked,reviewRecordLinks).key)){
   const current=location.href;
   const query=new URLSearchParams({filed:linkedItem});
+  if(recordItemKind(linked,reviewRecordLinks)==='id') query.set('item-kind','id');
   void fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
     .then(response=>response.ok ? response.json() : null)
     .then(filed=>{

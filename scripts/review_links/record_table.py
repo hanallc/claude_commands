@@ -636,28 +636,23 @@ const filterControl={
 };
 function resolveRecordLink(value,kind,{resolveItem,hasKey}){
  if(!value || kind==='key') return {key:value,pending:false};
- const key=resolveItem ? resolveItem(value,kind) : value;
- if(key===null) return {key:value,pending:false};
+ const key=resolveItem?.(value) ?? value;
  return {key,pending:Boolean(resolveItem && hasKey && !hasKey(key))};
 }
-function recordItemLink(params,options){
- const jump=params.get('jump'),saved=history.state?.recordTable;
- let kind=options.stableItemLinks && !jump ? params.get('item-kind') : null;
- if(kind!=='key' && kind!=='id'){
-  kind=saved && !saved.pendingItem ? 'key' : 'id';
-  if(options.stableItemLinks && !jump && !saved && ['owner','show','q','sort','dir'].every(name=>params.has(name)))
-   kind=params.get('linked')==='1' ? 'legacy-linked' : 'key';
- }
- return resolveRecordLink(jump || params.get('item'),kind,options);
+function recordItemKind(params,options){
+ if(options.stableItemLinks) return !params.get('jump') && params.get('item-kind')==='id' ? 'id' : 'key';
+ const saved=history.state?.recordTable;
+ return saved && !saved.pendingItem ? 'key' : 'id';
 }
-function resolveShownRecordId(index,value,kind){
+function recordItemLink(params,options){
+ return resolveRecordLink(params.get('jump') || params.get('item'),recordItemKind(params,options),options);
+}
+function resolveShownRecordId(index,value){
  if(!value || index.has(value)) return value;
  const shown=value.toLowerCase();
  let key=null;
  for(const entry of index.values()){
   if(entry.id.toLowerCase()!==shown) continue;
-  // An older linked address can hold a stored key or an unresolved ID.
-  if(kind==='legacy-linked') return null;
   if(key!==null) return value;
   key=entry.key;
  }
@@ -1072,7 +1067,7 @@ function placeParams(){
  return params;
 }
 const resolveStoredItem=value=>options.resolveStoredItem?.(value) ?? value;
-const resolveItem=(value,kind)=>options.resolveItem ? options.resolveItem(value,kind) : resolveStoredItem(value);
+const resolveItem=value=>options.resolveItem?.(value) ?? resolveStoredItem(value);
 const canResolveItem=Boolean(options.resolveItem || options.resolveStoredItem);
 const linkLookup={stableItemLinks:options.stableItemLinks,hasKey:options.hasKey,resolveItem:canResolveItem ? resolveItem : undefined};
 const itemLinkKey=()=>recordItemLink(placeParams(),linkLookup).key;
@@ -1084,8 +1079,7 @@ function readFilterKeys(params,saved){
  }
  keys=new Set();
  pendingFilterIds.clear();
- const legacyKind=saved ? 'key' : 'id';
- for(const [field,kind] of [['key',legacyKind],['filter-key','key'],['filter-id','id']]){
+ for(const [field,kind] of [['key','key'],['filter-key','key'],['filter-id','id']]){
   for(const value of params.getAll(field)){
    const {key,pending}=resolveRecordLink(value,kind,linkLookup);
    if(pending) pendingFilterIds.add(value);else keys.add(key);
@@ -1126,7 +1120,7 @@ function readPlace(params,{followingItemLink=false,keepKeys=false}={}){
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  if(linkedItem) linkedItem=resolveStoredItem(linkedItem);
- pendingItem=Boolean(canResolveItem && linkedItem && saved?.pendingItem);
+ pendingItem=Boolean(canResolveItem && linkedItem && saved?.pendingItem && recordItemKind(params,options)==='id');
  const reveal=options.revealLinked && params.get('reveal')==='1';
  revealedLinkedItem=reveal || (saved?.revealedLinkedItem && resolveStoredItem(saved.revealedLinkedItem)===linkedItem) ? linkedItem : '';
  owner=options.resolveOwner?.(owner) ?? owner;

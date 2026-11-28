@@ -8487,7 +8487,7 @@ Element.prototype.animate=function(...args){
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_reload_keeps_a_saved_verdict_and_the_selected_show(self) -> None:
-        self.check_review_address_cases('copied-legacy-link', 'copied-legacy-row', 'verdict', 'show')
+        self.check_review_address_cases('copied-legacy-refresh', 'copied-legacy-link', 'copied-legacy-row', 'verdict', 'show')
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_reload_keeps_marked_review_links(self) -> None:
@@ -8505,8 +8505,10 @@ const reloaded=Boolean(sessionStorage.getItem('review-reload'));
 const copied=CASE.startsWith('copied');
 const copiedRow=CASE.endsWith('-row');
 const legacyCopy=CASE.startsWith('copied-legacy');
+const lateCollision=CASE==='copied-legacy-refresh';
 if(!reloaded){
  const place=copiedRow ? {show:'all'} : {item:INITIAL_ITEM};
+ if(CASE==='verdict' || CASE==='appearance') place['item-kind']='id';
  history.replaceState(null,'','#'+new URLSearchParams(place));
 }
 if((copied || CASE==='appearance') && reloaded) history.replaceState(null,'');
@@ -8520,6 +8522,9 @@ if(CASE==='appearance' || removeSavedRow){
  const key=removeSavedRow ? 'page-owner/C1' : 'page-owner/C2';
  const [removed]=index.r.splice(index.r.findIndex(entry=>entry[0]===key),1);
  if(!removeSavedRow){arrivingReviewRow=removed;arrivingReviewRow[1]='builds/C2';}
+ if(lateCollision){
+  [arrivingReviewRow]=index.r.splice(index.r.findIndex(entry=>entry[0]==='page-owner/C2'),1);
+ }
  node.textContent=JSON.stringify(index);
 }
 const initialBodyRequests=[],fetchBody=fetch;
@@ -8611,18 +8616,22 @@ window.fetch=(url,options)=>{
    await refreshIndex(index=>{index.r=index.r.filter(entry=>entry[0]!==key);});
    check(!row() && !sessionStorage.getItem(savedKey),
     'The new snapshot confirms the removal and clears the saved verdict marker.');
-   await follow({item:'BUILDS/c2'});
+   await follow({item:'BUILDS/c2','item-kind':'id'});
    check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
     'A new link resolves the shown ID and clears the missing item notice.');
    await follow({item:'unknown/C1'});
    check(!notice.hidden && notice.textContent==='This review is no longer on the Review page.',
     'An unknown ID shows the missing item notice.');
-   await follow({show:'all',key:'builds/C2'});
+   await follow({show:'all','filter-id':'builds/C2'});
    const shown=[...content.querySelectorAll('[data-list-item]:not([hidden])')];
    check(shown.length===1 && shown[0].dataset.key===otherKey && !expanded(otherKey),
     'A filter link shows the row with the matching ID and keeps its card closed.');
   }else if(CASE==='restored' || copied){
    if(copied) check(initialHistory===null,'The copied address loads without browser history state.');
+   if(lateCollision){
+    check(!row() && !row(otherKey) && !notice.hidden,'Review shows the missing notice before the other row arrives.');
+    await refreshIndex(index=>index.r.push(arrivingReviewRow));
+   }
    check(!row() && row(otherKey) && !expanded(otherKey) && !notice.hidden && addressItem()===key,
     'A missing saved key does not open a card with the same shown ID.');
    if(legacyCopy) check(new URLSearchParams(location.hash.slice(1)).get('item-kind')==='key',
@@ -8667,7 +8676,7 @@ window.fetch=(url,options)=>{
         setup = r"""<script>
 window.setInterval=()=>0;
 const copiedPlace=sessionStorage.getItem('review-filter-place');
-history.replaceState(null,'',copiedPlace || '#show=all&key=builds%2FC1');
+history.replaceState(null,'',copiedPlace || '#show=all&filter-id=builds%2FC1');
 const initialHistory=history.state;
 </script>"""
         before_index = r"""<script>
@@ -8696,14 +8705,14 @@ if(!copiedPlace && shown.join()==='page-owner/C1'){
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_legacy_review_links_retry_an_unresolved_displayed_id(self) -> None:
+    def test_review_links_retry_only_marked_displayed_ids(self) -> None:
         records = [replace(item, id='builds/C2') if item.key == 'page-owner/C2' else item
                    for item in review_items.read(self.root)]
         with patch.object(review_items, 'read', return_value=records):
             page = browser_markup(self.root)
         setup = r"""<script>
 window.setInterval=()=>0;
-history.replaceState(null,'','#'+new URLSearchParams({owner:'',show:'all',q:'',sort:'',dir:'asc',...LINK}));
+history.replaceState(HISTORY,'','#'+new URLSearchParams({owner:'',show:'all',q:'',sort:'',dir:'asc',...LINK}));
 </script>"""
         before_index = r"""<script>
 const node=document.querySelector('[data-review-index]'),fullIndex=JSON.parse(node.textContent);
@@ -8731,29 +8740,36 @@ node.textContent=JSON.stringify(indexWithoutTarget);
  try{
   check(!row(),'The displayed ID is unresolved at startup.');
   await refresh(indexWithoutTarget,'missing');
-  const stored=link.item && !link.linked;
-  const retained=link.item ? address().get('item-kind')===(stored ? 'key' : 'id') && address().get('item')==='builds/C2' :
-   address().get('filter-id')==='builds/C2';
+  const stored=link['item-kind']!=='id' && !link['filter-id'];
+  const retained=link.item ? (address().get('item-kind') || 'key')===(stored ? 'key' : 'id') &&
+   address().get('item')==='builds/C2' : address().get(stored ? 'filter-key' : 'filter-id')==='builds/C2';
   check(!row() && retained,'A refresh keeps the address while the row is absent.');
   await refresh(fullIndex,'confirmed');
   const open=row()?.querySelector('.list-toggle').getAttribute('aria-expanded');
-  if(stored){
-   check(open==='false' && address().get('item')==='builds/C2' && address().get('item-kind')==='key' &&
-    !review.querySelector('[data-missing-item]').hidden,'The older row address keeps the missing item notice.');
+  if(stored && link.item){
+   check(open==='false' && address().get('item')==='builds/C2' &&
+    !review.querySelector('[data-missing-item]').hidden,'The older card address keeps the missing item notice.');
+  }else if(stored){
+   check(!row() && address().get('filter-key')==='builds/C2' &&
+    !review.querySelector('[data-missing-keys]').hidden,'The older filter keeps the missing key notice.');
   }else if(link.item){
    check(open==='true' && address().get('item')===key && address().get('item-kind')==='key',
-    'A refresh resolves the old item link and saves the key.');
+    'A refresh resolves the marked item link and saves the key.');
   }else{
    check(open==='false' && address().get('filter-key')===key && !address().has('filter-id'),
-    'A refresh resolves the old filter link and saves the key.');
+    'A refresh resolves the marked filter link and saves the key.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         request_script = '<script>'+review_page.CARD_REQUEST_SCRIPT
-        for link in ({'item': 'builds/C2', 'linked': '1'}, {'key': 'builds/C2'}, {'item': 'builds/C2'}):
-            with self.subTest(link=link):
-                markup = page.replace('<head>', '<head>'+setup.replace('LINK', json.dumps(link)), 1)
+        old_link = {'item': 'builds/C2', 'linked': '1'}
+        old_history: dict[str, object] = {'recordTable': {'opened': [], 'linkedItem': 'builds/C2', 'pendingItem': True}}
+        for link, history in ((old_link, None), (old_link, old_history), ({'key': 'builds/C2'}, None),
+                              ({**old_link, 'item-kind': 'id'}, None), ({'filter-id': 'builds/C2'}, None)):
+            with self.subTest(link=link, history=history):
+                script = setup.replace('HISTORY', json.dumps(history)).replace('LINK', json.dumps(link))
+                markup = page.replace('<head>', '<head>'+script, 1)
                 markup = markup.replace(request_script, before_index+request_script, 1)
                 markup = markup.replace('</body>', probe.replace('LINK', json.dumps(link))+'</body>', 1)
                 self.assertEqual(firefox_probe_results(markup.encode()), [[]])

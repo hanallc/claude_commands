@@ -7384,6 +7384,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertNotIn(key, {entry["key"] for entry in updated.entries})
             target = updated.filed_item_url(case.root, key)
             self.assertTrue(target.startswith(studio_page.PAGE_PATH + "#item="), target)
+            shown_id = updated.records[key].id
+            self.assertNotEqual(shown_id, key)
+            for value, marker, expected in ((key, {}, target), (shown_id, {}, ''),
+                                            (shown_id, {'item-kind': 'id'}, target)):
+                with self.subTest(value=value, marker=marker):
+                    lookup = self.request(review_page.PAGE_PATH + '?' + urlencode({'filed': value, **marker}))
+                    self.assertEqual((lookup.status, json.loads(lookup.body)), (200, {'url': expected}))
+                    linked = self.request(review_page.PAGE_PATH + '?' + urlencode({'item': value, **marker}))
+                    self.assertEqual((linked.status, linked.headers.get('location', '')),
+                                     (303 if expected else 200, expected))
             result = self.request(review_page.card_url(key))
             self.assertEqual((result.status, result.headers.get("location")), (303, target))
             card = self.request(review_page.card_url(key, studio_question=True))
