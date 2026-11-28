@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, chdir, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from contextlib import AbstractContextManager, ExitStack, chdir, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import timedelta
 import errno
@@ -43,7 +43,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
-from scripts.production import checkpoint_gate, gate
+from scripts.production import affected_modules, checkpoint_gate, gate, land_runs
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.test_checkpoint_gate import GatePlacementFixture
@@ -604,6 +604,111 @@ class GuestEntryTests(unittest.TestCase):
         output = subprocess.run(command, cwd=candidate, capture_output=True, text=True, check=True, timeout=30,
                                 env={**os.environ, 'CLAUDE_PYTHON': sys.executable}).stdout.splitlines()
         self.assertEqual(output, [f'["{runner}", "{request}", "--run-copy", "7"]', 'runner commit', str(candidate)])
+
+
+class GuestFactCacheTests(unittest.TestCase):
+    root: Path = Path()
+    home: Path = Path()
+    kept: Path = Path()
+    run_cache: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.home = self.root / 'home'
+        self.home.mkdir()
+        main = self.root / 'main'
+        state = Path(land_runs.DEFAULT_STATE_DIR)
+        self.kept = main / state.name / affected_modules.FACT_CACHE_NAME
+        self.run_cache = self.home.joinpath(*state.parts[1:], affected_modules.FACT_CACHE_NAME)
+        _ = self.enterContext(patch.object(build_folders, 'leased_build_folder', return_value=nullcontext(main)))
+        _ = self.enterContext(patch.object(build_folders, 'mark_folder_use'))
+
+    def cache(self, state: str | None = None) -> AbstractContextManager[None]:
+        environment = {'HOME': str(self.home)}
+        if state is not None:
+            environment['GATE_STATE_DIR'] = state
+        return mac_linux._guest_fact_cache('claude', environment)  # pyright: ignore[reportPrivateUsage]
+
+    def seed(self) -> None:
+        self.kept.parent.mkdir(parents=True)
+        _ = self.kept.write_bytes(b'kept facts')
+
+    def test_copy_in_uses_the_kept_bytes(self) -> None:
+        self.seed()
+        with self.cache():
+            self.assertEqual(self.run_cache.read_bytes(), self.kept.read_bytes())
+
+    def test_guest_cache_is_off_when_gate_state_dir_is_set(self) -> None:
+        self.seed()
+        selected = self.home / 'selected' / self.kept.name
+        with redirect_stderr(io.StringIO()) as errors, self.cache(str(selected.parent)):
+            for cache in (selected, self.run_cache):
+                self.assertFalse(cache.parent.exists())
+                cache.parent.mkdir(parents=True)
+                _ = cache.write_bytes(b'run facts')
+        self.assertEqual(self.kept.read_bytes(), b'kept facts')
+        self.assertFalse(self.kept.with_suffix('.lock').exists())
+        self.assertEqual(errors.getvalue(), 'Guest fact cache is off because GATE_STATE_DIR is set.\n')
+
+    def test_replaced_run_cache_updates_the_kept_file(self) -> None:
+        self.seed()
+        with self.cache():
+            original = self.run_cache.stat()
+            replacement = self.root / 'replacement'
+            _ = replacement.write_bytes(b'new! facts')
+            os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+            os.replace(replacement, self.run_cache)
+        self.assertEqual(self.kept.read_bytes(), b'new! facts')
+
+    def test_unchanged_run_cache_leaves_the_kept_file_in_place(self) -> None:
+        self.seed()
+        original = self.kept.stat()
+        with self.cache():
+            self.assertEqual(self.run_cache.read_bytes(), b'kept facts')
+        current = self.kept.stat()
+        self.assertEqual((current.st_ino, current.st_mtime_ns), (original.st_ino, original.st_mtime_ns))
+        self.assertFalse(self.kept.with_suffix('.lock').exists())
+
+    def test_busy_kept_lock_skips_publication(self) -> None:
+        self.seed()
+        with self.kept.with_suffix('.lock').open('ab') as lock, self.cache():
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _ = self.run_cache.write_bytes(b'new facts')
+        self.assertEqual(self.kept.read_bytes(), b'kept facts')
+
+    def test_missing_kept_cache_starts_cold_and_can_publish(self) -> None:
+        with redirect_stderr(io.StringIO()) as errors, self.cache():
+            self.assertFalse(self.run_cache.exists())
+            _ = self.run_cache.write_bytes(b'first facts')
+        self.assertEqual(errors.getvalue(), '')
+        self.assertEqual(self.kept.read_bytes(), b'first facts')
+
+    def test_other_gate_state_stays_in_the_run_folder(self) -> None:
+        with self.cache():
+            _ = self.run_cache.write_bytes(b'first facts')
+            _ = self.run_cache.with_name('full-required').write_text('run state')
+        self.assertEqual(set(self.kept.parent.iterdir()), {self.kept, self.kept.with_suffix('.lock')})
+
+    def test_copy_out_failure_preserves_the_kept_file(self) -> None:
+        self.seed()
+        with (patch.object(os, 'replace', wraps=os.replace) as replace_cache,
+              redirect_stderr(io.StringIO()) as errors, self.cache()):
+            _ = self.run_cache.write_bytes(b'new facts')
+            replace_cache.side_effect = OSError('copy failed')
+        self.assertEqual(errors.getvalue(), 'Guest fact cache copy out failed: copy failed\n')
+        self.assertEqual(self.kept.read_bytes(), b'kept facts')
+
+    def test_link_to_state_outside_the_run_is_not_published(self) -> None:
+        self.seed()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        _ = (outside / self.kept.name).write_bytes(b'outside facts')
+        with self.cache():
+            self.run_cache.unlink()
+            self.run_cache.parent.rmdir()
+            self.run_cache.parent.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.kept.read_bytes(), b'kept facts')
 
 
 class MacLinuxSandboxTests(unittest.TestCase):
@@ -5108,20 +5213,30 @@ with (patch.object(conf, 'read', read_config),
 
     def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
+        state = Path(land_runs.DEFAULT_STATE_DIR)
+        cache = Path(*state.parts[1:], affected_modules.FACT_CACHE_NAME)
+        kept = self.guest_home / 'build/claude/main' / state.name / cache.name
         for status in (0, 4):
-            program = f'import os, sys\nprint("guest ran in", os.getcwd(), flush=True)\nsys.exit({status})\n'
+            program = ('import os, sys\nfrom pathlib import Path\n'
+                       + f'cache = Path.home() / {str(cache)!r}\n'
+                       + ('assert cache.read_bytes() == b"0"\n' if status else 'assert not cache.exists()\n')
+                       + f'cache.write_bytes({str(status).encode()!r})\n'
+                       + f'print("guest ran in", os.getcwd(), flush=True)\nsys.exit({status})\n')
             script = self.repo / 'scripts/fixture/hand.py'
             _ = script.write_text(program, encoding='utf-8')
             command = mac_linux.GuestCommand(settings)
             try:
-                process = command.start(self.repo, ['python3', 'scripts/fixture/hand.py'], work='hand-made',
-                                        unit='caller', bootstrap=self.root / 'bootstrap.tar',
-                                        checked={script: program.encode()})
+                with patch.dict(os.environ):
+                    _ = os.environ.pop('GATE_STATE_DIR', None)
+                    process = command.start(self.repo, ['python3', 'scripts/fixture/hand.py'], work='hand-made',
+                                            unit='caller', bootstrap=self.root / 'bootstrap.tar',
+                                            checked={script: program.encode()})
                 with process:
                     output, _ = process.communicate(timeout=60)
             finally:
                 command.finish()
             self.assertEqual(process.returncode, status, output)
+            self.assertEqual(kept.read_bytes(), str(status).encode())
             self.assertTrue(output.decode().endswith(f'guest ran in {self.guest_home / "build/claude/caller/1"}\n'),
                             output)
             # start reads the start line, so the process output does not hold it.
