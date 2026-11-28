@@ -304,6 +304,19 @@ As built (tip ab8abb95b6, branch `postmaster-noaction`, on main as e42c959226 on
 - Tests: `scripts/notify/test_pushover.py`, `test_review.py`, `test_push_texts.py`, `test_silence.py`, `scripts/message/test_send.py`, `scripts/hooks/test_push_gate.py`, `scripts/whoami/test_quota_zero_episode.py`.
 - Gate: `--affected` green on ab8abb95b6 (11-27); behavior check exit 0, key 5c2c4358.
 
+### Phase 24 — The stop pause hook finishes in its budget under load  · status: done
+
+List 565, producer morty: "Bug: the conversation pause hook gives up after 5 seconds when the machine is busy". nate, Nov 27: root cause it as a bug; no weaker test and no longer limit as the only fix. natedev go 11-28 03:07 EST.
+
+As built (tip c7b9c05e1c, branch `postmaster-pauseflake`, on main as 22086a99db on 11-28):
+
+- Cause: inside its 5 s budget, the stop hook imported all of `conversation_pause.py` with `scripts.message`, `scripts.production` and `scripts.lib.conf`, only to lock and rewrite one JSON record. At load 156 the cold import passed 5 s.
+- `scripts/hooks/pause_record.py` holds the record lock, the record and phase types, their read and write, `mark_reply_ended` and the scheduled prompt records, with standard-library imports only. `conversation_pause.py` imports these names; the stop hook imports only `pause_record`.
+- `hook_budget.pause_state_root` is the one state root; the `state_root` aliases are removed. `record_path` and `scheduled_prompts_path` live in `hook_budget.py`.
+- Cold import inside the budget: 533 ms before, 194 ms after. The 5 s budget and `test_hooks_install_no_signal_handler` do not change.
+- Tests: `scripts/hooks/test_conversation_pause_processes.py` (the stop worker loads no `scripts.message`, `scripts.production` or `scripts.lib.conf` module). Doc: `docs/as-built/conversation-pause.md`.
+- Gate: `--affected` green on c7b9c05e1c, 703 modules (11-28); behavior check exit 0, key 056714ba.
+
 ## Acceptance gate
 
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
