@@ -187,7 +187,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
-        self.assertIn("saved question answer or feedback.", prompt)
+        self.assertIn("saved question answer.", prompt)
         self.assertIn('Use "specified" when you find words to assess', prompt)
         self.assertIn('Use "against" only when the change removes or changes behavior Nate explicitly asked for.', prompt)
         self.assertIn('A refinement of a term Nate did not define, such as "history", does not warrant "against".', prompt)
@@ -549,7 +549,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("The land waits", output)
         self.assertIsInstance(behavior_check.read_record(key), behavior_check.Waiting)
 
-    def test_only_nates_answer_or_feedback_in_a_registered_question_verifies_a_request(self) -> None:
+    def test_only_nates_answer_in_a_registered_question_verifies_a_request(self) -> None:
         args, key = self.changed_range()
         source = self.root / "configured-questions" / "question-fixture.md"
         moment = datetime.fromisoformat("2026-11-26T10:00:00-08:00")
@@ -567,11 +567,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         question.item["review_log"] = review_events.encode((replace(answer, who="nate"), replace(feedback, who="nate")))
         update_registration.write_question_record(question)
         self.assertIsInstance(self.verify_requested(source, MOVE_REQUEST), behavior_review.NateRequest)
+        self.assertIsInstance(self.verify_requested(source, feedback_quote), behavior_review.NateSpecified)
         copy = self.write(self.root / "question-copy.md", source.read_text())
-        self.assertIsInstance(self.verify_requested(copy, feedback_quote), behavior_review.NateSpecified)
-        self.reply(json.dumps([self.requested(source, feedback_quote)]))
+        self.assertIsInstance(self.verify_requested(copy, MOVE_REQUEST), behavior_review.NateSpecified)
+        self.reply(json.dumps([self.requested(source, MOVE_REQUEST)]))
         with mock.patch.object(astra_review, "run_review", return_value=0):
-            output = f"{key} clear\ntest_fixture.py::test_move\nNate's request (2026-11-26, {source}): {feedback_quote}\n"
+            output = f"{key} clear\ntest_fixture.py::test_move\nNate's request (2026-11-26, {source}): {MOVE_REQUEST}\n"
             self.assertEqual(self.cli("run", *args), (0, output))
         self.assertEqual(self.cli("check", *args), (0, ""))
 
