@@ -15,6 +15,7 @@ from collections.abc import Callable
 import hashlib
 from importlib import import_module
 import json
+import math
 import os
 import re
 import shlex
@@ -995,8 +996,7 @@ def execute_durable(args: Arguments) -> int:
             parent, name_arg = instance.parent, instance.name
             pane_launch = instance.pane_launch
             if args.prompt:
-                if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove,
-                                                       design_roles.RoleNeedsRecovery)):
+                if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove)):
                     refuse("the design role has no open worker")
                 expected_worker = instance.lifecycle.staff_id
         else:
@@ -1019,11 +1019,15 @@ def execute_durable(args: Arguments) -> int:
                 return staff_worker.startup_result(name, current)
             print(json.dumps(current.row.to_json()))
             return 0
-        return staff_worker.dispatch(parent, name, role, prompt, session_dir=Path(args.session_dir),
+        result = staff_worker.dispatch(parent, name, role, prompt, session_dir=Path(args.session_dir),
             slot=name.value, phase=args.phase, kind="astra",
             reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
             completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
-            launcher_command=launcher_command(), expected_worker=expected_worker)
+            launcher_command=launcher_command(), expected_worker=expected_worker,
+            prompt_timeout=herdr.PROGRAM_TIMEOUT_SECONDS if isinstance(claim, staff.DesignWorkerClaim) else math.inf)
+        if isinstance(claim, staff.DesignWorkerClaim) and result is staff_worker.DispatchSubmission.SUBMITTED:
+            design_roles.accept_dispatch(claim, prompt)
+        return result
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
