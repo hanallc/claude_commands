@@ -2297,7 +2297,7 @@ function scheduleParkExpiry({readAt},requestStarted){
  };
  schedule();
 }
-const drafts=new Map();
+const drafts=versionHost?.listDrafts ?? new Map();
 const unparkMessages={
  cleared:'Unparked',
  cleared_newer_parking_active:'The original Unpark cleared parking. A newer parking time is active',

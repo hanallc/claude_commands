@@ -5955,6 +5955,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         cleared = replace(notice, changes=tuple(replace(change, cleared=True) for change in notice.changes))
         self.assertEqual(version_notice.read(root), cleared)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
     def test_browser_version_notice_keeps_the_review_send_available_for_undo(self) -> None:
         with capture_sender("send_message") as send:
             _ = self.check_version_notice_browser(version_card_probe(br"""
@@ -5984,6 +5985,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 """), hold_review=True)
         send.assert_not_called()
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
     def test_browser_version_notice_opens_related_and_blocking_items(self) -> None:
         _ = self.check_version_notice_browser(version_card_probe(br"""
   const list=()=>document.querySelector('iframe[data-console-page="list"]');
@@ -6002,6 +6004,29 @@ class ReviewLinksServerTests(unittest.TestCase):
   card.contentDocument.querySelector('[data-version-list-dialog] [data-close]').click();
   await until(()=>!frame(),'Close did not close the linked item.');
   check(list().contentDocument===underlying && document.activeElement===banner(504),'Close returns focus to the notice link.');
+"""), linked_items=True)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
+    def test_browser_version_notice_keeps_the_tell_draft_after_following_a_link(self) -> None:
+        _ = self.check_version_notice_browser(version_card_probe(br"""
+  const details=number=>frame().contentWindow.recordDetails(item(number));
+  const wordsBox=number=>details(number).querySelector('textarea[name="words"]');
+  const words='Keep these words for the source item.';
+  const source=wordsBox(504);
+  source.value=words;
+  source.dispatchEvent(new page.defaultView.Event('input',{bubbles:true}));
+  details(504).querySelector('a[data-record-jump][href$="L492"]').click();
+  await until(()=>item(492),'The Related link did not open List 492.');
+  check(wordsBox(492).value==='','The related item has its own draft.');
+  banner(504).click();
+  await until(()=>item(504),'The source item did not reopen.');
+  check(wordsBox(504).value===words,'Reopening the source item restores its Tell draft.');
+  check(!wordsBox(504).form.querySelector('[value="tell"]').disabled,'The restored draft can be sent.');
+  frame().contentDocument.querySelector('[data-version-list-dialog] [data-close]').click();
+  await until(()=>!frame(),'Close did not close the overlay.');
+  banner(504).click();
+  await until(()=>item(504),'The source item did not reopen after Close.');
+  check(wordsBox(504).value===words,'Closing the overlay keeps the Tell draft.');
 """), linked_items=True)
 
     def check_version_notice_browser(self, probe: bytes, *, allow_proof: bool = False, hold_review: bool = False,

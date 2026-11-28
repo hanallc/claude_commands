@@ -439,6 +439,7 @@ _VERSION_SCRIPT = r'''(() => {
  const notice=document.querySelector('.version-notice'),form=notice.querySelector('form');
  const rows=form.querySelector('ul'),failure=form.querySelector('[role=alert]');
  const frames=document.querySelector('.frame-area'),shell=document.querySelector('#console-shell');
+ const listDrafts=new Map();
  let current,visible='',reading=false,clearing=false,card,selected='',opener='',requested='',edit=0;
  const itemLink=key=>rows.querySelector('a[data-version-item="'+CSS.escape(key)+'"]');
  const itemURL=key=>new URL('/console/list.html?'+new URLSearchParams({item:key,reveal:'1'}),location.href);
@@ -525,6 +526,7 @@ _VERSION_SCRIPT = r'''(() => {
   if(cardBusy() || key===requested) return false;
   if(!card){
    const frame=card=document.createElement('iframe');frame.title='List item';frame.dataset.versionCard='';
+   frame.listDrafts=listDrafts;
    frame.addEventListener('version-card-closed',()=>{if(card===frame) closeCard();});
    frame.addEventListener('version-card-item',event=>{
     if(card===frame && (!event.detail || event.detail===requested)) selectItem(event.detail);
