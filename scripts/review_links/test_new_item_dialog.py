@@ -20,7 +20,7 @@ from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
-from scripts.production import investigation, staff
+from scripts.production import investigation, record_store, staff
 from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
                                   review_submissions, serve)
 from scripts.review_links.browser_test_support import firefox_probe_results
@@ -2134,7 +2134,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             except new_item_dialog.SubmissionScreenshotExpired as error:
                 self.send_json(409, {"code": "screenshot_expired", "error": str(error)})
                 return
-            except review_submissions.SubmissionConflict as error:
+            except record_store.SubmissionConflict as error:
                 self.send_json(error.status, {"reason": str(error)})
                 return
             except (OSError, ValueError) as error:
@@ -2201,7 +2201,7 @@ class NewItemDialogTests(unittest.TestCase):
         with patch.object(conf, "local_host_key_name", return_value="otherhost"):
             self.assertEqual(new_item_dialog.read_saved_item_limits().images, 2)
             self.assertEqual(new_item_dialog.read_stored_image_byte_limit(), 101)
-            with self.assertRaises(new_item_dialog.SubmissionError):
+            with self.assertRaises(record_store.SubmissionError):
                 _ = new_item_dialog.read_evidence(fields)
 
     def test_new_item_uses_a_machine_value_without_a_limit_line(self) -> None:
@@ -2303,7 +2303,7 @@ window.fetch = (path, options) => {
         restored = new_item_dialog.read_submission(fields)
         self.assertEqual(restored, details)
         new_item_dialog.require_reply_token(restored, token)
-        with self.assertRaises(new_item_dialog.SubmissionError):
+        with self.assertRaises(record_store.SubmissionError):
             new_item_dialog.require_reply_token(restored, "b" * 43)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
@@ -2574,7 +2574,7 @@ window.fetch = (path, options) => {
         self.assertEqual(new_item_dialog.read_page_capture(capture),
                          new_item_dialog.PageCaptureRequest("/console/list.html#show=open", 1137, 688, True))
         for bad in ({"width": True}, {"height": 2161}, {"place": "//other.invalid/"}, {"dark": "true"}):
-            with self.subTest(bad=bad), self.assertRaises(new_item_dialog.SubmissionError):
+            with self.subTest(bad=bad), self.assertRaises(record_store.SubmissionError):
                 _ = new_item_dialog.read_page_capture({**capture, **bad})
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")

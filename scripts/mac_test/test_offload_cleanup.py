@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -17,7 +18,7 @@ import io
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
-from scripts.mac_test import eligibility, offload, mac_test, nextest_log
+from scripts.mac_test import eligibility, floor_claims, offload, mac_test, nextest_log
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
@@ -27,7 +28,7 @@ from scripts.lint.memory_test_support import (
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
-from scripts.lib import conf, removal_guard, test_hang_guard
+from scripts.lib import build_folders, conf, removal_guard, test_hang_guard
 from scripts.lib.shell_test_support import fixture_zsh_environment
 
 
@@ -49,27 +50,35 @@ sweep_discovery_workers=4
 sweep_dep_info_head_bytes=4096
 """
 
-TRIM_WITHOUT_PROC = """\
+TRIM_FIXTURE = """\
+import json
 import os
 import sys
-from contextlib import redirect_stdout
-from functools import partial
-from io import StringIO
 from pathlib import Path
-from scripts.lib import conf_reads
-from scripts.lint import sweep
+from unittest import mock
+from scripts.lib import conf_reads, removal_guard
+from scripts.lint import sweep, tmp_sweep
 
-# The Mac has no /proc. Use a private missing path on the test host.
-sweep.sweep_workspace = partial(sweep.sweep_workspace, proc=os.environ["CLEANUP_TEST_PROC"])
 fixture = Path(os.environ["CLEANUP_TEST_DIR"])
-with StringIO() as output, conf_reads.record_reads(fixture / "trim-config-reads"):
+keys = ("GIT_DIR", "GIT_WORK_TREE", "LINT_SWEEP_STATE_DIR", "LINT_SWEEP_DOC_INDEX_MIB")
+(fixture / "trim-environment.json").write_text(json.dumps({key: os.environ[key] for key in keys if key in os.environ}))
+removed_paths = []
+remove = removal_guard.remove
+
+def guarded_remove(checked, *, account):
+    removed_paths.append(str(checked.path))
+    if os.environ["CLEANUP_TEST_TRIM"] == "refuse":
+        raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT)
+    remove(checked, account=account)
+
+with (conf_reads.record_reads(fixture / "trim-config-reads"),
+      mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([])),
+      mock.patch.object(sweep, "mac_build_process_use", return_value=sweep.NoBuildProcessUse()),
+      mock.patch.object(removal_guard, "remove", side_effect=guarded_remove)):
     try:
-        with redirect_stdout(output):
-            exec(sys.argv.pop(1))
+        exec(sys.argv.pop(1))
     finally:
-        report = output.getvalue()
-        (fixture / "trim-report").write_text(report)
-        sys.stdout.write(report)
+        (fixture / "guarded-paths.json").write_text(json.dumps(removed_paths))
 """
 
 
@@ -224,6 +233,7 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.home_directory = self.root / "home with spaces"
         self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
         self.mirror.mkdir(parents=True)
+        (self.mirror / floor_claims.MIRROR_MARK).touch()
         self.temporary_directory = self.root / "tmp"
         self.temporary_directory.mkdir()
         self.bin_directory = self.root / "bin"
@@ -242,11 +252,12 @@ case ${2##*/} in
         ;;
     -c)
         [ "$1" = -B ] || exit 99
-        if [ "$CLEANUP_TEST_TRIM" != run ]; then
-            exit "$CLEANUP_TEST_TRIM"
-        fi
+        case "$CLEANUP_TEST_TRIM" in
+            run|refuse) ;;
+            *) exit "$CLEANUP_TEST_TRIM" ;;
+        esac
         shift 2
-        set -- -B -c ''' + shlex.quote(TRIM_WITHOUT_PROC) + r''' "$@"
+        set -- -B -c ''' + shlex.quote(TRIM_FIXTURE) + r''' "$@"
         ;;
     *) exit 99 ;;
 esac
@@ -273,6 +284,7 @@ while (( $# )); do
     shift
 done
 mkdir -p -- "$target" || exit 99
+printf '{}\n' > "$target/.rustc_info.json"
 printf 'built\n' > "$target/nextest-output"
 printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
@@ -286,7 +298,7 @@ exit "$CLEANUP_TEST_STATUS"
         abandoned_session_minutes: int = 7,
         budget_gib: str = "24",
         budget_values: tuple[tuple[str, str], ...] = (),
-        trim: int | Literal["run"] = 0,
+        trim: int | Literal["run", "refuse"] = 0,
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         settings = self.root / "command-mac.conf"
@@ -305,34 +317,39 @@ exit "$CLEANUP_TEST_STATUS"
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
             + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
         )
-        return subprocess.run(
-            [*shell, "-c", text], cwd=self.home_directory,
-            env={**shell_environment(self.root),
-                 "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
-                 "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status),
-                 "CLEANUP_TEST_TRIM": str(trim), "CLEANUP_TEST_PROC": str(self.root / "mac-proc")},
-            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
+        with build_folders.mac_mirror_hold(self.mirror, build_folders.MacMirrorHold.SHARED,
+                                           root=self.mirror.parent) as lease:
+            assert isinstance(lease, int), lease
+            return subprocess.run(
+                [*shell, "-c", text], cwd=self.home_directory, pass_fds=(lease,),
+                env={**shell_environment(self.root),
+                     "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
+                     "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status),
+                     "CLEANUP_TEST_TRIM": str(trim), floor_claims.MIRROR_LEASE_FDS: str(lease)},
+                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+            )
 
-    def cleanup_lines(self, answer: subprocess.CompletedProcess[str]) -> list[str]:
+    def cleanup_lines(self, answer: subprocess.CompletedProcess[str], *, trim_status: int = 0) -> list[str]:
         lines = [line for line in answer.stdout.splitlines()
                  if not line.startswith("mac_test: full nextest log: ")]
         if lines[-1] == "mac_cleanup=skipped":
             return lines
-        self.assertRegex(lines[2], r"^mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=(yes|no|unknown)$")
+        self.assertRegex(lines[2], rf"^mac_trim=status={trim_status} elapsed_seconds=[0-9]+ "
+                         + r"over_budget=(yes|no|unknown) size_kib=([0-9]+|unknown) budget_gib=\S+$")
         return lines[:2] + lines[3:]
 
-    def assert_budget_review(self, target: Path, *, listed: bool) -> str:
-        report = (self.root / "trim-report").read_text()
-        plans = [Path(line.removeprefix("removal list: ")) for line in report.splitlines()
-                 if line.startswith("removal list: ")]
-        self.assertEqual(len(plans), int(listed), report)
-        if listed:
-            [plan] = plans
-            self.assertEqual(plan.parent, self.home_directory / removal_guard.LIST_DIRECTORY)
-            rows = [removal_guard.ListedEntry.parse(line) for line in plan.read_text().splitlines()]
-            self.assertEqual([(row.path, row.fingerprint) for row in rows], [(target, "")])
-        return report
+    def assert_guarded_paths(self, *paths: Path) -> None:
+        self.assertEqual(json.loads((self.root / "guarded-paths.json").read_text()), list(map(str, paths)))
+        self.assertFalse((self.home_directory / removal_guard.LIST_DIRECTORY).exists())
+
+    def incremental_output(self, name: str, used: float) -> Path:
+        profile = self.mirror / "target/debug"
+        (profile / ".fingerprint").mkdir(parents=True, exist_ok=True)
+        output = profile / "incremental" / name / "output.o"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        _ = output.write_bytes(os.urandom(64 * 1024))
+        os.utime(output, (used, used))
+        return output
 
     def test_unusable_log_directory_refuses_setup_before_lint(self) -> None:
         _ = install_nextest_log_writer(self.home_directory)
@@ -449,7 +466,7 @@ exit "$CLEANUP_TEST_STATUS"
                                 self.assertEqual((session / "compiler-output").read_text(), "session data")
                                 self.assertEqual(lock.read_text(), "session lock")
 
-    def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
+    def test_remote_text_below_space_floor_trims_only_old_output_after_pass_and_failure(self) -> None:
         target = self.mirror / "target"
         sibling = self.mirror / "keep-source"
         temporary_file = self.temporary_directory / "keep-temporary"
@@ -460,37 +477,29 @@ exit "$CLEANUP_TEST_STATUS"
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 with self.subTest(shell=shell, status=status):
-                    target.mkdir(exist_ok=True)
+                    now = time.time()
+                    old = self.incremental_output("old-session", now - 7200)
+                    new = self.incremental_output("new-session", now)
                     _ = (target / "previous-build").write_text("old\n")
-                    answer = self.run_remote(shell, status)
-                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                    lines = self.cleanup_lines(answer)
-                    self.assertEqual(lines[:2], ["nextest finished", f"mac_exit={status}"])
-                    self.assertEqual(len(lines), 3)
-                    self.assertRegex(lines[2], r"^mac_cleanup=0 [0-9]+ 99$")
-                    cleanup = offload.parse_cleanup(lines[2].removeprefix("mac_cleanup="))
-                    if not isinstance(cleanup, offload.CleanupDone):
-                        self.fail("The removal marker did not report a completed cleanup.")
-                    if not isinstance(cleanup.size, offload.MeasuredCleanupSize):
-                        self.fail("The target size was not measured.")
-                    self.assertGreater(cleanup.size.kib, 0)
-                    self.assertEqual(answer.stderr, "")
-                    self.assertFalse(target.exists())
+                    identity = target.stat()
+                    answer = self.run_remote(shell, status, budget_gib=str(96 / 1024 ** 2), trim="run")
+                    self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                    self.assertEqual(self.cleanup_lines(answer),
+                                     ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                    self.assertTrue(target.is_dir(), target)
+                    self.assertTrue(os.path.samestat(identity, target.stat()))
+                    self.assertFalse(old.parent.exists())
+                    self.assertEqual(len(new.read_bytes()), 64 * 1024)
+                    self.assertEqual((target / "previous-build").read_text(), "old\n")
+                    self.assertEqual((target / "nextest-output").read_text(), "built\n")
+                    self.assert_guarded_paths(old.parent)
+                    self.assertRegex(answer.stdout, r"mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=no")
                     self.assertEqual((self.root / "sweep-switch").read_text(), "1")
-                    self.assertEqual(
-                        cast(list[str], json.loads((self.root / "df-arguments.json").read_text())),
-                        ["-g", str(self.home_directory)],
-                    )
+                    self.assertFalse((self.root / "df-arguments.json").exists())
                     for path in (sibling, temporary_file, other_target):
                         self.assertEqual(path.read_text(), "keep\n")
 
         with self.subTest(environment="private"):
-            environment_log = self.root / "shell-environment.json"
-            write_shell(self.bin_directory / "df", r'''
-json_args "${GIT_DIR-unset}" "${GIT_WORK_TREE-unset}" \
-    "$LINT_SWEEP_STATE_DIR" "$LINT_SWEEP_DOC_INDEX_MIB" > "$CLEANUP_TEST_DIR/shell-environment.json"
-printf '%s' "$CLEANUP_TEST_DF_OUTPUT"
-''')
             with mock.patch.dict(os.environ, {
                 "GIT_DIR": str(self.root / "caller-git"),
                 "GIT_WORK_TREE": str(self.root / "caller-worktree"),
@@ -500,10 +509,13 @@ printf '%s' "$CLEANUP_TEST_DF_OUTPUT"
                 answer = self.run_remote(["/bin/sh"], 0, trim="run")
             self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
             self.assertEqual(self.cleanup_lines(answer)[:2], ["nextest finished", "mac_exit=0"])
-            self.assertEqual(json.loads(environment_log.read_text()),
-                             ["unset", "unset", str(self.root / "sweep-state"), DOC_INDEX_MIB])
+            environment = cast(dict[str, str], json.loads((self.root / "trim-environment.json").read_text()))
+            self.assertNotIn("GIT_DIR", environment)
+            self.assertNotIn("GIT_WORK_TREE", environment)
+            self.assertEqual(environment["LINT_SWEEP_STATE_DIR"], str(self.root / "sweep-state"))
+            self.assertEqual(environment["LINT_SWEEP_DOC_INDEX_MIB"], DOC_INDEX_MIB)
 
-    def test_failed_size_measurement_still_removes_the_target_under_sh_and_zsh(self) -> None:
+    def test_failed_size_measurement_keeps_the_target_under_sh_and_zsh(self) -> None:
         write_shell(self.bin_directory / "du", r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/du-arguments.json"
 printf '12\t%s\n' "$2"
@@ -511,16 +523,18 @@ exit 1
 ''')
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
-                answer = self.run_remote(shell, 0)
+                answer = self.run_remote(shell, 0, trim="run")
                 self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
                 self.assertEqual(self.cleanup_lines(answer),
-                                 ["nextest finished", "mac_exit=0", "mac_cleanup=0 - 99"])
+                                 ["nextest finished", "mac_exit=0", "mac_cleanup=kept"])
                 self.assertEqual(answer.stderr, "")
-                self.assertFalse((self.mirror / "target").exists())
+                self.assertRegex(answer.stdout, r"mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=unknown")
+                self.assertEqual((self.mirror / "target" / "nextest-output").read_text(), "built\n")
+                self.assert_guarded_paths()
                 self.assertEqual(json.loads((self.root / "du-arguments.json").read_text()),
                                  ["-sk", str(self.mirror / "target")])
 
-    def test_remote_text_at_or_above_space_floor_keeps_build_output(self) -> None:
+    def test_remote_trim_uses_repository_budget_and_keeps_the_target(self) -> None:
         target = self.mirror / "target"
         target.mkdir()
         existing = target / "previous-build"
@@ -537,22 +551,18 @@ exit 1
                         self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
+                        self.assertFalse((self.root / "df-arguments.json").exists())
 
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
-                for default_kib, repository_kib, listed in ((96, 0, True), (256, 96, True), (96, 256, False)):
+                for default_kib, repository_kib, trimmed in ((96, 0, True), (256, 96, True), (96, 256, False)):
                     with self.subTest(shell=shell, status=status, default_kib=default_kib,
                                       repository_kib=repository_kib):
                         shutil.rmtree(target)
-                        old = target / "debug/incremental/old-session/output.o"
-                        new = target / "debug/incremental/new-session/output.o"
-                        for path, age in ((old, 7200), (new, 600)):
-                            path.parent.mkdir(parents=True)
-                            _ = path.write_bytes(os.urandom(64 * 1024))
-                            modified = time.time() - age
-                            os.utime(path, (modified, modified))
-                            os.utime(path.parent, (modified, modified))
-                        (target / "debug/.fingerprint").mkdir()
+                        now = time.time()
+                        old = self.incremental_output("old-session", now - 7200)
+                        new = self.incremental_output("new-session", now - 600)
+                        identity = target.stat()
                         overrides = (("mac_budget_gib.hana's project", str(repository_kib / 1024 ** 2)),) if repository_kib else ()
                         answer = self.run_remote(
                             shell, status, free_floor_gib=100,
@@ -562,11 +572,14 @@ exit 1
                         self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
                         self.assertEqual(self.cleanup_lines(answer),
                                          ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
-                        _ = self.assert_budget_review(target, listed=listed)
-                        self.assertEqual(len(old.read_bytes()), 64 * 1024)
+                        self.assertTrue(target.is_dir(), target)
+                        self.assertTrue(os.path.samestat(identity, target.stat()))
+                        self.assertEqual(old.exists(), not trimmed)
+                        self.assert_guarded_paths(*((old.parent,) if trimmed else ()))
+                        if not trimmed:
+                            self.assertEqual(old.stat().st_size, 64 * 1024)
                         self.assertEqual(len(new.read_bytes()), 64 * 1024)
-                        over_budget = "yes" if listed else "no"
-                        self.assertRegex(answer.stdout, rf"mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget={over_budget}")
+                        self.assertRegex(answer.stdout, r"mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=no")
 
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for trim_fails in (False, True):
@@ -582,35 +595,31 @@ exit 1
                                      + f"fixture 500 300 {99 if trim_fails else 200} 60% /\n"),
                     )
                     self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                    self.assertEqual(retained.exists(), not trim_fails)
-                    lines = answer.stdout.splitlines()
-                    trim_lines = [line for line in lines if line.startswith("mac_trim=")]
-                    self.assertEqual(len(trim_lines), 1, answer.stdout)
-                    self.assertRegex(trim_lines[0],
-                                     rf"^mac_trim=status={9 if trim_fails else 0} elapsed_seconds=[0-9]+ over_budget=yes$")
+                    self.assertEqual(retained.stat().st_size, 128 * 1024)
+                    trim_status = 9 if trim_fails else 1
+                    self.assertEqual(self.cleanup_lines(answer, trim_status=trim_status),
+                                     ["nextest finished", "mac_exit=42", f"mac_cleanup={trim_status}"])
+                    size = subprocess.check_output(["du", "-sk", str(target)], text=True).split()[0]
+                    budget = re.escape(str(96 / 1024 ** 2))
+                    self.assertRegex(answer.stdout,
+                                     rf"mac_trim=status={trim_status} elapsed_seconds=[0-9]+ "
+                                     + rf"over_budget=yes size_kib={size} budget_gib={budget}")
                     self.assertNotIn("lint sweep:", answer.stdout)
-                    if trim_fails:
-                        self.assertRegex(lines[-1], r"^mac_cleanup=0 [0-9]+ 99$")
-                    else:
-                        self.assertEqual(lines[-1], "mac_cleanup=kept")
+                    if not trim_fails:
+                        self.assert_guarded_paths()
 
         with self.subTest(user_zone="caller has no zone"):
             shutil.rmtree(target, ignore_errors=True)
-            old = target / "debug/incremental/old-session/output.o"
-            old.parent.mkdir(parents=True)
-            _ = old.write_bytes(os.urandom(64 * 1024))
-            (target / "debug/.fingerprint").mkdir()
             modified = datetime(2020, 2, 3, 4, 5, tzinfo=UTC).timestamp()
-            for path in (old, old.parent):
-                os.utime(path, (modified, modified))
+            old = self.incremental_output("old-session", modified)
             with mock.patch.dict(os.environ):
                 _ = os.environ.pop("USER_ZONE", None)
                 answer = self.run_remote(["/bin/sh"], 0, free_floor_gib=50, budget_gib=str(32 / 1024 ** 2), trim="run")
             self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
             self.assertEqual(self.cleanup_lines(answer), ["nextest finished", "mac_exit=0", "mac_cleanup=kept"])
-            self.assertEqual(len(old.read_bytes()), 64 * 1024)
-            report = self.assert_budget_review(target, listed=True)
-            self.assertIn("last used 2020-02-03 04:05 to 2020-02-03 04:05", report)
+            self.assertFalse(old.parent.exists())
+            self.assertEqual((target / "nextest-output").read_text(), "built\n")
+            self.assert_guarded_paths(old.parent)
             self.assertNotIn("user_zone", (self.root / "trim-config-reads").read_text().splitlines())
 
     def test_remote_text_with_unreadable_space_keeps_build_output(self) -> None:
@@ -627,6 +636,7 @@ exit 1
                         self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
+                        self.assertFalse((self.root / "df-arguments.json").exists())
 
     def test_remote_text_with_another_target_dir_keeps_every_build_directory(self) -> None:
         target = self.mirror / "target"
@@ -645,22 +655,24 @@ exit 1
                         self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
                         self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])
 
-    def test_remote_text_reports_delete_failure_after_the_test_status(self) -> None:
+    def test_remote_text_reports_guard_refusal_after_the_test_status(self) -> None:
         remove = self.bin_directory / "rm"
         write_shell(remove, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/remove-arguments.json"
 exit 7
 ''')
-        with mock.patch.dict(os.environ, {"PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"]}):
-            for shell in (["/bin/sh"], ["zsh", "-f"]):
-                for status in (0, 42):
-                    with self.subTest(shell=shell, status=status):
-                        answer = self.run_remote(shell, status)
-                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=7"])
-                        self.assertTrue((self.mirror / "target" / "nextest-output").exists())
-                        arguments = cast(list[str], json.loads((self.root / "remove-arguments.json").read_text()))
-                        self.assertEqual([word for word in arguments if not word.startswith("-")], [str(self.mirror / "target")])
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                with self.subTest(shell=shell, status=status):
+                    old = self.incremental_output("old-session", time.time() - 7200)
+                    answer = self.run_remote(shell, status, budget_gib=str(32 / 1024 ** 2), trim="refuse")
+                    self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                    self.assertEqual(self.cleanup_lines(answer, trim_status=1),
+                                     ["nextest finished", f"mac_exit={status}", "mac_cleanup=1"])
+                    self.assert_guarded_paths(old.parent)
+                    self.assertEqual(old.stat().st_size, 64 * 1024)
+                    self.assertEqual((self.mirror / "target" / "nextest-output").read_text(), "built\n")
+                    self.assertFalse((self.root / "remove-arguments.json").exists())
 
 
 class MacActivityShellTests(unittest.TestCase):

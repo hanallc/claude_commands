@@ -28,7 +28,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import build_folders, scratch
-from scripts.lib.checkout_test_support import write_stdlib_tool
+from scripts.lib.checkout_test_support import fixture_shim_source, write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.shell_test_support import fixture_zsh_environment
@@ -1196,6 +1196,10 @@ print(json.dumps(sys.argv[1:]))
                        **copies_environment(root),
                        'PATH': os.pathsep.join((str(root), os.defpath)),
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
+        python_shim = root / '.claude/scripts/lib/py'
+        python_shim.parent.mkdir(parents=True)
+        _ = python_shim.write_text(fixture_shim_source())
+        python_shim.chmod(0o755)
         gate_root = root / 'gate-root'
         gate_root.mkdir()
         _ = write_config_fixture(root / 'config/build_folders.conf', f'roots.gate={gate_root}\n')

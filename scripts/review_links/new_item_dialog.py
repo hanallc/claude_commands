@@ -12,6 +12,7 @@ from typing import Literal, cast
 
 from scripts.lib import conf
 from scripts.production import staff
+from scripts.production.record_store import SubmissionConflict, SubmissionError
 from scripts.review_links import page_frame, reply_tokens
 
 
@@ -93,16 +94,6 @@ def read_stored_image_byte_limit() -> int:
     if bound <= 0:
         raise conf.Unusable(f"{settings.source}: {key}: expected a positive upper bound")
     return bound
-
-
-class SubmissionError(ValueError):
-    """The request cannot be saved or applied to this item."""
-
-
-class SubmissionConflict(SubmissionError):
-    """The request ID already names different item data."""
-
-    status: Literal[409] = 409
 
 
 class SubmissionScreenshotExpired(SubmissionConflict):

@@ -3,13 +3,13 @@
 import ast
 import importlib.util
 import os
-from functools import cache
 from pathlib import Path
 import shutil
 import shlex
 import subprocess
 import sys
 
+from scripts.lib.helper_tree_test_support import runtime_files as runtime_files
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, startup_pythonpath
 
 
@@ -22,16 +22,6 @@ startup._descends_from_gate_module = lambda: False
 STANDALONE_TEST_STARTUP = WITHOUT_GATE_ANCESTRY + """
 startup._direct_test_scope_enforces_deadline = lambda unit: False
 """
-
-
-@cache
-def runtime_files() -> tuple[Path, ...]:
-    """List runtime files without compiled files or unrelated test modules."""
-    helpers = {"test_config_form.py", "test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
-    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
-                 for path in sorted((SOURCE / folder).rglob("*"))
-                 if (path.is_file() or path.is_symlink() and path.is_dir()) and "__pycache__" not in path.parts
-                 and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
 
 
 def copy_with_bytecode(source: Path, destination: Path) -> None:

@@ -3950,17 +3950,17 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 if mode == "accepted":
                     (self.root / "postmaster/heartbeat.json").unlink()
                 keys = self.root / "keys.json"
-                write = write_text_atomic
+                write_keys = review_hold.write_message_keys
                 replace_entry = os.replace
 
-                def fail_stage(path: Path, text: str) -> None:
+                def fail_stage(directory: Path, records: object) -> None:
                     stage = "resolved" if mode == "resolved" else "publishing"
-                    if path == keys:
-                        stored = cast(send.KeyStates, json.loads(text))
+                    if directory == self.root:
+                        stored = cast(send.KeyStates, records)
                         marker = send.pending_deliveries(stored.get(mode, {"last": {}})).get("session:recipient")
                         if marker is not None and "postmaster" in marker and marker["postmaster"]["stage"] == stage:
                             raise OSError("stage write failed")
-                    write(path, text)
+                    write_keys(directory, records)
 
                 def interrupt_publication(source: str | Path, target: str | Path) -> None:
                     if Path(target).parent == self.root / "postmaster/outbox" and str(target).endswith(".json"):
@@ -3975,7 +3975,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
                 patcher = (mock.patch.object(send, "remove_queued_key", side_effect=KeyboardInterrupt)
                            if mode in ("accepted", "postmaster-accepted")
-                           else mock.patch.object(send, "write_atomic", fail_stage) if mode != "interrupt"
+                           else mock.patch.object(review_hold, "write_message_keys", fail_stage)
+                           if mode != "interrupt"
                            else mock.patch.object(os, "replace", interrupt_publication))
                 with patcher, self.assertRaises(failure), redirect_stdout(io.StringIO()):
                     _ = send.main(options)
@@ -4427,14 +4428,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.session("after", "Replacement")
         options = local_options(["--to", "session:before", "--key", "notice", "--repeat-minutes", "30",
                                  "--recipient-key", "logical-recipient", "--from", "fixture", "--text", "Notice"])
-        keys = self.root / "keys.json"
+        write_keys = review_hold.write_message_keys
 
-        def stop_after_first_acceptance_write(path: Path, text: str) -> None:
-            write_text_atomic(path, text)
-            if path == keys and self.relayed:
+        def stop_after_first_acceptance_write(directory: Path, records: object) -> None:
+            write_keys(directory, records)
+            if directory == self.root and self.relayed:
                 raise KeyboardInterrupt
 
-        with (mock.patch.object(send, "write_atomic", side_effect=stop_after_first_acceptance_write),
+        with (mock.patch.object(review_hold, "write_message_keys", side_effect=stop_after_first_acceptance_write),
               self.assertRaises(KeyboardInterrupt)):
             _ = send.send(options)
         accepted = self.claims("notice")
