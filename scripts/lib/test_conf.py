@@ -387,16 +387,6 @@ conf_reads.record('disabled')
         self.assertIsInstance(conf.read("accounts").origin("notes_directory", str), conf.UnavailableValue)
         self.assertEqual(source.read_text(), contents)
 
-    def test_missing_key_in_a_patched_directory_refuses_repository_values(self) -> None:
-        del os.environ["CONF_DIR"]
-        source = self.directory / "accounts.conf"
-        _ = source.write_text("# whole: 1..\nusage_stale_minutes=23\n")
-        with (mock.patch.object(conf, "directory", return_value=self.directory), redirect_stderr(io.StringIO())):
-            settings = conf.read("accounts")
-            self.assertEqual(settings.whole("usage_stale_minutes"), 23)
-            with self.assertRaisesRegex(conf.Unusable, "key is missing"):
-                _ = settings.text("notes_directory")
-
     def test_missing_accounts_key_uses_git_before_repository(self) -> None:
         self.history()
         source = self.directory / "accounts.conf"

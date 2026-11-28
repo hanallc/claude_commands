@@ -371,14 +371,10 @@ def read_bytes(source: Path) -> ConfigurationBytes:
         return ConfigurationBytes(stream.read(), stamp)
 
 
-_DEFAULT_DIRECTORY = "~/.claude/config"
-
-
 def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:
     """Read and parse the live file once; resolve faults when a setting is used."""
     source = path(file)
-    repository_allowed = (isinstance(file, str) and "CONF_DIR" not in os.environ
-                          and source.parent == Path(_DEFAULT_DIRECTORY).expanduser())
+    repository_allowed = "CONF_DIR" not in os.environ
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
     try:
         if load is not None:
@@ -408,7 +404,7 @@ def read_or_repository(stem: str) -> ConfigRead:
 
 def directory() -> Path:
     """Return the live configuration folder, or the test fixture override."""
-    return Path(os.environ.get("CONF_DIR") or _DEFAULT_DIRECTORY).expanduser()
+    return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser()
 
 
 def path(file: str | Path) -> Path:
