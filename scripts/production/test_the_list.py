@@ -20,8 +20,8 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol, cast, final, override
-from unittest.mock import Mock, patch
+from typing import IO, Literal, Protocol, cast, final, override
+from unittest.mock import MagicMock, Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts.console_text.test_support import accepting_console_text
@@ -46,6 +46,27 @@ LIST_TEXT_LIMITS = {
     "max_chars.next_step": 72,
     "max_chars.evidence_line": 90,
 }
+
+
+@contextmanager
+def fixed_scheduled_clock() -> Generator[None]:
+    with (patch.object(time, "monotonic", return_value=0.0),
+          patch.object(the_list, "monotonic", return_value=0.0)):
+        yield
+
+
+@contextmanager
+def accept_scheduled_sends(record: Callable[[str, the_list.RunNotice], None]) -> Generator[None]:
+    def launch(command: list[str], *, stdout: IO[bytes], pass_fds: tuple[int, ...],
+               **_options: object) -> MagicMock:
+        _, identity, _, kind = command[command.index("--key") + 1].split(":")
+        record(identity, the_list.RunNotice[kind.upper()])
+        output_size = stdout.write(b"SENT: delivered\n")
+        _ = os.write(pass_fds[0], f"0 {output_size} 0\n".encode())
+        return MagicMock(returncode=0)
+
+    with patch.object(subprocess, "Popen", side_effect=launch):
+        yield
 
 
 def copy_list_item(identity: str, *, source_keeper: staff.StaffId, destination_keeper: staff.StaffId) -> None:
@@ -583,8 +604,7 @@ else:
                     self.assertEqual(sent.read_text(), "")
                     extra_logs = missed_days + int(case == "Lose receipt")
                     with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
-                        with (patch.object(time, "monotonic", return_value=0.0),
-                              patch.object(the_list, "monotonic", return_value=0.0)):
+                        with fixed_scheduled_clock():
                             the_list.fire_scheduled(UPKEEP_INTERVAL)
                         working = the_list.load(MORTY.id, item.id)
                         self.assertIs(working.state, the_list.ItemState.WORKING)
@@ -652,7 +672,7 @@ else:
                         self.assertIs(changed.state, the_list.ItemState.SCHEDULED)
                         next_time = due + timedelta(days=1)
                         self.assertIn(f"next {next_time.isoformat()}", the_list.table(MORTY.id))
-                        with patch.object(the_list, "now", return_value=next_time):
+                        with patch.object(the_list, "now", return_value=next_time), fixed_scheduled_clock():
                             the_list.fire_scheduled(UPKEEP_INTERVAL)
                             code, _, error = self.command("confirm", "--id", item.id, "--run", run_key)
                             self.assertEqual(code, 1)
@@ -663,7 +683,8 @@ else:
                         self.assertEqual(len(changed.log), len(item.log) + 2 + extra_logs)
                         self.assertIn(next_time.isoformat(), str(changed.log[-1].what))
                         self.assertEqual(len(sent.read_text().splitlines()), 4)
-                        with patch.object(the_list, "now", return_value=next_time + timedelta(days=1)):
+                        with (patch.object(the_list, "now", return_value=next_time + timedelta(days=1)),
+                              fixed_scheduled_clock()):
                             the_list.fire_scheduled(UPKEEP_INTERVAL)
                         self.assertEqual(len(sent.read_text().splitlines()), 4)
                     self.assertIs(changed.state, the_list.ItemState.WORKING)
@@ -702,17 +723,14 @@ else:
         owner = the_list.RunNotice.OWNER_START
         producer = the_list.RunNotice.PRODUCER_START
 
-        def send(_identity: str, _delivery: the_list.RunDelivery, notice: the_list.RunNotice,
-                 _capture: the_list.ScheduledNoticeCapture, on_started: Callable[[], None]) -> bool:
-            on_started()
+        def record(_identity: str, notice: the_list.RunNotice) -> None:
             sends.append(notice)
             if notice is owner:
                 clock.return_value = cast(float, getattr(the_list, "_SCHEDULED_SEND_SECONDS"))
-            return True
 
         with (patch.object(time, "monotonic", clock), patch.object(the_list, "monotonic", clock),
               patch.object(remote, "local_machine", return_value="natedev"),
-              patch.object(the_list, "_send_scheduled_notice", side_effect=send)):
+              accept_scheduled_sends(record)):
             the_list.fire_scheduled(UPKEEP_INTERVAL)
             saved = the_list.load(MORTY.id, item.id)
             self.assertEqual(sends, [owner])
@@ -738,16 +756,12 @@ else:
         sends: list[tuple[str, the_list.RunNotice]] = []
         budget = cast(float, getattr(the_list, "_SCHEDULED_SEND_SECONDS")) / 2
 
-        def send(identity: str, _delivery: the_list.RunDelivery, notice: the_list.RunNotice,
-                 _capture: the_list.ScheduledNoticeCapture, on_started: Callable[[], None]) -> bool:
-            on_started()
+        def record(identity: str, notice: the_list.RunNotice) -> None:
             sends.append((identity, notice))
-            return True
 
-        with (patch.object(time, "monotonic", return_value=0.0),
-              patch.object(the_list, "monotonic", return_value=0.0),
+        with (fixed_scheduled_clock(),
               patch.object(remote, "local_machine", return_value="natedev"),
-              patch.object(the_list, "_send_scheduled_notice", side_effect=send),
+              accept_scheduled_sends(record),
               operation_deadline.within(budget)):
             the_list.fire_scheduled(UPKEEP_INTERVAL)
             self.assertEqual(sends, [(first.id, owner), (second.id, owner)])
@@ -783,6 +797,39 @@ else:
         delivery = saved.run_deliveries[0]
         self.assertIs(delivery.confirmation, the_list.AwaitingInstruction.OWNER)
         self.assertEqual(delivery.notices, (the_list.ScheduledNotice(owner), the_list.ScheduledNotice(producer)))
+        self.assertNotIn("Delivery uncertain", "\n".join(str(entry.what) for entry in saved.log))
+
+    def test_later_notice_with_short_budget_at_launch_stays_ready(self) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        item = self.add("Slow preparation", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        clock = Mock(return_value=0.0)
+        owner, producer = the_list.RunNotice.OWNER_START, the_list.RunNotice.PRODUCER_START
+        send_budget = cast(float, getattr(the_list, "_SCHEDULED_SEND_SECONDS"))
+        item_budget = cast(float, getattr(the_list, "_SCHEDULED_ITEM_SECONDS"))
+        prepared: list[the_list.RunNotice] = []
+        sends: list[the_list.RunNotice] = []
+
+        def command(identity: str, delivery: the_list.RunDelivery, notice: the_list.RunNotice) -> list[str]:
+            prepared.append(notice)
+            if notice is producer:
+                saved = the_list.load(MORTY.id, identity).run_deliveries[0]
+                self.assertIn(the_list.ScheduledNotice(producer, the_list.NoticeState.SENDING), saved.notices)
+                self.assertGreaterEqual(operation_deadline.remaining(), send_budget)
+                clock.return_value = item_budget - send_budget / 2
+            return ["--key", f"list-run:{identity}:{delivery.key}:{notice.name.lower()}"]
+
+        with (patch.object(time, "monotonic", clock), patch.object(the_list, "monotonic", clock),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(the_list, "_scheduled_notice_command", side_effect=command),
+              accept_scheduled_sends(lambda _identity, notice: sends.append(notice))):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(prepared, [owner, producer])
+        self.assertEqual(sends, [owner])
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.run_deliveries[0].notices, (
+            the_list.ScheduledNotice(owner, the_list.NoticeState.ACCEPTED),
+            the_list.ScheduledNotice(producer, the_list.NoticeState.READY),
+        ))
         self.assertNotIn("Delivery uncertain", "\n".join(str(entry.what) for entry in saved.log))
 
     def check_scheduled_instruction_interrupt(self, attempted: Path) -> None:
@@ -891,7 +938,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
         later = self.add("Later scan item", changes=changes)
         clock = Mock(return_value=0.0)
 
-        def timeout_sender(*_args: object) -> None:
+        def timeout_sender(*_args: object, **_kwargs: object) -> None:
             clock.return_value = cast(float, getattr(the_list, "_SCHEDULED_CHECK_SECONDS"))
             raise the_list.ListError("message delivery timed out")
 
@@ -917,7 +964,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
         self.assertEqual(self.command("update", "--id", item.id, "--scope", "this", "--start", moved.isoformat(),
                                       "--source", "nate"), (0, "Repeats: Daily for 2 runs\n", ""))
         if case != "same check":
-            with patch.object(the_list, "now", return_value=second), redirect_stderr(io.StringIO()):
+            with (patch.object(the_list, "now", return_value=second), fixed_scheduled_clock(),
+                  redirect_stderr(io.StringIO())):
                 the_list.fire_scheduled(UPKEEP_INTERVAL)
                 after_second = the_list.load(MORTY.id, item.id)
                 active = after_second.run_deliveries[0]
@@ -938,7 +986,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
                     self.assertEqual(delivered.log[active.log_index].what,
                                      f"Scheduled run due {second.isoformat()}. Settled by a manual state change.")
         tick = moved + timedelta(seconds=30) if case == "same check" else moved
-        with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
+        with (patch.object(the_list, "now", return_value=tick), fixed_scheduled_clock(),
+              redirect_stderr(io.StringIO())):
             the_list.fire_scheduled(UPKEEP_INTERVAL)
             if case == "same check":
                 first_check = the_list.load(MORTY.id, item.id)
