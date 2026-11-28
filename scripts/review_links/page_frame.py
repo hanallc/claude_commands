@@ -458,21 +458,40 @@ _VERSION_SCRIPT = r'''(() => {
  const notice=document.querySelector('.version-notice'),form=notice.querySelector('form');
  const rows=form.querySelector('ul'),failure=form.querySelector('[role=alert]');
  const frames=document.querySelector('.frame-area'),shell=document.querySelector('#console-shell');
- let current,visible='',reading=false,clearing=false,card,source,edit=0;
+ let current,visible='',reading=false,clearing=false,card,selected='',opener='',edit=0;
+ const itemLink=key=>rows.querySelector('a[data-version-item="'+CSS.escape(key)+'"]');
+ function selectItem(key){
+  if(key===selected) return;
+  itemLink(selected)?.setAttribute('aria-expanded','false');
+  selected=key;
+  itemLink(selected)?.setAttribute('aria-expanded','true');
+  if(key) opener=key;
+ }
  function closeCard(){
   card?.remove();card=null;
-  source?.setAttribute('aria-expanded','false');
-  if(source?.isConnected) source.focus({preventScroll:true});
-  source=null;
+  selectItem('');
+  itemLink(opener)?.focus({preventScroll:true});
+  opener='';
  }
  function render(data){
   current=data;
   const signature=JSON.stringify(data.changes);
-  if(signature===visible) return;
-  visible=signature;
   const focused=notice.contains(document.activeElement);
-  const position=[...rows.children].findIndex(row=>row.contains(document.activeElement));
-  rows.replaceChildren(...data.changes.map(change=>{
+  const changed=signature!==visible;
+  const position=changed ? [...rows.children].findIndex(row=>row.contains(document.activeElement)) : -1;
+  if(changed){
+   visible=signature;
+   renderRows(data.changes);
+  }
+  notice.hidden=!data.changes.length && failure.hidden;
+  if(focused && position>=0){
+   const target=rows.children[Math.min(position,rows.children.length-1)]?.querySelector('button');
+   (target || document.querySelector('.nav-entry[aria-current], [data-console-page]:not([hidden])'))
+    ?.focus({preventScroll:true});
+  }else if(focused && notice.hidden) document.querySelector('.nav-entry[aria-current]')?.focus({preventScroll:true});
+ }
+ function renderRows(changes){
+  rows.replaceChildren(...changes.map(change=>{
    const row=document.createElement('li'),link=document.createElement('a');
    const title=document.createElement('span'),button=document.createElement('button');
    const item=new URLSearchParams({item:change.key,reveal:'1'});
@@ -480,20 +499,17 @@ _VERSION_SCRIPT = r'''(() => {
    link.textContent='#'+change.number;
    link.dataset.versionItem=change.key;
    link.setAttribute('aria-haspopup','dialog');
-   link.setAttribute('aria-expanded',String(source?.dataset.versionItem===change.key));
+   link.setAttribute('aria-expanded',String(selected===change.key));
    title.textContent=change.title;
    button.type='submit';button.name='clear';button.value=String(change.number);button.textContent='Clear';
    button.setAttribute('aria-label','Clear #'+change.number);
    row.append(link,title,button);
    return row;
   }));
-  if(card) source=[...rows.querySelectorAll('a')].find(link=>link.getAttribute('aria-expanded')==='true');
-  notice.hidden=!rows.children.length && failure.hidden;
-  if(focused && position>=0){
-   const target=rows.children[Math.min(position,rows.children.length-1)]?.querySelector('button');
-   (target || document.querySelector('.nav-entry[aria-current], [data-console-page]:not([hidden])'))
-    ?.focus({preventScroll:true});
-  }else if(focused && notice.hidden) document.querySelector('.nav-entry[aria-current]')?.focus({preventScroll:true});
+ }
+ function reportFailure(message){
+  showActionFailure(failure,message);
+  notice.hidden=false;
  }
  async function refresh(){
   if(reading || clearing || document.visibilityState!=='visible') return;
@@ -520,7 +536,7 @@ _VERSION_SCRIPT = r'''(() => {
    if(!response.ok) throw new Error(data.reason || 'The change could not clear. Try again.');
    render(data);
   }catch(error){
-   showActionFailure(failure,error instanceof SyntaxError ? 'The change could not clear. Try again.' : error.message);
+   reportFailure(error instanceof SyntaxError ? 'The change could not clear. Try again.' : error.message);
   }finally{clearing=false;}
  });
  rows.addEventListener('click',event=>{
@@ -528,18 +544,19 @@ _VERSION_SCRIPT = r'''(() => {
   if(!link || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   event.preventDefault();
   const key=link.dataset.versionItem;
-  source?.setAttribute('aria-expanded','false');
-  source=link;source.setAttribute('aria-expanded','true');
-  if(card?.contentDocument?.openVersionListItem?.(key)) return;
+  const result=card?.contentDocument?.openVersionListItem?.(key);
+  if(result==='opened' || result==='blocked') return;
   if(!card){
    card=document.createElement('iframe');card.title='List item';card.dataset.versionCard='';
    card.addEventListener('version-card-closed',closeCard);
+   card.addEventListener('version-card-item',event=>selectItem(event.detail));
    card.addEventListener('load',()=>{
-    if(!card || card.contentDocument?.openVersionListItem) return;
+    if(card?.contentDocument?.openVersionListItem) return;
     closeCard();
-    showActionFailure(failure,'The List item could not open. Try again.');
+    reportFailure('The List item could not open. Try again.');
    });
   }
+  selectItem('');
   const url=new URL(link.href);
   url.searchParams.set('version-card','1');
   card.src=url;
@@ -576,12 +593,22 @@ _VERSION_CARD_SCRIPT = r'''<script>
  const dialog=document.querySelector('[data-list-review-dialog]');
  const host=window.frameElement;
  if(!host?.hasAttribute('data-version-card')) return;
- document.openVersionListItem=key=>{
-  const list=document.querySelector('[data-list]');
-  const aliases=JSON.parse(list.dataset.itemAliases);
-  key=Object.hasOwn(aliases,key) ? aliases[key] : key;
+ const list=document.querySelector('[data-list]');
+ const aliases=JSON.parse(list.dataset.itemAliases);
+ const overlay=dialog.querySelector('[data-list-linked-overlay]');
+ const shownItem=()=>dialog.open && !overlay.hidden ? overlay.querySelector('[data-list-item]')?.dataset.key : '';
+ let requested='',opened='',published='';
+ function publishItem(){
+  const key=shownItem()===opened ? requested : '';
+  if(key===published) return;
+  published=key;
+  host.dispatchEvent(new CustomEvent('version-card-item',{detail:key}));
+ }
+ document.openVersionListItem=request=>{
+  if(dialog.open && overlay.hidden) return 'blocked';
+  const key=Object.hasOwn(aliases,request) ? aliases[request] : request;
   const item=list.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
-  if(!item) return false;
+  if(!item) return 'missing';
   // Use the Studio linked item action so the overlay keeps its standard controls.
   const link=document.createElement('a');
   link.dataset.listLinkedCard='';link.hidden=true;
@@ -589,18 +616,22 @@ _VERSION_CARD_SCRIPT = r'''<script>
   link.textContent=item.querySelector('[data-label="Item"] strong').textContent;
   item.querySelector('td').append(link);
   link.click();link.remove();
-  return dialog.open;
+  if(shownItem()!==key) return 'blocked';
+  requested=request;opened=key;
+  publishItem();
+  return 'opened';
  };
  const key=new URLSearchParams(location.search).get('item') || new URLSearchParams(location.hash.slice(1)).get('item');
- if(!key || !document.openVersionListItem(key)){
+ if(!key || document.openVersionListItem(key)!=='opened'){
   delete document.openVersionListItem;
   return;
  }
  new MutationObserver(()=>{
+  publishItem();
   if(dialog.open) host.hidden=false;
   else if(dialog.querySelector('iframe[data-saving]')) host.hidden=true;
   else host.dispatchEvent(new Event('version-card-closed'));
- }).observe(dialog,{attributes:true,attributeFilter:['open','data-saving'],subtree:true,childList:true});
+ }).observe(dialog,{attributes:true,attributeFilter:['open','hidden','data-saving'],subtree:true,childList:true});
 })();
 </script>'''
 

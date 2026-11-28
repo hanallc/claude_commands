@@ -1,5 +1,7 @@
 """Test the revision scan and the saved notice."""
 
+from dataclasses import asdict
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -43,12 +45,33 @@ class VersionNoticeTests(unittest.TestCase):
         self.assertEqual({(change.number, change.key, change.title) for change in notice.changes},
                          {(493, "fixture/L493", "Open the shared overlay"),
                           (499, "fixture/L499", "Show the List item number")})
-        _ = version_notice.clear(folder, notice.revision, None)
         commit("Update the console tests")
         with patch.object(the_list, "display_list_records") as records:
             version_notice.start(folder, checkout)
         records.assert_not_called()
-        self.assertEqual(version_notice.read(folder).changes, ())
+        updated = version_notice.read(folder)
+        self.assertNotEqual(updated.revision, notice.revision)
+        self.assertEqual(updated.changes, notice.changes)
+
+    def test_missing_revision_sets_a_new_baseline_and_keeps_uncleared_lines(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = folder / "checkout"
+        checkout.mkdir()
+        git = version_notice.git
+        _ = git(checkout, "init", "-b", "main")
+        _ = git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                "commit", "--allow-empty", "-m", "Update the Studio filters (List 504)")
+        kept = version_notice.Change(493, "fixture/L493", "Open the shared overlay")
+        cleared = version_notice.Change(499, "fixture/L499", "Show the List item number", cleared=True)
+        previous = version_notice.Notice("a" * 40, (kept, cleared))
+        _ = (folder / version_notice.FILE).write_text(json.dumps(asdict(previous)), encoding="utf-8")
+
+        with patch.object(the_list, "display_list_records") as records:
+            version_notice.start(folder, checkout)
+
+        records.assert_not_called()
+        revision = git(checkout, "rev-parse", "--verify", "HEAD").strip()
+        self.assertEqual(version_notice.read(folder), version_notice.Notice(revision, (kept,)))
 
     def test_first_start_records_head_without_a_message(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))

@@ -123,15 +123,35 @@ VERSION_BROWSER_PROBE = br"""<script>
         innerWidth===1440 && innerHeight===900,'The notice shows in a 1440 by 900 dark console.');
   if(proof) return;
   links()[0].click();
+  check(links()[0].getAttribute('aria-expanded')==='false','The link waits for the item to open.');
   await until(()=>overlay()?.querySelector('[data-number="504"]'),'The List 504 overlay did not open.');
   const card=frame();
-  check(card.contentDocument.querySelector('dialog[open] [data-close]')?.textContent==='Close',
-        'The shared List overlay shows Close.');
+  const close=card.contentDocument.querySelector('dialog[open] [data-close]');
+  check(close?.textContent==='Close','The shared List overlay shows Close.');
+  check(links()[0].getAttribute('aria-expanded')==='true','The link is selected when the item opens.');
+  const relatedReview=()=>overlay()?.querySelector('a[data-list-review-card]');
+  await until(relatedReview,'The List item did not show its Review link.');
+  relatedReview().click();
+  await until(()=>card.contentDocument.querySelector('dialog[open] iframe[title="Review card"]')
+   ?.contentDocument.querySelector('[data-review-body]'),'The linked Review card did not open.');
+  const review=card.contentDocument.querySelector('dialog[open] iframe[title="Review card"]').contentDocument;
+  links()[1].click();
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  check(frame()===card && card.contentDocument.querySelector('dialog[open] iframe')?.contentDocument===review,
+        'The notice keeps the open Review card.');
+  check(notice.querySelector('a[aria-expanded="true"]')===null,'The notice selects no link over a Review card.');
+  close.click();
+  await until(()=>!frame(),'Close did not close the Review card.');
+  links()[0].click();
+  await until(()=>overlay()?.querySelector('[data-number="504"]'),'List 504 did not reopen.');
+  const listCard=frame();
   links()[1].click();
   await until(()=>overlay()?.querySelector('[data-number="499"]'),'List 499 did not replace List 504.');
-  check(frame()===card && overlay().querySelectorAll('[data-list-item]').length===1,'One overlay shows the selected item.');
-  const dialog=card.contentDocument.querySelector('dialog[open]');
-  const realm=card.contentWindow;
+  check(frame()===listCard && overlay().querySelectorAll('[data-list-item]').length===1,
+        'One overlay shows the selected item.');
+  check(notice.querySelector('a[aria-expanded="true"]')===links()[1],'The replacement link is selected.');
+  const dialog=listCard.contentDocument.querySelector('dialog[open]');
+  const realm=listCard.contentWindow;
   dialog.dispatchEvent(new realm.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   await until(()=>!frame(),'Escape did not close the overlay.');
   check(studio().contentDocument===page && document.activeElement===links()[1],'Escape restores the page and link.');
@@ -140,10 +160,13 @@ VERSION_BROWSER_PROBE = br"""<script>
   frame().contentDocument.querySelector('dialog[open] [data-close]').click();
   await until(()=>!frame(),'Close did not close the overlay.');
   const send=window.fetch;
-  window.fetch=(url,options)=>{
-   if(url.endsWith('/version-notice') && options?.method==='POST') options.body.set('token','bad-token');
-   return send(url,options);
+  const refuseClear=()=>{
+   window.fetch=(url,options)=>{
+    if(url.endsWith('/version-notice') && options?.method==='POST') options.body.set('token','bad-token');
+    return send(url,options);
+   };
   };
+  refuseClear();
   notice.querySelector('li button').click();
   const failure=notice.querySelector('[role=alert]');
   await until(()=>!failure.hidden,'The refusal did not show the failure line.');
@@ -152,6 +175,17 @@ VERSION_BROWSER_PROBE = br"""<script>
   notice.querySelector('li button').click();
   await until(()=>links().length===2,'Clear did not remove the first line.');
   check(failure.hidden && links()[0].textContent==='#499','Clear removes only its line.');
+  refuseClear();
+  notice.querySelector('header button').click();
+  await until(()=>!failure.hidden,'The refused Clear all did not show the failure line.');
+  window.fetch=send;
+  const endpoint=notice.querySelector('form').action;
+  const {revision,token}=await (await fetch(endpoint)).json();
+  const response=await fetch(endpoint,{method:'POST',body:new URLSearchParams({revision,token,clear:'all'})});
+  check(response.ok,'Clear all from a second request removes the remaining lines.');
+  window.dispatchEvent(new Event('focus'));
+  await until(()=>links().length===0,'The notice did not read the other clear.');
+  check(!notice.hidden && !failure.hidden,'The notice keeps the failure line after the other clear.');
   notice.querySelector('header button').click();
   await until(()=>notice.hidden,'Clear all did not remove the notice.');
   check(studio().contentDocument===page,'Clear all leaves the Studio page open.');
@@ -6147,6 +6181,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_version_notice_publishes_after_bind_and_before_serving(self) -> None:
+        root = self.root / "startup"
+        revision = "a" * 40
+
+        def check_notice(server: serve.ReviewLinksServer) -> None:
+            self.assertGreater(server.server_port, 0)
+            self.assertEqual(version_notice.read(root), version_notice.Notice(revision))
+
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_routing, "review_root", return_value=root),
+              patch.object(version_notice, "git", return_value=revision + "\n") as git,
+              patch.object(serve.ReviewLinksServer, "serve_forever", autospec=True, side_effect=check_notice) as run,
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(serve.main(["--port", str(self.port)]), 1)
+            self.assertFalse((root / version_notice.FILE).exists())
+            git.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(serve.main(["--port", "0"]), 0)
+            git.assert_called_once()
+            run.assert_called_once()
+
     def test_version_notice_clears_one_all_and_concurrent_requests(self) -> None:
         self.server.verified_tailscale_address = "127.0.0.1"
         revision = "a" * 40
@@ -6164,6 +6219,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         self.assertEqual(clear("all", "bad-token"), 403)
         self.assertEqual(clear("all", seen="b" * 40), 409)
+        self.assertEqual(clear(""), 400)
         self.assertEqual(version_notice.read(self.root), record)
         self.assertEqual(clear(493), 200)
         self.assertEqual(version_notice.read(self.root).changes[0], replace(changes[0], cleared=True))
@@ -6181,8 +6237,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         firefox = shutil.which("firefox")
         assert firefox is not None
         self.server.verified_tailscale_address = "127.0.0.1"
-        keeper = self.configure_list_keeper()
-        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((keeper,))))
+        case = self.review_fixture(changes=1)
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        cache = serve.ConsoleReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        _ = self.enterContext(patch.object(self.server, "root", case.root))
+        _ = self.enterContext(patch.object(self.server, "review_cache", cache))
+        _ = self.enterContext(patch.object(self.server, "delivery_status", case.status))
+        change = next(item for item in cache.get().records.values() if item.type == review_items.ReviewType.CHANGE)
         changes: list[version_notice.Change] = []
         for number, title in (
             (493, "Umbrella items show their linked items and state."),
@@ -6193,12 +6256,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 changes={"next_step": "Read the change in the console."})
             if number == 493:
                 _ = the_list.close(keeper.id, item.id, "The List item is closed.", source="nate")
+            if number == 504:
+                _ = the_list.link(keeper.id, item.id, (change.key,), source="nate")
             changes.append(version_notice.Change(number, f"{keeper.id}/{item.id}", title))
         notice = version_notice.Notice("b" * 40, tuple(reversed(changes)))
-        state = self.root / version_notice.FILE
+        state = case.root / version_notice.FILE
         results: list[list[str]] = []
         complete = threading.Event()
-        root = self.root
+        root = case.root
         shell = self.request("/console/").body
 
         class VersionBrowser(serve.ReviewLinksHandler):

@@ -1,4 +1,7 @@
-"""Record the List items in a new console version."""
+"""Record the List items in a new console version.
+
+Tabs open before the first deployment need one reload.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +42,15 @@ class VersionChanged(ValueError):
     """The request refers to an earlier console version."""
 
 
+@dataclass(frozen=True)
+class ClearOne:
+    number: int
+
+
+class ClearAll:
+    """Clear every change in the version."""
+
+
 def git(checkout: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(checkout), *arguments], check=True, timeout=15,
                           capture_output=True, encoding="utf-8", errors="replace").stdout
@@ -76,7 +88,12 @@ def start(root: Path, checkout: Path) -> None:
             return
         changes: dict[int, Change] = {}
         if previous.revision:
-            numbers = list_numbers(git(checkout, "log", "--format=%B%x00", f"{previous.revision}..{revision}"))
+            try:
+                messages = git(checkout, "log", "--format=%B%x00", f"{previous.revision}..{revision}")
+            except subprocess.CalledProcessError:
+                # Git cannot read the range. Use HEAD as the new baseline.
+                messages = ""
+            numbers = list_numbers(messages)
             if numbers:
                 rows = {row.item.number: row for row in the_list.display_list_records(include_closed=True)}
                 for number in numbers:
@@ -88,14 +105,16 @@ def start(root: Path, checkout: Path) -> None:
         _write(root, Notice(revision, tuple(changes.values())))
 
 
-def clear(root: Path, revision: str, number: int | None) -> Notice:
+def clear(root: Path, revision: str, scope: ClearOne | ClearAll) -> Notice:
     """Clear one line or all lines in the version the user saw."""
     with file_lock.exclusive(root / (FILE + ".lock")):
         current = read(root)
         if revision != current.revision:
             raise VersionChanged("The version changed. Read the new changes before you clear them.")
-        changes = tuple(replace(change, cleared=True) if number in (None, change.number) else change
-                        for change in current.changes)
+        changes = tuple(
+            replace(change, cleared=True) if isinstance(scope, ClearAll) or change.number == scope.number else change
+            for change in current.changes
+        )
         if changes == current.changes:
             return current
         updated = replace(current, changes=changes)

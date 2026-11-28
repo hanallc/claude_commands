@@ -1648,10 +1648,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.json_response(403, {"reason": "The clear token expired. Try again after the next live update."})
                     return
                 selected = fields["clear"][0]
-                if selected != "all" and not re.fullmatch(r"[1-9][0-9]*", selected):
+                if selected == "all":
+                    scope = version_notice.ClearAll()
+                elif re.fullmatch(r"[1-9][0-9]*", selected):
+                    scope = version_notice.ClearOne(int(selected))
+                else:
                     raise ValueError("Choose one change to clear or use Clear all.")
-                notice = version_notice.clear(server.root, fields["revision"][0],
-                                              None if selected == "all" else int(selected))
+                notice = version_notice.clear(server.root, fields["revision"][0], scope)
             else:
                 notice = version_notice.read(server.root)
         except version_notice.VersionChanged as error:
@@ -3527,10 +3530,6 @@ def main(arguments: list[str]) -> int:
         if fixture is None:
             root = change_routing.review_root()
             root.mkdir(parents=True, exist_ok=True)
-            try:
-                version_notice.start(root, Path(__file__).resolve().parents[2])
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                print(f"review-links version notice: {error}", file=sys.stderr)
             service = ReviewLinksServer(address, root, initialize_review=True)
         else:
             root = fixture
@@ -3540,6 +3539,11 @@ def main(arguments: list[str]) -> int:
             service = ReviewLinksServer(address, root, mode=ServerMode.LIST_FIXTURE)
         with service as server:
             server.verified_tailscale_address = address[0]
+            if fixture is None:
+                try:
+                    version_notice.start(root, Path(__file__).resolve().parents[2])
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    print(f"review-links version notice: {error}", file=sys.stderr)
             print(f"review-links: serving {root} on {address[0]}:{server.server_port}", flush=True)
             try:
                 server.serve_forever()
