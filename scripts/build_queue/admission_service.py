@@ -5283,6 +5283,25 @@ done
         return self.assignments.get(execution_identity.attempt_key(episode, attempt),
             status_wire.UnknownPlacementStatus(episode, attempt))
 
+    def _awaits_mac_report(self, saved: records.SavedPlacementAssignment, *, guest_end_proven: bool = False) -> bool:
+        """Keep consumed Mac attempts open while their coordinator can report."""
+        assignment = saved.assignment
+        report = saved.terminal_report
+        # SettlementRequest, AttemptCompleted, and AttemptLost are reports from the coordinator.
+        if isinstance(report, placement.TerminalAttemptReport):
+            if report.outcome != GUEST_SETTLEMENT_REQUESTED:
+                return False
+            if guest_end_proven and saved.guest_settlement_requested_by_coordinator:
+                return False
+            # A resubmit can settle a guest attempt with no recorded start.
+            if guest_end_proven and not _guest_start_observed(saved):
+                return False
+        return (isinstance(saved.permission, placement.PermissionConsumed)
+                and (assignment.destination.provider == "mac" or is_mac_linux_guest(assignment.destination))
+                and self.current_assignments.get(assignment.episode) == execution_identity.attempt_key(
+                    assignment.episode, assignment.attempt)
+                and self._placement_owner_live(assignment.owner))
+
     def _provider_release_evidence(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None
                                    ) -> placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest:
         """Read evidence for the submitted request under the current configuration."""
@@ -5309,7 +5328,8 @@ done
                 return placement.ClosedAssignment("local run has ended")
             if isinstance(self._lifetime(reservation), gate.EndedStep):
                 return placement.ClosedAssignment("local execution has ended")
-        elif self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
+        elif (self._provider_claim_released(saved, self._provider_release_evidence(saved, keys))
+                and not self._awaits_mac_report(saved)):
             return placement.ClosedAssignment("provider claim released")
         return saved.state
 
@@ -5332,10 +5352,6 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        if (assignment.destination.provider == "mac" and isinstance(saved.permission, placement.PermissionConsumed)
-                and self._placement_owner_live(assignment.owner)):
-            # Keep the attempt current until the coordinator reports the verdict or asks for a replacement.
-            return False
         return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
             and isinstance(saved.permission, placement.PermissionConsumed)
             and evidence.observed_at > saved.permission.consumed_at
@@ -5396,6 +5412,7 @@ done
                 and isinstance(saved.terminal_report, placement.NoTerminalReport)
                 and isinstance(saved.state, placement.CurrentAssignment)
                 and self._ended_claim_holder(saved) and self._next_claim_takes_over(saved)):
+            # The coordinator reports a verdict or loss before it resubmits.
             report = self._lost_report()
             self._close_for_report(replace(saved, terminal_report=report), report, persist_change=False)
 
@@ -5887,11 +5904,12 @@ done
         self.assignments[key] = records.SavedPlacementAssignment(assignment, provider=claim,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
-        place_key = _place_key(request.owner, request.since)
-        place = self.places.get(place_key)
-        if place is not None and place.episode == request.episode and isinstance(place.lost_launch_at, float):
-            self._depart_queue_id(place.move_id)
-            self.places[place_key] = replace(place, lost_launch_at=NoLostLaunch())
+        if self.lost_move_ids:
+            place_key = _place_key(request.owner, request.since)
+            place = self.places.get(place_key)
+            if place is not None and place.episode == request.episode and isinstance(place.lost_launch_at, float):
+                self._depart_queue_id(place.move_id)
+                self.places[place_key] = replace(place, lost_launch_at=NoLostLaunch())
         self.current_assignments[request.episode] = key
         return assignment
 
@@ -6670,6 +6688,8 @@ done
                 if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
                     continue
             if isinstance(report, placement.NoTerminalReport):
+                if self._awaits_mac_report(saved):
+                    continue
                 report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
@@ -6758,19 +6778,24 @@ done
         if self.current_assignments.get(assignment.episode) != key:
             return wire.Refused("the attempt is not current")
         outcome = SCALER_SETTLEMENT_REQUESTED if scaler else GUEST_SETTLEMENT_REQUESTED
-        saved = self._record_settlement_request(key, saved, outcome)
+        saved = self._record_settlement_request(key, saved, outcome, guest_requested_by_coordinator=not scaler)
         if scaler:
             _ = self._settle_aws_dispatch(saved)
         self._schedule_pass()
         return wire.Ok()
 
     def _record_settlement_request(self, key: str, saved: records.SavedPlacementAssignment,
-                                   outcome: placement.AttemptDeclined) -> records.SavedPlacementAssignment:
-        if not isinstance(saved.terminal_report, placement.NoTerminalReport):
+                                   outcome: placement.AttemptDeclined, *,
+                                   guest_requested_by_coordinator: bool = False) -> records.SavedPlacementAssignment:
+        report = saved.terminal_report
+        if isinstance(report, placement.NoTerminalReport):
+            report = placement.TerminalAttemptReport(outcome,
+                placement.DispatchPathPending("launch settlement is pending"), self.clock.now())
+        elif not (guest_requested_by_coordinator and report.outcome == GUEST_SETTLEMENT_REQUESTED
+                  and not saved.guest_settlement_requested_by_coordinator):
             return saved
-        terminal = placement.TerminalAttemptReport(outcome,
-            placement.DispatchPathPending("launch settlement is pending"), self.clock.now())
-        saved = replace(saved, terminal_report=terminal)
+        saved = replace(saved, terminal_report=report,
+                        guest_settlement_requested_by_coordinator=guest_requested_by_coordinator)
         self.assignments[key] = saved
         self.persist()
         self._schedule_pass()
@@ -6802,17 +6827,11 @@ done
         if settled_at is None:
             self.assignments[attempt_key] = self._expire_guest_replacement(saved)
             return
+        if self._awaits_mac_report(saved, guest_end_proven=True):
+            return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
-        started = _guest_start_observed(saved)
-        if ((isinstance(report, placement.NoTerminalReport) and (saved.guest_proof_required or started)
-                or started and isinstance(report, placement.TerminalAttemptReport)
-                and report.outcome == GUEST_SETTLEMENT_REQUESTED)
-                and self.current_assignments.get(episode) == attempt_key
-                and self._placement_owner_live(assignment.owner)):
-            # The coordinator can still report the result after settlement.
-            return
-        if started and (isinstance(report, placement.NoTerminalReport)
+        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
                 or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             report = placement.TerminalAttemptReport(
                 placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),
@@ -6836,12 +6855,7 @@ done
         now = self.clock.now() if checked_at is None else checked_at
         if isinstance(limit, int) and now < report.received_at + limit:
             return saved
-        assignment = saved.assignment
-        if (checked_at is None and report.outcome == GUEST_SETTLEMENT_REQUESTED
-                and self.current_assignments.get(assignment.episode) == execution_identity.attempt_key(
-                    assignment.episode, assignment.attempt)
-                and self._placement_owner_live(assignment.owner)):
-            # An unproven end leaves the current attempt open for the coordinator's report.
+        if checked_at is None and self._awaits_mac_report(saved):
             return saved
         reason = _guest_wait_timeout(saved.assignment.attempt, limit)
         return replace(saved, terminal_report=replace(report, outcome=placement.AttemptCancelled(reason)),

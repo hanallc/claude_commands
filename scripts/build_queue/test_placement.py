@@ -5359,6 +5359,43 @@ class LostMacPlacementTests(unittest.TestCase):
         assert isinstance(authorized, wire.FirstAuthorization), authorized
         return authorized, process
 
+    def test_guest_end_proof_keeps_the_attempt_open_for_a_late_verdict(self) -> None:
+        settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(settlement=settle))):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            key = publish_candidate(fixture, request).key
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            authorized, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            fixture.end_owner(holder)
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            settle.return_value = placement.Settled()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), attempt)
+            self.assertIsInstance(fixture.server.assignments[attempt].terminal_report, placement.NoTerminalReport)
+
+            outcome = placement.AttemptCompleted(1)
+            verdict = wire.ExecutionReport("late-verdict", assignment, authorized.claim,
+                execution_identity.ExecutionEvidenceUnavailable("the guest start report is missing", fixture.clock.now()),
+                outcome, placement.DispatchPathSettled())
+            _ = fixture.server.handle_request(verdict)
+            _ = fixture.run_pass()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+            self.assertEqual(saved.terminal_report.outcome, outcome)
+
     def test_guest_loss_can_follow_an_expired_unproven_settlement_request(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
