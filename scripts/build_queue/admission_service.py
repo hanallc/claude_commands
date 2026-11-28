@@ -2526,7 +2526,9 @@ class AdmissionServer:
         for key in sorted(self.manual_guest_settlement):
             saved = guests[key]
             assignment = saved.assignment
-            command = [python, "-m", "scripts.build_targets.mac_linux", "--reconcile-end",
+            root = target_config.build_targets_state_root().absolute()
+            command = ["env", f"BUILD_TARGETS_STATE_DIR={root}", python,
+                       "-m", "scripts.build_targets.mac_linux", "--reconcile-end",
                        assignment.episode, str(placement.scaler_attempt_number(assignment.attempt))]
             steps.append(f"{key!r} (queue unit: run {shlex.join(command)})")
         for key in sorted(scalers):

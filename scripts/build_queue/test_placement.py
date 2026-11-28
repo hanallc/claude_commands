@@ -915,6 +915,28 @@ class PlacementTests(unittest.TestCase):
             self.assertIn(f"{command})", startup)
             self.assertEqual(messages, [("builds", startup)])
 
+    def test_guest_recovery_command_names_the_service_state_root(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(service, "send_admission_alert", return_value=True)):
+            root = fixture.root / "target state"
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}):
+                request = mac_linux_and_natedev_request(fixture, natedev=False)
+                _ = publish_candidate(fixture, request)
+                guest = assignment_for(fixture, request)
+                holder = guest_gate(fixture, guest)
+                self.assertIsInstance(consume_guest_permission(fixture, guest, holder)[0], wire.FirstAuthorization)
+                state = service.read_state(fixture.state_dir)
+                state.current_assignments[guest.episode] = "missing"
+                _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+
+                with redirect_stderr(io.StringIO()) as warnings:
+                    fixture.restart()
+            python = str(Path(service.__file__).resolve().parents[1] / "lib/py")
+            command = ["env", f"BUILD_TARGETS_STATE_DIR={root}", python, "-m", "scripts.build_targets.mac_linux",
+                       "--reconcile-end", guest.episode, str(int(guest.attempt, 16))]
+            self.assertIn(f"queue unit: run {shlex.join(command)})", warnings.getvalue())
+
     def test_startup_requires_manual_recovery_for_two_consumed_guests(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
         reconcile = mock.Mock()
@@ -5352,6 +5374,37 @@ class LostMacPlacementTests(unittest.TestCase):
         authorized, = fixture.server.handle_request(wire.ConsumePermission("launch", assignment, claim, holder=holder))
         assert isinstance(authorized, wire.FirstAuthorization), authorized
         return authorized, process
+
+    def test_a_new_run_takes_the_place_of_a_dead_run_with_an_open_guest_attempt(self) -> None:
+        from scripts.build_queue.test_place_take import UNIT, JOB, place_rules, run_since
+
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(mac_linux, "reconcile_unproven")):
+            place_rules(fixture)
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            request = replace(request, identity=replace(request.identity, unit=UNIT, job=StepJob(JOB)))
+            _ = publish_candidate(fixture, request)
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            self.assertIsInstance(consume_guest_permission(fixture, guest, holder, proof_required=True)[0],
+                                  wire.FirstAuthorization)
+            assert isinstance(request.run, wire.RunIdentity)
+            fixture.end_run(request.run)
+
+            fixture.clock.advance(10)
+            new = mac_linux_and_natedev_request(fixture, natedev=False)
+            new = replace(new, identity=replace(new.identity, unit=UNIT, job=StepJob(JOB)))
+            _ = publish_candidate(fixture, new)
+            self.assertIsInstance(fixture.server.handle_request(new)[0], wire.PlacementWait)
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply), reply
+            waiter, = (step for step in reply.reading.view.waiting if step.pid == new.owner.pid)
+            self.assertEqual(waiter.took_place, "failed")
+            assert isinstance(new.run, wire.RunIdentity)
+            self.assertEqual(run_since(fixture, new.run), request.since)
 
     def test_guest_end_proof_keeps_the_attempt_open_for_a_late_verdict(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
