@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 import math
 import os
 from pathlib import Path
@@ -257,9 +256,9 @@ class ConfigRead:
             if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
-        for committed in _committed_files(self.source):
+        for settings in _committed_settings(self.source):
             try:
-                value, raw_value = read_key(_read_settings(committed, self.source))
+                value, raw_value = read_key(settings)
             except (ValueError, ArithmeticError):
                 continue
             if not current_limit:
@@ -350,9 +349,9 @@ class ConfigRead:
                 return settings.copy()
             except (OSError, UnicodeError):
                 pass
-        for contents in _committed_files(self.source):
+        for settings in _committed_settings(self.source):
             _warning(f"warning: {self.source}: keys: {fault.reason}")
-            return _read_settings(contents, self.source)
+            return settings
         _warning(f"warning: {self.source}: keys: {fault.reason}")
         raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
 
@@ -462,18 +461,30 @@ def _read_settings(contents: str, source: Path) -> dict[str, Setting]:
     return settings
 
 
+_repository_fixtures: dict[tuple[str, Path, ConfigurationStamp], dict[str, Setting]] = {}
+_repository_fixtures_lock = Lock()
+
+
 def _read_repository(stem: str, source: Path) -> tuple[dict[str, Setting], ConfigurationStamp | UnstampedConfiguration]:
-    if conf_reads.shift_reads_enabled():
-        stamp = ConfigurationStamp.from_stat(source.stat())
-        return _repository_fixture(stem, source, stamp), stamp
-    return _read_settings(source.read_text(encoding="utf-8"), source), UnstampedConfiguration.UNSTAMPED
+    if not conf_reads.shift_reads_enabled():
+        return _read_settings(source.read_text(encoding="utf-8"), source), UnstampedConfiguration.UNSTAMPED
+    with source.open(encoding="utf-8") as stream:
+        stamp = _file_stamp(stream.fileno())
+        key = (stem, source, stamp)
+        if (cached := _repository_fixtures.get(key)) is not None:
+            return cached, stamp
+        contents = stream.read()
+    parsed = _fixture_settings(stem, source, contents)
+    with _repository_fixtures_lock:
+        _repository_fixtures[key] = parsed
+        if len(_repository_fixtures) > 128:
+            _ = _repository_fixtures.pop(next(iter(_repository_fixtures)))
+    return parsed, stamp
 
 
-@lru_cache(maxsize=128)
-def _repository_fixture(stem: str, source: Path, _stamp: ConfigurationStamp) -> dict[str, Setting]:
+def _fixture_settings(stem: str, source: Path, contents: str) -> dict[str, Setting]:
     from scripts.lib import conf_fixture
 
-    contents = source.read_text(encoding="utf-8")
     lines = conf_fixture.config_lines(f"{stem}.conf", contents, settings=settings, decimal=decimal)
     return _read_settings("\n".join(lines), source)
 
@@ -592,6 +603,17 @@ def _committed_files(source: Path) -> Iterator[str]:
         committed = _git(checkout, "show", f"{revision}:{relative}")
         if committed.returncode == 0:
             yield committed.stdout
+
+
+def _committed_settings(source: Path) -> Iterator[dict[str, Setting]]:
+    stem = source.stem
+    use_fixture_rules = (conf_reads.shift_reads_enabled()
+                         and source.resolve() == _repository_path(stem).resolve())
+    for contents in _committed_files(source):
+        if use_fixture_rules:
+            yield _fixture_settings(stem, source, contents)
+        else:
+            yield _read_settings(contents, source)
 
 
 def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:

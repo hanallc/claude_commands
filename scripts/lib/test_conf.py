@@ -1,8 +1,8 @@
 """Configuration reads at use, validates limits, and recovers from git history."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import redirect_stderr
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr
 from decimal import Decimal
 import io
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import cast, override
+from typing import Literal, cast, override
 import unittest
 from unittest import mock
 
@@ -430,6 +430,56 @@ conf_reads.record('disabled')
         self.assertNotIn("word", settings.values())
         self.assertIn("accounts.conf:count: 42 -> 43", log.read_text().splitlines())
 
+    def test_repository_history_recovery_uses_the_fixture_rules(self) -> None:
+        log = self.root / "shift-reads"
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
+        self.history()
+        repository = self.directory / "accounts.conf"
+        _ = repository.write_text("# whole: 0..\ncount=42\nnotes_directory=/raw\nlogin_probe_directory=/tmp\n")
+        _ = self.git("add", "config/accounts.conf")
+        _ = self.git("commit", "-qm", "Add the repository configuration")
+        os.environ["CONF_DIR"] = str(self.root / "missing-config")
+
+        with mock.patch.object(conf, "_repository_path", return_value=repository), redirect_stderr(io.StringIO()):
+            settings = conf.read_or_repository("accounts")
+            self.assertNotIn("login_probe_directory", settings.values())
+            with self.assertRaisesRegex(conf.Unusable, "key is missing"):
+                _ = settings.text("login_probe_directory")
+
+            repository.unlink()
+            settings = conf.read_or_repository("accounts")
+            values = settings.values()
+            self.assertEqual(values["count"], "43")
+            self.assertEqual(values["notes_directory"], "~/rust/hanadocs/agents")
+            self.assertNotIn("login_probe_directory", values)
+            self.assertEqual(settings.whole("count"), 43)
+        self.assertIn("accounts.conf:count: 42 -> 43", log.read_text().splitlines())
+
+    def test_repository_fixture_uses_the_stamp_of_the_open_file(self) -> None:
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(self.root / "shift-reads")))
+        repository = self.root / "repository-config/accounts.conf"
+        first, second = repository.with_name("first.conf"), repository.with_name("second.conf")
+        _ = first.write_text("# whole: 0..\ncount=42\n")
+        _ = second.write_text("# whole: 0..\ncount=50\n")
+        repository.unlink()
+        repository.symlink_to(first)
+        open_file = Path.open
+
+        def switch_target(source: Path, mode: Literal["r"] = "r", *, encoding: str | None = None,
+                          errors: str | None = None, newline: str | None = None) -> io.TextIOWrapper:
+            self.assertEqual(source, repository)
+            repository.unlink()
+            repository.symlink_to(second)
+            return open_file(source, mode, encoding=encoding, errors=errors, newline=newline)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=switch_target):
+            raced = conf.read_or_repository("accounts")
+            self.assertEqual(raced.whole("count"), 51)
+        repository.unlink()
+        repository.symlink_to(first)
+        self.assertEqual(conf.read_or_repository("accounts").whole("count"), 43)
+        self.assertEqual(raced.stamp, conf.file_stamp(second))
+
     def test_warm_repository_fixture_needs_no_new_reads_or_parses(self) -> None:
         log = self.root / "shift-reads"
         self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
@@ -438,8 +488,18 @@ conf_reads.record('disabled')
         _ = repository.write_text("# whole: 0..\ncount=42\n")
         read = conf.read("accounts")
         parse = cast(Callable[[str], dict[str, conf.Setting]], getattr(conf, "_parse"))
+        open_file = Path.open
+        read_text = mock.Mock()
 
-        with (mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read_text,
+        @contextmanager
+        def count_reads(source: Path, mode: Literal["r", "w"] = "r", *, encoding: str | None = None,
+                        errors: str | None = None, newline: str | None = None) -> Generator[io.TextIOWrapper]:
+            with open_file(source, mode, encoding=encoding, errors=errors, newline=newline) as stream:
+                yield stream
+                if mode == "r" and stream.tell() > 0:
+                    read_text(source, encoding=encoding)
+
+        with (mock.patch.object(Path, "open", autospec=True, side_effect=count_reads),
               mock.patch.object(conf, "_parse", wraps=parse) as parse_settings):
             self.assertEqual(read.whole("count"), 43)
             cold_parse_count = parse_settings.call_count
