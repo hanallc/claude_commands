@@ -20,6 +20,7 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable, Collection, Generator, Hashable, Mapping, Sequence
+from contextvars import ContextVar
 
 import argparse
 import contextlib
@@ -34,6 +35,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -643,6 +645,18 @@ def _saved_process(
     if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
         return SavedProcessIdReused()
     return observed
+
+
+_supervised_results: ContextVar[frozenset[Path]] = ContextVar("supervised_results", default=frozenset())
+
+
+@contextlib.contextmanager
+def _supervise_result(path: Path) -> Generator[None]:
+    token = _supervised_results.set(_supervised_results.get() | {path.resolve()})
+    try:
+        yield
+    finally:
+        _supervised_results.reset(token)
 
 
 def _supervisor_alive(path: Path, record: Mapping[str, object]) -> bool:
@@ -3058,6 +3072,8 @@ def resume_pending_worker_results(run: Path, identity: staff.StaffId) -> None:
 
 def _resume_orphan_result(path: Path, *, replay_completion: bool = False) -> None:
     """Start a detached retry if the supervisor has ended."""
+    if (supervised := _supervised_results.get()) and path.resolve() in supervised:
+        return
     record = _read_record_if_present(path)
     if (record is None or record["status"] != "finished" or not (replay_completion or _result_retry_pending(record))
             or _supervisor_alive(path, record)):
@@ -3068,8 +3084,9 @@ def _resume_orphan_result(path: Path, *, replay_completion: bool = False) -> Non
         command.append("--complete")
     try:
         with Path(record["log"]).open("ab") as log:
-            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        threading.Thread(target=child.wait, daemon=True).start()
     except OSError as error:
         print(f"detached_runs: {path.stem}: could not start result delivery: {error}", file=sys.stderr)
 
@@ -3247,13 +3264,15 @@ class SupervisedResultPruned(Enum):
     REMOVED = "the run record was pruned"
 
 
+def _wait_for_result_retry(settings: conf.ConfigRead) -> None:
+    time.sleep(settings.number("result_push_retry_seconds"))
+
+
 def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
     """Retry this run's delivery after releasing the completion lock."""
     from scripts.herdr import worker_panes
 
     settings = conf.read("detached_runs")
-    limit = settings.whole("result_push_retries")
-    delay = settings.number("result_push_retry_seconds")
     while True:
         try:
             record = _read_record_if_present(path)
@@ -3265,23 +3284,25 @@ def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
                                or _needs_stopped_result_completion(record))
             if relay_retry and not staged_alert and not _needs_push_retry(record):
                 return record
-            if relay_retry and (staged_alert or retries >= limit):
+            if relay_retry and (staged_alert or retries >= settings.whole("result_push_retries")):
                 _alert_failed_push(path, check_receipt=staged_alert)
                 current = _read_record_if_present(path)
                 if current is None:
                     return SupervisedResultPruned.REMOVED
                 if current.get("push_alert_delivery"):
-                    time.sleep(delay)
+                    _wait_for_result_retry(settings)
                     continue
                 if _needs_pane_input_retry(current) or _awaits_pane_receipt(current):
                     continue
                 return current
+        except conf.Unusable:
+            raise
         except (OSError, ValueError, SystemExit) as error:
             detail = " ".join(str(error).splitlines())
             print(f"detached_runs: {path.stem}: result retry record is unavailable: {detail}", file=sys.stderr)
-            time.sleep(delay)
+            _wait_for_result_retry(settings)
             continue
-        time.sleep(delay)
+        _wait_for_result_retry(settings)
         try:
             current = _read_record_if_present(path)
             if current is None:
@@ -3605,7 +3626,7 @@ def command_supervise(args: argparse.Namespace) -> int:
     except ValueError:
         kind = DetachedRunKind.DETECT
     prefix = scope_prefix(log, environment, kind=kind)
-    with _completion_sources(Path(__file__).resolve().parents[1]):
+    with _supervise_result(record_path), _completion_sources(Path(__file__).resolve().parents[1]):
         command = _place_command_in_run_slice(record["command"]) if prefix else record["command"]
         exit_code = _run(prefix + command, environment, log)
         with record_lock(record_path):
@@ -3618,7 +3639,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
         # unless the result is already held.
         record = _checkpoint_command_exit(record_path, exit_code)
-        retry_delay = conf.read("detached_runs").number("result_push_retry_seconds")
+        retry_settings = conf.read("detached_runs")
         if run_slice := record.get("command_slice"):
             while True:
                 try:
@@ -3626,7 +3647,7 @@ def command_supervise(args: argparse.Namespace) -> int:
                     break
                 except (OSError, ValueError) as error:
                     print(f"detached_runs: {record['run_id']}: slice cleanup failed: {error}", file=sys.stderr)
-                    time.sleep(retry_delay)
+                    _wait_for_result_retry(retry_settings)
         elif record.get("stop_pass_requested") and not _stopped_group_has_ended(record):
             grace, kill_grace = _scope_stop_graces()
             deadline = time.monotonic() + grace + kill_grace
@@ -3656,7 +3677,7 @@ def command_supervise(args: argparse.Namespace) -> int:
                             and not _worker_result_pending(record.get("delivery", ""))):
                         return 0
                     if record["status"] == "running" and not _stopped_group_has_ended(record):
-                        time.sleep(retry_delay)
+                        _wait_for_result_retry(retry_settings)
                         continue
                 elif not record.get("delivery"):
                     # The delivery process saves a checkpoint before it starts a send.
@@ -3667,7 +3688,7 @@ def command_supervise(args: argparse.Namespace) -> int:
                 break
             except (OSError, ValueError, SystemExit) as error:
                 print(f"detached_runs: {record_path.stem}: result completion read failed: {error}", file=sys.stderr)
-                time.sleep(retry_delay)
+                _wait_for_result_retry(retry_settings)
         saved = _retry_result_delivery(record_path)
         if saved is SupervisedResultPruned.REMOVED:
             return int(bool(record.get("scope_error")))
