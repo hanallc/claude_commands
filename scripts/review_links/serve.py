@@ -2115,7 +2115,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             try:
                 if respond_first:
-                    self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
+                    self.new_item_saved(response, saved.id, edited)
             finally:
                 if respond_first:
                     if ((pending or on_list) and isinstance(screenshot, new_item_dialog.PageScreenshot)
@@ -2127,9 +2127,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not respond_first:
                 self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
         finally:
-            if isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent):
-                server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
-                                                 attached=review_submissions.PAGE_SCREENSHOT in details.images)
+            try:
+                if respond_first and send is not None:
+                    _ = server.start_new_item_delivery(send, claim=claim)
+            finally:
+                if isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent):
+                    server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
+                                                     attached=review_submissions.PAGE_SCREENSHOT in details.images)
 
     def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
         """File or recover a Scheduled item under the shared draft lock."""
@@ -3398,7 +3402,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
     def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
                             host: str, screenshot: new_item_dialog.SubmissionScreenshot) -> None:
-        """Save the evidence after the response and delivery."""
+        """Save evidence before delivery and after the response when Send replies first."""
         saved = created.saved
         if (request is not None and request.page_state is not None
                 and isinstance(screenshot, new_item_dialog.PageScreenshot)):

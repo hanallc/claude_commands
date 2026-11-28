@@ -526,6 +526,7 @@ def read_record(key: str) -> LandingRecord | NoReview:
 def write_record(key: str, record: LandingRecord) -> None:
     path = record_path(key)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state: dict[str, object]
     if isinstance(record, Clear):
         state = {"state": "clear", "reply": str(record.reply)}
     elif isinstance(record, Waiting):
