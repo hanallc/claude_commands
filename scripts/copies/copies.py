@@ -50,6 +50,10 @@ from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_copies import CopyGitFailure, source_checkout
 from scripts.build_queue import first_step
+from scripts.build_queue.admission_records import (
+    ACTIVE_GATES as ACTIVE_GATES, COPY_ERROR_STATUS as COPY_ERROR_STATUS, OWNER,
+    ActiveGate, CopyError as CopyError, checked_owner, recorded_owner as recorded_owner,
+)
 from scripts.lib.build_steps import (
     GATE_SCRIPTS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
@@ -67,22 +71,9 @@ if TYPE_CHECKING:
 # Checksums skip equal files. Changed files get the receiver write time.
 RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
-OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
 PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
-
-
-@dataclass(frozen=True)
-class ActiveGate:
-    """The caller holds the copy for the gate."""
-
-    tree: Path
-    source: Path
-    owner: str
-
-
-ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
 
 
 @dataclass(frozen=True)
@@ -94,15 +85,6 @@ class AdmissionSourceCopy:
 
 
 ADMISSION_SOURCE_COPIES: ContextVar[tuple[AdmissionSourceCopy, ...]] = ContextVar("admission_source_copies", default=())
-
-COPY_ERROR_STATUS = 2
-
-
-class CopyError(Exception):
-    """An invalid request or an unavailable checkout."""
-
-    exit_code: int = COPY_ERROR_STATUS
-
 
 # Git's exit status when `git remote get-url` names no configured remote.
 NO_SUCH_REMOTE = 2
@@ -466,28 +448,6 @@ def source_owner(source: Path) -> str:
     return recorded_owner(source) or fallback_owner("verify")
 
 
-def recorded_owner(source: Path, *,
-                   intent: scratch.RemovalIntentAccess = scratch.RemovalIntentAccess.RECOVER) -> str:
-    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
-    for active in reversed(ACTIVE_GATES.get()):
-        if active.tree == source.resolve():
-            return active.owner
-    record = scratch.task_of(source, intent=intent)
-    if isinstance(record, copy_record.Registered):
-        owner = record.fields.get("owner_unit")
-        if isinstance(owner, str):
-            return checked_owner(owner)
-    from scripts.production import staff
-    from scripts.agents.remote import local_machine
-    try:
-        member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
-        if member is not None:
-            return str(member.id)
-    except staff.StaffUnreadable:
-        pass
-    return ""
-
-
 def fallback_owner(role: str) -> str:
     """Use a configured role owner when the caller has no production context."""
     path, values = config_settings()
@@ -582,12 +542,6 @@ def repository_name(source: Path) -> str:
 def main_checkout(source: Path) -> Path:
     """Keep the public copies API for the shared checkout reader."""
     return source_checkout(source)
-
-
-def checked_owner(owner: str) -> str:
-    if not OWNER.fullmatch(owner):
-        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
-    return owner
 
 
 def holder(tree: Path) -> KnownHolder | UnreadableHolder:

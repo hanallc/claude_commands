@@ -94,6 +94,7 @@ from urllib.parse import unquote_to_bytes
 from scripts.lib import build_folder_lock, build_folders, cargo_output, conf, copy_record, git_files, removal_guard, session_folder, time_limit  # noqa: E402
 from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.copy_record import RemovalIntentAccess as RemovalIntentAccess
 
 from scripts.lib.build_folders import (  # noqa: E402
     BuildFolderSpec, FolderRemovalLease, HeldFolderRemovalLease, RefusedRemovalLease, build_folder_path, collector_lease,
@@ -929,13 +930,6 @@ def folder_record(path: Path) -> Path:
     """The file that holds path's task: its own record, else its removal mark."""
     record = path / copy_record.RECORD
     return record if record.is_file() else removal_mark(path)
-
-
-class RemovalIntentAccess(Enum):
-    """Select whether a stale removal intent may be cleared."""
-
-    RECOVER = "recover"
-    READ_ONLY = "read only"
 
 
 def pending_removal(path: Path, *,

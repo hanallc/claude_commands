@@ -816,7 +816,7 @@ class GateRecovery:
                                    recorded_merge=self.rollback_head, recovery=self)
                     self.rollback = ""
                     self.save()
-            except (GateRefused, copies.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
+            except (GateRefused, admission_records.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
                 if self.groups or self.tokens:
                     raise
                 raise RollbackRecoveryRefused(f"gate recovery kept {self.path} for {repo}: {error}") from error
@@ -3474,7 +3474,7 @@ def nightly_git(repo: Path, *arguments: str) -> str:
 def _nightly_unit(args: GateArguments) -> str:
     """Use the production's merge unit or the nightly role."""
     if args.unit:
-        return copies.checked_owner(args.unit)
+        return admission_records.checked_owner(args.unit)
     if not args.production:
         raise GateRefused("nightly needs --unit or --production")
     record = staff.snapshot()
@@ -3490,7 +3490,7 @@ def _nightly_unit(args: GateArguments) -> str:
         return "nightly"
     if len(units) > 1:
         raise GateRefused(f"{owner.name}: the production record has multiple merge units. Pass --unit.")
-    return copies.checked_owner(str(units[0].id))
+    return admission_records.checked_owner(str(units[0].id))
 
 
 def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
@@ -4091,7 +4091,7 @@ def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> 
             return 0 if result.passed else 1
     except GatePlacementIncomplete:
         raise
-    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (admission_records.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
 
@@ -4209,7 +4209,7 @@ def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.Argume
     if args.nightly and args.unit:
         try:
             _ = _nightly_unit(args)
-        except copies.CopyError as error:
+        except admission_records.CopyError as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             raise SystemExit(1) from None
     if not args.modules:
@@ -4308,7 +4308,7 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
             return 0
     except GatePlacementIncomplete:
         raise
-    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (admission_records.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
 
