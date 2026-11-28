@@ -31,6 +31,11 @@ from scripts.production.unrouted_alert import notify as notify_unrouted
 
 @contextmanager
 def routing_fixture_environment(root: Path) -> Generator[None]:
+    """Keep every state, config, zone and Git read of the routing tests under root.
+
+    Known limit (F007): with TMPDIR inside a Git repository, record_store.py:293 walks parents on its
+    own, and a ':' in TMPDIR splits GIT_CEILING_DIRECTORIES; the gate always sets a fresh TMPDIR outside.
+    """
     root = root.resolve()
     home = root / "home"
     home.mkdir()
