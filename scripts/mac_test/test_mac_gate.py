@@ -1259,7 +1259,9 @@ print(json.dumps(sys.argv[1:]))
                     self.assertEqual(int(close_status.read_text()), 0, (root / 'close.log').read_text())
                     self.assertTrue((root / 'close_started').exists())
                     self.assertFalse(isinstance(process_start(child_pid), Started))
-                    record = cloud_gate.read(root / 'interrupted')
+                    interrupted = root / 'interrupted'
+                    wait_until(interrupted.exists, root)
+                    record = cloud_gate.read(interrupted)
                     self.assertEqual(record['groups'], {})
                     self.assertEqual(record['folders'], [])
                 finally:
