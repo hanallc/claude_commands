@@ -925,7 +925,7 @@ class VerifyRunSlot:
 
 @dataclass(frozen=True)
 class MacOutageFence:
-    """Require a reading taken after the loss report."""
+    """Require a probe answer from after the outage guard starts."""
 
     reported_at: float
     recovery_observed: bool = False
@@ -1386,6 +1386,19 @@ class MacDiskRecoveryPendingEvidence(placement.FreshHostEvidence):
 
 
 @dataclass(frozen=True)
+class MacLinuxProbeFailureEvidence(placement.FreshHostEvidence):
+    """The guest probe could not connect or timed out."""
+
+
+@dataclass(frozen=True)
+class GuestProbeOutage:
+    """Measure the grace period in the current service process."""
+
+    fence: MacOutageFence
+    started_monotonic: float
+
+
+@dataclass(frozen=True)
 class _MacHostExcluded:
     reason: str
 
@@ -1444,6 +1457,7 @@ class HostEvidenceWorker:
         self.interval: float = interval
         self.lock: threading.Lock = threading.Lock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
+        self.guest_outages: dict[str, GuestProbeOutage] = {}
         self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
         self.dispatch_observations: dict[str, DispatchEvidence] = {}
         self.due: dict[placement.HostEvidenceKey, float] = {key: 0.0}
@@ -1460,7 +1474,25 @@ class HostEvidenceWorker:
 
     def publish(self, evidence: placement.HostEvidence) -> None:
         with self.lock:
-            self.observations[evidence.key] = evidence
+            self._publish_evidence(evidence)
+
+    def _publish_evidence(self, evidence: placement.HostEvidence) -> None:
+        """Update the outage guard for each probe before the next probe can replace it."""
+        self.observations[evidence.key] = evidence
+        destination = evidence.key.destination
+        if not is_mac_linux_guest(destination):
+            return
+        outage = self.guest_outages.get(destination.host)
+        if outage is None and isinstance(evidence, MacLinuxProbeFailureEvidence):
+            self.guest_outages[destination.host] = GuestProbeOutage(
+                MacOutageFence(self.clock.now()), self.clock.monotonic())
+        elif (outage is not None and isinstance(evidence, placement.FreshHostEvidence)
+              and evidence.probe_answered and evidence.observed_at > outage.fence.reported_at):
+            del self.guest_outages[destination.host]
+
+    def guest_outage(self, host: str) -> GuestProbeOutage | None:
+        with self.lock:
+            return self.guest_outages.get(host)
 
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Keep the attempt until the worker confirms settlement."""
@@ -1624,7 +1656,7 @@ class HostEvidenceWorker:
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
-            self.observations[key] = evidence
+            self._publish_evidence(evidence)
             for attempt, probe, observed in dispatches_read:
                 if (self.dispatch_probes.get(attempt) is probe
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
@@ -5232,6 +5264,8 @@ class AdmissionServer:
         try:
             _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry),
                                         wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
+        except (mac_linux.GuestConnectionFailed, subprocess.TimeoutExpired):
+            return MacLinuxProbeFailureEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
         except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
         return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost(), probe_answered=True)
@@ -6872,6 +6906,10 @@ done
         settlement = None if probe is None else probe[0].dispatch_settlement(probe[1])
         if (settlement is None
                 or (settled_at := self._guest_settlement_ready_at(saved, settlement.observed_at)) is None):
+            if (probe is not None and not self._awaits_mac_report(saved)
+                    and (loss := self._guest_outage_loss(saved, probe[0])) is not None):
+                self._close_lost_attempt(saved, loss, self.clock.now())
+                return
             self.assignments[attempt_key] = self._expire_guest_replacement(saved)
             return
         if self._awaits_mac_report(saved, settlement=settlement):
@@ -6893,6 +6931,26 @@ done
         saved_terminal = (replace(terminal, received_at=settled_at) if submitted is not None
                           and (assignment.owner != submitted.owner or assignment.since != submitted.since) else terminal)
         self._close_for_report(replace(expired, terminal_report=saved_terminal), terminal, persist_change=False)
+
+    def _guest_outage_loss(self, saved: records.SavedPlacementAssignment,
+                           worker: HostEvidenceWorker) -> placement.AttemptLost | None:
+        """Require a full outage and a confirmed coordinator exit."""
+        assignment = saved.assignment
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        report = saved.terminal_report
+        if (self.current_assignments.get(assignment.episode) != attempt or attempt in self.manual_guest_settlement
+                or isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, placement.AttemptCompleted)):
+            return None
+        outage = worker.guest_outage(assignment.destination.host)
+        if outage is None:
+            return None
+        limit = _guest_wait_limit()
+        owner = assignment.owner
+        if (not isinstance(limit, int) or self.clock.monotonic() < outage.started_monotonic + limit
+                or owner.host != self.host or owner_may_be_live(self.proc.owner_start(owner.pid), owner.start_time)):
+            return None
+        return placement.AttemptLost(placement.MacOutage.GUEST_END_UNPROVEN, outage.fence.reported_at)
 
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
@@ -6992,12 +7050,23 @@ done
         if not isinstance(limit, int) or not now >= outcome.outage_since + limit:
             return self._placement_status(assignment, "the Mac outage wait has not expired", check_lifetime=False)
 
+        self._close_lost_attempt(saved, outcome, now, submitted=submitted)
+        self.persist()
+        self._publish_replies(self._project_replies(self._queue_order()))
+        return self._placement_status(assignment, check_lifetime=False)
+
+    def _close_lost_attempt(self, saved: records.SavedPlacementAssignment, outcome: placement.AttemptLost,
+                            now: float, *, submitted: wire.PlacementRequest | None = None) -> None:
+        assignment = saved.assignment
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        destination = assignment.destination
         self.mac_outages[destination.target] = MacOutageFence(now)
         terminal = placement.TerminalAttemptReport(outcome, placement.DispatchPathSettled(), now)
         self._close_placement(replace(saved, terminal_report=terminal), "lost", placement.RetryAt(0),
                               persist_change=False)
         _ = self.execution_evidence.pop(key, None)
-        if self._placement_waiting(submitted):
+        if (submitted is not None and isinstance(saved.permission, placement.PermissionConsumed)
+                and self._placement_waiting(submitted)):
             self._pin_lost_run(submitted, saved.permission.consumed_at)
         # Offers made before the outage cannot authorize a start.
         for offer in tuple(self.assignments.values()):
@@ -7006,9 +7075,6 @@ done
                     and isinstance(offer.permission, placement.PermissionAvailable)
                     and isinstance(offer.terminal_report, placement.NoTerminalReport)):
                 self._close_placement(offer, placement.MAC_OUTAGE_WAIT, placement.RetryAt(0), persist_change=False)
-        self.persist()
-        self._publish_replies(self._project_replies(self._queue_order()))
-        return self._placement_status(assignment, check_lifetime=False)
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
                           | wire.PrerequisiteReport | wire.CancelPlacement,
