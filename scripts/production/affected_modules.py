@@ -1404,8 +1404,14 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             content_changes = {path for path in changed if not path.startswith("config/")}
             python = {path for path in changed if path.endswith(".py")}
             removed = {path for path in python if not (repo / path).is_file()}
-            needs_base_blobs = has_folder_records or bool(removed) or cached.writable_path is not None
-            base_blobs = revision_files(repo, base.commit) if needs_base_blobs else {}
+            needs_base_blobs = has_folder_records or bool(removed)
+            base_blobs: dict[str, str] = {}
+            if needs_base_blobs or cached.published:
+                try:
+                    base_blobs = revision_files(repo, base.commit)
+                except (GraphError, OSError, ValueError):
+                    if needs_base_blobs:
+                        raise
             scanned_parents = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set[str]()
             base_paths = {path for path in base_blobs if path.endswith(".py")}
             old_graph: dict[str, set[str]] = {}
