@@ -34,7 +34,7 @@ from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, gate_source, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -2999,6 +2999,7 @@ class Deployment:
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
             values = cloud_gate.settings()
+            tools = gate_source.prepare_tools(revision, values.words('packages'))
             # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
             timings = GateRegionTimings.read(self.directory)
             additional = regions[1:]
@@ -3031,7 +3032,7 @@ class Deployment:
                 'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
                 'security_group': outputs['GateSecurityGroup']}
             manifest: dict[str, object] = {
-                'deployment_id': deployment_id, 'revision': revision,
+                'deployment_id': deployment_id, 'revision': revision, 'source_tool_paths': list(tools),
                 'instance_types': values.words('instance_types'),
                 'gpu_instance_types': gpu_types,
                 'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
