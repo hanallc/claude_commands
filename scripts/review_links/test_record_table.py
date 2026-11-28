@@ -20,6 +20,7 @@ const lostReplies=new Map();
 let finishPost;
 window.setInterval=()=>0;
 window.fetch=(path,options={})=>{
+ if(path===REVIEW_SAVE_FAILURE) return Promise.resolve(Response.json({outcome:'pending'}));
  if(options.method!=='POST'){
   if(new URL(path,location.href).searchParams.has('item-state')){
    return Promise.resolve({ok:true,json:async()=>({item_state:'Working',parked:'false',unread:'true'})});
@@ -33,17 +34,18 @@ window.fetch=(path,options={})=>{
   return Promise.reject(new Error(reason));
  }
  return new Promise((resolve,reject)=>{
-  finishPost=reason=>{
-   if(reason){
+  finishPost=(reason,refused)=>{
+   if(refused) resolve(Response.json({reason},{status:400}));
+   else if(reason){
     if(options.keepalive) lostReplies.set(request,reason);
     reject(new Error(reason));
    }else resolve({headers:new Headers(),ok:true,json:async()=>({
-    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
+    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed',words_saved:false
    })});
   };
  });
 };
-</script>'''
+</script>'''.replace(b'REVIEW_SAVE_FAILURE', json.dumps(review_page.SAVE_FAILURE_PATH).encode())
     probe = r'''<script>
 (async()=>{
  const reloadKey='save-notice-reload';
@@ -82,9 +84,9 @@ window.fetch=(path,options={})=>{
    if(!finishPost) throw new Error('The save did not start.');
    check(clear(),'the next save clears the notice at submission');
    const finish=finishPost;
-   return {row,form,finish:async reason=>{finish(reason);await settled;}};
+   return {row,form,finish:async (reason,refused=false)=>{finish(reason,refused);await settled;}};
   };
-  const save=async(row,reason='')=>{
+  const save=async(row,reason='',refused=false)=>{
    const save=await startSave(row);
    row=save.row;
    if(!reason){
@@ -95,21 +97,26 @@ window.fetch=(path,options={})=>{
       motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===duration),
       'a successful save starts the configured row fade');
    }else if(action==='works') open(anchor);
-   await save.finish(reason);
+   await save.finish(reason,refused);
   };
-  const failure=(row,reason)=>{
+  const failureText=(reason,refused=false)=>{
+   if(action==='remove') return 'Save not confirmed: '+reason;
+   return 'Not saved: '+(refused ? reason : 'The save outcome is not known yet.');
+  };
+  const inlineFailureText=reason=>action==='works' ? failureText(reason) : reason;
+  const failure=(row,reason,refused=false)=>{
    // A lost Remove restores the row. Collapse it to check the table notice.
    if(action==='remove' && recordIsOpen(row)) row.querySelector('.list-toggle').click();
    const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
-   const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
-   check(!status.hidden && status.textContent===label+': '+prefix+reason,
+   check(!status.hidden && status.textContent===label+': '+failureText(reason,refused),
     'the table shows only '+reason);
   };
   for(const row of [first,second,third]){
    await save(row);
    check(clear(),'a successful save leaves no notice');
   }
-  await save(older,'Fixture first failure');failure(older,'Fixture first failure');
+  const refused=action==='works';
+  await save(older,'Fixture first failure',refused);failure(older,'Fixture first failure',refused);
   await save(newer,'Fixture latest failure');failure(newer,'Fixture latest failure');
   await save(next);
   check(clear(),'a later success leaves no notice');
@@ -120,10 +127,10 @@ window.fetch=(path,options={})=>{
    await olderSave.finish('Fixture older overlapping failure');
    if(newerReason){
     failure(newer,newerReason);
-    check(newerSave.form.querySelector('[data-send-status]').textContent.includes(newerReason),
+    check(newerSave.form.querySelector('[data-send-status]').textContent.includes(inlineFailureText(newerReason)),
      'the newer failure stays on its row');
    }else check(clear(),'an older failure adds no notice after a newer success');
-   check(olderSave.form.querySelector('[data-send-status]').textContent.includes('Fixture older overlapping failure'),
+   check(olderSave.form.querySelector('[data-send-status]').textContent.includes(inlineFailureText('Fixture older overlapping failure')),
     'the older failure stays on its row');
   }
   await save(reload,'Fixture failure before reload');
