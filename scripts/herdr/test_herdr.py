@@ -4384,7 +4384,8 @@ class HerdrTests(unittest.TestCase):
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
         with (self.question_box(client, pane, session) as commands,
               patch.object(herdr, "check_target", wraps=herdr.check_target) as checks):
-            self.assertIs(client.answer_question(pane, text, target=session), herdr.AnswerTransportCompleted.SENT)
+            result = client.answer_question(pane, text, target=session, require_open=lambda: None)
+        self.assertIs(result, herdr.AnswerTransportCompleted.SENT)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text),
                                     ("pane", "send-keys", pane, "enter"), ("pane", "send-keys", pane, "enter")])
         self.assertEqual([cast(str, entry.kwargs["text"]) for entry in checks.call_args_list], ["", text, text])
@@ -4403,8 +4404,9 @@ class HerdrTests(unittest.TestCase):
                 record(pane, text)
 
             with patch.object(script_prompts, "record", side_effect=record_before_send) as evidence:
-                self.assertIs(client.answer_question(pane, text, target=session), herdr.AnswerTransportCompleted.SENT)
+                result = client.answer_question(pane, text, target=session, require_open=lambda: None)
             evidence.assert_called_once_with(pane, text)
+        self.assertIs(result, herdr.AnswerTransportCompleted.SENT)
         self.assertIn(("pane", "send-text", pane, text), commands)
         self.assertTrue(script_prompts.typed_by_script(pane, text))
 
@@ -4442,8 +4444,9 @@ class HerdrTests(unittest.TestCase):
         client = self.herdr
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
         with self.question_box(client, pane, session, prompt_marker="›") as commands:
-            self.assertIs(client.answer_question(pane, text, target=session), herdr.AnswerTransportCompleted.SENT)
+            result = client.answer_question(pane, text, target=session, require_open=lambda: None)
             self.assertIsInstance(client.composer(pane), herdr.NoComposer)
+        self.assertIs(result, herdr.AnswerTransportCompleted.SENT)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text),
                                     ("pane", "send-keys", pane, "enter"), ("pane", "send-keys", pane, "enter")])
 
@@ -4456,7 +4459,7 @@ class HerdrTests(unittest.TestCase):
                 return herdr.NativeAgentProcess(herdr.PaneSessionReport(current), "fixture-start", {})
 
             with patch.object(herdr, "native_process", side_effect=native):
-                result = client.answer_question(pane, text, target=session)
+                result = client.answer_question(pane, text, target=session, require_open=lambda: None)
                 self.assertIsInstance(result, herdr.AnswerDeliveryUnknown)
                 assert isinstance(result, herdr.AnswerDeliveryUnknown)
                 self.assertIn("does not run session", result.reason)
@@ -4467,7 +4470,7 @@ class HerdrTests(unittest.TestCase):
         pane, session = "w1:p1", "fixture-question"
         with (self.question_box(client, pane, session) as commands,
               patch.object(client, "_send_keys", side_effect=herdr.HerdrCommandNotStarted("the command could not start"))):
-            result = client.answer_question(pane, "Use JSON.", target=session)
+            result = client.answer_question(pane, "Use JSON.", target=session, require_open=lambda: None)
         self.assertEqual(result, herdr.AnswerDidNotSubmit("the command could not start"))
         self.assertEqual(commands, [])
 

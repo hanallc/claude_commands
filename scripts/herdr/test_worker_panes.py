@@ -4196,12 +4196,29 @@ class WorkerPaneTests(StaffTestCase):
                               "terminal may be held by editor because its stdin is unavailable")
                     self.assertEqual(send.body_text(options), f"Worker {row.name}: anomaly: {reason}\n{body}")
 
-    def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
+    def test_unclaimed_unknown_pane_affects_only_the_worker_it_names(self) -> None:
         absent = self.worker("absent")
-        self.world.add(self.parent, "w1:p9", live=False, label="foreign")
-        self.world.unknown["w1:p9"] = "unreadable pane in the parent's tab"
+        named = self.worker("named")
+        pane = "w1:p9"
+        self.world.add(self.parent, pane, live=False, label=worker_panes.agent_name(self.parent, named.name))
+        self.world.unknown[pane] = "unreadable pane in the parent's tab"
         found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
-        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+        self.assertEqual(found[absent.id], worker_panes.ClosedWorker(absent))
+        self.assertEqual(found[named.id], worker_panes.ProcessUnknownWorker(
+            named, pane, "terminal-w1:p9", "unreadable pane in the parent's tab"))
+
+    def test_unreadable_worker_pane_does_not_hide_an_absent_sibling(self) -> None:
+        absent = self.worker("absent")
+        unreadable = self.worker("unreadable")
+        pane = "w1:p9"
+        self.world.add(unreadable, pane)
+        self.world.unknown[pane] = "process permission denied"
+        with redirect_stderr(io.StringIO()) as errors:
+            found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertEqual(found[unreadable.id], worker_panes.ProcessUnknownWorker(
+            unreadable, pane, "terminal-w1:p9", "process permission denied"))
+        self.assertEqual(found[absent.id], worker_panes.ClosedWorker(absent))
+        self.assertNotIn("anomaly: absent:", errors.getvalue())
 
     def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")

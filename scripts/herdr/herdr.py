@@ -1328,6 +1328,7 @@ PROGRAM_TIMEOUT_SECONDS = 10.0
 def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     prompt_transport = argv[3:5] == ["agent", "prompt"]
+    input_transport = prompt_transport or argv[3:5] == ["pane", "send-text"]
     deadline = worker_lifecycle.effective_deadline(time.monotonic() + timeout)
     try:
         remaining = operation_deadline.remaining(timeout)
@@ -1335,14 +1336,14 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
         raise HerdrLaunchRefused(f"{argv[0]}: {error}") from error
     try:
         env = unmarked_environment() if environment is None else child_environment(environment)
-        if not prompt_transport:
+        if not input_transport:
             try:
                 return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
             except UnicodeDecodeError as error:
                 raise HerdrFailure("the Herdr reply cannot be decoded") from error
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except Exception as error:
-        if prompt_transport or isinstance(error, OSError):
+        if input_transport or isinstance(error, OSError):
             raise HerdrCommandNotStarted(f"{argv[0]}: {error}") from error
         raise
     with process:
@@ -1351,7 +1352,8 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
         except BaseException as error:
             process.kill()
             if isinstance(error, UnicodeDecodeError):
-                raise HerdrFailure("the Herdr prompt reply cannot be decoded") from error
+                command = "prompt" if prompt_transport else "send-text"
+                raise HerdrFailure(f"the Herdr {command} reply cannot be decoded") from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
@@ -3601,34 +3603,39 @@ class Herdr:
         submission = TrackedPromptSubmission(lambda: None)
         try:
             self.prompt(pane, text, target=target, on_submission=submission)
+        except AgentBlocked as error:
+            return AnswerDidNotSubmit(str(error))
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             if submission.may_have_submitted:
                 return AnswerDeliveryUnknown(str(error))
             return AnswerDidNotSubmit(str(error))
         return AnswerTransportCompleted.SENT
 
-    def answer_question(self, pane: str, text: str, *, target: str) -> AnswerTransport:
+    def answer_question(self, pane: str, text: str, *, target: str,
+                        require_open: Callable[[], None]) -> AnswerTransport:
         """Answer a Codex question through the selected session's input box."""
         if not target:
             return AnswerDidNotSubmit(f"{pane}: would send keys without a named target session")
-        may_have_sent_keys = False
+        may_have_typed = False
         try:
             for index, key in enumerate(("shift+left", "enter", "enter")):
                 expected = "" if index == 0 else text
                 if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
                                     pane_info=self.pane_row(pane), client=self):
                     raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-                may_have_sent_keys = True
-                try:
-                    self._send_keys(pane, key)
-                except HerdrCommandNotStarted:
-                    may_have_sent_keys = index != 0
-                    raise
+                require_open()
+                self._send_keys(pane, key)
                 if index == 0:
                     script_prompts.record(pane, text)
-                    _ = self.run("pane", "send-text", pane, text)
+                    require_open()
+                    may_have_typed = True
+                    try:
+                        _ = self.run("pane", "send-text", pane, text)
+                    except HerdrCommandNotStarted:
+                        may_have_typed = False
+                        raise
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            if may_have_sent_keys:
+            if may_have_typed:
                 return AnswerDeliveryUnknown(str(error))
             return AnswerDidNotSubmit(str(error))
         return AnswerTransportCompleted.SENT

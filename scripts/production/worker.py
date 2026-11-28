@@ -2698,7 +2698,10 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         last = fields
         if number == boundary and _answer_digest(json.dumps(fields, sort_keys=True)) != saved.get("request_digest"):
             return AnswerTranscriptUnavailable.UNAVAILABLE
-        if isinstance(backend, staff.CodexBackend):
+        turn_ended = _transcript_turn_boundary(fields)
+        if isinstance(backend, staff.CodexBackend) and turn_ended:
+            open_questions.clear()
+        elif isinstance(backend, staff.CodexBackend):
             raw = fields.get("payload")
             payload = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
             kind = payload.get("type")
@@ -2718,7 +2721,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         if entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
             accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
-        elif accepted and (entry.startswith("assistant:\n") or _transcript_turn_boundary(fields)):
+        elif accepted and (entry.startswith("assistant:\n") or turn_ended):
             next_request = True
     if not number or number < boundary or len(open_questions) > 1:
         return AnswerTranscriptUnavailable.UNAVAILABLE
@@ -2771,8 +2774,17 @@ def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staf
                             box.call if isinstance(box, CodexQuestionBox) else "")
     artifacts = CompletionArtifacts(owner, run)
     artifacts.write(path, json.dumps(asdict(pending)))
-    transport = (client.answer_question(state.pane, submitted, target=target) if isinstance(box, CodexQuestionBox)
-                 else client.answer_prompt(state.pane, submitted, target=target))
+    if isinstance(box, CodexQuestionBox):
+        def require_open_question() -> None:
+            current = _answer_request(path, row, backend)
+            if isinstance(current, AnswerTranscriptUnavailable):
+                raise herdr_types.HerdrFailure("the transcript cannot verify the selected Codex question")
+            if current.input_path != box:
+                raise herdr_types.HerdrFailure("the selected Codex question is no longer open")
+
+        transport = client.answer_question(state.pane, submitted, target=target, require_open=require_open_question)
+    else:
+        transport = client.answer_prompt(state.pane, submitted, target=target)
     if isinstance(transport, herdr.AnswerDidNotSubmit):
         artifacts.unlink(path)
         return _refuse_answer(name, f"answer did not submit: {transport.reason}")
