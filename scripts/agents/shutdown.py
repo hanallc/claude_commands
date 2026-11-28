@@ -766,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, RetirementRefused) as error:
             print(str(error))
             return 1
+    if len(arguments) == 2 and arguments[0] == "_retired-retry-journal":
+        return retry_retirement_journal_here(arguments[1])
     if len(arguments) == 3 and arguments[0] == "_keep-workers-check":
         return _remote_keep_workers_check(arguments[1], arguments[2])
     parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
@@ -1417,6 +1419,13 @@ def retired_remote_read(machine: str, arguments: list[str]) -> str:
 def require_retired_record_unchanged(branch: staff.ParkedBranch, checked: staff.RetiredUnitOrigin,
                                      location: staff.RemovedWorktree) -> None:
     try:
+        if unit_machine_is_local(location.machine):
+            check_retired_checkout(location)
+        else:
+            _ = retired_remote_read(location.machine, ["_retired-checkout-absent", location.machine, str(location.path)])
+    except (OSError, ValueError, RetirementRefused, subprocess.SubprocessError) as error:
+        raise staff.StaffRefused(f"cannot confirm checkout absence: {error}") from error
+    try:
         if unit_machine_is_local(checked.machine):
             tip = retired_origin_tip_at(checked.checkout, branch.value)
         else:
@@ -1429,13 +1438,6 @@ def require_retired_record_unchanged(branch: staff.ParkedBranch, checked: staff.
         raise staff.StaffRefused(f"cannot recheck origin branch {branch.value}: {error}") from error
     if tip != checked.tip:
         raise staff.StaffRefused(f"origin branch {branch.value} changed before record removal")
-    try:
-        if unit_machine_is_local(location.machine):
-            check_retired_checkout(location)
-        else:
-            _ = retired_remote_read(location.machine, ["_retired-checkout-absent", location.machine, str(location.path)])
-    except (OSError, ValueError, RetirementRefused, subprocess.SubprocessError) as error:
-        raise staff.StaffRefused(f"cannot confirm checkout absence: {error}") from error
 
 
 def require_retired_commit(run: git_merge_tree.GitRunner, tip: str) -> None:
@@ -1653,8 +1655,8 @@ def unit_machine_is_local(machine: str) -> bool:
     return machine.split(".", 1)[0].casefold() in {local_machine().split(".", 1)[0].casefold(), alias}
 
 
-def retirement_journal(row: staff.StaffRow) -> Path:
-    return Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown"))) / "retire-worktrees" / f"{row.id}.json"
+def retirement_journal(identity: staff.StaffId) -> Path:
+    return Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown"))) / "retire-worktrees" / f"{identity}.json"
 
 
 def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSnapshot,
@@ -1738,7 +1740,8 @@ def unit_local_command() -> int:
                 if fields["action"] == "retire-complete":
                     result["code"] = int(not complete_retirement(row, record, saved))
                 elif fields["action"] == "retired-forget-journal":
-                    forget_retirement_journal(row, saved)
+                    if saved is not None:
+                        _ = forget_retirement_journal(row.id, row.name)
                     result["code"] = 0
                 elif saved is None or complete_retirement(row, record, saved):
                     check_retired_checkout(location)
@@ -1747,7 +1750,7 @@ def unit_local_command() -> int:
                     result["code"] = 0
             elif fields["action"] == "retire":
                 settings = conf.read("production")
-                journal = retirement_journal(row)
+                journal = retirement_journal(row.id)
                 pane = retirement_pane(row, record)
                 if location.path.exists():
                     try:
@@ -1929,7 +1932,7 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
 
 
 def read_retirement_journal(row: staff.StaffRow, location: staff.RemovedWorktree) -> dict[str, object] | None:
-    journal = retirement_journal(row)
+    journal = retirement_journal(row.id)
     try:
         saved = cast(object, json.loads(journal.read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -1954,12 +1957,28 @@ def complete_retirement(row: staff.StaffRow, record: staff.StaffSnapshot,
     return retirement_close_idle_shell(pane, row, record)
 
 
-def forget_retirement_journal(row: staff.StaffRow, saved: dict[str, object] | None) -> None:
-    if saved is not None:
-        try:
-            retirement_journal(row).unlink(missing_ok=True)
-        except OSError as error:
-            print(f"anomaly: {row.name}: cannot remove retirement journal: {' '.join(str(error).splitlines())}")
+def forget_retirement_journal(identity: staff.StaffId, name: str) -> bool:
+    try:
+        retirement_journal(identity).unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        print(f"anomaly: {name}: cannot remove retirement journal: {' '.join(str(error).splitlines())}")
+        return False
+    return True
+
+
+def retry_retirement_journal_here(name: str) -> int:
+    try:
+        identity = staff.native_id(name)
+        if staff.authority_snapshot().by_id(identity) is not None:
+            raise staff.StaffRefused(f"{identity}: the staff row still exists")
+        if forget_retirement_journal(identity, identity):
+            print(f"{identity}: retirement journal removed")
+        return 0
+    except (staff.StaffRefused, OSError) as error:
+        print(f"anomaly: {name}: cannot retry retirement journal: {error}")
+        return 1
 
 
 def check_retired_checkout(location: staff.RemovedWorktree) -> None:
@@ -2140,19 +2159,33 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
         return 1
     origin = staff.RetiredUnitOrigin(local_machine(), unit.production.checkout,
                                     tips.commits.get("origin", staff.OriginBranchAbsent()))
-    staff.remove_retired_unit(row, origin)
-    if local:
-        forget_retirement_journal(row, saved)
-    else:
+    try:
+        staff.remove_retired_unit(row, origin)
+    except staff.RetiredUnitRemovalUnconfirmed as error:
+        print(f"{unit.name}: {error}. Run agents retire {row.id} again.")
+        return 1
+    if not local:
         _ = unit_remote_command("retired-forget-journal", row, record)
+    elif saved is not None:
+        _ = forget_retirement_journal(row.id, row.name)
     print(f"{unit.name}: retired record removed")
     return 0
 
 
-def named_staff_unit(name: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+@dataclass(frozen=True)
+class AbsentStaffRecord:
+    identity: staff.StaffId
+
+
+def named_staff_unit(name: str, record: staff.StaffSnapshot) -> staff.StaffRow | AbsentStaffRecord:
     matches = [member for member in record.rows if member.kind == "unit" and member.name == name]
     row = (record.by_member_reference(name)
            or (matches[0] if len(matches) == 1 else record.by_path(name)))
+    if row is None and record.by_id(staff.StaffId(name)) is None:
+        try:
+            return AbsentStaffRecord(staff.native_id(name))
+        except staff.StaffRefused:
+            pass
     if row is None or row.kind != "unit":
         raise ValueError(f"{name}: no unique unit staff row")
     return row
@@ -2171,6 +2204,18 @@ def retire_named_unit(name: str) -> int:
             settings = conf.read("production")
             record = staff.snapshot()
             row = named_staff_unit(name, record)
+            if isinstance(row, AbsentStaffRecord):
+                identity = row.identity
+                if forget_retirement_journal(identity, identity):
+                    print(f"{identity}: retirement journal removed")
+                else:
+                    status, output = run_remote(["_retired-retry-journal", identity])
+                    if output:
+                        print(output)
+                    elif status:
+                        print(f"anomaly: {identity}: cannot check the retirement journal on {other_machine()}")
+                print(f"{identity}: retired record removed")
+                return 0
             unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record)
             return retirement_retire(unit, settings=settings, record=record)
         except (RetirementRefused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable,

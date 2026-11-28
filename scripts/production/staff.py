@@ -197,6 +197,10 @@ class StaffAbsent(StaffUnreadable):
     """No staff record exists yet; a first seed may create it."""
 
 
+class RetiredUnitRemovalUnconfirmed(StaffUnreadable):
+    """The caller timed out before it received the result of the removal."""
+
+
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
@@ -1617,7 +1621,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
         arguments = [*arguments, "--worker-row"]
     timeout = _wait_seconds("remote_seconds")
     if arguments[0] == "remove-retired-unit":
-        arguments = [*arguments, "--request-deadline", str(time.time() + timeout)]
+        arguments = [*arguments, "--request-budget-seconds", str(timeout)]
     command = ["ssh", "-o", "BatchMode=yes", machine,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
@@ -1626,6 +1630,8 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
                               input=input_text, capture_output=True,
                               text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
+        if arguments[0] == "remove-retired-unit" and isinstance(error, subprocess.TimeoutExpired):
+            raise RetiredUnitRemovalUnconfirmed("retired record removal result is not confirmed") from error
         if time.monotonic() >= worker_lifecycle.effective_deadline():
             raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
         raise StaffUnreadable(f"{machine} not reached") from error
@@ -2954,7 +2960,7 @@ class _Arguments:
     new_id: str = ""
     value: str = ""
     only_unknown: bool = False
-    request_deadline: float = 0.0
+    request_budget_seconds: float = 0.0
     verb: str = ""
     kind: Kind | None = None
     unit_type: UnitType | None = None
@@ -3091,7 +3097,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = retire_parser.add_argument("--worker-row", action="store_true", help=argparse.SUPPRESS)
     retired_unit_parser = verbs.add_parser("remove-retired-unit", help=argparse.SUPPRESS)
     _ = retired_unit_parser.add_argument("--json", action="store_true")
-    _ = retired_unit_parser.add_argument("--request-deadline", type=float, required=True)
+    _ = retired_unit_parser.add_argument("--request-budget-seconds", type=float, required=True)
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
@@ -3325,16 +3331,18 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
-    seed_text = sys.stdin.read() if arguments.verb in ("apply-seed", "remove-retired-unit") else ""
     with ExitStack() as resources:
         if arguments.verb == "remove-retired-unit":
             from scripts.agents import worker_lifecycle
+            from scripts.lib import conf
 
             started = time.monotonic()
-            remaining = arguments.request_deadline - time.time()
-            if not math.isfinite(remaining) or remaining <= 0:
+            budget = arguments.request_budget_seconds
+            margin = conf.read("send").number("caller_margin_seconds")
+            if not math.isfinite(budget) or budget <= margin:
                 raise StaffRefused("retired unit removal request deadline expired")
-            _ = resources.enter_context(worker_lifecycle.operation_deadline(deadline=started + remaining))
+            _ = resources.enter_context(worker_lifecycle.operation_deadline(deadline=started + budget - margin))
+        seed_text = sys.stdin.read() if arguments.verb in ("apply-seed", "remove-retired-unit") else ""
         if is_owner() and not arguments.row_write and arguments.verb not in (
                 "set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer"):
             _ = resources.enter_context(operation())

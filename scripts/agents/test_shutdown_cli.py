@@ -1035,8 +1035,11 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             ("peer checkout record is missing", "no recorded repository for checkout"),
             ("local checkout returns during liveness check", "still exists on"),
             ("peer checkout returns during liveness check", "still exists on mac"),
+            ("peer checkout request changes the origin tip", "origin branch alpha-branch changed before record removal"),
             ("origin changes during liveness check", "origin branch alpha-branch changed before record removal"),
             ("origin read passes the request deadline", "retired unit removal request deadline expired"),
+            ("origin read passes the request deadline with clock skew", "retired unit removal request deadline expired"),
+            ("caller times out after record removal", ""),
         )
         for scenario, refusal in cases:
             with self.subTest(scenario=scenario):
@@ -1050,7 +1053,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     tip = git(origin, "rev-parse", ref)
                     checkout_returns = "checkout returns" in scenario
                     missing_peer_record = scenario == "peer checkout record is missing"
-                    origin_read_expires = scenario == "origin read passes the request deadline"
+                    origin_changes_during_checkout = scenario == "peer checkout request changes the origin tip"
+                    origin_read_expires = scenario.startswith("origin read passes the request deadline")
                     if scenario.startswith("peer"):
                         location = case.unit_worktree()
                         assert isinstance(location, staff.RemovedWorktree)
@@ -1068,7 +1072,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             _ = git(origin, "update-ref", "-d", ref, tip)
                             worktrees.write_record(worktrees.new_record(
                                 case.worktree, "alpha-branch", peer, base, "alpha", "main"))
-                        elif checkout_returns:
+                        elif checkout_returns or origin_changes_during_checkout:
                             worktrees.write_record(worktrees.new_record(
                                 case.worktree, "alpha-branch", case.checkout, base, "alpha", "main"))
                         elif missing_peer_record:
@@ -1120,16 +1124,26 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.calls.clear()
                     require_stopped = staff.require_stopped
 
-                    def change_facts_after_stop_check(identity: staff.StaffId) -> None:
+                    def change_origin() -> None:
                         nonlocal origin_refs
+                        changed = git(origin, "commit-tree", "main^{tree}", "-p", tip, "-m", "New tip")
+                        _ = git(origin, "update-ref", ref, changed, tip)
+                        origin_refs = git(origin, "for-each-ref")
+
+                    def change_facts_after_stop_check(identity: staff.StaffId) -> None:
                         require_stopped(identity)
                         if identity == members[-1].id:
                             if checkout_returns:
                                 case.worktree.mkdir()
                             else:
-                                changed = git(origin, "commit-tree", "main^{tree}", "-p", tip, "-m", "New tip")
-                                _ = git(origin, "update-ref", ref, changed, tip)
-                                origin_refs = git(origin, "for-each-ref")
+                                change_origin()
+
+                    def peer_request(args: list[str], stdin: str = "",
+                                     limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
+                        result = case.remote_call(args, stdin=stdin, limit=limit)
+                        if origin_changes_during_checkout and args[0] == "_retired-checkout-absent":
+                            change_origin()
+                        return result
 
                     def run(argv: list[str], cwd: Path | None = None, *,
                             settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
@@ -1146,22 +1160,26 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             if scenario == "peer unreachable":
                                 _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", return_value=(255, "")))
                             else:
-                                _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", side_effect=case.remote_call))
+                                _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", side_effect=peer_request))
                         guess_clone = checks.enter_context(mock.patch.object(worktree_records, "main_checkout_for_word",
                             return_value=case.checkout))
                         if scenario.endswith("during liveness check"):
                             _ = checks.enter_context(mock.patch.object(staff, "require_stopped",
                                 side_effect=change_facts_after_stop_check))
-                        if scenario.startswith("peer") and checkout_returns:
+                        if scenario.startswith("peer") and (checkout_returns or origin_changes_during_checkout):
                             _ = checks.enter_context(mock.patch.object(roster, "peer_snapshot",
                                 return_value=roster.Roster([], [])))
                         if origin_read_expires:
                             expected = record.by_id(case.unit_staff_id)
                             assert expected is not None
-                            code, output = case.remove_record_with_expired_origin_read(expected, tip)
+                            clock_offset = -3.0 if scenario.endswith("with clock skew") else 0.0
+                            code, output = case.remove_record_with_expired_origin_read(expected, tip, clock_offset)
+                        elif scenario == "caller times out after record removal":
+                            code, output = case.retry_after_unconfirmed_record_removal(tip)
                         else:
                             code, output = case.retire()
-                    authority_refusal = scenario.endswith("during liveness check") or origin_read_expires
+                    authority_refusal = (scenario.endswith("during liveness check") or origin_read_expires
+                                         or origin_changes_during_checkout)
                     expected_code = 2 if authority_refusal else int(bool(refusal))
                     case.assertEqual(code, expected_code, output)
                     if missing_peer_record:
@@ -1181,11 +1199,14 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 finally:
                     case.doCleanups()
 
-    def remove_record_with_expired_origin_read(self, row: staff.StaffRow, tip: str) -> tuple[int, str]:
+    def remove_record_with_expired_origin_read(self, row: staff.StaffRow, tip: str,
+                                               authority_clock_offset: float) -> tuple[int, str]:
         elapsed = 0.0
+        clock_offset = 0.0
         wall_time = time.time()
         monotonic = time.monotonic()
         request_timeout = 20.0
+        margin = conf.read("send").number("caller_margin_seconds")
         limits: list[remote.RemoteCallLimit] = []
 
         def read_origin(args: list[str], *, limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
@@ -1196,20 +1217,22 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             return 0, json.dumps(tip)
 
         def request(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
-            nonlocal elapsed
+            nonlocal elapsed, clock_offset
             self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
             self.assertEqual(timeout, request_timeout)
             elapsed = 1.0
+            clock_offset = authority_clock_offset
             with (mock.patch.object(staff, "is_owner", return_value=True),
                   mock.patch.object(sys, "stdin", io.StringIO(input)),
                   redirect_stdout(io.StringIO()) as result, redirect_stderr(io.StringIO()) as error):
                 status = staff.main(shlex.split(argv[-1])[2:])
+            clock_offset = 0.0
             return subprocess.CompletedProcess(argv, status, result.getvalue(), error.getvalue())
 
         state = Path(os.environ["STAFF_FILE"])
         before = state.read_bytes()
         origin = staff.RetiredUnitOrigin("mac", self.checkout, tip)
-        with (mock.patch.object(time, "time", side_effect=lambda: wall_time + elapsed),
+        with (mock.patch.object(time, "time", side_effect=lambda: wall_time + elapsed + clock_offset),
               mock.patch.object(time, "monotonic", side_effect=lambda: monotonic + elapsed),
               mock.patch.object(staff, "is_owner", return_value=False),
               mock.patch.object(staff, "require_stopped"),
@@ -1218,8 +1241,35 @@ class RetireUnitTests(ShutdownRepositoryFixture):
               redirect_stderr(io.StringIO()) as errors):
             code = staff.cli_result(lambda: staff.remove_retired_unit(row, origin) or 0)
         self.assertEqual(state.read_bytes(), before)
-        self.assertEqual(limits, [remote.TimeLimit(kind="time limit", seconds=request_timeout - 1)])
+        self.assertEqual(limits, [remote.TimeLimit(kind="time limit", seconds=request_timeout - margin)])
         return code, errors.getvalue()
+
+    def retry_after_unconfirmed_record_removal(self, tip: str) -> tuple[int, str]:
+        remove = staff.remove_retired_unit
+
+        def lose_reply(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+            with (mock.patch.object(staff, "is_owner", return_value=True),
+                  mock.patch.object(staff, "remove_retired_unit", new=remove),
+                  mock.patch.object(sys, "stdin", io.StringIO(input)),
+                  mock.patch.object(staff, "require_stopped"),
+                  mock.patch.object(shutdown, "retired_origin_tip_at", return_value=tip),
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(staff.main(shlex.split(argv[-1])[2:]), 0)
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        def remove_through_authority(row: staff.StaffRow, origin: staff.RetiredUnitOrigin) -> None:
+            with (mock.patch.object(staff, "is_owner", return_value=False),
+                  mock.patch.object(subprocess, "run", side_effect=lose_reply)):
+                remove(row, origin)
+
+        with mock.patch.object(staff, "remove_retired_unit", side_effect=remove_through_authority):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"retired record removal result is not confirmed. Run agents retire {self.unit_staff_id} again.", output)
+        self.assertIsNone(staff.by_id(self.unit_staff_id))
+        with mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call):
+            return self.retire()
 
     def test_retirement_refuses_a_failed_worktree_scan_before_inspecting_git_files(self) -> None:
         def fail_scan(argv: list[str], cwd: Path | None = None, *,
@@ -2136,7 +2186,7 @@ fi
 
     def test_remote_retirement_retries_failed_steps_without_retiring_the_staff_row(self) -> None:
         for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal",
-                        "journal removal", "checkout remains before journal removal"):
+                        "journal removal", "checkout remains before journal removal", "journal removal then retry"):
             with self.subTest(failure=failure):
                 case = RetireUnitTests()
                 case.setUp()
@@ -2181,13 +2231,14 @@ fi
                             case.assertEqual(case.stops()[:2], [["stop_resume.stop", DIRECTOR], ["stop_resume.stop", SEAT]])
                             case.assertNotEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
                             continue
-                        if failure in ("journal removal", "checkout remains before journal removal"):
+                        if failure in ("journal removal", "checkout remains before journal removal", "journal removal then retry"):
                             unlink = Path.unlink
                             journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                            journal_removal_fails = failure != "checkout remains before journal removal"
                             def refuse_journal(path: Path, missing_ok: bool = False) -> None:
                                 if path == journal:
                                     case.assertIsNone(staff.by_id(row.id))
-                                    if failure == "journal removal":
+                                    if journal_removal_fails:
                                         raise PermissionError("fixture journal removal failed")
                                 unlink(path, missing_ok=missing_ok)
                             check_branch = shutdown.check_peer_retired_branch
@@ -2211,12 +2262,17 @@ fi
                                 code, output = case.retire()
                             case.assertEqual(code, 0, output)
                             case.assertIn("retired record removed", output)
-                            case.assertEqual(journal.exists(), failure == "journal removal")
-                            if failure == "journal removal":
+                            case.assertEqual(journal.exists(), journal_removal_fails)
+                            if journal_removal_fails:
                                 case.assertEqual(output.count("anomaly:"), 1, output)
                                 case.assertIn("fixture journal removal failed", output)
                             case.assertEqual(case.stops(), before)
                             case.assertIsNone(staff.by_id(row.id))
+                            if failure == "journal removal then retry":
+                                code, output = case.retire()
+                                case.assertEqual(code, 0, output)
+                                case.assertIn("retirement journal removed", output)
+                                case.assertFalse(journal.exists())
                             continue
                         code, output = case.retire()
                     case.assertNotEqual(code, 0, output)

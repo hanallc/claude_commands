@@ -396,6 +396,8 @@ Retirement reads process facts with the reader for the host that owns the worktr
 Retirement keeps the recorded pane address and its terminal identity before cleanup.
 The remote retirement journal keeps both identities for completion retries.
 Removal of the retired staff rows permits deletion of the journal.
+If retirement cannot confirm the staff write, it prints a retry command with the staff ID.
+A retry by staff ID reports when the rows are gone and deletes a remaining journal.
 Cleanup excludes only that pane's proved idle shell from the remaining processes.
 After successful retirement, it closes that pane as its last step on the pane's machine.
 It sends no signal to that shell.
