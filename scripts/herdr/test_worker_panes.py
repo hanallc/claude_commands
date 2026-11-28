@@ -4257,9 +4257,51 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertIsInstance(worker_panes.observe_worker(self.parent.id, row, record),
                                           worker_panes.UncertainWorker)
             self.world.locations["w1:p1"]["agent_session"] = {"kind": "id", "value": unreadable.current_session}
-            self.assertEqual(self.observation(unreadable), worker_panes.ProcessUnknownWorker(
-                unreadable, "w1:p1", "terminal-w1:p1", "process permission denied"))
-            self.assertEqual(self.observation(absent), worker_panes.ClosedWorker(absent))
+            self.assertIsInstance(self.observation(unreadable), worker_panes.UncertainWorker)
+            self.assertIsInstance(self.observation(absent), worker_panes.UncertainWorker)
+
+    def test_unreadable_panes_with_no_proved_parent_tab_leave_workers_uncertain(self) -> None:
+        live, absent = self.worker("live"), self.worker("absent")
+        self.world.add(live, "w1:p1")
+        (pane_launch.record_directory() / "agents.json").unlink()
+        self.world.unknown.update({"w1:p0": "cannot read parent process", "w1:p1": "cannot read worker process"})
+        for row in (live, absent):
+            with self.subTest(worker=row.name):
+                self.assertIsInstance(self.observation(row), worker_panes.UncertainWorker)
+
+    def test_stale_session_report_cannot_prove_absence_after_a_failed_process_read(self) -> None:
+        live, absent = self.worker("live"), self.worker("absent")
+        self.world.add(live, "w1:p1")
+        (pane_launch.record_directory() / "agents.json").unlink()
+        self.world.locations["w1:p1"]["agent_session"] = {"kind": "id", "value": absent.current_session}
+        self.assertIsInstance(self.observation(live), worker_panes.OpenWorker)
+        self.world.unknown["w1:p1"] = "cannot read worker process"
+        record = staff.snapshot()
+        for row in (live, absent):
+            with self.subTest(worker=row.name):
+                self.assertIsInstance(worker_panes.observe_worker(self.parent.id, row, record),
+                                      worker_panes.UncertainWorker)
+
+    def test_failed_recovery_read_leaves_a_retained_worker_uncertain(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        server_result = self.world.result
+        process_reads = 0
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            nonlocal process_reads
+            if arguments == ("pane", "process-info", "--pane", "w1:p1"):
+                process_reads += 1
+                if process_reads == 2:
+                    raise herdr_types.HerdrFailure("cannot read recovery process")
+            return server_result(*arguments, deadline=deadline)
+
+        with patch.object(self.world, "result", side_effect=result):
+            observed = self.observation(row)
+        self.assertEqual(process_reads, 2)
+        self.assertIsInstance(observed, worker_panes.UncertainWorker)
+        assert isinstance(observed, worker_panes.UncertainWorker)
+        self.assertIn("w1:p1: cannot read recovery process", observed.reason)
 
     def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")
