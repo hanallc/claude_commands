@@ -50,8 +50,8 @@ UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
 UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
-# Give real fixture commands short deadlines.
-# A test that exercises a deadline sets its own value.
+# Give fixtures short deadlines and the word values their tests expect.
+# Explicit fixture settings take precedence.
 TEST_CONFIG_DEFAULTS = {
     "accounts.conf": (
         "quota_relay_timeout_seconds=30\n"
@@ -86,11 +86,34 @@ TEST_CONFIG_DEFAULTS = {
         "source_settle_seconds=2\n"
     ),
     "build_folders.conf": (
+        "roots.system=/tmp\n"
+        "roots.build=~/build\n"
+        "roots.build.natedev=/build\n"
+        "names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n"
+        "patterns.legacy-unique={purpose}{suffix}\n"
         "slots.wait_seconds=30\n"
         "locks.probe_wait_seconds=0.25\n"
         "locks.probe_retry_seconds=0.005\n"
     ),
     "build_targets.conf": (
+        "targets=hana-aws,mac,mac-linux,natedev\n"
+        "pinned_targets=hana-gpu\n"
+        "kind.hana-gpu=ssh\n"
+        "platform.hana-gpu=linux\n"
+        "settings.hana-gpu=cloud_gate.conf\n"
+        "kind.natedev=local\n"
+        "platform.natedev=linux\n"
+        "kind.mac=ssh\n"
+        "platform.mac=macos\n"
+        "settings.mac=mac_test.conf\n"
+        "kind.mac-linux=ssh\n"
+        "platform.mac-linux=linux\n"
+        "settings.mac-linux=mac_linux.conf\n"
+        "enabled.mac-linux=on\n"
+        "kind.hana-aws=ssh\n"
+        "platform.hana-aws=linux\n"
+        "settings.hana-aws=hana_aws.conf\n"
+        "notices.mac=on\n"
         "hold_sender_timeout_seconds=30\n"
         "sync.connect_timeout_s=10\n"
         "sync.reach_timeout_s=30\n"
@@ -102,6 +125,9 @@ TEST_CONFIG_DEFAULTS = {
     ),
     "buildlog.conf": "index_read_wait_seconds=1\n",
     "cloud_gate.conf": (
+        "enabled=on\n"
+        "execution_transport=hana-gpu\n"
+        "hana_gpu_route_enabled=on\n"
         "gpu_setup_dry_run_retry_timeout_s=30\n"
         "gpu_setup_dry_run_retry_interval_s=5\n"
         "spot_price_live_read_timeout_s=3\n"
@@ -136,6 +162,10 @@ TEST_CONFIG_DEFAULTS = {
         "fetch_lock_wait_seconds=0.5\n"
     ),
     "hana_aws.conf": (
+        "enabled=on\n"
+        "host=aws-hana\n"
+        "execution_transport=hana-control\n"
+        "kinds=check,lint\n"
         "guard_grace_seconds=30\n"
         "mount_timeout_seconds=15\n"
         "stop_poll_seconds=10\n"
@@ -181,6 +211,14 @@ TEST_CONFIG_DEFAULTS = {
         "terminate_grace_seconds=3\n"
     ),
     "mac_test.conf": (
+        "offload=on\n"
+        "host=mac\n"
+        "ci_repo=hanallc/hana\n"
+        "ci_variable=MACOS_CI\n"
+        "ci_workflow=ci.yml\n"
+        "ci_job=macOS: Compile and Test\n"
+        "linux_only.hana=hana_video,hana_clerestory\n"
+        "offload_exclude..claude=doc\n"
         "connect_timeout_s=6\n"
         "probe_timeout_s=15\n"
         "floor_sweep_timeout_s=30\n"
@@ -339,17 +377,47 @@ def shifted_config_lines(source: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:")
+
+
+@lru_cache(maxsize=128)
+def _fixture_template_lines(text: str, fixture_keys: frozenset[str]) -> tuple[str, ...]:
+    # Omit unpinned words so a required read reports a missing key before main.
+    # A read with a fallback uses that fallback.
+    # Git recovery reads only the fixture path's history, if it has any.
+    lines = text.splitlines()
+    omitted: set[int] = set()
+    replaced: set[str] = set()
+    for index, line in enumerate(lines):
+        if "=" not in line:
+            continue
+        for key, setting in conf.settings(line).items():
+            if key in fixture_keys and key not in replaced:
+                replaced.add(key)
+                continue
+            try:
+                _ = conf.decimal(setting.value)
+            except ValueError:
+                omitted.add(index)
+                if index and lines[index - 1].strip().startswith(LIMIT_PREFIXES):
+                    omitted.add(index - 1)
+    return shifted_config_lines("\n".join(line for index, line in enumerate(lines) if index not in omitted))
+
+
 def fixture_config_lines(source: Path, existing: str, overrides: str) -> list[str]:
-    """Shift inherited settings and keep explicit fixture settings."""
-    text = source.read_text() if source.exists() else ""
+    """Shift inherited numbers and keep explicit fixture settings."""
+    text = source.read_text(encoding="utf-8") if source.exists() else ""
     explicit = source == ADMISSION_CONFIG_FIXTURE
-    lines = text.splitlines() if explicit else list(shifted_config_lines(text))
     defaults = "" if explicit else TEST_CONFIG_DEFAULTS.get(source.name, "")
-    limit_prefixes = ("# whole:", "# range:", "# one of:")
+    if explicit:
+        lines = text.splitlines()
+    else:
+        fixture_keys = frozenset(conf.settings("\n".join((defaults, existing, overrides))))
+        lines = list(_fixture_template_lines(text, fixture_keys))
     for layer, keep_shifts in ((defaults, False), (existing, True), (overrides, False)):
         previous = before_limit = ""
         for raw in layer.splitlines():
-            limit = previous if previous.startswith(limit_prefixes) else ""
+            limit = previous if previous.startswith(LIMIT_PREFIXES) else ""
             mark = before_limit if keep_shifts and limit else ""
             before_limit, previous = previous, raw.strip()
             key, separator, value = raw.partition("=")
@@ -361,7 +429,7 @@ def fixture_config_lines(source: Path, existing: str, overrides: str) -> list[st
             for index, line in enumerate(lines):
                 if line.partition("=")[0].strip() == key:
                     start = index
-                    if index and lines[index - 1].strip().startswith(limit_prefixes):
+                    if index and lines[index - 1].strip().startswith(LIMIT_PREFIXES):
                         start -= 1
                         limit = limit or lines[start]
                         if start and lines[start - 1].startswith(conf_reads.SHIFT_MARK):
@@ -383,23 +451,21 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
 
 
 def copy_config_file_fixture(source: Path, destination: Path) -> Path:
-    """Copy one committed config with its inherited numeric values shifted."""
-    if source.name in TEST_CONFIG_DEFAULTS:
-        contents = "\n".join(fixture_config_lines(source, "", "")) + "\n"
-    else:
-        text = source.read_text(encoding="utf-8")
-        lines = shifted_config_lines(text)
-        contents = text if lines == tuple(text.splitlines()) else "\n".join(lines) + "\n"
+    """Copy one config with shifted numbers and pinned words."""
+    contents = "\n".join(fixture_config_lines(source, "", "")) + "\n"
     _ = destination.write_text(contents, encoding="utf-8")
     return destination
 
 
 def copy_config_fixture(source: Path, destination: Path) -> Path:
     """Copy the committed configuration folder into a private fixture."""
-    _ = shutil.copytree(source, destination)
-    for template in source.glob("*.conf"):
-        _ = copy_config_file_fixture(template, destination / template.name)
-    return destination
+    def copy_file(original: str, target: str) -> str:
+        path = Path(original)
+        if path.name.endswith(".conf"):
+            return str(copy_config_file_fixture(path, Path(target)))
+        return shutil.copy2(original, target)
+
+    return shutil.copytree(source, destination, copy_function=copy_file)
 
 
 def write_config_fault(path: Path, source: str) -> int:

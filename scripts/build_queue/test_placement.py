@@ -43,6 +43,7 @@ from scripts.build_targets import mac_linux, target_config
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
+from scripts.lint.memory_test_support import write_config_fixture as write_config_fixture
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.production import gate as production_gate
@@ -63,16 +64,6 @@ FIXTURE_MAC_SCOPE = RepositoryScope("hana")
 SCALER_TARGET_NAME = "claude-aws"
 
 
-# The mac_test settings these tests depend on. A tune of the repository settings must not change a test.
-MAC_TEST_PINS = "offload=on\nprobe_timeout_s=15\nlinux_only.hana=hana_video,hana_clerestory\n"
-
-
-def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Write a fixture settings file. A new mac_test file gets the pins in place of the repository values."""
-    pins = MAC_TEST_PINS if (template or path.stem) == "mac_test" and not path.exists() else ""
-    return memory_test_support.write_config_fixture(path, pins + overrides, template=template)
-
-
 class PlacementFixture(AdmissionFixture):
     """Supply private provider evidence across each service restart."""
 
@@ -80,7 +71,6 @@ class PlacementFixture(AdmissionFixture):
 
     def __init__(self, *, private_child_starts: bool = False) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
-        self.settings_pinned: bool = False
         super().__init__(private_child_starts=private_child_starts)
 
     @override
@@ -94,10 +84,6 @@ class PlacementFixture(AdmissionFixture):
         settings = conf.path("mac_test")
         if settings.parent != self.root:
             raise AssertionError(f"a placement test must not read the live settings: {settings}")
-        if not self.settings_pinned:
-            settings.unlink(missing_ok=True)
-            _ = write_config_fixture(settings)
-            self.settings_pinned = True
         server = super().new_server(start=False)
         self.read_host_evidence = server.read_provider_evidence
         server.host_probe = self.read_provider
