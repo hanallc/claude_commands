@@ -22,6 +22,11 @@ Use the `agents` program.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - Use `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` to move Claude sessions to a numbered account.
 - Use `agents retire NAME` to remove the staff record and tab. For an active unit, the command also starts checkout cleanup. It keeps conversation files.
+  For a showrunner, retire or transfer its units first. Detach or retire its child showrunners first.
+  Use a staff ID when a unit and a showrunner have the same name.
+  The command checks and removes old retired unit records before it retires the showrunner.
+  Close any pane the command names in an ownership refusal. Then retire the showrunner again.
+  It stops the showrunner's workers and removes their records. It keeps the document and merge branch.
 - Use `agents retire STAFF_ID` to remove an old retired unit record. The command checks each branch tip and keeps the Git refs and folders.
 - Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.

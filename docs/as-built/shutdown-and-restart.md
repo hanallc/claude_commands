@@ -411,6 +411,30 @@ If a check times out, retirement keeps the rows and reports the check and retry 
 A caller timeout can leave removal unconfirmed while the authority finishes the write.
 A retry by staff ID reports current absence and can remove a remaining old journal.
 
+`agents retire NAME` retires a showrunner when no active unit or child showrunner reports to it.
+The command names each unit to retire or transfer and each child showrunner to detach or retire.
+Use a staff ID when a unit and a showrunner have the same name.
+The command removes old retired unit records before it removes their showrunner.
+It checks the branch tips for each old record and keeps the Git refs and folders.
+A failed check keeps the showrunner and names the old unit.
+The staff writer removes the showrunner and its direct workers in the same transaction that records the cleanup receipt.
+The receipt records the session host. The command refuses if it cannot identify the host.
+Before any staff write, the session host checks the live process in each pane.
+For a worker, the publication must match the live process PID and start.
+If ownership is unclear, the command names the panes to close before retirement can proceed.
+The journal saves each proved terminal ID, shell identity, and original publication.
+The session host stops those conversations and finds each saved terminal on its Herdr server.
+It closes each matching idle shell, including one at a new pane address.
+It reports each replacement terminal and leaves it open.
+An unreadable pane list or unproved shell keeps the journal and receipt.
+The journal records the stop's exact publication before the stop writes it.
+After closure or proved absence, cleanup removes the original publication or a matching stop publication.
+Cleanup keeps a publication that a replacement writes.
+Cleanup removes the restart entries outside the staff write transaction.
+Cleanup clears the receipt after it removes the restart entries and update timer.
+Retry with the showrunner's staff ID to continue cleanup on its session host.
+The command keeps the production document, merge branch, and conversation files.
+
 Unit rename closes the unit's own pane after its ownership checks.
 A pane already gone counts as closed.
 Checkout moves stop before moving files and resume afterward.

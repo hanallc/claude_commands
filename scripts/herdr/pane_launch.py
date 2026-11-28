@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast, overload
 from enum import Enum
 from importlib import import_module
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -50,6 +51,7 @@ class LaunchOptions(TypedDict):
     written_at: str
     pid: NotRequired[int]
     proc_start: NotRequired[str]
+    retirement_write_id: NotRequired[str]
     producer_binding: NotRequired[bool]
     implicit_claude_home: NotRequired[str]
 
@@ -552,7 +554,8 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
         required_strings = (required_strings - {"session_id", "name", "cwd", "kind", "config_dir"}) | {"staff_id"}
     else:
         _ = saved_kind(cast(NativePaneLaunch, cast(object, launch)))
-    for field in ("pane_id", "session_id", "staff_id", "config_dir", "cwd", "name", "model", "written_at"):
+    for field in ("pane_id", "session_id", "staff_id", "config_dir", "cwd", "name", "model", "written_at",
+                  "retirement_write_id"):
         if field not in launch and field not in required_strings:
             continue
         if not isinstance(launch.get(field), str):
@@ -725,6 +728,49 @@ def without_staff_labels(entry: PaneLaunch) -> PaneLaunch:
     return current
 
 
+class StopPublicationAction(Enum):
+    SEED = "record the live process before stop"
+    END = "mark the launch ended during stop"
+
+
+@dataclass(frozen=True)
+class StopPublicationEdit:
+    pane: str
+    action: StopPublicationAction
+
+
+@dataclass(frozen=True)
+class UnpublishedStopPane:
+    """The stop writer has no previous publication for this pane."""
+
+
+type StopPublicationCapture = Callable[[Path, StopPublicationEdit, PaneLaunch | UnpublishedStopPane, PaneLaunch], bool]
+_stop_publication_capture: ContextVar[StopPublicationCapture | None] = ContextVar("stop_publication_capture", default=None)
+_stop_publication_edit: ContextVar[StopPublicationEdit | None] = ContextVar("stop_publication_edit", default=None)
+
+
+@contextmanager
+def capture_stop_publications(capture: StopPublicationCapture) -> Generator[None]:
+    """Approve and record the stop writer's exact value before publication."""
+    token = _stop_publication_capture.set(capture)
+    try:
+        yield
+    finally:
+        _stop_publication_capture.reset(token)
+
+
+@contextmanager
+def stop_publication_edit(pane: str, action: StopPublicationAction) -> Generator[None]:
+    if _stop_publication_capture.get() is None:
+        yield
+        return
+    token = _stop_publication_edit.set(StopPublicationEdit(pane, action))
+    try:
+        yield
+    finally:
+        _stop_publication_edit.reset(token)
+
+
 def save(path: Path, entries: dict[str, PaneLaunch], *,
          record: staff.StaffSnapshot | StaffSnapshotRead = StaffSnapshotRead.CURRENT) -> None:
     """Publish one retained launch file through the atomic writer."""
@@ -734,6 +780,17 @@ def save(path: Path, entries: dict[str, PaneLaunch], *,
         record = staff.StaffSnapshot(())
     entries = {pane: retained_launch(entry, record) for pane, entry in entries.items()}
     with _publication_lock(path.parent):
+        capture, edit = _stop_publication_capture.get(), _stop_publication_edit.get()
+        if capture is not None and edit is not None:
+            current = read_strict(path)
+            previous = current.get(edit.pane, UnpublishedStopPane())
+            replacement = entries[edit.pane].copy()
+            # A resume can clear the ended mark without changing the launch time.
+            replacement["retirement_write_id"] = uuid4().hex
+            if not capture(path, edit, previous, replacement):
+                return
+            current[edit.pane] = replacement
+            entries = current
         atomic_file.write_text_atomic(path, json.dumps(entries, indent=2, sort_keys=True) + "\n")
 
 
@@ -749,6 +806,8 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
         owner = None
     with locked(path):
         if owner is not None and owner.kind == "producer":
+            if _stop_publication_capture.get() is not None and _stop_publication_edit.get() is not None:
+                return
             request = process_producer_launch_request(owner.id)
             if isinstance(request, ProducerLaunchRequest) and request.session != native_session:
                 request = ProducerLaunchFromStaff.CURRENT

@@ -370,7 +370,11 @@ def _set_ended(session: str, pane_id: str, session_id: str, ended: bool,
             return
         if entry.get("ended", False) != ended:
             entry["ended"] = ended
-            save(session, entries)
+            if ended:
+                with pane_launch.stop_publication_edit(pane_id, pane_launch.StopPublicationAction.END):
+                    save(session, entries)
+            else:
+                save(session, entries)
 
 
 def forget_unit(unit_id: str) -> list[str]:
@@ -546,7 +550,8 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
         cwd = owner.cwd if isinstance(owner.cwd, str) else ""
         entry = launch(pane_id, session_id, cwd, environment, owner.arguments, kind=owner.kind)
         entry.update(pid=owner.pid, proc_start=started)
-        write(session, entry)
+        with pane_launch.stop_publication_edit(pane_id, pane_launch.StopPublicationAction.SEED):
+            write(session, entry)
         print(f"{pane_id}: {pane.get('label') or ''} {session_id}")
     return 0
 

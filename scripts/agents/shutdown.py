@@ -49,7 +49,7 @@ import re
 import signal
 import subprocess
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
@@ -81,6 +81,7 @@ from scripts.production import (
     unit_config,
     unit_move,
     production_admission,
+    showrunners,
     worker,
     unit_names,
 )
@@ -753,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
+    if arguments[:1] == ["_retire-showrunner"] and len(arguments) <= 2:
+        return retirement_showrunner_command(arguments[1:])
     if arguments[:1] == ["_retire-production"] and (
             len(arguments) == 2 or len(arguments) == 3 and arguments[2] == "--legacy"):
         return retirement_production_command(staff.StaffId(arguments[1]), legacy=len(arguments) == 3)
@@ -963,6 +966,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if options.to:
                 raise ValueError("--to is only for producer retirement")
+            member = record.by_member_reference(options.session)
+            if member is None:
+                member = next((row for row in record.find(kind="showrunner") if row.name == options.session), None)
+                if member is not None:
+                    units = [row for row in record.find(kind="unit") if row.name == member.name]
+                    if units:
+                        matches = [f"showrunner {member.name} ({member.id})"]
+                        matches.extend(f"unit {record.qualified_name(row)} ({row.id})" for row in units)
+                        raise ValueError(f"{member.name}: several staff rows match: {', '.join(matches)}. Use a staff ID.")
+            if member is not None and member.kind == "showrunner":
+                return retire_showrunner(member)
             return retire_named_unit(options.session)
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
@@ -2249,6 +2263,35 @@ class RetiringPane(NamedTuple):
     shell: RetirementShell | UnprovedShell = UnprovedShell()
 
 
+@dataclass(frozen=True)
+class NoRetirementPublication:
+    """The proved pane has no saved publication."""
+
+
+class RetirementAgentProcess(NamedTuple):
+    pid: int
+    start: str
+
+
+@dataclass(frozen=True)
+class UnprovedRetirementAgent:
+    """The saved terminal has no agent generation for publication changes."""
+
+
+@dataclass(frozen=True)
+class ShowrunnerTerminalCleanup:
+    member: staff.StaffId
+    place: herdr.HerdrPlace
+    terminal: str
+    shell: RetirementShell
+    publication: pane_launch.PaneLaunch | NoRetirementPublication
+    agent: RetirementAgentProcess | UnprovedRetirementAgent = UnprovedRetirementAgent()
+    stop_publications: tuple[pane_launch.PaneLaunch, ...] = ()
+
+    def accepts_publication(self, entry: pane_launch.PaneLaunch) -> bool:
+        return entry == self.publication or entry in self.stop_publications
+
+
 class RetirementPaneCleanup(Enum):
     ACTIVE = "active"
     OLD_RECORD = "old record"
@@ -2281,6 +2324,120 @@ def retirement_pane(row: staff.StaffRow, record: staff.StaffSnapshot) -> Retirin
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         print(f"anomaly: {row.name}: cannot read its pane: {error}")
     return herdr.NoPane(row.name)
+
+
+def retirement_pane_facts(pane: RetiringPane | herdr.NoPane) -> dict[str, object]:
+    return {
+        "pane_session": pane.session if isinstance(pane, RetiringPane) else "",
+        "pane_id": pane.pane if isinstance(pane, RetiringPane) else "",
+        "pane_terminal": pane.terminal if isinstance(pane, RetiringPane) else "",
+        **({"shell_pid": pane.shell.pid, "shell_start": pane.shell.start}
+           if isinstance(pane, RetiringPane) and isinstance(pane.shell, RetirementShell) else {}),
+    }
+
+
+def showrunner_pane_info(client: herdr.Herdr, pane: str) -> dict[str, object]:
+    return herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
+                             "showrunner pane process info")
+
+
+def showrunner_shell(info: dict[str, object]) -> RetirementShell:
+    pid = info.get("shell_pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("the pane shell PID is unavailable")
+    started = process_start.process_start(pid)
+    if not isinstance(started, process_start.Started):
+        raise ValueError("the pane shell start is unavailable")
+    return RetirementShell(pid, started.start)
+
+
+def showrunner_pane_inventory(client: herdr.Herdr) -> dict[str, herdr.PaneIdentity]:
+    panes = client.panes()
+    addresses = {pane["pane_id"]: pane for pane in panes}
+    terminals = {pane.get("terminal_id", "") for pane in panes}
+    if "" in addresses or "" in terminals or len(addresses) != len(panes) or len(terminals) != len(panes):
+        raise ValueError(f"{client.session}: pane inventory has missing or duplicate identities")
+    return addresses
+
+
+def prove_showrunner_terminal(client: herdr.Herdr, pane: herdr.PaneIdentity, member: staff.StaffRow,
+                             publication: pane_launch.PaneLaunch | NoRetirementPublication
+                             ) -> ShowrunnerTerminalCleanup:
+    identity, terminal = pane["pane_id"], pane.get("terminal_id", "")
+    info = showrunner_pane_info(client, identity)
+    shell = showrunner_shell(info)
+    foreground = herdr.foreground_pane_conversation(info, pane)
+    if (not isinstance(foreground, pane_launch.ProvedPaneConversation)
+            or foreground.identity != member.current_session):
+        raise ValueError("the member's live session is unavailable")
+    started = process_start.process_start(foreground.pid)
+    if member.kind == "worker":
+        if isinstance(publication, NoRetirementPublication) or publication.get("pid") != foreground.pid:
+            raise ValueError("the publication does not identify the live worker process")
+        if not isinstance(started, process_start.Started) or publication.get("proc_start") != started.start:
+            raise ValueError("the publication does not identify the live worker process start")
+    current_shell = showrunner_shell(showrunner_pane_info(client, identity))
+    current = client.pane_row(identity)
+    if not terminal or isinstance(current, herdr.NoPane) or current.get("terminal_id") != terminal or current_shell != shell:
+        raise ValueError("the pane terminal or shell changed during ownership proof")
+    agent = (RetirementAgentProcess(foreground.pid, started.start) if isinstance(started, process_start.Started)
+             else UnprovedRetirementAgent())
+    return ShowrunnerTerminalCleanup(member.id, herdr.HerdrPlace(client.session, identity), terminal, shell,
+                                     publication, agent)
+
+
+def retiring_showrunner_terminals(row: staff.StaffRow, workers: Sequence[staff.StaffRow],
+                                  record: staff.StaffSnapshot) -> tuple[ShowrunnerTerminalCleanup, ...]:
+    members = {member.id: member for member in (row, *workers)}
+    publications: dict[str, dict[str, pane_launch.PaneLaunch]] = {}
+    for path in sorted(pane_record.record_directory().glob("*.json")):
+        entries = pane_record.read_strict(path.stem)
+        if any(isinstance(reference := pane_launch.launch_reference(entry, record), pane_launch.StaffLaunchReference)
+               and reference.id in members for entry in entries.values()):
+            publications[path.stem] = entries
+    _ = publications.setdefault(herdr.shared_session(), {})
+    targets: list[ShowrunnerTerminalCleanup] = []
+    refusals: list[str] = []
+    for session, entries in publications.items():
+        client = herdr.Herdr(session)
+        panes = client.panes()
+        scan = client.scan_row_panes(record, [dict(pane) for pane in panes])
+        live = {pane["pane_id"]: member for member, matches in scan.found.items() for pane in matches}
+        for pane in panes:
+            identity = pane["pane_id"]
+            entry = entries.get(identity)
+            reference = pane_launch.launch_reference(entry, record) if entry is not None else None
+            claimed = members.get(reference.id) if isinstance(reference, pane_launch.StaffLaunchReference) else None
+            current = live.get(identity)
+            member = claimed or (members.get(current) if current is not None else None)
+            if member is None:
+                continue
+            try:
+                terminal = pane.get("terminal_id")
+                if not terminal or sum(item.get("terminal_id") == terminal for item in panes) != 1:
+                    raise ValueError("the terminal identity is missing or shared")
+                if reference is not None and reference != pane_launch.StaffLaunchReference(member.id):
+                    raise ValueError("the publication names another member")
+                if current is not None and current != member.id:
+                    raise ValueError("the live pane belongs to another member")
+                targets.append(prove_showrunner_terminal(client, pane, member,
+                    entry if entry is not None else NoRetirementPublication()))
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                refusals.append(f"{session}:{identity} ({error})")
+    if refusals:
+        raise ValueError(f"Cannot prove pane ownership for {', '.join(refusals)}. Close these panes, then retire again.")
+    return tuple(targets)
+
+
+def retirement_pane_from_journal(row: staff.StaffRow, saved: dict[str, object]) -> RetiringPane | herdr.NoPane:
+    if not saved.get("pane_id"):
+        return herdr.NoPane(row.name)
+    if not saved.get("pane_terminal"):
+        raise ValueError("the journal has no saved terminal identity")
+    pid, start = saved.get("shell_pid"), saved.get("shell_start")
+    shell = (RetirementShell(pid, start) if type(pid) is int and pid > 0 and isinstance(start, str) and start
+             else UnprovedShell())
+    return RetiringPane(str(saved["pane_session"]), str(saved["pane_id"]), str(saved["pane_terminal"]), shell)
 
 
 def retirement_idle_shell(place: RetiringPane | herdr.NoPane, pid: int) -> bool:
@@ -2325,6 +2482,8 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                 isinstance(place, RetiringPane) and session == place.session and identity == place.pane, identity)):
             try:
                 pane = panes.get(identity)
+                launch = publications[session].get(identity)
+                reference = pane_launch.launch_reference(launch, record) if launch is not None else None
                 if isinstance(place, RetiringPane) and session == place.session and identity == place.pane:
                     terminal = place.terminal
                 else:
@@ -2339,9 +2498,8 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                         started = process_start.process_start(shell.pid)
                         if (isinstance(started, (process_start.Gone, process_start.Zombie))
                                 or isinstance(started, process_start.Started) and started.start != shell.start):
-                            launch = publications[session].get(identity)
                             if (launch is not None
-                                    and isinstance(reference := pane_launch.launch_reference(launch, record), pane_launch.StaffLaunchReference)
+                                    and isinstance(reference, pane_launch.StaffLaunchReference)
                                     and reference.id in owners):
                                 pane_launch.retire_launch(pane_record.record_directory() / f"{session}.json", identity, launch)
                             continue
@@ -2354,8 +2512,6 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                         report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"{session}:{identity}")
                         return False
                     continue
-                launch = publications[session].get(identity)
-                reference = pane_launch.launch_reference(launch, record) if launch is not None else None
                 if reference is not None and (not isinstance(reference, pane_launch.StaffLaunchReference)
                                                or reference.id not in owners):
                     continue
@@ -2369,6 +2525,50 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
                 report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"{session}:{identity}: {error}")
                 return False
+    return True
+
+
+def retire_showrunner_pane_publication(target: ShowrunnerTerminalCleanup) -> None:
+    session, pane = target.place.session, target.place.pane
+    accepted = pane_record.read_strict(session).get(pane)
+    if accepted is None or not target.accepts_publication(accepted):
+        return
+    try:
+        pane_launch.retire_launch(pane_record.record_path(session), pane, accepted)
+    except ValueError:
+        if pane_record.read_strict(session).get(pane) == accepted:
+            raise
+
+
+def close_showrunner_terminals(owner: staff.StaffRow, targets: tuple[ShowrunnerTerminalCleanup, ...]) -> bool:
+    for target in sorted(targets, key=lambda target: target.member == owner.id):
+        place = target.place
+        address = f"{place.session}:{place.pane}"
+        try:
+            client = herdr.Herdr(place.session)
+            inventory = showrunner_pane_inventory(client)
+            original = inventory.get(place.pane)
+            if original is not None and original.get("terminal_id") != target.terminal:
+                print(f"{address}: terminal identity changed. The replacement terminal stays open.")
+            pane = next((pane for pane in inventory.values() if pane.get("terminal_id") == target.terminal), None)
+            if pane is not None:
+                identity = pane["pane_id"]
+                address = f"{place.session}:{identity}"
+                info = showrunner_pane_info(client, identity)
+                if showrunner_shell(info) != target.shell:
+                    raise ValueError("the saved shell identity changed")
+                foreground = herdr.foreground_pane_conversation(info, pane)
+                if (info.get("foreground_process_group_id") != target.shell.pid
+                        or foreground is not pane_launch.NoForegroundConversation.FOUND):
+                    raise ValueError("foreground work remains")
+                if (not client.close_tab_confirmed(identity, terminal=target.terminal)
+                        or any(current.get("terminal_id") == target.terminal
+                               for current in showrunner_pane_inventory(client).values())):
+                    raise ValueError("terminal closure is unconfirmed")
+            retire_showrunner_pane_publication(target)
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+            report_retirement_cleanup(owner, "Pane cleanup is incomplete", f"{address}: {error}")
+            return False
     return True
 
 
@@ -2483,12 +2683,16 @@ def forget_retirement_journal(identity: staff.StaffId, name: str) -> bool:
 def retry_retirement_journal_here(name: str) -> int:
     try:
         identity = staff.native_id(name)
-        if staff.authority_snapshot().by_id(identity) is not None:
+        record = staff.authority_snapshot()
+        if record.by_id(identity) is not None:
             raise staff.StaffRefused(f"{identity}: the staff row still exists")
+        completed = retirement_receipt(identity, record, kind="showrunner")
+        if not isinstance(completed, NoRetirementReceipt):
+            return retire_showrunner_here(completed)
         if forget_retirement_journal(identity, identity):
             print(f"{identity}: retirement journal removed")
         return 0
-    except (staff.StaffRefused, OSError) as error:
+    except (RetirementDeferred, *RETIREMENT_IO_ERRORS, staff.StaffNotFound) as error:
         print(f"anomaly: {name}: cannot retry retirement journal: {error}")
         return 1
 
@@ -2681,15 +2885,10 @@ def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
     previous_token = saved.get("cleanup_token")
     token = previous_token if isinstance(previous_token, str) else uuid4().hex
     if not saved:
-        pane = retirement_pane(row, record)
         saved = {
             "session": row.current_session, "worktree": str(unit.worktree),
             "checkout": str(unit.production.checkout), "branch": unit.branch,
-            "pane_session": pane.session if isinstance(pane, RetiringPane) else "",
-            "pane_id": pane.pane if isinstance(pane, RetiringPane) else "",
-            "pane_terminal": pane.terminal if isinstance(pane, RetiringPane) else "",
-            **({"shell_pid": pane.shell.pid, "shell_start": pane.shell.start}
-               if isinstance(pane, RetiringPane) and isinstance(pane.shell, RetirementShell) else {}),
+            **retirement_pane_facts(retirement_pane(row, record)),
         }
     workers = record.find(kind="worker", parent=row.id)
     if kept_work:
@@ -2777,16 +2976,11 @@ def run_retirement_cleanup(unit: RetiringUnit, record: staff.StaffSnapshot, save
 def clean_retired_unit(unit: RetiringUnit, record: staff.StaffSnapshot, saved: dict[str, object],
                        token: str, *, settings: conf.ConfigRead) -> RetirementResult:
     row = unit.staff_member
-    if saved.get("pane_id"):
-        if not saved.get("pane_terminal"):
-            report_retirement_cleanup(row, "Pane cleanup is unconfirmed", "the journal has no saved terminal identity")
-            return RetirementResult.PENDING
-        pid, start = saved.get("shell_pid"), saved.get("shell_start")
-        shell = (RetirementShell(pid, start) if type(pid) is int and pid > 0 and isinstance(start, str) and start
-                 else UnprovedShell())
-        pane = RetiringPane(str(saved["pane_session"]), str(saved["pane_id"]), str(saved["pane_terminal"]), shell)
-    else:
-        pane = herdr.NoPane(row.name)
+    try:
+        pane = retirement_pane_from_journal(row, saved)
+    except ValueError as error:
+        report_retirement_cleanup(row, "Pane cleanup is unconfirmed", str(error))
+        return RetirementResult.PENDING
     if saved.get("pane_only") is not True and saved.get("checkout_cleanup_complete") is not True:
         pane_workers, reasons = retirement_stop_members(row, record)
         if reasons:
@@ -2959,7 +3153,13 @@ def finish_retirement_from_journal(row: staff.StaffRow) -> RetirementResult:
     return RetirementResult.COMPLETE
 
 
-def retired_unit_receipt(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
+@dataclass(frozen=True)
+class NoRetirementReceipt:
+    """No local journal matches the retirement reference."""
+
+
+def retirement_receipt(reference: str, record: staff.StaffSnapshot, *,
+                       kind: Literal["unit", "showrunner", "either"] = "either") -> staff.StaffRow | NoRetirementReceipt:
     matches: list[staff.StaffRow] = []
     for journal in retirement_journal_folder().glob("*.json"):
         saved = retirement_json(journal)
@@ -2972,14 +3172,382 @@ def retired_unit_receipt(reference: str, record: staff.StaffSnapshot) -> staff.S
             if reference in (journal.stem, saved.get("qualified_name")):
                 raise RetirementDeferred(f"cannot read the saved staff row for {journal.stem}: {error}") from error
             continue
+        if row.kind not in ("unit", "showrunner") or (kind != "either" and row.kind != kind):
+            continue
+        if row.kind == "unit" and isinstance(row.worktree, staff.WorktreeUnfilled):
+            continue
         parent = record.parent_of(row)
-        qualified = f"{parent.name}/{row.name}" if parent is not None else saved.get("qualified_name")
-        if (row.kind == "unit" and not isinstance(row.worktree, staff.WorktreeUnfilled) and journal == retirement_journal(row)
+        qualified = f"{parent.name}/{row.name}" if row.kind == "unit" and parent is not None else saved.get("qualified_name")
+        if (journal == retirement_journal(row)
                 and record.by_id(row.id) is None and reference in (row.id, row.name, row.current_session, qualified)):
             matches.append(row)
     if len(matches) > 1:
         raise RetirementDeferred(f"{reference}: several retirement receipts match. Use a staff id")
-    return matches[0] if matches else None
+    return matches[0] if matches else NoRetirementReceipt()
+
+
+@dataclass(frozen=True)
+class ForwardedShowrunnerRetirement:
+    owner: staff.StaffRow
+
+
+@dataclass(frozen=True)
+class ShowrunnerCleanupMembers:
+    owner: staff.StaffRow
+    token: str
+    workers: tuple[staff.StaffRow, ...]
+
+
+@dataclass(frozen=True)
+class PendingShowrunnerCleanup:
+    members: ShowrunnerCleanupMembers
+    terminals: tuple[ShowrunnerTerminalCleanup, ...]
+
+
+@dataclass(frozen=True)
+class CompletedShowrunnerCleanup:
+    members: ShowrunnerCleanupMembers
+
+
+type ShowrunnerRetirementJournal = ForwardedShowrunnerRetirement | PendingShowrunnerCleanup | CompletedShowrunnerCleanup
+
+
+def read_showrunner_retirement(row: staff.StaffRow) -> ShowrunnerRetirementJournal | NoRetirementJournal:
+    saved = read_retirement_journal(retirement_journal(row))
+    if isinstance(saved, NoRetirementJournal):
+        return saved
+    if saved.get("completed_row") != row.to_json():
+        raise ValueError("the cleanup journal does not match the showrunner")
+    if saved.keys() == {"completed_row"}:
+        return ForwardedShowrunnerRetirement(row)
+    token = saved.get("cleanup_token")
+    raw_workers = saved.get("workers")
+    complete = saved.get("cleanup_complete", False)
+    if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or not isinstance(raw_workers, list) or type(complete) is not bool):
+        raise ValueError("invalid showrunner cleanup journal")
+    workers: list[staff.StaffRow] = []
+    for raw in cast(list[object], raw_workers):
+        if not isinstance(raw, dict):
+            raise ValueError("invalid showrunner worker cleanup facts")
+        worker_facts = cast(dict[str, object], raw)
+        worker = staff.StaffRow.from_json(worker_facts.get("row"))
+        if worker.kind != "worker" or not worker.reports_to(row.id):
+            raise ValueError("the cleanup journal names another showrunner's worker")
+        workers.append(worker)
+    members = ShowrunnerCleanupMembers(row, token, tuple(workers))
+    if complete:
+        return CompletedShowrunnerCleanup(members)
+    raw_panes = saved.get("panes")
+    if not isinstance(raw_panes, list):
+        raise ValueError("the showrunner cleanup journal has no saved terminals")
+    member_ids = {member.id for member in (row, *workers)}
+    terminals = tuple(showrunner_terminal_from_journal(raw, member_ids) for raw in cast(list[object], raw_panes))
+    if len({(target.place.session, target.terminal) for target in terminals}) != len(terminals):
+        raise ValueError("the cleanup journal names the same terminal twice")
+    return PendingShowrunnerCleanup(members, terminals)
+
+
+def showrunner_terminal_from_journal(raw: object, members: set[staff.StaffId]) -> ShowrunnerTerminalCleanup:
+    if not isinstance(raw, dict):
+        raise ValueError("invalid showrunner terminal cleanup facts")
+    facts = cast(dict[str, object], raw)
+    member = staff.StaffId(herdr.json_text(facts.get("staff_id"), "cleanup staff ID"))
+    session = herdr.json_text(facts.get("pane_session"), "cleanup pane session")
+    pane = herdr.json_text(facts.get("pane_id"), "cleanup pane ID")
+    terminal = herdr.json_text(facts.get("pane_terminal"), "cleanup terminal ID")
+    pid, start = facts.get("shell_pid"), facts.get("shell_start")
+    if member not in members or not session or not pane or not terminal:
+        raise ValueError("invalid showrunner terminal identity in the cleanup journal")
+    if type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start:
+        raise ValueError(f"{session}:{pane}: the cleanup journal has no saved shell identity")
+    publication = facts.get("publication")
+    original = (NoRetirementPublication() if publication is None
+                else retirement_publication_from_journal(publication, pane))
+    agent_pid, agent_start = facts.get("agent_pid"), facts.get("agent_start")
+    if agent_pid is None and agent_start is None:
+        agent = UnprovedRetirementAgent()
+    elif type(agent_pid) is int and agent_pid > 0 and isinstance(agent_start, str) and agent_start:
+        agent = RetirementAgentProcess(agent_pid, agent_start)
+    else:
+        raise ValueError(f"{session}:{pane}: invalid saved agent identity")
+    raw_stop_publications = facts.get("stop_publications", [])
+    if not isinstance(raw_stop_publications, list):
+        raise ValueError(f"{session}:{pane}: invalid saved stop publications")
+    stop_publications = tuple(retirement_publication_from_journal(entry, pane)
+                              for entry in cast(list[object], raw_stop_publications))
+    if stop_publications and (isinstance(agent, UnprovedRetirementAgent) or any(
+            not entry.get("retirement_write_id") or entry.get("pid") != agent.pid or entry.get("proc_start") != agent.start
+            for entry in stop_publications)):
+        raise ValueError(f"{session}:{pane}: saved stop publication has a different agent")
+    return ShowrunnerTerminalCleanup(member, herdr.HerdrPlace(session, pane), terminal,
+                                     RetirementShell(pid, start), original, agent, stop_publications)
+
+
+def retirement_publication_from_journal(raw: object, pane: str) -> pane_launch.PaneLaunch:
+    if not isinstance(raw, dict) or cast(dict[str, object], raw).get("pane_id") != pane:
+        raise ValueError(f"{pane}: invalid saved pane publication")
+    return cast(pane_launch.PaneLaunch, cast(object, raw))
+
+
+def save_showrunner_retirement(saved: ShowrunnerRetirementJournal) -> None:
+    if isinstance(saved, ForwardedShowrunnerRetirement):
+        row = saved.owner
+        facts: dict[str, object] = {}
+    else:
+        members = saved.members
+        row = members.owner
+        facts = {"cleanup_token": members.token,
+                 "cleanup_complete": isinstance(saved, CompletedShowrunnerCleanup),
+                 "workers": [{"row": worker.to_json()} for worker in members.workers]}
+        if isinstance(saved, PendingShowrunnerCleanup):
+            facts["panes"] = [
+                {"staff_id": target.member, "pane_session": target.place.session, "pane_id": target.place.pane,
+                 "pane_terminal": target.terminal, "shell_pid": target.shell.pid, "shell_start": target.shell.start,
+                 "publication": None if isinstance(target.publication, NoRetirementPublication) else target.publication,
+                 "stop_publications": target.stop_publications,
+                 **({"agent_pid": target.agent.pid, "agent_start": target.agent.start}
+                    if isinstance(target.agent, RetirementAgentProcess) else {})}
+                for target in saved.terminals]
+    journal = retirement_journal(row)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(journal, json.dumps({**facts, "completed_row": row.to_json()}) + "\n")
+
+
+def remove_showrunner_retired_units(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    retired = [(member, member.worktree) for member in record.find(kind="unit", parent=row.id)
+               if isinstance(member.worktree, staff.RemovedWorktree)]
+    if not retired:
+        return True
+    settings = conf.read("production")
+    for member, location in retired:
+        try:
+            unit = retirement_find_unit(row.name, str(member.id), record=record)
+            if remove_retired_record(unit, location, record, settings=settings) == 0:
+                continue
+        except (RetirementRefused, RetirementBeforeRemoval, RetirementDeferred, staff.StaffNotFound,
+                *RETIREMENT_IO_ERRORS) as error:
+            print(f"{row.name}: cannot remove retired unit {member.name} ({member.id}). {error}")
+            return False
+        print(f"{row.name}: cannot remove retired unit {member.name} ({member.id}).")
+        return False
+    return True
+
+
+def showrunner_retirement_machine(row: staff.StaffRow) -> str:
+    machine = stop_resume.member_machine(row)
+    if not machine:
+        raise ValueError(f"{row.name}: the showrunner's session machine is unknown")
+    return machine
+
+
+def retire_showrunner_here(row: staff.StaffRow) -> int:
+    machine = showrunner_retirement_machine(row)
+    if not unit_machine_is_local(machine):
+        raise ValueError(f"{row.name}: the showrunner belongs to {machine}")
+    with staff.slot_operation(row.id, row.name):
+        authority = staff.authority_snapshot()
+        current = authority.by_id(row.id)
+        if current is not None:
+            if current.to_json() != row.to_json():
+                raise staff.StaffRefused(f"{row.name}: the showrunner changed before retirement")
+            staff.require_showrunner_retirable(row, authority.rows)
+            workers = authority.find(kind="worker", parent=row.id)
+            record = authority
+            with retirement_member_locks(row, record):
+                terminals = retiring_showrunner_terminals(row, workers, record)
+                if not remove_showrunner_retired_units(row, record):
+                    return 1
+                members = ShowrunnerCleanupMembers(row, uuid4().hex, tuple(workers))
+                saved = PendingShowrunnerCleanup(members, terminals)
+                save_showrunner_retirement(saved)
+                staff.remove_showrunner_for_retirement(row, workers, members.token)
+                if not finish_showrunner_retirement(saved, record):
+                    return 1
+        else:
+            saved = read_showrunner_retirement(row)
+            if isinstance(saved, NoRetirementJournal):
+                return int(missing_retirement_journal(row.id, authority) is RetirementResult.PENDING)
+            if isinstance(saved, ForwardedShowrunnerRetirement):
+                raise ValueError("the session host has no showrunner cleanup facts")
+            workers = saved.members.workers
+            member_ids = {row.id, *(worker.id for worker in workers)}
+            record = staff.StaffSnapshot((row, *workers, *(member for member in authority.rows if member.id not in member_ids)))
+            with retirement_member_locks(row, record):
+                if not finish_showrunner_retirement(saved, record):
+                    return 1
+    print(f"{row.name} retired")
+    return 0
+
+
+def prove_showrunner_stop_publication(target: ShowrunnerTerminalCleanup, member: staff.StaffRow,
+                                      action: pane_launch.StopPublicationAction, entry: pane_launch.PaneLaunch,
+                                      record: staff.StaffSnapshot) -> bool:
+    agent = target.agent
+    if (isinstance(agent, UnprovedRetirementAgent) or entry.get("pid") != agent.pid
+            or entry.get("proc_start") != agent.start
+            or pane_launch.launch_reference(entry, record) != pane_launch.StaffLaunchReference(member.id)):
+        return False
+    try:
+        client = herdr.Herdr(target.place.session)
+        address = target.place.pane
+        pane = client.pane_row(address)
+        if isinstance(pane, herdr.NoPane) or pane.get("terminal_id") != target.terminal:
+            return False
+        info = showrunner_pane_info(client, address)
+        if showrunner_shell(info) != target.shell:
+            return False
+        if action is pane_launch.StopPublicationAction.SEED:
+            foreground = herdr.foreground_pane_conversation(info, pane)
+            started = process_start.process_start(agent.pid)
+            if (not isinstance(foreground, pane_launch.ProvedPaneConversation)
+                    or (foreground.identity, foreground.pid) != (member.current_session, agent.pid)
+                    or not isinstance(started, process_start.Started) or started.start != agent.start):
+                return False
+        current = client.pane_row(address)
+        return not isinstance(current, herdr.NoPane) and current.get("terminal_id") == target.terminal
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+        return False
+
+
+def stop_showrunner_members(saved: PendingShowrunnerCleanup, record: staff.StaffSnapshot
+                            ) -> tuple[PendingShowrunnerCleanup, list[str]]:
+    pending = saved
+    indices = {(target.place.session, target.place.pane): index for index, target in enumerate(saved.terminals)}
+
+    def capture(path: Path, edit: pane_launch.StopPublicationEdit,
+                previous: pane_launch.PaneLaunch | pane_launch.UnpublishedStopPane,
+                entry: pane_launch.PaneLaunch) -> bool:
+        nonlocal pending
+        index = indices.get((path.stem, edit.pane))
+        if index is None:
+            return False
+        target = pending.terminals[index]
+        member = record.by_id(target.member)
+        if member is None:
+            return False
+        if isinstance(previous, pane_launch.UnpublishedStopPane):
+            if not isinstance(target.publication, NoRetirementPublication):
+                return False
+        elif not target.accepts_publication(previous):
+            return False
+        if not prove_showrunner_stop_publication(target, member, edit.action, entry, record):
+            return False
+        # Save the new value while the pane publication lock is held.
+        # Keep the previous values for a failure before publication.
+        updated = replace(target, stop_publications=(*target.stop_publications, entry))
+        journal = replace(pending, terminals=(*pending.terminals[:index], updated, *pending.terminals[index + 1:]))
+        save_showrunner_retirement(journal)
+        pending = journal
+        return True
+
+    with pane_launch.capture_stop_publications(capture):
+        _, reasons = retirement_stop_members(saved.members.owner, record)
+    return pending, reasons
+
+
+def finish_showrunner_retirement(saved: PendingShowrunnerCleanup | CompletedShowrunnerCleanup,
+                                 record: staff.StaffSnapshot) -> bool:
+    members = saved.members
+    row = members.owner
+    authority = staff.authority_snapshot()
+    receipt = authority.retirement_cleanup.get(row.id)
+    expected = staff.ShowrunnerRetirementReceipt(members.token, showrunner_retirement_machine(row))
+    if authority.by_id(row.id) is not None or (
+            receipt != expected and not (isinstance(saved, CompletedShowrunnerCleanup) and receipt is None)):
+        raise ValueError("the staff record does not confirm showrunner retirement")
+    if isinstance(saved, PendingShowrunnerCleanup):
+        with staff.supplied_snapshot(record), worker_panes.defer_worker_anomalies():
+            pending, reasons = stop_showrunner_members(saved, record)
+            if reasons:
+                report_retirement_cleanup(row, "Session cleanup is incomplete", ". ".join(dict.fromkeys(reasons)))
+                return False
+            if not close_showrunner_terminals(row, pending.terminals):
+                return False
+        save_showrunner_retirement(CompletedShowrunnerCleanup(members))
+    restart_members = [row.id, *(worker.id for worker in members.workers)]
+    if not staff.is_owner():
+        shutdown_record.forget([str(member) for member in restart_members])
+    notifier = SCRIPTS / "message/notifier.sh"
+    timer = showrunners.timer_name(row.id, record)
+    removed = retirement_run([str(notifier), "remove", timer])
+    if removed.returncode:
+        raise ValueError(f"cannot remove update timer {timer}: {retirement_failure(removed)}")
+    staff.finish_unit_retirement(row.id, members.token, restart_members=restart_members)
+    if row.id in staff.authority_snapshot().retirement_cleanup:
+        raise ValueError("the showrunner cleanup receipt remains")
+    retirement_journal(row).unlink(missing_ok=True)
+    return True
+
+
+def retire_showrunner(row: staff.StaffRow) -> int:
+    try:
+        record = staff.authority_snapshot()
+        if record.by_id(row.id) is not None:
+            staff.require_showrunner_retirable(row, record.rows)
+        machine = showrunner_retirement_machine(row)
+        if unit_machine_is_local(machine):
+            return retire_showrunner_here(row)
+        require_showrunner_retirement_route(machine)
+        with staff.slot_operation(row.id, row.name):
+            save_showrunner_retirement(ForwardedShowrunnerRetirement(row))
+            code = request_remote_showrunner_retirement(row.id, machine, ["_retire-showrunner"],
+                                                        stdin=json.dumps(row.to_json()))
+            if not code:
+                retirement_journal(row).unlink(missing_ok=True)
+            return code
+    except (RetirementDeferred, staff.StaffNotFound, *RETIREMENT_IO_ERRORS) as error:
+        if os.path.lexists(retirement_journal(row)):
+            report_retirement_cleanup(row, "Retirement is incomplete", str(error))
+        else:
+            report_retirement_before_removal(row.id, str(error))
+        return 1
+
+
+def require_showrunner_retirement_route(machine: str) -> None:
+    route = remote.machine_alias(machine)
+    if isinstance(route, remote.MachineNameRefused):
+        raise ValueError(route.reason)
+    if route.alias != other_machine():
+        raise ValueError(f"no retirement route to {machine}")
+
+
+def request_remote_showrunner_retirement(identity: staff.StaffId, machine: str, arguments: list[str],
+                                         *, stdin: str = "") -> int:
+    code, output = run_remote(arguments, stdin=stdin, limit=remote.WhileLinkAlive(kind="while link alive"))
+    if output:
+        print(output)
+    if code == 255:
+        raise ValueError(f"cannot confirm retirement on {machine}")
+    if not code and identity in staff.authority_snapshot().retirement_cleanup:
+        raise ValueError("the showrunner cleanup receipt remains")
+    return code
+
+
+def retry_showrunner_retirement_here(identity: staff.StaffId) -> int:
+    record = staff.authority_snapshot()
+    if record.by_id(identity) is not None:
+        raise ValueError("the showrunner staff row still exists")
+    receipt = record.retirement_cleanup.get(identity)
+    if isinstance(receipt, staff.ShowrunnerRetirementReceipt) and not unit_machine_is_local(receipt.machine):
+        raise ValueError(f"the showrunner cleanup belongs to {receipt.machine}")
+    completed = retirement_receipt(identity, record, kind="showrunner")
+    if isinstance(completed, NoRetirementReceipt):
+        return int(missing_retirement_journal(identity, record) is RetirementResult.PENDING)
+    return retire_showrunner_here(completed)
+
+
+def retirement_showrunner_command(arguments: list[str]) -> int:
+    try:
+        if arguments:
+            return retry_showrunner_retirement_here(staff.native_id(arguments[0]))
+        row = staff.StaffRow.from_json(cast(object, json.load(sys.stdin)))
+        if row.kind != "showrunner":
+            raise ValueError("the retirement request requires a showrunner")
+        return retire_showrunner_here(row)
+    except (RetirementDeferred, staff.StaffNotFound, *RETIREMENT_IO_ERRORS) as error:
+        print(f"Retire showrunner: {error}")
+        return 1
 
 
 def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, record: staff.StaffSnapshot,
@@ -3051,16 +3619,32 @@ def unit_production_name(row: staff.StaffRow, record: staff.StaffSnapshot) -> st
 
 
 def retirement_completion_for_reference(name: str, record: staff.StaffSnapshot) -> int | None:
+    identity = staff.StaffId(name)
+    receipt = record.retirement_cleanup.get(identity)
+    if isinstance(receipt, staff.ShowrunnerRetirementReceipt):
+        try:
+            if unit_machine_is_local(receipt.machine):
+                return retry_showrunner_retirement_here(identity)
+            require_showrunner_retirement_route(receipt.machine)
+            code = request_remote_showrunner_retirement(identity, receipt.machine, ["_retire-showrunner", identity])
+            if not code:
+                (retirement_journal_folder() / f"{identity}.json").unlink(missing_ok=True)
+            return code
+        except (RetirementDeferred, staff.StaffNotFound, *RETIREMENT_IO_ERRORS) as error:
+            print(f"{identity}: showrunner cleanup is incomplete. {error}")
+            print(f"Run agents retire {identity} again.")
+            return 1
     try:
-        completed = retired_unit_receipt(name, record)
+        completed = retirement_receipt(name, record)
     except RetirementDeferred as error:
         reason = " ".join(str(error).splitlines()).rstrip(".")
         print(f"Cleanup is incomplete: {reason}.")
         return 0
-    if completed is not None:
+    if not isinstance(completed, NoRetirementReceipt):
+        if completed.kind == "showrunner":
+            return retire_showrunner(completed)
         return retirement_complete(completed)
-    identity = staff.StaffId(name)
-    if identity in record.retirement_cleanup:
+    if receipt is not None:
         if not os.path.lexists(retirement_journal_folder() / f"{identity}.json"):
             return missing_retirement_journal(identity, record).code
         print(f"Cleanup is incomplete: cannot read the cleanup facts for {identity}.")

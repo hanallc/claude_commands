@@ -27,7 +27,7 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
-from scripts.agents import set_model, status_entry, test_stop_resume, worker_lifecycle
+from scripts.agents import set_model, shutdown_record, status_entry, test_stop_resume, worker_lifecycle
 from scripts.build_queue import admission_records
 from scripts.direct import progress_history
 from scripts.copies import copies
@@ -707,6 +707,441 @@ class RetireUnitTests(ShutdownRepositoryFixture):
     @cached_property
     def pane_world(self) -> PaneWorld:
         return PaneWorld()
+
+    def test_showrunner_retirement_names_the_directors_that_block_it(self) -> None:
+        unit = staff.by_id(self.unit_staff_id)
+        assert unit is not None and isinstance(unit.parent, staff.ReportsTo)
+        _ = fixture_member("unit", name="beta", parent=unit.parent.id)
+        parent = fixture_member("showrunner", name="parent-production")
+        child = fixture_member("showrunner", name="child-production", parent=parent.id)
+        unknown = fixture_member("showrunner", name="unknown-machine")
+        before = self.staff.staff_file.read_bytes()
+        for scenario, reference, messages in (
+            ("two active units", unit.parent.id, ("Retire or transfer these units first: alpha, beta.",)),
+            ("child showrunner", parent.name, (f"Detach or retire these child showrunners first: {child.name}.",)),
+            ("a shared bare name", "alpha", (unit.id, unit.parent.id, "Use a staff ID")),
+            ("unknown session machine", unknown.name, ("the showrunner's session machine is unknown",)),
+        ):
+            with self.subTest(scenario=scenario):
+                code, output = self.retire(reference=reference)
+                self.assertNotEqual(code, 0, output)
+                for message in messages:
+                    self.assertIn(message, output)
+                self.assertEqual(self.staff.staff_file.read_bytes(), before)
+                self.assertEqual(self.stops(), [])
+
+    def test_showrunner_retirement_checks_and_removes_its_old_unit_records(self) -> None:
+        for scenario in ("unmerged local tip", "merged tips"):
+            with self.subTest(scenario=scenario), ExitStack() as cleanup:
+                case = RetireUnitTests()
+                _ = cleanup.callback(case.doCleanups)
+                case.setUp()
+                case.park_without_worktree()
+                _ = case.stop_session(DIRECTOR)
+                _ = case.stop_session(SEAT)
+                record = staff.snapshot()
+                unit = record.by_id(case.unit_staff_id)
+                assert unit is not None
+                parent = record.parent_of(unit)
+                assert parent is not None
+                workers = record.find(kind="worker", parent=unit.id)
+                if scenario == "unmerged local tip":
+                    _ = git(case.checkout, "checkout", "alpha-branch")
+                    _ = (case.checkout / "work.txt").write_text("Unmerged unit work\n", encoding="utf-8")
+                    _ = git(case.checkout, "commit", "-qam", "Unmerged unit work")
+                    _ = git(case.checkout, "checkout", "main")
+                with copies.standing(str(unit.id), case.checkout, copies.CommittedSource("HEAD")) as tree:
+                    kept_file = tree / case.doc.name
+                    contents = kept_file.read_bytes()
+                    first_stop = len(case.stops())
+                    before = case.staff.staff_file.read_bytes()
+                    local_refs = git(case.checkout, "for-each-ref")
+                    origin_refs = git(case.root / "origin.git", "for-each-ref")
+                    code, output = case.retire(reference=parent.id)
+                    current = staff.authority_snapshot()
+                    if scenario == "unmerged local tip":
+                        self.assertNotEqual(code, 0, output)
+                        self.assertIn(unit.name, output)
+                        self.assertIn("unmerged", output)
+                        self.assertEqual(case.staff.staff_file.read_bytes(), before)
+                        self.assertEqual(case.stops()[first_stop:], [])
+                    else:
+                        self.assertEqual(code, 0, output)
+                        self.assertIsNone(current.by_id(parent.id))
+                        self.assertIsNone(current.by_id(unit.id))
+                        self.assertEqual(current.find(kind="worker", parent=unit.id), [])
+                        for worker in workers:
+                            self.assertIsNone(current.by_id(worker.id))
+                        self.assertEqual(case.stops()[first_stop:], [["stop_resume.stop", parent.current_session]])
+                    self.assertEqual(git(case.checkout, "for-each-ref"), local_refs)
+                    self.assertEqual(git(case.root / "origin.git", "for-each-ref"), origin_refs)
+                    self.assertEqual(kept_file.read_bytes(), contents)
+
+    def test_showrunner_retirement_stops_its_workers_and_keeps_the_production_files(self) -> None:
+        merge_tip = git(self.checkout, "rev-parse", "main")
+        origin_tip = git(self.root / "origin.git", "rev-parse", "main")
+        unit = staff.by_id(self.unit_staff_id)
+        assert unit is not None
+        workers = staff.snapshot().find(kind="worker", parent=self.unit_staff_id)
+        world = self.pane_world
+        process_root = self.root / "showrunner-processes"
+
+        def read_process(pid: int) -> process_start.ProcessStart:
+            return process_start.proc_table_start(pid, process_root)
+
+        def read_agent_start(pid: int) -> str | None:
+            observed = read_process(pid)
+            return observed.start if isinstance(observed, process_start.Started) else None
+
+        def read_agent_session(config_dir: str, pid: int) -> str:
+            self.assertEqual(config_dir, str(self.config))
+            return world.processes[pid].current_identity
+
+        def read_agent_environment(pid: int) -> dict[str, str]:
+            return {**world.processes[pid].environment, "CLAUDE_CONFIG_DIR": str(self.config)}
+
+        def stop_fixture_process(identity: str, kind: str = "", *,
+                                 codex: herdr.CodexConversations | None = None) -> StopResult:
+            del kind, codex
+            return self.stop_session(identity)
+
+        _ = self.enterContext(mock.patch.object(process_start, "process_start", side_effect=read_process))
+        _ = self.enterContext(mock.patch.object(sessions, "process_start", side_effect=read_agent_start))
+        _ = self.enterContext(mock.patch.object(pane_record, "_process_environment", side_effect=read_agent_environment))
+        _ = self.enterContext(mock.patch.object(pane_record, "_account_local_conversation", side_effect=read_agent_session))
+        _ = self.enterContext(mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
+        _ = self.enterContext(mock.patch.object(stop_resume, "stop", STOP_SESSION))
+        _ = self.enterContext(mock.patch.object(stop_resume, "_stop", side_effect=stop_fixture_process))
+
+        def process_stat(pid: int) -> Path:
+            return process_root / str(pid) / "stat"
+
+        def publish_process(pid: int) -> str:
+            path = process_stat(pid)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            start = str(pid * 10)
+            _ = path.write_text(f"{pid} (fixture) S " + "0 " * 18 + f"{start}\n", encoding="utf-8")
+            return start
+
+        def publish_pane(member: staff.StaffRow, pane: str, *, live: bool = True, tab: str = "w2:t2",
+                         publish: bool = True) -> None:
+            world.add(member, pane, live=live, workspace="w2", tab=tab)
+            world.shells[pane] = 998300 + int(pane.rsplit(":p", 1)[1])
+            _ = publish_process(world.shells[pane])
+            if publish:
+                world.record(member, pane)
+            if live:
+                pid = world.foreground[pane][0]
+                started = publish_process(pid)
+                if publish:
+                    entry = pane_record.read_strict(world.session)[pane]
+                    entry["pid"], entry["proc_start"] = pid, started
+                    pane_record.write(world.session, entry)
+
+        pane_path = pane_record.record_path(world.session)
+        owned_panes = {"w2:p1", "w2:p2"}
+
+        def read_owned_publications() -> dict[str, pane_launch.PaneLaunch]:
+            return {pane: entry for pane, entry in pane_record.read_strict(world.session).items() if pane in owned_panes}
+
+        def remove_fixture_panes() -> None:
+            for pane in tuple(world.locations):
+                if pane != "w1:p2":
+                    world.remove_pane(pane)
+            for pane in tuple(world.shells):
+                if pane.startswith("w2:"):
+                    del world.shells[pane]
+
+        for scenario, machine in (("stop creates the showrunner publication", remote.local_machine()),
+                                  ("local", remote.local_machine()), ("remote", "mac"),
+                                  ("retry", remote.local_machine())):
+            with self.subTest(scenario=scenario), ExitStack() as patches:
+                name = scenario.replace(" ", "-")
+                doc = self.checkout / f"{name}-production.md"
+                document = self.doc.read_bytes()
+                _ = doc.write_bytes(document)
+                owner = fixture_member("showrunner", name=f"{name}-production", doc=staff.LiveDoc(machine, doc))
+                worker = fixture_member("worker", name="reviewer", parent=owner.id)
+                publish_pane(owner, "w2:p1", publish=scenario != "stop creates the showrunner publication")
+                publish_pane(worker, "w2:p2")
+                self.claude.extend([session(owner.current_session, owner.name, 4201),
+                                    session(worker.current_session, worker.name, 4202)])
+                first_stop = len(self.stops())
+                if scenario == "remote":
+                    _ = patches.enter_context(mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call))
+                if scenario == "stop creates the showrunner publication":
+                    self.assertNotIn("w2:p1", read_owned_publications())
+                    close = world.close_tab_confirmed
+
+                    def close_after_publication(pane: str, *, target: str = "", terminal: str = "") -> bool:
+                        if pane == "w2:p1":
+                            self.assertTrue(read_owned_publications()[pane].get("ended"))
+                        return close(pane, target=target, terminal=terminal)
+
+                    _ = patches.enter_context(mock.patch.object(world, "close_tab_confirmed", side_effect=close_after_publication))
+                if scenario == "retry":
+                    with mock.patch.object(staff, "finish_unit_retirement", side_effect=OSError("fixture receipt write failed")):
+                        code, output = self.retire(reference=owner.name)
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn(f"Run agents retire {owner.id} again.", output)
+                    self.assertIsNone(staff.by_id(owner.id))
+                    self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                    code, output = self.retire(reference=str(owner.id))
+                else:
+                    code, output = self.retire(reference=owner.name)
+                self.assertEqual(code, 0, output)
+                current = staff.authority_snapshot()
+                self.assertIsNone(current.by_id(owner.id))
+                self.assertIsNone(current.by_id(worker.id))
+                self.assertNotIn(owner.id, current.retirement_cleanup)
+                self.assertEqual(current.by_id(self.unit_staff_id), unit)
+                self.assertEqual(current.find(kind="worker", parent=self.unit_staff_id), workers)
+                self.assertCountEqual(self.stops()[first_stop:], [
+                    ["stop_resume.stop", owner.current_session],
+                    ["stop_resume.stop", worker.current_session],
+                ])
+                self.assertEqual({pane["pane_id"] for pane in self.pane_world.panes()}, {"w1:p2"})
+                self.assertEqual(read_owned_publications(), {})
+                self.assertEqual(doc.read_bytes(), document)
+                self.assertEqual(git(self.checkout, "rev-parse", "main"), merge_tip)
+                self.assertEqual(git(self.root / "origin.git", "rev-parse", "main"), origin_tip)
+
+        for scenario in ("retry after stop changes publications", "retry keeps a resumed publication",
+                         "retry after a publication write is interrupted"):
+            with self.subTest(scenario=scenario), ExitStack() as cleanup:
+                _ = cleanup.callback(remove_fixture_panes)
+                name = scenario.replace(" ", "-")
+                doc = self.checkout / f"{name}.md"
+                _ = doc.write_bytes(self.doc.read_bytes())
+                owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
+                worker = fixture_member("worker", name="reviewer", parent=owner.id)
+                publish_pane(owner, "w2:p1")
+                publish_pane(worker, "w2:p2")
+                self.claude.extend([session(owner.current_session, owner.name, 4201),
+                                    session(worker.current_session, worker.name, 4202)])
+                before = read_owned_publications()
+
+                if scenario == "retry after a publication write is interrupted":
+                    publish = atomic_file.write_text_atomic
+
+                    def interrupt_after_publish(path: Path, content: str, *, new_file_mode: int | None = None,
+                                                before_replace: Callable[[], None] | None = None) -> None:
+                        publish(path, content, new_file_mode=new_file_mode, before_replace=before_replace)
+                        if path == pane_path:
+                            raise KeyboardInterrupt("fixture interruption after publication")
+
+                    with (mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupt_after_publish),
+                          self.assertRaisesRegex(KeyboardInterrupt, "fixture interruption after publication")):
+                        _ = self.retire(reference=owner.name)
+                    self.assertNotEqual(read_owned_publications()["w2:p1"]["written_at"], before["w2:p1"]["written_at"])
+                else:
+                    with mock.patch.object(world, "close_tab_confirmed", side_effect=OSError("fixture pane close failed")):
+                        code, output = self.retire(reference=owner.name)
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn("fixture pane close failed", output)
+                    after = read_owned_publications()
+                    for pane in owned_panes:
+                        self.assertNotEqual(after[pane]["written_at"], before[pane]["written_at"])
+                        self.assertTrue(after[pane].get("ended"))
+                self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+
+                remaining: dict[str, pane_launch.PaneLaunch] = {}
+                if scenario == "retry keeps a resumed publication":
+                    resumed = read_owned_publications()["w2:p2"]
+                    resumed["ended"] = False
+                    pane_record.write(world.session, resumed)
+                    remaining["w2:p2"] = resumed
+                code, output = self.retire(reference=owner.id)
+                self.assertEqual(code, 0, output)
+                self.assertNotIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                self.assertEqual({pane["pane_id"] for pane in world.panes()}, {"w1:p2"})
+                self.assertEqual(read_owned_publications(), remaining)
+
+        for scenario, machine in (
+            ("two published idle worker panes", remote.local_machine()),
+            ("a stale publication points to an unrelated idle shell", remote.local_machine()),
+            ("retry from the peer", "mac"),
+            ("receipt without a session host journal", "mac"),
+            ("restart record write fails", remote.local_machine()),
+            ("timer removal fails", remote.local_machine()),
+        ):
+            with self.subTest(scenario=scenario), ExitStack() as cleanup:
+                _ = cleanup.callback(remove_fixture_panes)
+                name = scenario.replace(" ", "-")
+                doc = self.checkout / f"{name}.md"
+                _ = doc.write_bytes(self.doc.read_bytes())
+                owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(machine, doc))
+                worker = fixture_member("worker", name="reviewer", parent=owner.id)
+                publish_pane(owner, "w2:p1")
+                two_idle_panes = scenario == "two published idle worker panes"
+                stale_publication = scenario == "a stale publication points to an unrelated idle shell"
+                publish_pane(worker, "w2:p2", live=not two_idle_panes)
+                self.claude.append(session(owner.current_session, owner.name, 4201))
+                if two_idle_panes:
+                    publish_pane(worker, "w2:p3", live=False, tab="w2:t3")
+                    publish_pane(owner, "w2:p4", live=False, tab="w2:t4")
+                elif stale_publication:
+                    process_stat(world.foreground["w2:p2"][0]).unlink()
+                    world.remove_pane("w2:p2")
+                    world.add(unit, "w2:p2", live=False, terminal="unrelated-terminal", workspace="w2", tab="w2:t2")
+                    world.shells["w2:p2"] = 998500
+                    _ = publish_process(world.shells["w2:p2"])
+                else:
+                    self.claude.append(session(worker.current_session, worker.name, 4202))
+                if two_idle_panes or stale_publication:
+                    before_staff = staff.record_path().read_bytes()
+                    before_panes = world.panes()
+                    before_stops = self.stops()
+                    before_publications = pane_record.read_strict(world.session)
+                    code, output = self.retire(reference=owner.name)
+                    self.assertNotEqual(code, 0, output)
+                    self.assertEqual(staff.record_path().read_bytes(), before_staff)
+                    self.assertEqual(world.panes(), before_panes)
+                    self.assertEqual(self.stops(), before_stops)
+                    self.assertEqual(pane_record.read_strict(world.session), before_publications)
+                    self.assertIn(f"{world.session}:w2:p2", output)
+                    if two_idle_panes:
+                        self.assertIn(f"{world.session}:w2:p3", output)
+                    self.assertIn("Close these panes, then retire again.", output)
+                    continue
+                restart_ids = [str(owner.id), str(worker.id)]
+                timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
+                if machine == "mac":
+                    with mock.patch.object(staff, "finish_unit_retirement", side_effect=OSError("fixture receipt write failed")):
+                        code, output = self.remote_call(["retire", owner.name])
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                    if scenario == "receipt without a session host journal":
+                        peer_journal = self.root / "remote-shutdown/retire-worktrees" / f"{owner.id}.json"
+                        peer_journal.unlink()
+                    with mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call):
+                        code, output = self.retire(reference=owner.id)
+                    if scenario == "receipt without a session host journal":
+                        self.assertNotEqual(code, 0, output)
+                        self.assertIn("cleanup facts are missing", output)
+                        self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                        continue
+                else:
+                    with ExitStack() as failures:
+                        if scenario == "restart record write fails":
+                            shutdown_record.update(started=[], pending=restart_ids)
+                            def fail_restart_write(path: Path, content: str) -> None:
+                                self.assertIsInstance(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable)
+                                raise OSError(f"fixture restart record write failed at {path} for {content.strip()}")
+                            _ = failures.enter_context(mock.patch.object(shutdown_record, "write_text_atomic",
+                                side_effect=fail_restart_write))
+                        else:
+                            timer.mkdir()
+                            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\n", encoding="utf-8")
+                            def fail_timer(argv: list[str], cwd: Path | None = None, *,
+                                           settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                                           ) -> subprocess.CompletedProcess[str]:
+                                if Path(argv[0]).name == "notifier.sh":
+                                    raise OSError("fixture timer removal failed")
+                                return self.fake_run(argv, cwd, settings=settings)
+                            _ = failures.enter_context(mock.patch.object(shutdown, "retirement_run", side_effect=fail_timer))
+                        code, output = self.retire(reference=owner.name)
+                    code_before_retry, output_before_retry = code, output
+                    self.assertNotEqual(code_before_retry, 0, output_before_retry)
+                    self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                    if scenario == "restart record write fails":
+                        self.assertIn("fixture restart record write failed", output_before_retry)
+                        self.assertTrue(set(restart_ids) <= set(shutdown_record.read()))
+                    code, output = self.retire(reference=owner.id)
+                self.assertEqual(code, 0, output)
+                self.assertNotIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                self.assertEqual(read_owned_publications(), {})
+                if scenario == "restart record write fails":
+                    self.assertFalse(set(restart_ids) & set(shutdown_record.read()))
+                elif scenario == "timer removal fails":
+                    self.assertEqual(list(timer.glob("*")), [])
+
+        for member, behavior in (
+            ("worker", "terminal was replaced"),
+            ("showrunner", "terminal was replaced"),
+            ("worker", "idle terminal moved"),
+            ("showrunner", "idle terminal moved"),
+            ("worker", "terminal moved with live work"),
+            ("worker", "terminal moved with unreadable process evidence"),
+        ):
+            with self.subTest(scenario=f"{member} {behavior}"), ExitStack() as cleanup:
+                _ = cleanup.callback(remove_fixture_panes)
+                name = f"{member} {behavior}".replace(" ", "-")
+                doc = self.checkout / f"{name}.md"
+                _ = doc.write_bytes(self.doc.read_bytes())
+                owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
+                worker = fixture_member("worker", name="reviewer", parent=owner.id)
+                publish_pane(owner, "w2:p1")
+                publish_pane(worker, "w2:p2")
+                self.claude.extend([session(owner.current_session, owner.name, 4201),
+                                    session(worker.current_session, worker.name, 4202)])
+                old = "w2:p2" if member == "worker" else "w2:p1"
+                replaced = behavior == "terminal was replaced"
+                two_live_panes = member == "worker" and behavior == "idle terminal moved"
+                with ExitStack() as failures:
+                    _ = failures.enter_context(mock.patch.object(world, "close_tab_confirmed",
+                        side_effect=OSError("fixture pane close failed")))
+                    if two_live_panes:
+                        publish_pane(worker, "w2:p4", tab="w2:t4")
+                    if replaced or two_live_panes:
+                        exit_pane = old if replaced else "w2:p4"
+                        remove_staff = staff.remove_showrunner_for_retirement
+
+                        def remove_staff_as_one_process_exits(
+                            row: staff.StaffRow, workers: Sequence[staff.StaffRow], token: str,
+                        ) -> None:
+                            remove_staff(row, workers, token)
+                            pid = world.foreground[exit_pane][0]
+                            if replaced:
+                                exited = world.processes[pid].current_identity
+                                self.claude = [item for item in self.claude if item["sessionId"] != exited]
+                            process_stat(pid).unlink()
+                            world.end_agent(exit_pane)
+
+                        _ = failures.enter_context(mock.patch.object(staff, "remove_showrunner_for_retirement",
+                            side_effect=remove_staff_as_one_process_exits))
+                    code, output = self.retire(reference=owner.name)
+                self.assertNotEqual(code, 0, output)
+                self.assertIn("fixture pane close failed", output)
+                self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                journal = shutdown.retirement_journal(owner)
+                before_journal = journal.read_bytes()
+                terminal = str(world.locations[old]["terminal_id"])
+                shell = world.shells[old]
+                world.remove_pane(old)
+                world.add(unit, old, live=False, terminal="replacement-terminal", workspace="w2", tab="w2:t2")
+                world.shells[old] = 998500
+                moved = "w2:p3"
+                if replaced:
+                    process_stat(shell).unlink()
+                else:
+                    world.add(unit, moved, live=False, terminal=terminal, workspace="w2", tab="w2:t3")
+                    world.shells[moved] = shell
+                    world.record(unit, old)
+                replacement_publication = pane_record.read_strict(world.session)[old]
+                if behavior == "terminal moved with live work":
+                    world.activate(unit.current_session, moved, "claude")
+                elif behavior == "terminal moved with unreadable process evidence":
+                    _ = process_stat(shell).write_text("unreadable", encoding="utf-8")
+
+                code, output = self.retire(reference=owner.id)
+                self.assertEqual(world.locations.get(old, {}).get("terminal_id"), "replacement-terminal")
+                self.assertIn(f"{old}: terminal identity changed", output)
+                if behavior in ("terminal moved with live work", "terminal moved with unreadable process evidence"):
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn("Pane cleanup is incomplete", output)
+                    self.assertIn(f"{world.session}:{moved}", output)
+                    self.assertEqual(world.locations[moved]["terminal_id"], terminal)
+                    self.assertEqual(journal.read_bytes(), before_journal)
+                    self.assertIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                else:
+                    self.assertEqual(code, 0, output)
+                    self.assertNotIn(owner.id, staff.authority_snapshot().retirement_cleanup)
+                    self.assertEqual({pane["pane_id"] for pane in world.panes()}, {"w1:p2", old})
+                if replaced:
+                    self.assertNotIn(old, pane_record.read_strict(world.session))
+                else:
+                    self.assertEqual(pane_record.read_strict(world.session)[old], replacement_publication)
 
     def test_retirement_removes_the_unit_record_worktree_and_branch(self) -> None:
         from scripts.production import census, unit_phases, live_units
@@ -1753,7 +2188,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                  settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
         """Git runs for real; every other command is recorded and answered."""
         del settings
-        if argv[0] == "git":
+        if argv[0] == "git" or Path(argv[0]).name == "notifier.sh":
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
         self.calls.append(call)

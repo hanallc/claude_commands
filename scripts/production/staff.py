@@ -268,8 +268,17 @@ class RetirementCheckoutClaim:
                 "recorded_path": str(self.recorded_path)}
 
 
+@dataclass(frozen=True)
+class ShowrunnerRetirementReceipt:
+    token: str
+    machine: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"token": self.token, "showrunner_machine": self.machine}
+
+
 # Older receipts carry only the token.
-RetirementCleanupReceipt = RetirementCheckoutClaim | str
+RetirementCleanupReceipt = RetirementCheckoutClaim | ShowrunnerRetirementReceipt | str
 
 
 @dataclass(frozen=True)
@@ -1632,13 +1641,16 @@ def _retirement_receipt(value: object) -> RetirementCleanupReceipt:
             if (re.fullmatch(r"[0-9a-f]{32}", token) and machine and machine == machine.strip()
                     and Path(path).is_absolute() and Path(recorded).is_absolute()):
                 return RetirementCheckoutClaim(token, machine, Path(path), Path(recorded))
+        case {"token": str(token), "showrunner_machine": str(machine)}:
+            if re.fullmatch(r"[0-9a-f]{32}", token) and machine and machine == machine.strip():
+                return ShowrunnerRetirementReceipt(token, machine)
         case _:
             pass
     raise StaffUnreadable("invalid retirement cleanup receipt")
 
 
 def _retirement_receipts_json(receipts: Mapping[StaffId, RetirementCleanupReceipt]) -> dict[StaffId, object]:
-    return {identity: receipt.to_json() if isinstance(receipt, RetirementCheckoutClaim) else receipt
+    return {identity: receipt if isinstance(receipt, str) else receipt.to_json()
             for identity, receipt in receipts.items()}
 
 
@@ -2802,15 +2814,72 @@ def remove_unit_for_retirement(unit: StaffRow, parent: StaffRow, workers: Sequen
     _forget_restart(list(members))
 
 
-def finish_unit_retirement(identity: StaffId, token: str) -> None:
+def require_showrunner_retirable(showrunner: StaffRow, rows: Sequence[StaffRow]) -> None:
+    children = [row for row in rows if row.reports_to(showrunner.id)]
+    units = sorted(row.name for row in children
+                   if row.kind == "unit" and not isinstance(row.worktree, RemovedWorktree))
+    showrunners = sorted(row.name for row in children if row.kind == "showrunner")
+    reasons: list[str] = []
+    if units:
+        reasons.append(f"Retire or transfer these units first: {', '.join(units)}.")
+    if showrunners:
+        reasons.append(f"Detach or retire these child showrunners first: {', '.join(showrunners)}.")
+    if reasons:
+        raise StaffRefused(f"{showrunner.name}: {' '.join(reasons)}")
+
+
+def remove_showrunner_for_retirement(showrunner: StaffRow, workers: Sequence[StaffRow], token: str) -> None:
+    """Remove the showrunner and its workers with one cleanup receipt."""
+    if showrunner.kind != "showrunner" or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise StaffRefused("invalid showrunner retirement receipt")
+    if isinstance(showrunner.doc, DocUnfilled):
+        raise StaffRefused(f"{showrunner.name}: the showrunner's session machine is unknown")
+    receipt = ShowrunnerRetirementReceipt(token, showrunner.doc.machine)
+    if not is_owner():
+        _ = _remote(["retirement-cleanup", showrunner.id, "remove-showrunner", token], input_text=json.dumps({
+            "showrunner": showrunner.to_json(), "workers": [worker.to_json() for worker in workers],
+        }))
+    else:
+        def edit(rows: list[StaffRow], pending: set[StaffId], cleanup: dict[StaffId, RetirementCleanupReceipt]) -> None:
+            if _required(rows, showrunner.id).to_json() != showrunner.to_json():
+                raise StaffRefused(f"{showrunner.name}: the showrunner changed before retirement")
+            require_showrunner_retirable(showrunner, rows)
+            retired = sorted(row.name for row in rows if row.kind == "unit" and row.reports_to(showrunner.id))
+            if retired:
+                raise StaffRefused(f"{showrunner.name}: retired unit records remain: {', '.join(retired)}")
+            actual = {row.id: row.to_json() for row in rows if row.kind == "worker" and row.reports_to(showrunner.id)}
+            if actual != {worker.id: worker.to_json() for worker in workers}:
+                raise StaffRefused(f"{showrunner.name}: the showrunner's workers changed before retirement")
+            if showrunner.id in cleanup:
+                raise StaffRefused(f"{showrunner.name}: a retirement cleanup receipt already exists")
+            members = {showrunner.id, *actual}
+            rows[:] = [row for row in rows if row.id not in members]
+            pending.difference_update(members)
+            cleanup[showrunner.id] = receipt
+
+        _record_transaction(edit)
+
+
+def finish_unit_retirement(identity: StaffId, token: str, *, restart_members: Sequence[StaffId] = ()) -> None:
     """Remove the receipt for completed cleanup."""
     if not is_owner():
-        _ = _remote(["retirement-cleanup", identity, "finish", token])
+        _ = _remote(["retirement-cleanup", identity, "finish", token,
+                     *(f"--restart-member={member}" for member in restart_members)])
         return
+
+    cleaned_receipt = _load(initial=True).retirement_cleanup.get(identity) if restart_members else None
+    if isinstance(cleaned_receipt, ShowrunnerRetirementReceipt):
+        if cleaned_receipt.token != token or identity not in restart_members:
+            raise StaffRefused(f"{identity}: the showrunner cleanup receipt does not match")
+        _forget_restart(list(restart_members), require_success=True)
 
     def edit(_rows: list[StaffRow], _pending: set[StaffId], cleanup: dict[StaffId, RetirementCleanupReceipt]) -> None:
         receipt = cleanup.get(identity)
-        if (receipt.token if isinstance(receipt, RetirementCheckoutClaim) else receipt) == token:
+        if isinstance(receipt, ShowrunnerRetirementReceipt):
+            if receipt != cleaned_receipt:
+                raise StaffRefused(f"{identity}: the showrunner cleanup receipt does not match")
+            del cleanup[identity]
+        elif (receipt.token if isinstance(receipt, RetirementCheckoutClaim) else receipt) == token:
             del cleanup[identity]
 
     _record_transaction(edit)
@@ -2902,13 +2971,15 @@ def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> Retire
     return RetiredUnitRemoval.REMOVED
 
 
-def _forget_restart(staff_ids: list[StaffId]) -> None:
+def _forget_restart(staff_ids: list[StaffId], *, require_success: bool = False) -> None:
     """A removed row never restarts, so its id leaves this machine's restart record."""
     # The restart record sits above the writer, like the runtime checks.
     forget = cast(Callable[[list[str]], None], import_module("scripts.agents.shutdown_record").forget)
     try:
         forget([str(staff_id) for staff_id in staff_ids])
     except (OSError, ValueError) as error:
+        if require_success:
+            raise
         print(f"staff: restart record anomaly: {error}", file=sys.stderr)
 
 
@@ -3205,6 +3276,7 @@ class _Arguments:
     expected_workers: str = ""
     cleanup_action: str = ""
     cleanup_token: str = ""
+    restart_member: list[str] = []
     creation_action: str = ""
     marker: str = ""
     profile: str = ""
@@ -3354,8 +3426,9 @@ def _parser() -> argparse.ArgumentParser:
     _ = remove_unit.add_argument("--json", action="store_true")
     cleanup = verbs.add_parser("retirement-cleanup", help=argparse.SUPPRESS)
     _ = cleanup.add_argument("target")
-    _ = cleanup.add_argument("cleanup_action", choices=("remove", "finish"))
+    _ = cleanup.add_argument("cleanup_action", choices=("remove", "remove-showrunner", "finish"))
     _ = cleanup.add_argument("cleanup_token")
+    _ = cleanup.add_argument("--restart-member", action="append")
     _ = cleanup.add_argument("--json", action="store_true")
 
 
@@ -3523,23 +3596,28 @@ def _main(arguments: _Arguments) -> int:
     if arguments.verb == "retirement-cleanup":
         if not is_owner():
             raise StaffRefused("the staff owner must write the retirement cleanup receipt")
-        if arguments.cleanup_action == "remove":
+        if arguments.cleanup_action in ("remove", "remove-showrunner"):
             raw = _decode(sys.stdin.read())
             if not isinstance(raw, dict):
                 raise StaffRefused("invalid retirement cleanup request")
             fields = cast(dict[str, object], raw)
-            unit = StaffRow.from_json(fields.get("unit"))
+            member_key = "unit" if arguments.cleanup_action == "remove" else "showrunner"
+            member = StaffRow.from_json(fields.get(member_key))
             workers = fields.get("workers")
-            if unit.id != arguments.target or not isinstance(workers, list):
-                raise StaffRefused("the retirement cleanup request does not match the unit")
-            claim = fields.get("claim_path")
-            if claim is not None and (not isinstance(claim, str) or not Path(claim).is_absolute()):
-                raise StaffRefused("invalid retirement checkout path")
-            remove_unit_for_retirement(unit, StaffRow.from_json(fields.get("parent")),
-                [StaffRow.from_json(worker) for worker in cast(list[object], workers)], arguments.cleanup_token,
-                claim_path=Path(claim) if isinstance(claim, str) else None)
+            if member.id != arguments.target or not isinstance(workers, list):
+                raise StaffRefused(f"the retirement cleanup request does not match the {member_key}")
+            expected_workers = [StaffRow.from_json(worker) for worker in cast(list[object], workers)]
+            if arguments.cleanup_action == "remove-showrunner":
+                remove_showrunner_for_retirement(member, expected_workers, arguments.cleanup_token)
+            else:
+                claim = fields.get("claim_path")
+                if claim is not None and (not isinstance(claim, str) or not Path(claim).is_absolute()):
+                    raise StaffRefused("invalid retirement checkout path")
+                remove_unit_for_retirement(member, StaffRow.from_json(fields.get("parent")),
+                    expected_workers, arguments.cleanup_token, claim_path=Path(claim) if isinstance(claim, str) else None)
         else:
-            finish_unit_retirement(StaffId(arguments.target), arguments.cleanup_token)
+            finish_unit_retirement(StaffId(arguments.target), arguments.cleanup_token,
+                                   restart_members=[StaffId(member) for member in arguments.restart_member or ()])
         print("null")
         return 0
     if arguments.verb == "worktree-write-lock-status":
