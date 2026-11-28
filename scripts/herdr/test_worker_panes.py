@@ -467,11 +467,6 @@ class PaneWorld(herdr.Herdr):
 
     @override
     def socket_request(self, method: str, **params: object) -> dict[str, object]:
-        if method == "pane.process_info":
-            return self.result("pane", "process-info", "--pane", cast(str, params["pane_id"]))
-        if method == "pane.close":
-            _ = self.run("pane", "close", cast(str, params["pane_id"]))
-            return {}
         if method == "layout.set_split_ratio":
             pane = cast(str, params["pane_id"])
             ratio = cast(float, params["ratio"])
@@ -509,12 +504,8 @@ class PaneWorld(herdr.Herdr):
                 shell_environment.parent.mkdir(parents=True, exist_ok=True)
                 write_text_atomic(shell_environment, "\0".join(
                     f"{key}={value}" for key, value in self.shell_environments.get(pane, {}).items()) + "\0")
-                if pane in self.shell_environments:
-                    write_text_atomic(shell_environment.with_name("stat"),
-                                      f"{shell} (zsh) S 0 0 0 0 {shell} " + "0 " * 13 + "1\n")
-                    (shell_environment.parent / "task").mkdir(exist_ok=True)
             pid, name, argv = self.foreground.get(pane, (shell, "zsh", ["zsh"]))
-            return {"process_info": {"pane_id": pane, "shell_pid": shell, "foreground_process_group_id": pid,
+            return {"process_info": {"shell_pid": shell, "foreground_process_group_id": pid,
                                       "foreground_processes": [{"pid": pid, "name": name, "argv": argv,
                                                                 "cwd": (self.locations[pane].get("cwd", str(Path.cwd()))
                                                                         if pane in self.locations else str(Path.cwd()))}]}}

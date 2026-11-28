@@ -34,7 +34,7 @@ from uuid import UUID
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
-from scripts.lib import conf, models_registry, nix_env, process_start, unit_runs
+from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
 from scripts.production import session_staff, staff, worker_admission
@@ -1655,87 +1655,6 @@ def recover_design_launch(parent: StaffId, name: WorkerName, claim: staff.Design
             row = worker_admission.publish(allowed, native.current_identity, launch_home=home).row
             role: WorkerRole = "astra-designer" if claim.role == "designer" else "astra-reviewer"
             _ = staff.set_worker_role(row.id, staff.KnownWorkerRole(role))
-
-
-@dataclass(frozen=True)
-class DesignCloseForeground:
-    location: herdr.ExistingPane
-    pid: int
-    start_ticks: int
-    group: int
-    shell: int
-
-
-class DesignCloseTerminalUnrecorded(Enum):
-    FIRST_ATTEMPT = "the role has not recorded a terminal for close"
-
-
-def _design_close_foreground(client: herdr.Herdr, location: herdr.ExistingPane,
-                             owner: herdr.ForegroundPaneAgent | herdr.PaneAtShell) -> DesignCloseForeground:
-    info = herdr.json_object(client.socket_request("pane.process_info", pane_id=location.pane).get("process_info"),
-                             "design pane process info")
-    shell, group = info.get("shell_pid"), info.get("foreground_process_group_id")
-    if (info.get("pane_id") != location.pane or type(shell) is not int or type(group) is not int
-            or shell <= 0 or group <= 0):
-        raise herdr_types.HerdrFailure("the design pane foreground is unproved")
-    members = [herdr.json_object(item, "design foreground member").get("pid")
-               for item in herdr.json_items(info.get("foreground_processes"), "design foreground members")]
-    if isinstance(owner, herdr.PaneAtShell):
-        if shell != group or members != [shell]:
-            raise herdr_types.HerdrFailure("the design shell has other live work")
-        pid = shell
-    else:
-        if group == shell or owner.pid not in members:
-            raise herdr_types.HerdrFailure("the design agent left the foreground")
-        pid = owner.pid
-    if os.environ.get("HERDR_PLATFORM", sys.platform) == "darwin":
-        ticks = herdr._darwin_process_generation(pid)  # pyright: ignore[reportPrivateUsage]
-        if isinstance(ticks, herdr.ProcessGenerationUnavailable):
-            raise herdr_types.HerdrFailure(ticks.reason)
-    else:
-        start = process_start.proc_table_start(pid, herdr.proc_root())
-        if not isinstance(start, process_start.Started):
-            raise herdr_types.HerdrFailure("the design process start time is unproved")
-        ticks = int(start.start)
-    return DesignCloseForeground(location, pid, ticks, group, shell)
-
-
-def close_design_launch(launch: DesignPaneLaunch, record_foreground: Callable[[DesignCloseForeground], None], *,
-                        recorded_terminal: str | DesignCloseTerminalUnrecorded) -> None:
-    """Close the marked terminal only while the recorded process has the foreground."""
-    client = _client()
-    location = _design_launch_pane(client, launch)
-    if isinstance(location, herdr.NoPane):
-        if isinstance(recorded_terminal, str) and any(row.get("terminal_id") == recorded_terminal for row in client.panes()):
-            raise herdr_types.HerdrFailure("the recorded design terminal still exists")
-        return
-    owner = _design_launch_process(client, location, launch)
-    expected = _design_close_foreground(client, location, owner)
-    pane = client.pane_row(location.pane)
-    if isinstance(pane, herdr.NoPane) or pane.get("terminal_id") != location.terminal:
-        raise herdr_types.HerdrFailure("the design launch terminal changed")
-    if isinstance(owner, herdr.PaneAtShell):
-        if not herdr.check_target("", action="close", place=herdr.HerdrPlace(client.session, location.pane),
-                                  terminal=location.terminal, pane_info=pane, client=client):
-            raise herdr_types.HerdrFailure("the design shell is unproved")
-    else:
-        record = staff.authority_snapshot()
-        if any(record.by_current_session(identity) is not None for identity in pane_launch.native_sessions(client, pane)):
-            raise herdr_types.HerdrFailure("the design launch session still belongs to staff")
-    record_foreground(expected)
-    herdr.forget_pane_evidence(client.session, location.pane)
-    pane = client.pane_row(location.pane)
-    if isinstance(pane, herdr.NoPane) or pane.get("terminal_id") != location.terminal:
-        raise herdr_types.HerdrFailure("the design launch terminal changed")
-    if _design_close_foreground(client, location, owner) != expected:
-        raise herdr_types.HerdrFailure("the design launch foreground identity changed")
-    try:
-        _ = client.socket_request("pane.close", pane_id=location.pane)
-    except (OSError, herdr_types.HerdrFailure) as error:
-        raise herdr_types.HerdrFailure(f"design pane close is incomplete. {error}") from error
-    herdr.forget_pane_evidence(client.session, location.pane)
-    if any(row.get("pane_id") == location.pane or row.get("terminal_id") == location.terminal for row in client.panes()):
-        raise herdr_types.HerdrFailure("design pane close is incomplete")
 
 
 def _parent_split(pane: str, ratio: float, label: str) -> herdr.SplitPane:

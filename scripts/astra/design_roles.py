@@ -301,10 +301,6 @@ class RoleRefused(ValueError):
     pass
 
 
-class RoleDispatchUncertain(RoleRefused):
-    """The worker could have received the prompt."""
-
-
 class DamagedDesignRecord(RoleRefused):
     path: Path
     field: str
@@ -759,21 +755,9 @@ def _require_identity(instance: RoleInstance) -> None:
 def recorded_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
     design = read_design(claim.design_id)
     _check_host(design)
-    return _instance(design, claim.role)
-
-
-@contextmanager
-def dispatch_claim(claim: staff.DesignWorkerClaim, prompt: Path) -> Generator[RoleInstance]:
-    directory = design_directory(claim.design_id)
-    with _lock(directory):
-        design = read_design(claim.design_id)
-        _check_host(design)
-        _require_no_transition(directory, claim.role)
-        instance = _instance(_migrate_parent(design, claim.role), claim.role)
-        _require_identity(instance)
-        if not instance.assignment_claim or Path(instance.assignment_claim).resolve() != prompt:
-            raise RoleRefused('the design assignment claim changed before dispatch')
-        yield instance
+    instance = _instance(design, claim.role)
+    _require_identity(instance)
+    return instance
 
 
 def claim_for_worker_name(name: str) -> staff.DesignWorkerClaim | staff.NoDesignWorkerClaim:
@@ -792,7 +776,7 @@ def start_claim(claim: staff.DesignWorkerClaim) -> Generator[RoleInstance]:
         design = read_design(claim.design_id)
         _check_host(design)
         instance = _instance(design, claim.role)
-        _require_no_transition(directory, claim.role)
+        _require_no_transition(directory)
         if instance.lifecycle != RoleNotOpened('pane-start', 'outcome_unknown'):
             raise RoleRefused('thread creation claim changed')
         if instance.pane_launch is worker_panes.NoDesignPaneLaunch.NOT_ISSUED:
@@ -805,29 +789,14 @@ def start_claim(claim: staff.DesignWorkerClaim) -> Generator[RoleInstance]:
         yield instance
 
 
-def _end_fence(directory: Path, role: Role) -> Path:
-    return directory / f'end-{role}.json'
-
-
 def _read_transition(directory: Path) -> dict[str, object]:
     path = directory / 'transition.json'
     return _read(path) if path.exists() else {}
 
 
-def _legacy_end_for(transition: Mapping[str, object], role: Role) -> bool:
-    return transition.get('reason') == 'explicit end' and transition.get('role') == role
-
-
-def _require_no_transition(directory: Path, role: Role) -> None:
-    other: Role = 'reviewer' if role == 'designer' else 'designer'
-    if (_end_fence(directory, role).exists()
-            or (directory / 'transition.json').exists() and not _legacy_end_for(_read_transition(directory), other)):
+def _require_no_transition(directory: Path) -> None:
+    if (directory / 'transition.json').exists():
         raise RoleRefused('RoleNeedsRecovery: a lifecycle transition is incomplete')
-
-
-def _require_no_role_ends(directory: Path) -> None:
-    if any(_end_fence(directory, role).exists() for role in ('designer', 'reviewer')):
-        raise RoleRefused('a role end is incomplete')
 
 
 def worker_parent(design: HeldDesign, role: Role, record: staff.StaffSnapshot) -> staff.StaffRow:
@@ -868,12 +837,10 @@ def _validate_binding(binding: Binding, repository: str, role: Role) -> None:
             raise RoleRefused('binding paths are outside the phase')
 
 
-def _idle(instances: Sequence[RoleInstance]) -> None:
-    for instance in instances:
-        _require_identity(instance)
+def _idle(design: HeldDesign) -> None:
     if any(instance.assignment_claim or isinstance(instance.lifecycle, RoleWorkerPublished)
            or (isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.claim)
-           for instance in instances):
+           for instance in design.roles):
         raise RoleRefused("role is busy; an assignment claim is active")
 
 
@@ -886,41 +853,6 @@ def _pane_recovery_idle(lifecycle: HeldWorker, claim: staff.DesignWorkerClaim) -
         raise RoleRefused('role process evidence is unavailable; worker is retained')
     if fields.get('state') == 'OpenWorker' and fields.get('activity') not in ('idle', 'done'):
         raise RoleRefused('role is busy; finish its turn first')
-
-
-def _role_dispatch_pass(design: HeldDesign, lifecycle: HeldWorker, prompt: Path) -> dict[str, object]:
-    run = (Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase)
-           else design_directory(design.placement.design_id))
-    state = worker_panes.run_state(run)
-    for passes in (pass_recorder.pass_slots(state), pass_recorder.retained_passes(state)):
-        for passed in passes.values():
-            recorded = passed.get('prompt_file')
-            if (isinstance(recorded, str) and passed.get('worker_id') == lifecycle.staff_id
-                    and Path(recorded).resolve() == prompt):
-                return passed
-    return {}
-
-
-def _accept_role_assignment(design: HeldDesign, role: Role, lifecycle: HeldWorker, prompt: Path) -> HeldDesign:
-    directory = design_directory(design.placement.design_id)
-    identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
-    for identifier in identifiers:
-        (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
-    instance = replace(_instance(design, role), assignment_claim='', lifecycle=RoleOpen(lifecycle.staff_id))
-    updated = _set_instance(design, instance)
-    _save(updated)
-    _project_hold(updated, role, staff.snapshot())
-    return updated
-
-
-def accept_dispatch(claim: staff.DesignWorkerClaim, prompt: Path) -> None:
-    """Record acceptance while dispatch_claim still holds the design lock."""
-    design = read_design(claim.design_id)
-    instance = _instance(design, claim.role)
-    if (not isinstance(instance.lifecycle, HeldWorker) or not instance.assignment_claim
-            or Path(instance.assignment_claim).resolve() != prompt):
-        raise RoleRefused('the design assignment claim changed before acceptance')
-    _ = _accept_role_assignment(design, claim.role, instance.lifecycle, prompt)
 
 
 def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
@@ -983,13 +915,12 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         run, phase = Path(design.binding.run_directory), design.binding.phase
     else:
         run, phase = design_directory(design.placement.design_id), 'astra-review'
-        with dispatch_claim(claim, prompt.resolve()):
-            state = worker_lifecycle.read_worker_state(run / 'progress_history_state.json')
-            if not state:
-                _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design_repository(design)])
-            if phase not in recorder_state.open_phase_ids(state):
-                _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
-                                   '--phase-title', 'Held Astra review'])
+        state = worker_lifecycle.read_worker_state(run / 'progress_history_state.json')
+        if not state:
+            _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design_repository(design)])
+        if phase not in recorder_state.open_phase_ids(state):
+            _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
+                               '--phase-title', 'Held Astra review'])
     instance = _instance(design, role)
     name = instance_name(instance)
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
@@ -999,14 +930,11 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         '--completion-actions', json.dumps(asdict(pass_recorder.CompletionActions(
             finish_phase=phase if isinstance(design.binding, DesignUnbound) else '')))])
     refusal = result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained'
-    if result.returncode == worker_panes.ExitCode.UNCERTAIN:
-        raise RoleDispatchUncertain(refusal)
     if result.returncode:
         if isinstance(design.binding, DesignUnbound):
             try:
-                with dispatch_claim(claim, prompt.resolve()):
-                    _recorder_command(['finish-phase', '--session-dir', str(run), '--phase-id', phase,
-                                       '--status', 'error'])
+                _recorder_command(['finish-phase', '--session-dir', str(run), '--phase-id', phase,
+                                   '--status', 'error'])
             except RoleRefused as error:
                 raise RoleRefused(refusal) from error
         raise RoleRefused(refusal)
@@ -1081,7 +1009,7 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
                                 checkout=checkout_source)
             _save(design)
         _check_host(design)
-        _require_no_transition(directory, role)
+        _require_no_transition(directory)
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
@@ -1117,7 +1045,7 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
     with _lock(directory):
         current = read_design(design_id)
         lifecycle = _instance(current, role).lifecycle
-        _require_no_transition(directory, role)
+        _require_no_transition(directory)
         if not isinstance(lifecycle, RoleWorkerPublished):
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
         record = staff.authority_snapshot()
@@ -1135,7 +1063,7 @@ def _begin_creation(design: HeldDesign, role: Role, claim: str) -> HeldDesign:
     design_id = design.placement.design_id
     directory = design_directory(design_id)
     with _lock(directory):
-        _require_no_transition(directory, role)
+        _require_no_transition(directory)
         current = read_design(design_id)
         instance = _instance(current, role)
         if (current.placement != design.placement or instance != _instance(design, role)
@@ -1157,7 +1085,7 @@ def recover(instance_id: str) -> HeldDesign:
     with _lock(directory):
         design = read_design(design_id)
         _check_host(design)
-        _require_no_transition(directory, role)
+        _require_no_transition(directory)
         design = _migrate_parent(design, role)
         instance = _instance(design, role)
         _require_identity(instance)
@@ -1184,15 +1112,6 @@ def recover(instance_id: str) -> HeldDesign:
         if isinstance(lifecycle, RoleWorkerPublished) and staff.authority_snapshot().by_id(lifecycle.staff_id) is None:
             raise RoleRefused('RoleNeedsRecovery: the recorded worker retired; run end to finish this role')
         _pane_recovery_idle(lifecycle, claim)
-        if instance.assignment_claim:
-            prompt = Path(instance.assignment_claim).resolve()
-            passed = _role_dispatch_pass(design, lifecycle, prompt)
-            delivery = pass_recorder.dispatch_delivery(passed)
-            if delivery.completion_id and delivery.completion_id in pass_recorder.string_list(passed.get('confirmed_delivery_ids')):
-                return _accept_role_assignment(design, role, lifecycle, prompt)
-            if (delivery.line and passed.get('status') in ('active', 'refused')
-                    or not passed and isinstance(lifecycle, RoleNeedsRecovery)):
-                raise RoleDispatchUncertain('RoleNeedsRecovery: dispatch acceptance is unproved')
         observed = _set_instance(design, replace(instance, assignment_claim=''))
         updated = _set_lifecycle(observed, role, RoleOpen(lifecycle.staff_id))
         _save(updated)
@@ -1217,8 +1136,8 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
         _require_identity(instance)
         if not isinstance(instance.lifecycle, (RoleOpen, RolePausedForMove)):
             raise RoleRefused(type(instance.lifecycle).__name__ + ': role is unavailable')
-        _require_no_transition(directory, role)
-        _idle((instance,))
+        _require_no_transition(directory)
+        _idle(design)
         _validate_binding(design.binding, design_repository(design), role)
         generation = design.placement.generation
     prompt, reply = _prompt(design, role, Path(prompt_file).read_text(encoding='utf-8'))
@@ -1227,10 +1146,10 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
         if current.placement.generation != generation:
             raise RoleRefused('binding changed before dispatch')
         selected = _instance(current, role)
-        _idle((selected,))
+        _idle(current)
         if selected != instance:
             raise RoleRefused('role changed before dispatch')
-        _require_no_transition(directory, role)
+        _require_no_transition(directory)
         current = _set_instance(current, replace(selected, assignment_claim=str(prompt)))
         _save(current)
 
@@ -1241,22 +1160,22 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
             current = read_design(design_id)
             selected = _instance(current, role)
             if selected.assignment_claim == str(prompt) and selected.lifecycle == instance.lifecycle:
-                keep_claim = isinstance(error, RoleDispatchUncertain)
-                if not keep_claim:
-                    try:
-                        passed = _role_dispatch_pass(current, instance.lifecycle, prompt.resolve())
-                        keep_claim = bool(pass_recorder.dispatch_delivery(passed).line)
-                    except (OSError, ValueError):
-                        keep_claim = True
-                updated = _set_instance(current, replace(selected, assignment_claim=str(prompt) if keep_claim else '',
-                    lifecycle=RoleNeedsRecovery(instance.lifecycle.staff_id, str(error))))
-                _save(updated)
+                failed = replace(selected, assignment_claim='',
+                                 lifecycle=RoleNeedsRecovery(instance.lifecycle.staff_id, str(error)))
+                _save(_set_instance(current, failed))
         raise
     with _lock(directory):
         current = read_design(design_id)
         selected = _instance(current, role)
-        if selected.assignment_claim == str(prompt) and selected.lifecycle == instance.lifecycle:
-            _ = _accept_role_assignment(current, role, instance.lifecycle, prompt)
+        if selected.assignment_claim != str(prompt) or selected.lifecycle != instance.lifecycle:
+            return submitted
+        updated = _set_instance(current, replace(selected, assignment_claim='',
+                                                 lifecycle=RoleOpen(instance.lifecycle.staff_id)))
+        _save(updated)
+        identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
+        for identifier in identifiers:
+            (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
+    _project_hold(updated, role, staff.snapshot())
     return submitted
 
 
@@ -1270,7 +1189,6 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
     _check_host(design)
     transition = directory / 'transition.json'
     with _lock(directory):
-        _require_no_role_ends(directory)
         fields = _read(directory / 'design.json')
         design = _published_workers(_decode_design(design_id, fields, repair_empty_repository=not isinstance(binding, KeepBinding)))
         damaged_binding = _object(fields.get('binding')).get('repository') == ''
@@ -1308,12 +1226,7 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
         else:
             if design.placement.generation != expected_generation:
                 raise RoleRefused('stale binding generation')
-            _idle(design.roles)
-            if not pending and not damaged_binding and target_binding != design.binding:
-                for instance in design.roles:
-                    design = _migrate_parent(design, instance.role)
-                    _require_identity(_instance(design, instance.role))
-                updated = replace(updated, roles=design.roles)
+            _idle(design)
             fields = _design_fields(updated)
             if pending and pending.get('target', fields) != fields:
                 raise RoleRefused('another lifecycle transition is incomplete')
@@ -1373,45 +1286,19 @@ def pending_messages(design_id: str, role: Role) -> tuple[PendingMessage, ...]:
                  for value in [_read(path)])
 
 
-def _end_fence_matches(path: Path, fence: Mapping[str, object]) -> bool:
-    return {key: value for key, value in _read(path).items() if key != 'foreground'} == fence
-
-
 def end_role(claim: staff.DesignWorkerClaim) -> RoleInstance:
-    """Check the end fence set by the process that holds the design lock."""
+    """Read the role from the record for the saved end transition."""
     directory = design_directory(claim.design_id)
     design = read_design(claim.design_id)
     _check_host(design)
     fence = {'generation': design.placement.generation, 'reason': 'explicit end', 'role': claim.role}
-    path = _end_fence(directory, claim.role)
-    if not _end_fence_matches(path, fence) and _read_transition(directory) != fence:
+    if _read_transition(directory) != fence:
         raise RoleRefused('the design end claim changed before close')
     instance = _instance(design, claim.role)
     _require_identity(instance)
     if isinstance(instance.lifecycle, RoleEnded):
         raise RoleRefused('the design role already ended')
     return instance
-
-
-def close_marked_design_launch(claim: staff.DesignWorkerClaim, launch: worker_panes.DesignPaneLaunch) -> None:
-    """Keep the first proved foreground in the role's end record."""
-    path = _end_fence(design_directory(claim.design_id), claim.role)
-    fence = _read(path)
-    if not _legacy_end_for(fence, claim.role):
-        raise RoleRefused('the design end claim changed before close')
-    terminal = (_text(_object(_object(fence['foreground']).get('location')), 'terminal')
-                if 'foreground' in fence else worker_panes.DesignCloseTerminalUnrecorded.FIRST_ATTEMPT)
-
-    def record_foreground(target: worker_panes.DesignCloseForeground) -> None:
-        if _read(path) != fence:
-            raise RoleRefused('the design end claim changed before close')
-        foreground = asdict(target)
-        if 'foreground' not in fence:
-            _atomic(path, {**fence, 'foreground': foreground})
-        elif fence['foreground'] != foreground:
-            raise RoleRefused('the recorded design close foreground changed')
-
-    worker_panes.close_design_launch(launch, record_foreground, recorded_terminal=terminal)
 
 
 def end(instance_id: str) -> HeldDesign:
@@ -1421,43 +1308,37 @@ def end(instance_id: str) -> HeldDesign:
     role = role_text
     directory = design_directory(design_id)
     claim = staff.DesignWorkerClaim(design_id, role)
-    transition = _end_fence(directory, role)
+    transition = directory / 'transition.json'
     with _lock(directory):
         design = read_design(design_id)
         _check_host(design)
-        if not isinstance(_instance(design, role).lifecycle, RoleEnded):
-            if (directory / 'transition.json').exists():
-                pending = _read_transition(directory)
-                if not any(_legacy_end_for(pending, kind) for kind in ('designer', 'reviewer')):
-                    raise RoleRefused('another lifecycle transition is incomplete')
-            design = _migrate_parent(design, role)
+        design = _migrate_parent(design, role)
         instance = _instance(design, role)
-        if not isinstance(instance.lifecycle, RoleEnded):
+        lifecycle = instance.lifecycle
+        if not isinstance(lifecycle, RoleEnded):
             _require_identity(instance)
-            if instance.assignment_claim:
-                raise RoleRefused('role is busy; an assignment claim is active')
+            pending_start = isinstance(lifecycle, (RoleNotOpened, RoleWorkerPublished))
+            _idle(_set_instance(design, replace(instance, lifecycle=RoleNotOpened())) if pending_start else design)
             fence = {'generation': design.placement.generation, 'reason': 'explicit end', 'role': role}
-            if transition.exists() and not _end_fence_matches(transition, fence):
-                raise RoleRefused('the design end claim changed before close')
-            if not transition.exists():
+            if transition.exists():
+                if _read(transition) != fence:
+                    raise RoleRefused('another lifecycle transition is incomplete')
+            else:
                 _atomic(transition, fence)
-            lifecycle = instance.lifecycle
             if isinstance(lifecycle, RoleNotOpened) and isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
                 staff.seal_design_worker_start(claim)
                 design = read_design(design_id)
-                instance = _instance(design, role)
-                lifecycle = instance.lifecycle
-            if isinstance(lifecycle, HeldWorker):
-                result = _worker_command(['end', '--design-role', str(claim)])
-                if result.returncode:
-                    raise RoleRefused(result.stderr.strip() or f'held worker end exited {result.returncode}; retry end')
-            elif isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
-                try:
-                    close_marked_design_launch(claim, instance.pane_launch)
-                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    raise RoleRefused(f'RoleNeedsRecovery: {error}') from error
-            reference = lifecycle.staff_id if isinstance(lifecycle, HeldWorker) else staff.StaffId('')
-            design = _set_lifecycle(design, role, RoleEnded(reference))
+                lifecycle = _instance(design, role).lifecycle
+
+    if not isinstance(lifecycle, RoleEnded):
+        if isinstance(lifecycle, HeldWorker):
+            result = _worker_command(['end', '--design-role', str(claim)])
+            if result.returncode:
+                raise RoleRefused(result.stderr.strip() or f'held worker end exited {result.returncode}; retry end')
+        reference = lifecycle.staff_id if isinstance(lifecycle, HeldWorker) else staff.StaffId('')
+        with _lock(directory):
+            current = read_design(design_id)
+            design = _set_lifecycle(current, role, RoleEnded(reference))
             _save(design)
     _finish_end(design, role)
     return design
@@ -1465,20 +1346,18 @@ def end(instance_id: str) -> HeldDesign:
 
 def _finish_end(design: HeldDesign, role: Role) -> None:
     """Release the census before clearing this role's end fence."""
+    lifecycle = _instance(design, role).lifecycle
+    if isinstance(lifecycle, HeldWorker) and lifecycle.staff_id:
+        _census_projection().release(lifecycle.staff_id)
     directory = design_directory(design.placement.design_id)
     with _lock(directory):
-        current = read_design(design.placement.design_id)
-        lifecycle = _instance(current, role).lifecycle
-        if not isinstance(lifecycle, RoleEnded):
-            raise RoleRefused('the ended role changed before cleanup')
-        if lifecycle.staff_id:
-            _census_projection().release(lifecycle.staff_id)
-        if role == 'reviewer' and isinstance(current.binding, DesignUnbound):
+        if isinstance(design.binding, DesignUnbound):
             if unit_runs.run_is_open(directory):
                 _recorder_command(['finish-run', '--session-dir', str(directory), '--status', 'completed'])
-        _end_fence(directory, role).unlink(missing_ok=True)
-        if _legacy_end_for(_read_transition(directory), role):
-            (directory / 'transition.json').unlink(missing_ok=True)
+        transition = directory / 'transition.json'
+        pending = _read(transition) if transition.exists() else {}
+        if pending.get('reason') == 'explicit end' and pending.get('role') == role:
+            transition.unlink(missing_ok=True)
 
 
 def list_roles() -> dict[str, object]:
@@ -1490,10 +1369,6 @@ def list_roles() -> dict[str, object]:
             for role in design.roles:
                 lifecycle = role.lifecycle
                 pending = _read_transition(path.parent)
-                if _end_fence(path.parent, role.role).exists():
-                    pending = _read(_end_fence(path.parent, role.role))
-                elif any(_legacy_end_for(pending, kind) for kind in ('designer', 'reviewer') if kind != role.role):
-                    pending = {}
                 if pending and not isinstance(lifecycle, (RoleNotOpened, RoleEnded)):
                     lifecycle = RoleNeedsRecovery(lifecycle.staff_id, 'incomplete ' + str(pending.get('reason')))
                 state = (_tag(lifecycle) if not isinstance(role.parent, RoleIdentityUnresolved)
@@ -1629,7 +1504,8 @@ def unbind_run(run_directory: str) -> None:
 def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) -> DesignBoundToPhase:
     """Reject the whole patch before attribution, including symlink and rename escapes."""
     design = read_design(design_id)
-    _require_no_transition(design_directory(design_id), 'designer')
+    if (design_directory(design_id) / 'transition.json').exists():
+        raise RoleRefused('binding transition is incomplete')
     if design.placement.generation != generation:
         raise RoleRefused('stale binding generation')
     _check_host(design)
@@ -1700,10 +1576,9 @@ def move_checkout(old_checkout: str, new_checkout: str, *,
                               placement=replace(design.placement, generation=design.placement.generation + 1))
             fields = _design_fields(updated)
         with _lock(directory):
-            _require_no_role_ends(directory)
             if read_design(design.placement.design_id) != design:
                 raise RoleRefused(f'binding changed before {reason}')
-            _idle(design.roles)
+            _idle(design)
             if (_read(transition) if transition.exists() else {}) != pending:
                 raise RoleRefused('checkout transition changed before publication')
             if not pending:

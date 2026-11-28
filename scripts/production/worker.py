@@ -953,7 +953,6 @@ def _client() -> herdr.Herdr:
 
 def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "", *,
                    deadline: float = math.inf,
-                   prompt_timeout: float = math.inf,
                    on_submission: Callable[[], object] = lambda: None) -> None:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
@@ -965,8 +964,7 @@ def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action:
         arguments.extend(("/compact", "--timeout", str(max(0, int((deadline - time.monotonic()) * 1000))), "--wait"))
     command = client.argv(*arguments)
     _ = on_submission()
-    result = subprocess.run(command, text=True, capture_output=True, check=False,
-                            timeout=prompt_timeout if math.isfinite(prompt_timeout) else None)
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
     herdr.require_success(result, f"herdr agent {action}")
 
 
@@ -1744,7 +1742,6 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              new_pass_instance_id: uuid.UUID | None = None,
              availability: CheckAssignmentAvailability | AvailabilityAtUse = AvailabilityAtUse.DIRECT_DISPATCH,
              expected_worker: StaffId | WorkerIdAtUse = WorkerIdAtUse.BY_NAME,
-             prompt_timeout: float = math.inf,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     record = staff.snapshot()
@@ -1939,8 +1936,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         try:
             result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
                                    run=session_dir, instance_id=instance, on_submission=submitted,
-                                   defer_compaction=defer_compaction, before_input=before_input,
-                                   prompt_timeout=prompt_timeout)
+                                   defer_compaction=defer_compaction, before_input=before_input)
         except CompactionStartupUncertain as error:
             # The helper can still deliver the prompt after this launcher returns.
             submitted()
@@ -2006,7 +2002,6 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                    before_input: Callable[[staff.StaffRow], worker_panes.CloseAllowed | worker_panes.DispatchHoldsWorker],
                    on_submission: Callable[[], object] = lambda: None,
                    defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
-                   prompt_timeout: float = math.inf,
                    ) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
     record = staff.snapshot()
@@ -2056,15 +2051,11 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
     if not input_allowed():
         return ExitCode.BUSY
     try:
-        _agent_command(client, current, "prompt", line, on_submission=on_submission, prompt_timeout=prompt_timeout)
+        _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
         reason = " ".join(str(error).splitlines())
         raise OSError(f"{reason}; prompt delivered to pane {current.pane}") from error
-    except subprocess.TimeoutExpired as error:
-        print(f"{current.row.name}: Herdr prompt timed out after {error.timeout:g} s. Submission is unproved.",
-              file=sys.stderr)
-        return ExitCode.UNCERTAIN
-    except herdr_types.HerdrFailure as error:
+    except (herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
         if isinstance(error, herdr.AgentBlocked) and codex:
             return _blocked_question(client, current, delivered_to=current.pane)
         reason = " ".join(str(error).splitlines())
@@ -4117,8 +4108,6 @@ def main(arguments: list[str] | None = None) -> int:
             lifecycle = instance.lifecycle
             row = record.by_id(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else None
             if args.command == "end" and row is None:
-                if isinstance(lifecycle, design_roles.HeldWorker) and isinstance(instance.pane_launch, worker_panes.DesignPaneLaunch):
-                    design_roles.close_marked_design_launch(claim, instance.pane_launch)
                 return ExitCode.OK
             if not isinstance(instance.parent, str):
                 raise ValueError("the design role has no recorded parent")
