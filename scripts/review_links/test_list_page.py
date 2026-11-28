@@ -3717,6 +3717,7 @@ document.body.append(result);
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="list-page-test-")))
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults", return_value=()))
         config = self.root / "config"
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)

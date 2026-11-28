@@ -604,6 +604,11 @@ class ReviewRecordNotPublished:
 
 
 @dataclass(frozen=True)
+class UnknownSubmittedReviewType:
+    """Review has no record from which to read the submitted type."""
+
+
+@dataclass(frozen=True)
 class ConfirmedReviewDetail:
     body: str
     revision: str
@@ -644,7 +649,7 @@ class ReviewSave:
     answer: str
     version: str
     item: ReviewItem | ReviewRecordNotPublished
-    submitted_type: ReviewType
+    submitted_type: ReviewType | UnknownSubmittedReviewType
     words_saved: bool
     detail: ReviewActionDetail = field(default_factory=ReviewDetailUnavailable)
 
@@ -756,6 +761,11 @@ class ReviewSnapshotCache:
             version = current.version
             detail: ReviewActionDetail = ReviewDetailUnavailable()
             item: ReviewItem | ReviewRecordNotPublished = ReviewRecordNotPublished()
+            retained = current.records.get(key)
+            if retained is None:
+                # A delivery retry can succeed after the action removes the row.
+                return ReviewSave(action.delivery, answer, version, item, UnknownSubmittedReviewType(),
+                                  words_saved=action.words_saved, detail=ClosedReviewDetail())
             try:
                 updated, item = self.publish_record(current, key)
                 version = updated.version
@@ -779,7 +789,7 @@ class ReviewSnapshotCache:
                 logging.getLogger(__name__).warning('Review saved %s. Publication will retry: %s', key, error)
             finally:
                 self.invalidate()
-            return ReviewSave(action.delivery, answer, version, item, current.records[key].type,
+            return ReviewSave(action.delivery, answer, version, item, retained.type,
                               words_saved=action.words_saved, detail=detail)
 
     def publish_delivery_result(self, key: str) -> None:
@@ -2548,10 +2558,11 @@ function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
 let index=readIndex(JSON.parse(document.querySelector('[data-review-index]').textContent));
-function requestReviewCard(key,version,saved=false){
+function requestReviewCard(key,version,saved=false,fetchCard=reviewFetch){
  const query=new URLSearchParams({body:key,version});
  if(saved) query.set('saved','1');
- return reviewFetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
+ const timeout=Number(document.querySelector('[data-review]').dataset.requestTimeoutSeconds)*1000;
+ return fetchCard(location.pathname+'?'+query,{cache:'no-store',signal:AbortSignal.timeout(timeout)})
   .then(async response=>({response,text:response.ok ? await response.text() : ''}));
 }
 const firstReviewCard=(()=>{
@@ -2567,7 +2578,8 @@ const firstReviewCard=(()=>{
  const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
  if(!index.has(key)) return null;
  const version=document.querySelector('[data-review]').dataset.version;
- const result=requestReviewCard(key,version);
+ // Start the linked card request before the save report handler is available.
+ const result=requestReviewCard(key,version,false,fetch);
  void result.catch(()=>{});
  return {key,version,result};
 })();
@@ -3362,6 +3374,10 @@ function setDraftListOpen(open){
 function createDraftRow(key){
  const row=document.createElement('li'),title=document.createElement('strong'),message=document.createElement('p');
  message.className='action-failure';message.setAttribute('role','status');
+ const choice=document.createElement('p');
+ choice.dataset.reviewChoiceNotice='';
+ choice.setAttribute('role','status');
+ choice.hidden=true;
  const bug=document.createElement('a'),filed=document.createElement('span');
  bug.dataset.reviewBugLink='';
  filed.append(' ',bug,' is filed.');
@@ -3374,8 +3390,8 @@ function createDraftRow(key){
  action.type='button';
  action.addEventListener('click',()=>void sendReviewDraft(key));
  row.dataset.draftListKey=key;
- row.append(title,message,label,action);draftList.append(row);
- return {row,title,message,bug,filed,words,action};
+ row.append(title,message,choice,label,action);draftList.append(row);
+ return {row,title,message,choice,bug,filed,words,action};
 }
 function renderReviewDrafts(){
  const drafts=[...reviewDrafts].filter(([,record])=>record.edit.draft.feedback);
@@ -3393,6 +3409,9 @@ function renderReviewDrafts(){
   const title=record.title ? record.cardId+' · '+record.title : record.cardId;
   if(entry.title.textContent!==title) entry.title.textContent=title;
   const bug=record.filedBug;
+  const choice=record.message==='Not saved: '+reviewDraftChoiceChanged ? record.message : '';
+  if(entry.choice.textContent!==choice) entry.choice.textContent=choice;
+  entry.choice.hidden=!choice;
   if(bug){
    if(entry.bug.textContent!==bug.label) entry.bug.textContent=bug.label;
    if(entry.bug.getAttribute('href')!==bug.href) entry.bug.setAttribute('href',bug.href);

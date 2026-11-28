@@ -13,7 +13,7 @@ from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field, replace
 from io import StringIO
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -23,6 +23,7 @@ from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.production import record_store, staff, test_record_store, update_registration
 from scripts.production.production_doc import production_backup_checkout
 from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
+from scripts.production.record_store import configured_review_vaults
 from scripts.review_links import reply_proofs, reply_tokens, review_link, review_page, review_submissions, test_review_submissions
 
 
@@ -36,6 +37,10 @@ class ArchivedLegacyQuestion:
 
 
 class ReplyProofTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults", return_value=()))
+
     def _archive_legacy_question_in_former_store(self, *, local_checkout: bool = False) -> ArchivedLegacyQuestion:
         case = set_up_fixture(self.addCleanup, test_review_submissions.ReviewSubmissionTests())
         git = test_record_store.NumberedRecordsTests().git
@@ -279,7 +284,8 @@ class ReplyProofTests(unittest.TestCase):
         _ = self._archive_legacy_question_in_former_store()
         config = conf.path("issue_score")
         _ = config.write_bytes(b"\xff")
-        self._assert_scan_refuses_path(config)
+        with patch.object(record_store, "configured_review_vaults", configured_review_vaults):
+            self._assert_scan_refuses_path(config)
 
     def test_dry_run_and_startup_name_the_unreadable_state_folder(self) -> None:
         _ = self._archive_legacy_question_in_former_store()
