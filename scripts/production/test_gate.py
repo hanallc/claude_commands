@@ -594,7 +594,7 @@ Path({str(marker)!r}).write_text(merge)
         given = {**dict.fromkeys(admission_records.OWNER_VARIABLES, ""), "CLAUDE_SESSION_NAME": "nightly"}
         self.environment.update(given)
         with mock.patch.dict(os.environ, given), mock.patch.object(gate, "run_suites", side_effect=suites), \
-             mock.patch.object(copies, "source_owner", side_effect=copies.CopyError("bad copy record")):
+             mock.patch.object(copies, "source_owner", side_effect=admission_records.CopyError("bad copy record")):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, [{"CLAUDE_SESSION_NAME": "nightly"}])
