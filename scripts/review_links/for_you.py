@@ -5,12 +5,11 @@ import json
 import os
 import subprocess
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from http.client import HTTPConnection, HTTPException
 from ipaddress import IPv4Address
 from pathlib import Path
-from threading import Lock
 from typing import Literal, cast
 
 from scripts.for_you.action import ActionStore, UserAction
@@ -59,7 +58,7 @@ class ForYouRow:
 
 @dataclass(frozen=True)
 class UnavailableSource:
-    """A source failure and whether it leaves its count known."""
+    """A failed or stale source prevents a complete action view."""
 
     source: str
     reason: str
@@ -73,82 +72,11 @@ class KnownOpenCount:
     value: int
 
 
-class ForYouCountPart(StrEnum):
-    ACTIONS = "actions"
-    REBUILD_REQUESTS = "rebuild requests"
-    REBUILD_COMPARISON = "rebuild comparison"
-
-
-@dataclass(frozen=True)
-class StaleOpenCount:
-    """The count with one or more parts from an earlier complete read."""
-
-    value: int
-    kept_parts: tuple[ForYouCountPart, ...]
-
-
-@dataclass(frozen=True)
-class PartialOpenCount:
-    """The count that includes readable records from an incomplete source."""
-
-    value: int
-    affected_parts: tuple[ForYouCountPart, ...]
-
-
 @dataclass(frozen=True)
 class UnavailableOpenCount:
-    """At least one count part has no usable value."""
+    """The complete count is unavailable; known_open counts only confirmed open cards."""
 
-
-type ForYouOpenCount = KnownOpenCount | StaleOpenCount | PartialOpenCount | UnavailableOpenCount
-
-
-@dataclass(frozen=True)
-class CountFromRows:
-    """Count the rows when the caller supplies an already assembled snapshot."""
-
-
-@dataclass(frozen=True)
-class CurrentCountPart[T]:
-    """A count part from a complete read of its source."""
-
-    value: T
-
-
-@dataclass(frozen=True)
-class KeptCountPart[T]:
-    """A count part that uses an earlier observation."""
-
-    value: T
-
-
-@dataclass(frozen=True)
-class ReadableCountPart[T]:
-    """A count part that uses the available facts from an incomplete source."""
-
-    value: T
-
-
-@dataclass(frozen=True)
-class MissingCountPart:
-    """The current read failed and there is no earlier value."""
-
-
-type AvailableCountPart[T] = CurrentCountPart[T] | KeptCountPart[T] | ReadableCountPart[T]
-type CountPartRead[T] = AvailableCountPart[T] | MissingCountPart
-
-
-def _open_count(actions: CountPartRead[int], requests: CountPartRead[frozenset[str]],
-                compared: AvailableCountPart[set[str]]) -> ForYouOpenCount:
-    if isinstance(actions, MissingCountPart) or isinstance(requests, MissingCountPart):
-        return UnavailableOpenCount()
-    value = actions.value + len(requests.value | compared.value)
-    parts = ((ForYouCountPart.ACTIONS, actions), (ForYouCountPart.REBUILD_REQUESTS, requests),
-             (ForYouCountPart.REBUILD_COMPARISON, compared))
-    affected = tuple(part for part, result in parts if not isinstance(result, CurrentCountPart))
-    if any(isinstance(result, ReadableCountPart) for _, result in parts):
-        return PartialOpenCount(value, affected)
-    return StaleOpenCount(value, affected) if affected else KnownOpenCount(value)
+    known_open: int
 
 
 class OtherActionCountUnavailable(StrEnum):
@@ -170,7 +98,7 @@ class StatusLineActions:
 
 @dataclass(frozen=True)
 class ForYouSnapshot:
-    """The rows, staff names, and source failures from one read."""
+    """The available rows and explicit failures from one read."""
 
     rows: tuple[ForYouRow, ...]
     unavailable: tuple[UnavailableSource, ...]
@@ -178,27 +106,11 @@ class ForYouSnapshot:
     comparison_refresh_due: bool = False
     comparison_deadline: int = 0
     rebuild_reasons: Mapping[str, str] = field(default_factory=dict[str, str])
-    count: ForYouOpenCount | CountFromRows = CountFromRows()
-    members: staff.StaffSnapshot = staff.StaffSnapshot(())
 
     @property
-    def open_count(self) -> ForYouOpenCount:
-        if not isinstance(self.count, CountFromRows):
-            return self.count
-        if self.unavailable:
-            return UnavailableOpenCount()
-        return KnownOpenCount(sum(row.status == "open" for row in self.rows))
-
-    def count_with_current_stores(self) -> KnownOpenCount | UnavailableOpenCount:
-        """Return the count when the action and request stores supplied current counts."""
-        count = self.open_count
-        if isinstance(count, KnownOpenCount):
-            return count
-        comparison_only = (ForYouCountPart.REBUILD_COMPARISON,)
-        if (isinstance(count, StaleOpenCount) and count.kept_parts == comparison_only
-                or isinstance(count, PartialOpenCount) and count.affected_parts == comparison_only):
-            return KnownOpenCount(count.value)
-        return UnavailableOpenCount()
+    def open_count(self) -> KnownOpenCount | UnavailableOpenCount:
+        count = sum(row.status == "open" for row in self.rows)
+        return UnavailableOpenCount(count) if self.unavailable else KnownOpenCount(count)
 
     def status_line_actions(self) -> StatusLineActions:
         if any(not source.partial for source in self.unavailable):
@@ -296,81 +208,6 @@ def status_rebuild_reasons(answer: rebuild_row.RebuildAnswer,
     return reasons
 
 
-_actions_lock = Lock()
-_confirmed_open_actions: dict[Path, int] = {}
-_requests_lock = Lock()
-_confirmed_requests: dict[Path, rebuild_row.OpenRebuildNeeds] = {}
-
-
-def _read_actions(watch: need.SourceWatch | None, unavailable: list[UnavailableSource]
-                  ) -> tuple[tuple[UserAction, ...], CountPartRead[int]]:
-    try:
-        store = ActionStore()
-    except (OSError, ValueError) as error:
-        unavailable.append(UnavailableSource("actions", str(error)))
-        return (), MissingCountPart()
-    with _actions_lock:
-        folder = store.folder.absolute()
-        try:
-            records = store.list() if watch is None else store.list(watch=watch.watch)
-        except (OSError, ValueError, RecursionError) as error:
-            unavailable.append(UnavailableSource("actions", str(error)))
-            if folder in _confirmed_open_actions:
-                return (), KeptCountPart(_confirmed_open_actions[folder])
-            return (), MissingCountPart()
-        count = sum(record.status == "open" for record in records)
-        _confirmed_open_actions[folder] = count
-        return records, CurrentCountPart(count)
-
-
-def _read_rebuild_requests(needs: rebuild_row.RebuildNeedsRead, names: Mapping[str, str],
-                           waiting_work: Callable[[str], str], unavailable: list[UnavailableSource]
-                           ) -> tuple[tuple[RebuildRequest, ...], CountPartRead[frozenset[str]], rebuild_row.OpenRebuildNeeds]:
-    folder = need.needs_folder().absolute()
-    if isinstance(needs, tuple):
-        summaries = needs
-    elif isinstance(needs, rebuild_row.PartialRebuildNeeds):
-        unavailable.append(UnavailableSource("rebuild needs", needs.reason, partial=True))
-        summaries = needs.summaries
-    else:
-        reason = (needs.reason if isinstance(needs, rebuild_row.RebuildNeedsUnavailable)
-                  else "The open rebuild records have not been read.")
-        unavailable.append(UnavailableSource("rebuild needs", reason))
-        if folder not in _confirmed_requests:
-            return (), MissingCountPart(), ()
-        summaries = _confirmed_requests[folder]
-
-    pending: list[RebuildRequest] = []
-    invalid = False
-    for summary in summaries:
-        for record in summary.records:
-            try:
-                pending.append(_request(record, names, waiting_work))
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                unavailable.append(UnavailableSource("rebuild needs", str(error), partial=True))
-                invalid = True
-    machines = frozenset(request.machine for request in pending)
-    if invalid or isinstance(needs, rebuild_row.PartialRebuildNeeds):
-        return tuple(pending), ReadableCountPart(machines), summaries
-    if isinstance(needs, tuple):
-        _confirmed_requests[folder] = needs
-        return tuple(pending), CurrentCountPart(machines), summaries
-    return tuple(pending), KeptCountPart(machines), summaries
-
-
-def _compared_machines(answer: rebuild_row.RebuildAnswer) -> AvailableCountPart[set[str]]:
-    """Count the machines that need a rebuild from the saved comparison."""
-    comparisons = {machine: rebuild_row.machine_rebuild_need(answer, machine) for machine in rebuild_row.MACHINES}
-    compared = {machine for machine, comparison in comparisons.items() if comparison.needed}
-    evidence = {comparison.evidence for comparison in comparisons.values()}
-    if rebuild_row.ComparisonEvidence.UNKNOWN in evidence:
-        return ReadableCountPart(compared)
-    if (answer.refresh_due or not isinstance(answer.expected, rebuild_row.ExpectedSystems)
-            or rebuild_row.ComparisonEvidence.SAVED in evidence):
-        return KeptCountPart(compared)
-    return CurrentCountPart(compared)
-
-
 def read(config: Path | None = None, *,
          rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None,
          include_running_revision: bool = True, include_status_reasons: bool = False,
@@ -390,8 +227,7 @@ def read(config: Path | None = None, *,
             if member.current_session:
                 names[member.current_session] = member.name
                 members_by_reference[member.current_session] = member
-    except (OSError, ValueError, RecursionError) as error:
-        members = staff.StaffSnapshot(())
+    except (OSError, ValueError) as error:
         unavailable.append(UnavailableSource("staff", str(error)))
 
     work_by_reference: dict[str, str] = {}
@@ -410,50 +246,71 @@ def read(config: Path | None = None, *,
             if isinstance(holder.run, staff.OpenRun):
                 try:
                     work = ", ".join(_open_phase_ids(holder.run.path, watch)) or "Not recorded"
-                except (OSError, ValueError, RecursionError) as error:
+                except (OSError, ValueError) as error:
                     unavailable.append(UnavailableSource(f"staff work {reference}", str(error)))
         work_by_reference[reference] = f"{name}: {work}"
         return work_by_reference[reference]
 
-    records, actions_count = _read_actions(watch, unavailable)
-    rows = [action_row(record, names.get(record.requested_by, record.requested_by)) for record in records]
+    rows: list[ForYouRow] = []
+    try:
+        store = ActionStore()
+        for record in store.list() if watch is None else store.list(watch=watch.watch):
+            rows.append(action_row(record, names.get(record.requested_by, record.requested_by)))
+    except (OSError, ValueError, RecursionError) as error:
+        unavailable.append(UnavailableSource("actions", str(error)))
 
-    with _requests_lock:
-        answer = rebuild if rebuild is not None else rebuild_row.read(config, watch=watch)
-        pending, requests_count, needs = _read_rebuild_requests(answer.needs, names, waiting_work, unavailable)
-    compared_count = _compared_machines(answer)
+    answer = rebuild if rebuild is not None else rebuild_row.read(config, watch=watch)
     if watch is not None:
         _watch_completed_requests(watch)
+    pending: tuple[RebuildRequest, ...] = ()
+    needs = answer.needs
+    if isinstance(needs, rebuild_row.RebuildNeedsNotRead):
+        unavailable.append(UnavailableSource("rebuild needs", "The open rebuild records have not been read."))
+    elif isinstance(needs, rebuild_row.RebuildNeedsUnavailable):
+        unavailable.append(UnavailableSource("rebuild needs", needs.reason, partial=needs.summaries is not None))
+    try:
+        pending = tuple(_request(record, names, waiting_work)
+                        for summary in needs for record in summary.records)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        unavailable.append(UnavailableSource("rebuild needs", str(error)))
 
-    compared = compared_count.value
+    compared: tuple[str, ...] = ()
+    comparison_current = False
+    probes = rebuild_row.RunningSystemProbes()
     working_directories: dict[str, str] = {}
-    values: Mapping[str, str]
     try:
         values = rebuild_row.config_values(config)
-    except (OSError, ValueError):
-        values = {}
-    for machine in rebuild_row.MACHINES:
-        directory = values.get(f"rebuild.cwd.{machine}", "")
-        if Path(directory).is_absolute() or directory.startswith("~/"):
+        for machine in ("natedev", "mac"):
+            directory = values[f"rebuild.cwd.{machine}"]
+            if not (Path(directory).is_absolute() or directory.startswith("~/")):
+                raise ValueError(f"rebuild.cwd.{machine}: provide an absolute path or a home path.")
             working_directories[machine] = directory
+        _ = rebuild_row.RebuildSettings.read(config)
+        compared = answer.compared
+        probes = answer.probes
+        comparison_current = (not answer.refresh_due and isinstance(answer.expected, rebuild_row.ExpectedSystems)
+                              and isinstance(answer.failure, rebuild_row.NoEvaluationFailure))
+        if not comparison_current:
+            unavailable.append(UnavailableSource("rebuild comparison", "The comparison is stale or unavailable."))
+        else:
+            for machine in ("natedev", "mac"):
+                if not probes.succeeded(machine):
+                    unavailable.append(UnavailableSource("rebuild comparison", f"{machine}: the running system is unavailable."))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        unavailable.append(UnavailableSource("rebuild comparison", str(error)))
 
-    machines = {request.machine for request in pending} | compared
+    machines = {request.machine for request in pending} | set(compared)
     records_by_machine = {summary.newest["machine"]: summary.records for summary in needs}
     changes = (rebuild_row.read_compared_changes(config, answer, watch=watch)
                if (include_running_revision and machines) or (include_status_reasons and compared) else {})
-    visible_machines = tuple(machine for machine in rebuild_row.MACHINES if machine in machines)
-    compared_machines = tuple(machine for machine in rebuild_row.MACHINES if machine in compared)
-    visible_answer = replace(answer, compared=compared_machines, needs=needs)
-    rebuild_reasons = status_rebuild_reasons(visible_answer, changes) if include_status_reasons else {}
+    rebuild_reasons = status_rebuild_reasons(answer, changes) if include_status_reasons else {}
     for machine in sorted(machines):
         active = tuple(sorted((request for request in pending if request.machine == machine),
                               key=lambda request: need.request_time(request.created_at)))
         requesters = {request.requester_reference for request in active if request.requester_reference}
         change = changes.get(machine)
-        reason = (rebuild_row.changes_for_display(visible_answer, machine, change, records_by_machine.get(machine, ())).text()
+        reason = (rebuild_row.changes_for_display(answer, machine, change, records_by_machine.get(machine, ())).text()
                   if include_running_revision else "")
-        comparison_current = (not answer.comparison_cache_stale and machine not in answer.unavailable_observed_needs
-                              and bool(answer.current_expected_path(machine)))
         running_revision = change.active_revision if include_running_revision and comparison_current and change else ""
         rows.append(ForYouRow(
             f"rebuild/{machine}", "rebuild", f"Rebuild {machine}", "rebuild", machine, working_directories.get(machine, ""),
@@ -462,9 +319,8 @@ def read(config: Path | None = None, *,
             active[0].created_at if active else "", "open", "automatic", "", active,
             requester_reference=next(iter(requesters)) if len(requesters) == 1 else "",
             running_revision=running_revision))
-    return ForYouSnapshot(tuple(rows), tuple(unavailable), visible_machines, answer.refresh_due,
-                          answer.comparison_deadline, rebuild_reasons,
-                          _open_count(actions_count, requests_count, compared_count), members=members)
+    return ForYouSnapshot(tuple(rows), tuple(unavailable), answer.machines, answer.refresh_due,
+                          answer.comparison_deadline, rebuild_reasons)
 
 
 def read_for_status_line(config: Path | None = None, *,
@@ -486,8 +342,7 @@ def read_for_status_line(config: Path | None = None, *,
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
-        snapshot = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild, include_running_revision=False)
-        count = snapshot.count_with_current_stores()
+        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild, include_running_revision=False).open_count
     except (OSError, ValueError):
         return "unavailable"
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"

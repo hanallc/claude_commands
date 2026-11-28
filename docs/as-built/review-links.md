@@ -534,57 +534,10 @@ It also reads on visibility, focus, panel opening, and a framed `for-you-complet
 A completion message during a read schedules a second read.
 A hidden tab stops the timer.
 A refresh preserves focused commands and text selections.
-Review and the notifier use the same comparison results for rebuild cards.
-Each count reads the rebuild comparison from disk.
-The rebuild cache keeps each machine’s last successful running path and expected path, with a separate time for each.
-The cache records the revision for each expected path.
-Only an expected path for the current revision can update the comparison.
-A path from an older revision leaves the comparison unknown and keeps any saved rebuild need.
-A saved rebuild stays open until a successful probe matches that path.
-A legacy cache adds no rebuilds and becomes due for refresh.
-Each need marker has the form `rebuild <machine>`. Its second word identifies its machine.
-An invalid machine record or a malformed marker for that machine makes its comparison unknown.
-The cache becomes due for refresh.
-The reader logs and ignores a marker if its second word is missing or names an unknown machine.
-A failed probe or evaluation preserves the last successful value and time of that path.
-The cache evaluates each machine in a separate Nix command.
-A failed evaluation starts a retry delay. Running probes continue during that delay.
-The cache reuses successful evaluations for the same commit and source when it retries.
-If no confirmed probe exists, the reader can use the running path from the rebuild changes cache.
-The reader saves a need from that path in a separate file for each machine before the count uses it.
-If the save fails, the need still counts for that read.
-The reader holds the machine’s lock while it reads the changes cache, compares the paths, and saves the observation.
-Both cache writers take the same locks before publication.
-A read, write, or lock failure makes only that machine’s observation unknown.
-Lock failures include errors when the reader releases a lock.
-The reader logs the failure and keeps the count from the facts it can read.
-A refresh publishes the comparison cache before it reads or updates any observation file.
-A failed observation update leaves the published comparison available and the refresh continues with the other machine.
-Each card uses its machine’s current comparison and matching changes record for the running revision.
-A partial request read counts the readable requests and shows their cards.
-A folder read failure can use the request records from the last complete read.
-The reader keeps the last complete action count if the action read fails.
-The count includes each machine once, even when it has an open request and a comparison shows a rebuild.
-The server marks the count stale and identifies the affected parts in `kept_parts`.
-The server marks a count from an incomplete source read with `partial: true`.
-Each comparison says the machine needs a rebuild, needs no rebuild, or has an unknown result.
-An unknown comparison adds no count or card. Open rebuild requests still count.
-When only the rebuild comparison is stale or incomplete, the badge shows the count without a state word or outline.
-The panel shows the open entries without stale text.
-The cache distinguishes successful, failed, and skipped probes. A skipped probe keeps the last comparison facts.
-The background refresh writes one system log entry when a probe or evaluation fails.
-A cache path failure leaves the comparison unknown and logs one entry until the path can be read again.
-If the staff read fails, Review and the notifier still show the action rows.
-Review shows the staff failure in its action notices.
-The server sends no new count if the action or request store has no usable count.
-If the request fails or the response gives no count, the page shows its newest complete count as stale.
-A complete count can include earlier observations.
-A partial count stays visible only until the next read result.
-The browser saves only confirmed counts for this console origin.
-The button and panel show the first server count when the browser has no saved count.
-For a transport failure, the phone badge shows a dotted outline in both navigation states.
-An explicit incomplete response clears the panel entries.
-A confirmed or comparison-only zero uses a quiet button and shows `No actions required.` in the panel.
+A transport failure keeps the last complete count and marks it stale.
+The phone badge shows a dotted outline for a stale count in both navigation states.
+An explicit unavailable response shows `?`, including with HTTP 503.
+A known zero uses a quiet button and shows `No actions required.` in the panel.
 
 `rebuilds.url` in `config/console.conf` still names `change_page.rebuilds_url`.
 That function returns `/console/rebuilds.html`.

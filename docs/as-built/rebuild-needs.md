@@ -112,12 +112,10 @@ The page names each damaged archive and shows the valid records.
 A failed need read leaves the cached system comparison visible.
 For the partial count rule, see [For you](for-you.md).
 The refresh compares running systems with `rebuild.ref` in `rebuild.repo`.
-Each machine is evaluated in its own Nix command.
-A valid machine path is reused for the same commit and source.
-A timeout, error, or empty path leaves no reusable path for that machine only.
+It reuses an evaluation only when both machine paths are valid for the same commit and source.
+A timeout, error, or empty path leaves no reusable evaluation.
 Each valid machine path still supplies its current comparison when the other machine has no path.
-The cache records the failed commit, evaluation source, failure time, and the machines that succeeded.
-After the wait, the retry evaluates only the machines that failed.
+The cache records the failed commit, evaluation source, and failure time.
 `rebuild.eval_retry_seconds` sets a 600-second wait before another evaluation for that commit and source.
 Refreshes during this wait keep the cached row.
 A new commit or evaluation source bypasses the wait.

@@ -38,7 +38,6 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
-from scripts.review_links.test_for_you import comparison_cache_details
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, scratch, urgency
@@ -2320,11 +2319,12 @@ class ChangePageTests(unittest.TestCase):
                     "d" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
                     "/nix/store/" + "1" * 32 + "-natedev", "/nix/store/" + "2" * 32 + "-mac")
                 running = "/nix/store/running-mac"
-                probes = rebuild_row.RunningSystemProbes(mac=True)
-                details = comparison_cache_details(expected, {"mac": running}, probes)
-                _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{details}\n")
+                details = {**asdict(expected), "running_system_probes": {"mac": True},
+                           "running_system_paths": {"mac": running}}
+                _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{json.dumps(details)}\n")
                 mac_answer = rebuild_row.RebuildAnswer(
-                    ("mac",), False, expected, compared=("mac",), probes=probes, running_paths={"mac": running})
+                    ("mac",), False, expected, compared=("mac",), probes=rebuild_row.RunningSystemProbes(mac=True),
+                    running_paths={"mac": running})
                 comparison = rebuild_row.ComparedChanges(running, "b" * 40, expected.commit, (
                     rebuild_row.Change("c" * 40, "2026-11-12T10:00:00+00:00", "Apply the Mac settings.", ""),
                     rebuild_row.Change("e" * 40, "2026-11-12T14:30:00+00:00", "memory: <defer> defrag", owner.id),
