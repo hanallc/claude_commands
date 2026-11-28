@@ -4929,7 +4929,9 @@ class AdmissionServer:
         from scripts.mac_test import eligibility, offload
 
         configuration = settings.configuration
-        if not configuration.value("offload", conf.on_off) and not mirrors:
+        outage = self.mac_outages.get(name)
+        awaiting_answer = outage is not None and not outage.recovery_observed
+        if not configuration.value("offload", conf.on_off) and not mirrors and not awaiting_answer:
             return _MacHostExcluded("off")
         recover = self._begin_mac_backoff_probe(name)
         try:
@@ -5330,6 +5332,9 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
+        if assignment.destination.provider == "mac" and self._placement_owner_live(assignment.owner):
+            # Keep the attempt current until the coordinator reports the verdict or asks for a replacement.
+            return False
         return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
             and isinstance(saved.permission, placement.PermissionConsumed)
             and evidence.observed_at > saved.permission.consumed_at
@@ -5391,7 +5396,7 @@ done
                 and isinstance(saved.state, placement.CurrentAssignment)
                 and self._ended_claim_holder(saved) and self._next_claim_takes_over(saved)):
             report = self._lost_report()
-            self._close_for_report(replace(saved, terminal_report=report, inferred_loss=True), report, persist_change=False)
+            self._close_for_report(replace(saved, terminal_report=report), report, persist_change=False)
 
     def _next_claim_takes_over(self, saved: records.SavedPlacementAssignment) -> bool:
         """A mac_test claim gives its kept claim and pending start to the next claim for its scope.
@@ -6660,7 +6665,7 @@ done
                     continue
             if isinstance(report, placement.NoTerminalReport):
                 report = self._lost_report()
-                saved = replace(saved, terminal_report=report, inferred_loss=True)
+                saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
 
     def _settle_aws_dispatch(self, saved: records.SavedPlacementAssignment, *,
@@ -6808,9 +6813,7 @@ done
         submitted = self.placement_requests.get(episode)
         saved_terminal = (replace(terminal, received_at=settled_at) if submitted is not None
                           and (assignment.owner != submitted.owner or assignment.since != submitted.since) else terminal)
-        self._close_for_report(replace(expired, terminal_report=saved_terminal,
-                                      inferred_loss=isinstance(report, placement.NoTerminalReport)),
-                               terminal, persist_change=False)
+        self._close_for_report(replace(expired, terminal_report=saved_terminal), terminal, persist_change=False)
 
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
@@ -6890,11 +6893,7 @@ done
         if (saved is None or saved.assignment != assignment or submitted is None
                 or (submitted.owner, submitted.since) != (assignment.owner, assignment.since)):
             return self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)
-        current = self.current_assignments.get(assignment.episode)
-        inferred = (current is None and saved.inferred_loss and saved.state == placement.ClosedAssignment("lost")
-                    and next(item for item in reversed(self.assignments.values())
-                             if item.assignment.episode == assignment.episode) is saved)
-        if not inferred and (current != key or not isinstance(saved.state, placement.CurrentAssignment)):
+        if self.current_assignments.get(assignment.episode) != key or not isinstance(saved.state, placement.CurrentAssignment):
             return self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)
         destination = assignment.destination
         target_matches = (destination.provider == "mac" if outcome.evidence is placement.MacOutage.MAC_STATUS_MISSING
@@ -6904,7 +6903,7 @@ done
             return self._placement_status(assignment, "the outage does not match the authorized attempt",
                                           check_lifetime=False)
         previous = saved.terminal_report
-        if (not inferred and isinstance(previous, placement.TerminalAttemptReport)
+        if (isinstance(previous, placement.TerminalAttemptReport)
                 and previous.outcome != GUEST_SETTLEMENT_REQUESTED):
             return self._placement_status(assignment, "the attempt already has a terminal report", check_lifetime=False)
         now = self.clock.now()
@@ -6914,7 +6913,7 @@ done
 
         self.mac_outages[destination.target] = MacOutageFence(now)
         terminal = placement.TerminalAttemptReport(outcome, placement.DispatchPathSettled(), now)
-        self._close_placement(replace(saved, terminal_report=terminal, inferred_loss=False), "lost", placement.RetryAt(0),
+        self._close_placement(replace(saved, terminal_report=terminal), "lost", placement.RetryAt(0),
                               persist_change=False)
         _ = self.execution_evidence.pop(key, None)
         if self._placement_waiting(submitted):
