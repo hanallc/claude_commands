@@ -138,7 +138,7 @@ import sys
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -192,7 +192,7 @@ from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefus
                          UserAction, NoActionRequired, action_conflicts, named_places, notification_header, notification_message,
                          parse_user_action, SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
-STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
+STATE = review_hold.message_state_directory()
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
 SESSIONS = Path.home() / ".claude" / "sessions"
 USER_CHANNEL = Path(__file__).resolve().parent.parent / "notify" / "pushover.py"
@@ -1189,35 +1189,33 @@ def as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-@contextmanager
-def locked() -> Generator[None]:
-    STATE.mkdir(parents=True, exist_ok=True)
-    with open(STATE / ".lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+def locked() -> AbstractContextManager[None]:
+    return review_hold.lock_message_state(STATE)
 
 
 def write_key_states(states: KeyStates) -> None:
     """Replace and sync the key records before their next external step."""
-    write_atomic(STATE / "keys.json", json.dumps(states, indent=2, sort_keys=True) + "\n")
+    review_hold.write_message_keys(STATE, states)
 
 
 def read_key_states(*, require_readable: bool = False) -> KeyStates:
+    if not require_readable:
+        return cast(KeyStates, review_hold.read_message_keys(STATE))
     try:
         return cast(KeyStates, json.loads((STATE / "keys.json").read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        if require_readable:
-            raise
         return {}
 
 
 @contextmanager
 def key_states(*, require_readable: bool = False) -> Generator[KeyStates]:
     """The key states, under the lock, written back on exit when changed."""
+    if not require_readable:
+        with review_hold.message_keys(STATE, locked()) as keys:
+            yield cast(KeyStates, keys)
+        return
     with locked():
-        states = read_key_states(require_readable=require_readable)
+        states = read_key_states(require_readable=True)
         before = json.dumps(states, sort_keys=True)
         yield states
         if json.dumps(states, sort_keys=True) != before:
@@ -1907,20 +1905,7 @@ def record_acceptance(message: Message, at: datetime) -> None:
 
 
 def record_released_acceptances(held: tuple[review_hold.ReviewMessage, ...], fallback_recipient: str, at: float) -> None:
-    """Start the repeat window for each held key when the list reaches the recipient."""
-    keyed = [(item.key, item.key_recipient or fallback_recipient) for item in held if item.key]
-    if not keyed:
-        return
-    accepted_at = datetime.fromtimestamp(at, timezone.utc)
-    with key_states() as states:
-        for key, address in keyed:
-            state = states.setdefault(key, {"last": {}})
-            last = state["last"].get(address)
-            if last is None or datetime.fromisoformat(last) < accepted_at:
-                state["last"][address] = accepted_at.isoformat()
-        for item in held:
-            if item.key and item.once_per_key:
-                states[item.key]["once_accepted"] = True
+    review_hold.record_released_acceptances(held, fallback_recipient, at, directory=STATE)
 
 
 @dataclass(frozen=True)

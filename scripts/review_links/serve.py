@@ -43,7 +43,7 @@ from scripts.build_queue import admission_client, admission_protocol as admissio
 from scripts.lib import atomic_file, conf, scratch, session_folder
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
-from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
+from scripts.production import change_routing, change_review, record_store, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
@@ -392,13 +392,13 @@ class PageCaptures:
              target: new_item_dialog.ScopedSubmissionKey) -> new_item_dialog.SubmissionScreenshot:
         """Keep the item with the capture so the worker can attach the screenshot."""
         if not new_item_dialog.capture_key_matches_draft(key, submitted_draft_id):
-            raise new_item_dialog.SubmissionConflict("The screenshot belongs to another draft.")
+            raise record_store.SubmissionConflict("The screenshot belongs to another draft.")
         with self._lock:
             capture = self._active(key)
             if capture is None:
                 return new_item_dialog.NO_PAGE_SCREENSHOT
             if capture.target not in (new_item_dialog.NoBoundCaptureTarget.UNBOUND, target):
-                raise new_item_dialog.SubmissionConflict("This screenshot belongs to another item.")
+                raise record_store.SubmissionConflict("This screenshot belongs to another item.")
             if capture.target is new_item_dialog.NoBoundCaptureTarget.UNBOUND:
                 capture.target = target
                 self._save(key, capture)
@@ -418,7 +418,7 @@ class PageCaptures:
                 capture.target = target
                 capture.state = UnavailableBoundCapture.UNAVAILABLE
             else:
-                raise new_item_dialog.SubmissionConflict("This screenshot belongs to another item.")
+                raise record_store.SubmissionConflict("This screenshot belongs to another item.")
             capture.completed.set()
             self._save(key, capture)
 
@@ -541,7 +541,7 @@ class PageCaptures:
                      and capture.target is new_item_dialog.NoBoundCaptureTarget.UNBOUND)
                     or (allow_pending and isinstance(capture.state, PageCapturePending))):
                 if capture.filing:
-                    raise new_item_dialog.SubmissionConflict("This screenshot is in use. Try Send again.")
+                    raise record_store.SubmissionConflict("This screenshot is in use. Try Send again.")
                 screenshot = capture.state
                 capture.filing = True
             else:
@@ -1710,7 +1710,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         try:
             key = new_item_dialog.read_capture_key(capture_key)
-        except new_item_dialog.SubmissionError:
+        except record_store.SubmissionError:
             self.json_response(404, {"error": "The page screenshot is unavailable."})
             return None
         server = cast(ReviewLinksServer, self.server)
@@ -1736,16 +1736,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             lengths = self.headers.get_all("Content-Length", [])
             if len(lengths) != 1 or self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
-                raise new_item_dialog.SubmissionError("Invalid New item request size.")
+                raise record_store.SubmissionError("Invalid New item request size.")
             size = int(lengths[0])
             if not 0 < size <= MAX_NEW_ITEM_BODY:
-                raise new_item_dialog.SubmissionError("Invalid New item request size.")
+                raise record_store.SubmissionError("Invalid New item request size.")
             body = self.rfile.read(size)
             if len(body) != size:
-                raise new_item_dialog.SubmissionError("Incomplete New item request.")
+                raise record_store.SubmissionError("Incomplete New item request.")
             payload = cast(object, json.loads(body.decode("utf-8")))
             if not isinstance(payload, dict):
-                raise new_item_dialog.SubmissionError("Invalid New item request.")
+                raise record_store.SubmissionError("Invalid New item request.")
             fields = cast(dict[str, object], payload)
             token = fields.get("token")
             valid_token = self.valid_request_token(token)
@@ -1760,7 +1760,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(409, {"code": "wrong_draft_kind", "error": str(error)})
             return
         except (ValueError, RecursionError) as error:
-            reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
+            reason = str(error) if isinstance(error, record_store.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
             return
         except OSError:
@@ -1795,19 +1795,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             has_capture_metadata = "defer_capture" in fields
             deferred: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT
             request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry | None = None
-            refusal: new_item_dialog.SubmissionError | None = None
+            refusal: record_store.SubmissionError | None = None
 
             def read_submission() -> new_item_dialog.NewItemRequest:
                 try:
                     item = new_item_dialog.read_request(
                         fields, has_capture="capture_key" in fields and not has_capture_metadata)
-                except new_item_dialog.SubmissionError:
+                except record_store.SubmissionError:
                     raise
                 except (ValueError, RecursionError) as error:
-                    raise new_item_dialog.SubmissionError("Invalid New item JSON.") from error
+                    raise record_store.SubmissionError("Invalid New item JSON.") from error
                 if "capture_key" in fields and (not item.page or not isinstance(
                         item.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
-                    raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
+                    raise record_store.SubmissionError("Open the New item dialog from a page owner.")
                 return item
 
             if not list_draft_id:
@@ -1821,7 +1821,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             refusal = new_item_dialog.SubmissionScreenshotExpired()
                         elif not review_submissions.DRAFT_ID.fullmatch(request.request_id):
                             refusal = new_item_dialog.SubmissionScreenshotReload()
-                except new_item_dialog.SubmissionError as error:
+                except record_store.SubmissionError as error:
                     if not browser_draft or not isinstance(draft, str):
                         raise
                     request = new_item_dialog.UnverifiedDraftRetry(draft, error)
@@ -1833,17 +1833,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             or not (review_submissions.is_draft_id(draft) or page == "list"
                                     and review_submissions.DRAFT_ID.fullmatch(draft))
                             or not new_item_dialog.capture_key_matches_draft(key, draft)):
-                        raise new_item_dialog.SubmissionError("The screenshot belongs to another draft.")
+                        raise record_store.SubmissionError("The screenshot belongs to another draft.")
                     if has_capture_metadata and isinstance(page, str) and page in page_frame.OWNER_PAGES:
                         deferred = new_item_dialog.DeferredCaptureIntent(
                             key, draft, deferred_capture_request(server.root, page, fields["defer_capture"]))
-            except new_item_dialog.SubmissionError as error:
+            except record_store.SubmissionError as error:
                 if not list_draft_id:
                     raise
                 # Check for a saved List draft before validating a new capture.
                 key, refusal = "", error
         except (ValueError, RecursionError) as error:
-            reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
+            reason = str(error) if isinstance(error, record_store.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
             return
         except OSError:
@@ -1874,7 +1874,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             list_assignee = review_submissions.ListWindowAssignee.RECIPIENT
             if "list_assignee" in fields:
                 if not list_draft_id or fields.get("page_recipient") == new_item_dialog.PageRecipient.PRODUCER:
-                    raise new_item_dialog.SubmissionError("Send a List assignee with a List draft.")
+                    raise record_store.SubmissionError("Send a List assignee with a List draft.")
                 list_assignee = review_submissions.list_command_assignee(fields["list_assignee"])
             initial_delivery = review_submissions.InitialDelivery(site if has_evidence else "", list_assignee)
             with ExitStack() as captures:
@@ -1978,10 +1978,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except review_submissions.DraftPending:
             self.pending_draft_response()
             return
-        except new_item_dialog.SubmissionConflict as error:
+        except record_store.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
-        except new_item_dialog.SubmissionError as error:
+        except record_store.SubmissionError as error:
             self.json_response(400, {"error": str(error)})
             return
         except (reply_tokens.UnavailableReplyToken, review_actions.SubmissionDeliveryPending) as error:
@@ -2033,10 +2033,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             status = 400 if error.reason is new_item.FilingRefusal.INVALID_SCHEDULE else 409
             self.json_response(status, {"error": str(error)})
             return
-        except new_item_dialog.SubmissionConflict as error:
+        except record_store.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
-        except new_item_dialog.SubmissionError as error:
+        except record_store.SubmissionError as error:
             self.json_response(400, {"error": str(error)})
             return
         except (OSError, ValueError, TypeError, staff.StaffRefused) as error:
@@ -2078,7 +2078,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if key:
             if len(key) <= 32:
-                raise new_item_dialog.SubmissionError("Use a key for this draft.")
+                raise record_store.SubmissionError("Use a key for this draft.")
             if server.ensure_page_capture(key, capture):
                 self.json_response(202, {"capture_key": key})
             else:
@@ -3015,7 +3015,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         key, draft, request = intent.capture_key, intent.submitted_draft_id, intent.request
         try:
             if not new_item_dialog.capture_key_matches_draft(key, draft):
-                raise new_item_dialog.SubmissionConflict("The screenshot belongs to another draft.")
+                raise record_store.SubmissionConflict("The screenshot belongs to another draft.")
             if not isinstance(request, new_item_dialog.PageCaptureRequest):
                 self.page_captures.unavailable(key, target)
                 return

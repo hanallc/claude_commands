@@ -63,6 +63,7 @@ from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
+from scripts.build_queue import admission_records
 from scripts.copies import copies
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr, pane_launch, worker_panes
@@ -1849,7 +1850,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     except copies.RemoteMirrorKept as error:
         print(f"refused: {error}")
         return 1
-    except copies.CopyError as error:
+    except admission_records.CopyError as error:
         print(f"anomaly: {error}".replace("\n", " "))
         if require_cleanup:
             return 1
@@ -1902,7 +1903,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
                 return 1
         try:
             copies.remove_trees(str(row.id))
-        except copies.CopyError as error:
+        except admission_records.CopyError as error:
             print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
         retirement_close_idle_shell(pane, row, record)
@@ -2127,7 +2128,7 @@ def retire_named_unit(name: str) -> int:
             row = named_staff_unit(name, record)
             unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record)
             return retirement_retire(unit, settings=settings, record=record)
-        except (RetirementRefused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable,
+        except (RetirementRefused, Refusal, ValueError, OSError, admission_records.CopyError, conf.Unusable,
                 unit_config.ConfigRefused, subprocess.SubprocessError) as error:
             print(f"retire: {error}")
             return 1
