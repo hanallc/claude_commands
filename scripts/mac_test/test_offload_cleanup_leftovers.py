@@ -23,8 +23,8 @@ class RunnerFenceCommandTests(unittest.TestCase):
         identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
         # Pin all command bytes, including the export that appends fd 8 to COPIES_MIRROR_LEASE_FDS.
         for scope, expected in (
-            ("run", "a7c69949c03746503691afd99d8833096047070cdbfc3d06d849c3727e15f4d2"),
-            ("claims/alpha.json", "bc44cbea9f76c188499e7dc534f7e98bd3b9b5d1bba0d5fb934d52f4280ca4c8"),
+            ("run", "8948cd12f086cf77b0d302e9e2cde73392c5c201b774f34fa1970c070d0d8c12"),
+            ("claims/alpha.json", "bcdd69303f84a2b2a9662ee18b2b1be94f2ee444199b2fa920fe61566a4a064c"),
         ):
             with self.subTest(scope=scope):
                 command = offload.fenced_start_command(identity, "mac", "printf 'mac_exit=42\\n'", scope_key=scope)

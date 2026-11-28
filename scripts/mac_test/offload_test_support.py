@@ -77,7 +77,7 @@ def assigned_adapter_main() -> int:
 
 
 class RemoteLine(TypedDict):
-    stream: Literal["stdout", "stderr"]
+    stream: Literal["stdout", "stderr", "ssh_stderr"]
     text: str
 
 

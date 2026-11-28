@@ -246,19 +246,28 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
 fi
 if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'lint clippy'* ||
       $remote == *'lint mend-check'* || $remote == *'lint doc'* ]]; then
+    exec 3>&2
+    if [[ $remote == $'(\n'* && $remote == *$'\n) 2>&1' ]]; then
+        exec 2>&1
+    fi
+    key=
+    if [[ $remote =~ /dispatch-fences/[^[:space:]]+[[:space:]]([a-f0-9]{64})[[:space:]] ]]; then
+        key=${BASH_REMATCH[1]}
+    fi
     if (( hold_run )); then
-        printf 'mac_exit=0\nfixture acknowledgement\n'
+        report_verdict mac_exit=0 "$key"
+        printf 'fixture acknowledgement\n'
         printf 'started\n' > "$root/run-started"
         await_release finish-run
     else
         printf 'started\n' > "$root/run-started"
     fi
     for index in "${!run_lines[@]}"; do
-        if [[ ${run_streams[index]} == stdout ]]; then
-            printf '%s\n' "${run_lines[index]}"
-        else
-            printf '%s\n' "${run_lines[index]}" >&2
-        fi
+        case ${run_streams[index]} in
+            stdout) printf '%s\n' "${run_lines[index]}";;
+            stderr) printf '%s\n' "${run_lines[index]}" >&2;;
+            ssh_stderr) printf '%s\n' "${run_lines[index]}" >&3;;
+        esac
         if (( index == 0 && hold_after_first_line )); then
             printf 'sent\n' > "$root/first-line-sent"
             await_release continue-run
@@ -267,10 +276,6 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
     if (( run_status_reported )); then
         verdict=${run_status_line##*$'\n'}
         if [[ $run_status_line == *$'\n'* ]]; then printf '%s\n' "${run_status_line%$'\n'*}"; fi
-        key=
-        if [[ $remote =~ /dispatch-fences/[^[:space:]]+[[:space:]]([a-f0-9]{64})[[:space:]] ]]; then
-            key=${BASH_REMATCH[1]}
-        fi
         report_verdict "$verdict" "$key"
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
         python3 - "$claim_file" <<'SETTLE_FENCE'

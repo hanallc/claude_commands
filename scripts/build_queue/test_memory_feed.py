@@ -3553,6 +3553,7 @@ const refresh = createPageRefresh(tick);
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
                 _ = write_config_fixture(installed / 'config/console.conf')
+                _ = write_config_fixture(installed / "config/waits.conf")
                 probe = textwrap.dedent("""
                     import builtins
                     import json
@@ -3599,6 +3600,8 @@ const refresh = createPageRefresh(tick);
                         getattr(memory_feed, sys.argv[2]).InstalledSchemaRevision)
                     with (mock.patch.object(memory_feed.program_memory_feed, 'configured_feed', return_value=None),
                           mock.patch.object(memory_feed.queue_view, 'refresh_mac_builds'),
+                          mock.patch.object(memory_feed, 'STEVE_DUMP_COMMAND', (str(memory_feed.PROC / 'missing-steve'),)),
+                          mock.patch.object(memory_feed, 'steve_journal', return_value=''),
                           mock.patch.object(memory_feed, 'report_reading',
                             return_value=memory_feed.charts.IndexUnavailable('private report fixture')),
                           mock.patch.object(memory_feed, 'reading', return_value={

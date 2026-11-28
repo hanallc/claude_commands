@@ -46,7 +46,7 @@ class MacReturnTests(OffloadCommandFixture):
 
     def set_transport_outage(self) -> None:
         self.fixture["probe_lines"].append("dispatch_mac_id=11111111-2222-3333-4444-555555555555")
-        self.fixture["run_lines"] = [{"stream": "stderr", "text": "Timeout, server mac not responding."}]
+        self.fixture["run_lines"] = [{"stream": "ssh_stderr", "text": "Timeout, server mac not responding."}]
         self.fixture["run_status_reported"] = False
         self.fixture["run_ssh_status"] = 255
         self.sync_fixture()
@@ -129,7 +129,7 @@ class MacReturnTests(OffloadCommandFixture):
 
     def test_native_reconnect_checks_the_original_attempt_before_the_deadline(self) -> None:
         self.set_transport_outage()
-        self.fixture["run_lines"] = [{"stream": "stderr", "text": "client_loop: send disconnect: Broken pipe"}]
+        self.fixture["run_lines"] = [{"stream": "ssh_stderr", "text": "client_loop: send disconnect: Broken pipe"}]
         self.sync_fixture()
         self.set_leftover_answer("clean")
         machine_id = "11111111-2222-3333-4444-555555555555"

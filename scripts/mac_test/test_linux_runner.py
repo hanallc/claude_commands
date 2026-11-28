@@ -43,6 +43,18 @@ MISSING_PROCESS_CWD = Path()
 BASH = shutil.which("bash") or "/bin/bash"
 
 
+def stream_remote_step(controller: offload.ProcessController, arguments: Sequence[str],
+                       output: str, status: int) -> offload.RemoteRunStatus:
+    """Give the runner merged remote output and a separate SSH diagnostic stream."""
+    with tempfile.TemporaryFile() as remote_output, tempfile.TemporaryFile() as ssh_errors:
+        _ = remote_output.write(output.encode())
+        _ = remote_output.seek(0)
+        process = mock.Mock(stdout=remote_output, stderr=ssh_errors,
+                            wait=mock.Mock(return_value=status), poll=mock.Mock(return_value=status))
+        with mock.patch.object(subprocess, "Popen", return_value=process):
+            return offload.ProcessController.stream_mac_run(controller, arguments)
+
+
 class ToolEvent(TypedDict):
     tool: str
     args: list[str]
@@ -899,18 +911,8 @@ class LinuxShellTests(unittest.TestCase):
 
         dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
 
-        class CompletedRemoteStep:
-            stdout: io.StringIO = io.StringIO(wire.stdout + wire.stderr)
-
-            def wait(self) -> int:
-                return wire.returncode
-
-            def poll(self) -> int:
-                return self.wait()
-
         def stream(arguments: Sequence[str]) -> offload.RemoteRunStatus:
-            with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
-                return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
+            return stream_remote_step(dispatch.controller, arguments, wire.stdout + wire.stderr, wire.returncode)
 
         with mock.patch.object(dispatch.controller, "stream_mac_run", side_effect=stream):
             result, _, output = dispatch.run_request(dispatch.request())
@@ -1459,17 +1461,7 @@ class LinuxProcessTests(unittest.TestCase):
             self.assertNotIn("Traceback", output.getvalue())
             shutil.rmtree(self.proc / "900")
 
-            class CompletedRemoteStep:
-                stdout: io.StringIO = io.StringIO(output.getvalue())
-
-                def wait(self) -> int:
-                    return 0
-
-                def poll(self) -> int:
-                    return self.wait()
-
-            with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
-                return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
+            return stream_remote_step(dispatch.controller, arguments, output.getvalue(), 0)
 
         with mock.patch.object(subprocess, "run", side_effect=cleanup), \
                 mock.patch.object(dispatch.controller, "stream_mac_run", side_effect=stream):
@@ -1589,17 +1581,7 @@ class LinuxProcessTests(unittest.TestCase):
             dispatch.actions.append("run")
             reply = runner(arguments)
 
-            class RemoteStartup:
-                stdout: io.StringIO = io.StringIO(reply.stdout + reply.stderr)
-
-                def wait(self) -> int:
-                    return reply.returncode
-
-                def poll(self) -> int:
-                    return self.wait()
-
-            with mock.patch.object(subprocess, "Popen", return_value=RemoteStartup()):
-                return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
+            return stream_remote_step(dispatch.controller, arguments, reply.stdout + reply.stderr, reply.returncode)
 
         shell = linux_runner.ShellEnvironment("fixture-shell", self.root / "exports", self.root / "inputs")
         with mock.patch.object(dispatch.controller, "capture", side_effect=capture), \
@@ -2211,20 +2193,10 @@ class LinuxDispatchTests(unittest.TestCase):
                 print("mac_exit=0\nmac_cleanup=kept")
         self.assertTrue((mirror / ".linux-run.json").exists())
 
-        class CompletedRemoteStep:
-            stdout: io.StringIO = io.StringIO(wire.getvalue())
-
-            def wait(self) -> int:
-                return 0
-
-            def poll(self) -> int:
-                return self.wait()
-
         def stream_child_run(arguments: Sequence[str]) -> offload.RemoteRunStatus:
             self.commands.append(list(arguments))
             self.actions.append("run")
-            with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
-                return offload.ProcessController.stream_mac_run(self.controller, arguments)
+            return stream_remote_step(self.controller, arguments, wire.getvalue(), 0)
 
         self.cleanup_reply = subprocess.CompletedProcess([], 0, "leftovers=1\nrc=0\n", "")
         with mock.patch.object(self.controller, "stream_mac_run", side_effect=stream_child_run):
