@@ -1922,8 +1922,8 @@ def _under_test_root(path: Path) -> bool:
     import tempfile
 
     resolved = path.expanduser().resolve()
-    return any(resolved.is_relative_to(root.resolve())
-               for root in (Path(tempfile.gettempdir()), Path("/tmp"), Path("/dev/shm")))
+    return ("test-runs" in resolved.parts
+            or any(resolved.is_relative_to(root.resolve()) for root in (Path(tempfile.gettempdir()), Path("/tmp"))))
 
 
 def _location_paths(row: StaffRow) -> tuple[Path, ...]:

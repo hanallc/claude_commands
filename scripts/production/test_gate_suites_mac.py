@@ -377,7 +377,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                 grant = cast(gate.LocalGateAssignment, options["local_grant"])
                 self.assertEqual((grant.grant, grant.owner), (reply.grant, reply.assignment.owner))
                 self.assertEqual(grant.sidecar, queue.root / "placement.cgroup")
-                run = cast(gate.GateRun, run_real(repo, *arguments, **options))
+                with mock.patch.dict(os.environ, {"TMPDIR": self.environment["TMPDIR"]}):
+                    run = cast(gate.GateRun, run_real(repo, *arguments, **options))
                 self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
                 return run
 
@@ -390,7 +391,6 @@ class MacGateSuitesTests(GateSuitesFixture):
                       mock.patch.object(gate, "gate_job_from_process",
                                         return_value=gate_job_for_command(["gate.py", *argv])),
                       mock.patch.object(mac_linux, "route") as guest,
-                      mock.patch.object(gate, "_gate_job_parent", return_value=self.fixture_root.parent),
                       mock.patch.object(gate, "gate_reservation") as second_reservation,
                       mock.patch.object(gate, "run_suites", side_effect=run_local) as local,
                       redirect_stderr(io.StringIO()) as errors):

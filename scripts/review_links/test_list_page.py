@@ -30,6 +30,7 @@ from uuid import uuid4
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
+from scripts.lib.socket_test_support import browser_socket_environment
 from scripts.console_text.test_support import accepting_console_text
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
@@ -216,15 +217,20 @@ class _Chrome(_Browser):
         self.sequence: int = 0
         self.blank: bool = True
         self.session_storage_written: bool = False
-        with (root / "chrome.log").open("wb") as log:
-            process = subprocess.Popen(
-                ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
-                 "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
-                 "--no-first-run", "--allow-file-access-from-files", "--remote-debugging-pipe",
-                 f"--user-data-dir={root / 'chrome'}", "about:blank"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0,
-                start_new_session=True)
-        super().__init__(process)
+        self.resources: ExitStack
+        with ExitStack() as browser_files:
+            browser_env = browser_files.enter_context(browser_socket_environment())
+            with (root / "chrome.log").open("wb") as log:
+                process = subprocess.Popen(
+                    ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
+                     "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--disable-background-networking",
+                     "--no-first-run", "--allow-file-access-from-files", "--remote-debugging-pipe",
+                     f"--user-data-dir={root / 'chrome'}", "about:blank"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0,
+                    start_new_session=True, env=browser_env)
+            super().__init__(process)
+            _ = browser_files.enter_context(self.resources)
+            self.resources = browser_files.pop_all()
         with self.stop_on_error():
             writer = process.stdin
             assert writer is not None

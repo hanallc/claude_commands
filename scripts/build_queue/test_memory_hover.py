@@ -1,5 +1,6 @@
 """Check the memory page hover with private captured readings."""
 from __future__ import annotations
+from scripts.lib.socket_test_support import browser_socket_environment
 from scripts.build_queue import admission_records
 
 from collections.abc import Mapping
@@ -1287,10 +1288,11 @@ document.querySelector('#result').textContent=JSON.stringify({{fits,intact,rende
 </script>""")
                 for width in (1440, 390):
                     with self.subTest(width=width):
-                        result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
-                            "--disable-background-networking", f"--user-data-dir={folder}/chrome",
-                            f"--window-size={width},720", "--dump-dom", page.as_uri()], capture_output=True,
-                            text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                        with browser_socket_environment() as browser_env:
+                            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                                f"--window-size={width},720", "--dump-dom", page.as_uri()], capture_output=True,
+                                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False, env=browser_env)
                         self.assertEqual(result.returncode, 0, result.stderr)
                         output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
                         layout = cast(dict[str, object], json.loads(output))
@@ -1347,10 +1349,11 @@ document.querySelector('#result').textContent = JSON.stringify({
 """
                 _ = page.write_text(page.read_text().replace("</body>", browser_test.replace(
                     "__READING__", memory_feed.page_json(page_reading)) + "</body>"))
-                result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
-                    "--disable-background-networking", f"--user-data-dir={folder}/chrome",
-                    "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True, text=True,
-                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                with browser_socket_environment() as browser_env:
+                    result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                        "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                        "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True, text=True,
+                        timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False, env=browser_env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
                 layout = cast(dict[str, object], json.loads(output))
@@ -1789,10 +1792,11 @@ const layouts = [240, 360, 1600].map(width => {{
 }});
 document.querySelector('#result').textContent = JSON.stringify(layouts);
 </script>""")
-            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
-                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
-                "--dump-dom", page.as_uri()], capture_output=True, text=True,
-                timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+            with browser_socket_environment() as browser_env:
+                result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                    "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                    "--dump-dom", page.as_uri()], capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False, env=browser_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
         layouts = cast(list[dict[str, object]], json.loads(output))
@@ -2891,10 +2895,11 @@ renderAwsHistory();
             document = memory_feed.page_document(0).replace("</body>",
                 '<output id="result"></output><script>' + script + probe + '</script></body>')
             _ = page.write_text(document, encoding="utf-8")
-            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
-                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
-                "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True,
-                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+            with browser_socket_environment() as browser_env:
+                result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                    "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                    "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True,
+                    text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False, env=browser_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
 

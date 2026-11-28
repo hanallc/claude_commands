@@ -335,13 +335,6 @@ def configured_gate_root() -> Path:
     return Path(_settings().text("roots.gate"))
 
 
-def tmpfs_temporary_parent() -> Path:
-    """Keep nested work under the caller's tmpfs folder."""
-    root = configured_gate_root()
-    inherited = inherited_temporary_parent().resolve()
-    return inherited if inherited.is_relative_to(root) else root
-
-
 def _parent(parent: BuildFolderParent) -> Path:
     if isinstance(parent, InheritedTemporaryParent):
         return inherited_temporary_parent()
@@ -530,9 +523,26 @@ def _parse_number(name: str) -> int:
     return int(name)
 
 
+_selected_build_root: ContextVar[Path | UseConfiguredValue] = ContextVar(
+    "selected_build_root", default=UseConfiguredValue.CURRENT)
+
+
+@contextmanager
+def use_build_root(root: Path) -> Generator[None]:
+    """Use the same build root for the allocation and its consumer."""
+    token = _selected_build_root.set(root)
+    try:
+        yield
+    finally:
+        _selected_build_root.reset(token)
+
+
 def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
     """Return the configured root for the local build folders."""
     if isinstance(settings, UseConfiguredValue):
+        root = _selected_build_root.get()
+        if isinstance(root, Path):
+            return root
         settings = _settings()
     return Path(settings.text("roots.build")).expanduser()
 
@@ -760,12 +770,17 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
         return InvalidFolderComponents(str(error))
 
 
-def test_runs_parent(checkout: Path) -> Path:
-    """Select a test parent from the checkout output or the caller's private temporary folder."""
+class TestRunPlacement(Enum):
+    DIRECT = "use the checkout output"
+    GATE = "use the build disk outside the checkout"
+
+
+def test_runs_parent(checkout: Path, *, placement: TestRunPlacement = TestRunPlacement.DIRECT) -> Path:
+    """Select the test parent for a modeled checkout or use the caller's temporary folder."""
     target = checkout / "target"
     output = None
     if isinstance(parse_form(checkout), BuildCopy):
-        if not target.is_symlink():
+        if placement is TestRunPlacement.GATE or not target.is_symlink():
             output = target
     elif target.is_symlink():
         with suppress(OSError, RuntimeError):
@@ -773,6 +788,13 @@ def test_runs_parent(checkout: Path) -> Path:
             if linked_output.is_dir() and isinstance(parse_form(linked_output), (WorktreeOutput, MainOutput)):
                 output = linked_output
     if output is not None:
+        if placement is TestRunPlacement.GATE:
+            root = build_root().resolve()
+            identity = (output.parent if output == target else output).resolve().relative_to(root)
+            parent = root / "test-runs" / identity
+            if parent.resolve() != parent:
+                raise InvalidFolderForm(f"{parent}: a model gate folder must not use a link")
+            return parent
         parent = output / "test-runs"
         if parent.is_symlink():
             raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
@@ -781,7 +803,12 @@ def test_runs_parent(checkout: Path) -> Path:
     from scripts.lib import session_folder, unit_runs
 
     inherited = inherited_temporary_parent().resolve()
-    parent = inherited.parent if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV) else inherited / "test-runs"
+    direct_name = "test-runs"
+    gate_name = "gate-test-runs"
+    temporary_root = inherited
+    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV) and inherited.parent.name in (direct_name, gate_name):
+        temporary_root = inherited.parent.parent
+    parent = temporary_root / (gate_name if placement is TestRunPlacement.GATE else direct_name)
     build = build_root().resolve()
     protected = (
         build / "test-runs",
@@ -1926,6 +1953,7 @@ class _TemporaryFolderRequest:
     """The temporary folder request retains its cleanup stack."""
     request: UniqueBuildFolder | BuildFolderSpec
     cleanup: ExitStack
+    keep_on_exit: Callable[[], bool] | Literal["remove"]
 
 
 def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> BuildFolderSpec:
@@ -2142,7 +2170,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     _register_build_lock(descriptor, path)
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
-                                                     descriptor=descriptor, temporary=not stable)
+                                                     descriptor=descriptor, temporary=not stable,
+                                                     keep_on_exit=request.keep_on_exit)
                     return path
                 except BaseException:
                     _forget_build_lock(descriptor)
@@ -3026,10 +3055,13 @@ class _ScratchBorrowerCheck(Protocol):
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
-                      descriptor: int, temporary: bool) -> None:
+                      descriptor: int, temporary: bool,
+                      keep_on_exit: Callable[[], bool] | Literal["remove"] = "remove") -> None:
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
+    if callable(keep_on_exit) and keep_on_exit():
+        return
     with ExitStack() as claim:
         root = build_root().resolve()
         canonical = _temporary_claim_location(path, root)
@@ -3140,10 +3172,11 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 
 
 @contextmanager
-def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Generator[Path]:
-    """Remove private work after the caller ends, including interrupted callers."""
+def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec, *,
+                           keep_on_exit: Callable[[], bool] | Literal["remove"] = "remove") -> Generator[Path]:
+    """Remove private work on exit unless the caller keeps it for the next sweep."""
     with ExitStack() as cleanup:
-        yield create_build_folder(_TemporaryFolderRequest(request, cleanup))
+        yield create_build_folder(_TemporaryFolderRequest(request, cleanup, keep_on_exit))
 
 
 def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[BuildFolderSpec], Path], *,

@@ -22,6 +22,7 @@ from scripts.aws_target import hana_guest, hana_payload, hana_protocol, hana_rec
 from scripts.aws_target.hana_generation import HanaHostGeneration
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.build_queue import execution_identity
+from scripts.lib.socket_test_support import short_socket_directory
 
 
 def request_for(payload: bytes) -> hana_protocol.HanaExecutionRequest:
@@ -251,12 +252,13 @@ print(args['--command-timeout-s'])
                                  timeout=5, check=False)
         if manager.returncode != 0:
             self.skipTest('A Linux systemd user manager is required')
-        with tempfile.TemporaryDirectory() as temporary, socket.socket(socket.AF_UNIX) as listener:
+        with (tempfile.TemporaryDirectory() as temporary, short_socket_directory() as sockets,
+              socket.socket(socket.AF_UNIX) as listener):
             root = Path(temporary)
             home = root / 'home'
             mount = hana_payload.payload_mount(home)
             write_policy(root / 'policy.conf', root / 'slots')
-            address = root / 'ready.sock'
+            address = Path(sockets) / 'ready.sock'
             listener.bind(str(address))
             listener.listen()
             listener.settimeout(10)

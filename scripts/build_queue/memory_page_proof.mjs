@@ -275,10 +275,12 @@ async function assertRowCenters(evaluate) {
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  const fixtureOutput = liveAwsCostSource ? '' : execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture())); from scripts.review_links import new_item_dialog, page_frame; from scripts.production import staff; page = Path(sys.argv[1]) / "memory_live.html"; page.write_bytes(page_frame.with_owner(page.read_bytes(), "builds", page_frame.NoShownOwner(), staff.StaffSnapshot(()), new_item_dialog.render))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
+  const writeFixture = 'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture())); from scripts.review_links import new_item_dialog, page_frame; from scripts.production import staff; page = Path(sys.argv[1]) / "memory_live.html"; page.write_bytes(page_frame.with_owner(page.read_bytes(), "builds", page_frame.NoShownOwner(), staff.StaffSnapshot(()), new_item_dialog.render))';
+  const readSocketSettings = 'from pathlib import Path; from scripts.lib import conf; from scripts.lib.socket_test_support import PROOF_CHROME_PREFIX, PROOF_CHROME_TEMP, proof_chrome_socket_address; root = Path(conf.read_or_repository("build_folders").text("roots.system")).expanduser(); proof_chrome_socket_address(root); print(json.dumps([str(root), PROOF_CHROME_PREFIX, PROOF_CHROME_TEMP]))';
+  const [systemTemporaryRoot, chromePrefix, chromeTemp] = liveAwsCostSource
+    ? [tmpdir(), 'memory-proof-chrome-', 'tmp']
+    : JSON.parse(execFileSync(process.env.PYTHON || 'python3', ['-c', writeFixture + '; ' + readSocketSettings, folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}));
   const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
   const beforePath = queueRowsProof || standingProof || outsideQueueProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
@@ -632,15 +634,15 @@ try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     // Chrome needs a short path for its Unix sockets.
-    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
+    const profile = await mkdtemp(join(systemTemporaryRoot, chromePrefix));
     try {
-      const temporary = join(profile, 'tmp');
+      const temporary = join(profile, chromeTemp);
       await mkdir(temporary);
       const chrome = spawn(chromePath, [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
+      ], {env:{...process.env,TMPDIR:temporary,MAC_CHROMIUM_TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);

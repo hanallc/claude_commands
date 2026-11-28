@@ -1952,7 +1952,7 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(20, "python3", parent=10, argv=("python3", "-m", "unittest", "scripts.direct.test_mac_idle"))
         cargo = self.process(21, "cargo", parent=20, start=11_001, argv=("/nix/store/rust/bin/cargo", "check", "--workspace"))
         (cargo / "cwd").unlink()
-        (cargo / "cwd").symlink_to("/dev/shm/mac-idle-suite-123/tmp456")
+        (cargo / "cwd").symlink_to("/build/claude/verify/1/target/test-runs/g-abcdefgh/m0001/tmp456")
         _ = self.process(30, "claude", start=100, session="claude-session")
         _ = self.process(31, "python3", parent=30, argv=("python3", "-m", "unittest", "scripts.agents.codex_test_support"))
         _ = self.process(40, "python3", argv=("python3", "-m", "unittest", "scripts.production.test_gate"),
@@ -1961,7 +1961,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(set(decisions), {20, 21, 31, 40})
         self.assertTrue(all(isinstance(item, hold_enforcer.WouldStopBuild) for item in decisions.values()))
         self.assertEqual(decisions[21].owner, OwningSession("codex-worker"))
-        self.assertEqual(decisions[21].process.cwd, "/dev/shm/mac-idle-suite-123/tmp456")
+        self.assertEqual(decisions[21].process.cwd, "/build/claude/verify/1/target/test-runs/g-abcdefgh/m0001/tmp456")
         self.assertEqual(decisions[40].owner, OwningSession("detached-session"))
 
     def test_waiting_merge_gate_and_verify_survive_while_their_build_children_stop(self) -> None:

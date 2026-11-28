@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.lib.socket_test_support import browser_socket_environment
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1215,12 +1216,13 @@ def window_probe_results(documents: dict[str, bytes], start: str, browser: str) 
             # Each browser takes its screenshot after the load event, and /complete holds that event for the results.
             profile, shot = Path(temporary) / 'profile', Path(temporary) / 'page.png'
             profile.mkdir()
-            command = (['google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--no-first-run',
+            command = (['google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run',
                         f'--user-data-dir={profile}', '--window-size=1440,900', f'--screenshot={shot}', url]
                        if browser == 'chrome' else
                        ['firefox', '--headless', '--no-remote', '--profile', str(profile),
                         '--window-size', '1440,900', '--screenshot', str(shot), url])
-            done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            with browser_socket_environment() as browser_env:
+                done = subprocess.run(command, capture_output=True, text=True, timeout=60, env=browser_env)
             if done.returncode or not complete.is_set():
                 raise AssertionError(f'{browser} did not report the window probe: {done.stderr}')
         finally:

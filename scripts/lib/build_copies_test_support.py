@@ -41,7 +41,6 @@ names.suffix_length=8
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system=/tmp
-roots.gate=/dev/shm
 roots.temporary={root / 'temporary'}
 roots.build={root / 'build'}
 roots.build.natedev={root / 'build'}
