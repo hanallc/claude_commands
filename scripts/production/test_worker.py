@@ -4766,6 +4766,32 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.append_codex_record(opened.pane, {"type": "event_msg", "payload": {"type": "task_complete"}})
         self.assert_blocked_answer_uses_prompt(opened.pane)
 
+    def test_answer_uses_a_prompt_after_task_started(self) -> None:
+        opened = self.answerable_worker(status="blocked")
+        self.agent.question_record(opened.pane, "old-format")
+        self.agent.append_codex_record(opened.pane, {"type": "event_msg", "payload": {"type": "task_started"}})
+        self.agent.append(opened.pane, "assistant", "Which format must I use?")
+        self.assert_blocked_answer_uses_prompt(opened.pane)
+
+    def test_answer_uses_the_box_for_a_new_call_after_task_started(self) -> None:
+        opened = self.answerable_worker(status="blocked")
+        self.agent.question_record(opened.pane, "old-format")
+        self.agent.append_codex_record(opened.pane, {"type": "event_msg", "payload": {"type": "task_started"}})
+        self.agent.question_record(opened.pane, "new-format")
+        world = self.fixture.world
+        before = len(world.commands)
+        self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        commands = world.commands[before:]
+        self.assertFalse(any(command[:2] == ("agent", "prompt") for command in commands))
+        self.assertEqual([command for command in commands
+                          if command[:2] in (("pane", "send-keys"), ("pane", "send-text"))],
+                         [("pane", "send-keys", opened.pane, "shift+left"),
+                          ("pane", "send-text", opened.pane, "Use JSON."),
+                          ("pane", "send-keys", opened.pane, "enter"),
+                          ("pane", "send-keys", opened.pane, "enter")])
+        (pending,) = self.run_dir.glob(".*.pending-answer.json")
+        self.assertEqual(worker_lifecycle.read_json_object(pending)["question_call"], "new-format")
+
     def test_answer_allows_retry_after_target_refusal_before_input(self) -> None:
         opened = self.answerable_worker()
         answer = ("answer", "impl", "--text", "Use JSON.")
@@ -4777,6 +4803,26 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
         self.assertEqual(self.agent.answers, [])
         del self.agent.answer_inputs[opened.pane]
+        self.assertEqual(self.command(*answer), (0, "done\n", ""))
+        self.assertEqual([pane for pane, _ in self.agent.answers], [opened.pane])
+
+    def test_answer_retries_after_prompt_preparation_fails(self) -> None:
+        opened = self.answerable_worker()
+        answer = ("answer", "impl", "--text", "Use JSON.")
+
+        def fail_preparation(_pane: str, _text: str) -> str:
+            self.assertEqual(len(list(self.run_dir.glob(".*.pending-answer.json"))), 1)
+            raise OSError("cannot record the prompt")
+
+        world = self.fixture.world
+        with (patch.object(herdr, "_prepare_prompt", side_effect=fail_preparation),
+              patch.object(world, "_prompt") as transport):
+            code, output, error = self.command(*answer)
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("answer did not submit: cannot record the prompt", error)
+        self.assertEqual(list(self.run_dir.glob(".*.pending-answer.json")), [])
+        transport.assert_not_called()
+        self.assertEqual(self.agent.answers, [])
         self.assertEqual(self.command(*answer), (0, "done\n", ""))
         self.assertEqual([pane for pane, _ in self.agent.answers], [opened.pane])
 

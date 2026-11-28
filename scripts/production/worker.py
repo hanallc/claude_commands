@@ -2675,11 +2675,12 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         if number == boundary and _answer_digest(json.dumps(fields, sort_keys=True)) != saved.get("request_digest"):
             return AnswerBlocked.UNAVAILABLE
         turn_ended = _transcript_turn_boundary(fields)
-        if turn_ended and isinstance(backend, staff.CodexBackend):
-            question_call = ""
         raw = fields.get("payload")
         payload = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
         kind = payload.get("type")
+        turn_started = fields.get("type") == "event_msg" and kind == "task_started"
+        if isinstance(backend, staff.CodexBackend) and (turn_ended or turn_started):
+            question_call = ""
         call = payload.get("call_id")
         if kind == "function_call" and payload.get("name") == "request_user_input" and isinstance(call, str):
             if number > boundary and accepted and status is herdr.AgentStatus.BLOCKED and call != saved.get("question_call"):
