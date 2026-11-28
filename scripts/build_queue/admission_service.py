@@ -1932,41 +1932,6 @@ def without_owners(inputs: records.QueueInputs, owners: set[str]) -> records.Que
     return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered if records.waiter_owner(row) not in owners])
 
 
-def with_guest_claim_returns(inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
-                             deferred: set[str], policy: records.AdmissionPolicy
-                             ) -> tuple[records.QueueInputs, frozenset[str]]:
-    """Use only earlier local contenders to return claims from guest waits."""
-    if not deferred or not inputs.ordered:
-        return inputs, frozenset()
-    claims = {slot.owner: slot.slot.reservation for slot in inputs.slots
-              if isinstance(slot, records.ContinuationSlot) and slot.owner in deferred
-              and slot.owner not in inputs.waiter_orders}
-    if not claims:
-        return inputs, frozenset()
-
-    positions = {records.waiter_owner(row): index for index, (_, row) in enumerate(ordered)}
-    local_rows = gate.ranked_queue_waiters(inputs)
-    guest_waits = [(path, row) for path, row in ordered if records.waiter_owner(row) in claims]
-    # Check the guest claims after the local walk so guest waits cannot block local contenders.
-    room = gate.inputs_room(inputs, policy)
-    kept, used = (room.kept, room.used) if isinstance(room, records.MemoryRoom) else (0, 0)
-    decisions = gate.admission_walk(inputs, local_rows + guest_waits, room, inputs.now, policy,
-                                   kept, used, policy.safety_bytes, gate.start_spacing_after(inputs.now, policy))
-    returned: set[str] = set()
-    for entry in decisions[len(local_rows):]:
-        hold = entry.decision.order_hold
-        if isinstance(hold, records.HeldBehindHead):
-            head = records.waiter_owner(hold.waiter)
-            owner = records.waiter_owner(entry.waiter)
-            # Use the original order to check that the local contender is earlier than the guest wait.
-            if head in inputs.waiter_orders and positions[head] < positions[owner]:
-                returned.add(claims[owner])
-    if returned:
-        inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
-                                             if gate.between_steps(slot).reservation not in returned))
-    return inputs, frozenset(returned)
-
-
 @dataclass(frozen=True)
 class NoPass:
     pass
@@ -3694,12 +3659,9 @@ class AdmissionServer:
         verify_slots = self._verify_slot_requests(inputs, policy.repository_runs)
         inputs = replace(inputs, verify_slot_requests={owner: slot.run_key for owner, slot in verify_slots.items()})
         # The placement pass rebuilds the local order from the queue order, so remove held waiters again.
-        inputs, deferred = self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds)
-        inputs, returned = with_guest_claim_returns(without_owners(inputs, held_owners),
-                                                    captured.queue_order, deferred, policy)
+        inputs = without_owners(self._placement_pass(inputs, captured.queue_order, policy,
+                                                      remote_start_hold_seconds), held_owners)
         result = gate.admission_pass(inputs, inputs.now, policy)
-        if returned:
-            result = replace(result, policy=replace(result.policy, returned_claims=result.policy.returned_claims | returned))
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
@@ -6133,16 +6095,26 @@ done
 
     def _placement_preview_inputs(self, inputs: records.QueueInputs, owners: dict[str, wire.PlacementRequest],
                                   choices: dict[str, tuple[placement.CandidateEligibility, ...]]
-                                  ) -> tuple[records.QueueInputs, set[str]]:
+                                  ) -> records.QueueInputs:
         """Prepare the local order before the placement walk."""
         preview_ordered: list[tuple[Path, records.Waiter]] = []
-        deferred_local: set[str] = set()
+        local_waits = dict(inputs.local_waits)
+        guest_candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
         for path, row in inputs.ordered:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
             if request is not None:
-                if not any(candidate.destination.provider == "local" for candidate in choices[owner]):
-                    deferred_local.add(owner)
+                candidates = choices[owner]
+                if not candidates:
+                    continue
+                if not any(candidate.destination.provider == "local" for candidate in candidates):
+                    guest = candidates[-1]
+                    if is_mac_linux_guest(guest.destination) and isinstance(wait := guest.eligibility, placement.EvidenceNeeded):
+                        wait = placement.EvidenceNeeded(PLACEMENT_REASON_TEXT.get(wait.reason, wait.reason))
+                        local_waits[owner] = wait
+                        guest_candidates[owner] = (replace(guest, eligibility=wait),)
+                    else:
+                        continue
                 prerequisite = self.prerequisites.get(request.episode)
                 if (isinstance(prerequisite, placement.TokenRequired)
                         and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked)):
@@ -6150,27 +6122,26 @@ done
                     _ = row.pop("token_left_at", None)
                     _ = row.pop("token_back_at", None)
             preview_ordered.append((path, row))
-        return without_owners(replace(inputs, ordered=preview_ordered), deferred_local), deferred_local
+        return replace(inputs, ordered=preview_ordered, local_waits=local_waits, placement_candidates=guest_candidates)
 
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
                         policy: records.AdmissionPolicy,
-                        remote_start_hold_seconds: int) -> tuple[records.QueueInputs, set[str]]:
+                        remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
             self.placement_hold_answers = {}
-            return inputs, set()
+            return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
         queued = [request for _, row in ordered if (request := owners.get(records.waiter_owner(row))) is not None]
         shared_free_at = self._newer_remote_free_readings(queued)
         local_occupied = inputs.occupied_cargo_folders
         choices = {owner: self._placement_choices(request) for owner, request in owners.items()}
-        preview_inputs, deferred = self._placement_preview_inputs(inputs, owners, choices)
+        preview_inputs = self._placement_preview_inputs(inputs, owners, choices)
         local_starts: set[str] = set()
         if preview_inputs.ordered:
-            preview_with_returns, _ = with_guest_claim_returns(preview_inputs, ordered, deferred, policy)
-            preview = gate.admission_pass(preview_with_returns, inputs.now, policy)
+            preview = gate.admission_pass(preview_inputs, inputs.now, policy)
             local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
@@ -6282,7 +6253,8 @@ done
                  if self._placement_waiting(request) and (candidates := self._placement_candidate_reading(request))}
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
-            pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named), deferred
+            pending_remote_starts=frozenset(pending_remote_starts), local_waits=preview_inputs.local_waits,
+            placement_candidates=named)
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:

@@ -664,6 +664,15 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertEqual(fixture.queue_pids(), [older.owner.pid, younger.owner.pid])
             assert isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait), reply
             self.assertIsInstance(reply.wait.reason, records.BehindHead)
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply), view
+            head, _follower = view.reading.view.waiting
+            self.assertEqual(head.placement_targets, ("mac-linux",))
+
+            token_wait = wire.PrerequisiteReport("token-wait", older.episode, older.owner, placement.TokenRequired())
+            self.assertEqual(fixture.connect(token_wait).replies(), [wire.Ok()])
+            self.assertIsInstance(fixture.connect(younger).replies()[0], wire.PlacementWait)
+            self.assertFalse(fixture.server.reservations)
 
     def test_placement_uses_natedev_before_reading_a_blocked_guest(self) -> None:
         from scripts.build_queue.test_placement import (
@@ -721,7 +730,7 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertIn("The guest block file is unreadable.", candidate.eligibility.reason)
             self.assertIn(str(block), candidate.eligibility.reason)
 
-    def test_a_guest_reading_wait_leaves_natedev_room_for_the_next_request(self) -> None:
+    def test_the_next_request_prefers_natedev_after_the_guest_wait_leaves(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, aws_gate_request, local_candidate, mac_linux_candidate, mac_linux_fixture,
             placement_request, read_aws_gate_evidence,
@@ -748,6 +757,8 @@ class PlacementStatusTests(unittest.TestCase):
 
             request = replace(request, route=older.route, constraints=replace(request.constraints,
                 candidates=(local, *request.constraints.candidates)))
+            cancelled = wire.CancelPlacement("cancel-guest", older.episode, older.owner, "the caller left")
+            self.assertEqual(fixture.connect(cancelled).replies(), [wire.Ok()])
             with mock.patch.object(fixture.server, "_aws_gate_spending", return_value=placement.AllowedHost()) as spending:
                 granted, = fixture.connect(request).replies()
             assert isinstance(granted, wire.LocalPlacementGranted), granted
@@ -840,6 +851,10 @@ class PlacementStatusTests(unittest.TestCase):
 
             _ = publish_candidate(fixture, younger, placement.TemporaryExclusion(placement.MAC_LINUX_NO_ANSWER))
             _ = fixture.run_pass()
+            self.assertIsInstance(fixture.connect(younger).replies()[0], wire.PlacementWait)
+            self.assertEqual(fixture.server.slots.get(prior.reservation), continuation)
+            cancelled = wire.CancelPlacement("cancel-guest", older.episode, older.owner, "the caller left")
+            self.assertEqual(fixture.connect(cancelled).replies(), [wire.Ok()])
             granted, = fixture.connect(younger).replies()
             assert isinstance(granted, wire.LocalPlacementGranted), granted
             self.assertEqual(granted.assignment.destination, local.destination)

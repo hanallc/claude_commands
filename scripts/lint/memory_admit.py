@@ -336,9 +336,9 @@ def waiter_state(row: Waiter) -> QueuedWaiter | TokenWaitingWaiter:
     return QueuedWaiter(row)
 
 
-def first_queued_waiter(rows: Iterable[Waiter], pending_remote_starts: frozenset[str]) -> QueuedWaiter | NoWaiter:
+def first_queued_waiter(rows: Iterable[Waiter], placement_holds: frozenset[str]) -> QueuedWaiter | NoWaiter:
     for row in rows:
-        if records.waiter_owner(row) in pending_remote_starts:
+        if records.waiter_owner(row) in placement_holds:
             return QueuedWaiter(row)
         state = waiter_state(row)
         if isinstance(state, QueuedWaiter):
@@ -2115,9 +2115,21 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
+def guest_reading_targets(inputs: QueueInputs, owner: str) -> tuple[str, ...]:
+    """Find the guest reading that holds local admission for this row."""
+    wait = inputs.local_waits.get(owner)
+    if wait is None or owner in inputs.pending_remote_starts:
+        return ()
+    return tuple(candidate.destination.target for candidate in inputs.placement_candidates.get(owner, ())
+                 if candidate.destination.provider == "ssh" and candidate.destination.target == "mac-linux"
+                 and candidate.eligibility == wait)
+
+
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
-    candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
+    placement_holds = inputs.pending_remote_starts | {
+        owner for owner in inputs.local_waits if guest_reading_targets(inputs, owner)}
+    candidate = first_queued_waiter((row for _, row in ordered), placement_holds)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
     returned_claims: set[str] = set()
@@ -2127,8 +2139,16 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
         admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
         if not inputs.slots:
             break
-        held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
-                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
+        held_owners: set[str] = set()
+        for entry in admissions:
+            hold = entry.decision.order_hold
+            if not entry.decision.reused_slot or not isinstance(hold, HeldBehindHead):
+                continue
+            owner = records.waiter_owner(entry.waiter)
+            # A guest reading holds order before its row can use local memory.
+            if guest_reading_targets(inputs, records.waiter_owner(hold.waiter)):
+                continue
+            held_owners.add(owner)
         if not held_owners:
             break
         # Return the claim before checking the earlier row's room again.
@@ -2232,7 +2252,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         reused = claim is not None
         within = reused and need <= held
         remote_start_pending = owner in inputs.pending_remote_starts
-        state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
+        state = (QueuedWaiter(row) if remote_start_pending or guest_reading_targets(inputs, owner)
+                 else waiter_state(row))
         fresh = not estimate_expired(row, now, policy)
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
@@ -2599,6 +2620,10 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
     for (_, row), admission in zip(ordered, result.rows, strict=True):
         own = admission.decision
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
+        cause = admission.reason.cause if isinstance(admission.reason, HeadAdmissionStatus) else admission.reason
+        targets = ()
+        if isinstance(cause, ReadingUnavailable) and inputs.local_waits.get(admission.owner) == placement.EvidenceNeeded(cause.reason):
+            targets = guest_reading_targets(inputs, admission.owner)
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                            identity["folder"], row["since"], row["need"], admission.reason, row.get("unit", ""),
                            project=step_project(row.get("repository_name", "")),
@@ -2606,7 +2631,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            package=row["package"] if "package" in row else PackageNotRecorded(),
                            job=row.get("job", GATE_JOB_NOT_RECORDED),
                            route=records.waiter_route(row), ci_runner=row.get("ci_runner", ""),
-                           ci_job_start=records.waiter_job_start(row), what=row.get("what", ""))
+                           ci_job_start=records.waiter_job_start(row), what=row.get("what", ""), placement_targets=targets)
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
