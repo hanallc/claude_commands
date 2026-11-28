@@ -695,6 +695,9 @@ else:
                     self.assertIn(rejection, (box / 'gate.log').read_text())
                     self.assertIn(rejection, ledger.text(uploads[-2], 'body'))
                     self.assertNotIn('stage=tests start', log)
+                    self.assertNotIn('stage=result upload', log)
+                    self.assertEqual(len(results), 1)
+                    self.assertFalse(any(row['destination'] == links['result'] for row in uploads))
                 if candidate_change == 'old transfer':
                     error = ledger.text(results[-1], 'error')
                     self.assertIn('CalledProcessError', error)
@@ -710,6 +713,7 @@ else:
                     self.assertEqual(json.loads(ledger.text(refusals[0], 'body'))['error'],
                                      'candidate predates guest entry point')
                     self.assertNotIn('stage=tests start', log)
+                    self.assertFalse(any(row['destination'] == links['result'] for row in uploads))
                 if failure == 'shell log signal':
                     self.assertTrue((root / 'signaled').exists())
                     self.assertIn('PUT log failed (curl exit 143, HTTP 000)', log)

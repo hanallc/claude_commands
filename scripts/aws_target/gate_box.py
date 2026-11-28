@@ -507,6 +507,7 @@ for metadata_path in ('/etc/ec2-metadata/instance-identity-document', '/run/clou
 ''' + GUEST_TRANSFERS + CURRENT_FILES_GUEST_SOURCE + r'''links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {**timestamps, 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
+boot_rejection = False
 try:
     if not (links.get('production') and gate_request.get('task') == 'paired'):
         result['tools'] = {}
@@ -577,10 +578,11 @@ try:
 except Exception as error:
     result['verdict'] = 'error'
     rejected = isinstance(error, GuestSourceRejected) or str(error) == 'candidate predates guest entry point'
+    boot_rejection = rejected and 'boot_error' in links
     result['error'] = str(error) if rejected else safe_gate_record(traceback.format_exc().encode()).decode()
     with log.open('a') as output:
         output.write(result['error'] + '\n')
-    if rejected and 'boot_error' in links:
+    if boot_rejection:
         record = safe_gate_record(json.dumps(result).encode())
         (root / 'boot-error.json').write_bytes(record)
         put('boot_error', record)
@@ -602,10 +604,11 @@ finally:
             put('log', content)
         except Exception as error:
             result['log_error'] = str(error)
-    stage('result upload')
-    publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
-    if links['step'] == 'start' and result['verdict'] == 'ready':
-        (root / 'prepared').touch()
+    if not boot_rejection:
+        stage('result upload')
+        publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
+        if links['step'] == 'start' and result['verdict'] == 'ready':
+            (root / 'prepared').touch()
 '''.replace('__GATE_STARTUP_SOURCE__', repr(inspect.getsource(python_startup)))
     .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)))
 

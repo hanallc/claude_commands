@@ -1026,7 +1026,9 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
             env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'HOME': str(box)})
         self.assertEqual(result.returncode, 0, result.stderr)
-        reply = cloud_gate.read(box / 'uploaded-result')
+        if missing_package:
+            self.assertFalse((box / 'uploaded-result').exists())
+        reply = cloud_gate.read(box / ('uploaded-boot-error' if missing_package else 'uploaded-result'))
         traces = [ledger.mapping(cast(object, json.loads(line))) for line in trace.read_text().splitlines()] if trace.exists() else []
         return reply, traces
 
@@ -1043,10 +1045,8 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
 
     def test_private_guest_boot_error_names_the_missing_package_and_http_status(self) -> None:
         reply, traces = self.guest(private=True, missing_package=True)
-        boot = cloud_gate.read(self.root / 'box/uploaded-boot-error')
-        self.assertEqual(boot['verdict'], 'error')
-        self.assertEqual(boot['error'], 'GuestSourceRejected: GET source failed (curl exit 22, HTTP 404)')
-        self.assertEqual(reply['error'], boot['error'])
+        self.assertEqual(reply['verdict'], 'error')
+        self.assertEqual(reply['error'], 'GuestSourceRejected: GET source failed (curl exit 22, HTTP 404)')
         self.assertEqual(traces, [])
 
     def test_paired_trial_prepares_one_package_without_remote_branch_commands(self) -> None:
@@ -1115,6 +1115,52 @@ printf '%s\\n' "$TRIAL_SERVICE_STATE"
                 folder = self.state / 'paired-trials' / os.environ['TRIAL_UNIT'].removeprefix('cloud-paired-trial-')
                 self.assertEqual((folder / gate_source.SOURCE_ARCHIVE).is_file(), hold != 'unowned')
                 self.assertEqual(len(tuple(folder.glob('*/request.json'))), 1)
+
+    def test_sweep_removes_expired_unowned_pack_after_the_user_bus_returns(self) -> None:
+        now = 1700000000
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now, (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(now, 'stopped', 'fixture'))
+        reservation = ledger.GateReservation('booking', now, now + 120, Decimal('.8'), Decimal('.02'))
+        self.assertIsInstance(book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+        root = self.state / 'paired-trials'
+        current = root / 'current'
+        current.mkdir(parents=True)
+        packages: dict[str, Path] = {}
+        for state in ('unowned', 'active', 'booking', 'unexpired'):
+            folder = root / state
+            module = folder / state
+            module.mkdir(parents=True)
+            cloud_gate.save(module / 'request.json', {'attempt': state, 'expires': now + (1 if state == 'unexpired' else -1)})
+            packages[state] = folder / gate_source.SOURCE_ARCHIVE
+            _ = packages[state].write_bytes(b'PACK')
+
+        calls: list[str] = []
+        bus_available = False
+
+        def show(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(list(arguments[:3]), ['systemctl', '--user', 'show'])
+            unit = arguments[3]
+            calls.append(unit)
+            if not bus_available:
+                return subprocess.CompletedProcess(arguments, 1, '', 'Failed to connect to bus')
+            fields = ('LoadState=loaded\nActiveState=active\nControlGroup=/trial\nJob=\n'
+                      if unit == 'cloud-paired-trial-active' else
+                      'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=\n')
+            return subprocess.CompletedProcess(arguments, 0, fields, '')
+
+        aws = mock.Mock(side_effect=AssertionError('The sweep must use only local evidence'))
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=aws), book,
+            self.settings, current / 'reservation', clock=lambda: now)
+        with mock.patch.object(subprocess, 'run', side_effect=show):
+            trial.discard_unowned_trial_archive(root / 'unowned', self.state)
+            self.assertTrue(all(path.is_file() for path in packages.values()))
+            bus_available = True
+            trial.sweep_trial_resources(current, worker)
+        self.assertEqual(calls, ['cloud-paired-trial-' + name for name in ('unowned', 'active', 'booking', 'unowned')])
+        self.assertEqual({name for name, path in packages.items() if path.is_file()}, {'active', 'booking', 'unexpired'})
+        self.assertTrue((root / 'unowned' / 'unowned' / 'request.json').is_file())
+        aws.assert_not_called()
 
     def test_local_guest_uses_two_trees_alternating_isolated_processes(self) -> None:
         reply, traces = self.guest()

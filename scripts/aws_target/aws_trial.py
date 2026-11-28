@@ -283,6 +283,8 @@ def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
             due = [path for path, row in requests if ledger.text(row, 'attempt') in unresolved]
             if due:
                 _ = cloud_gate.cleanup_requests(due, worker)
+            if (previous / gate_source.SOURCE_ARCHIVE).is_file():
+                discard_unowned_trial_archive(previous, worker.book.directory)
 
 
 def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -541,10 +543,14 @@ def paired_service(command: Sequence[str], unit: str) -> int:
                 _ = subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
 
 
-def discard_unowned_trial_archive(folder: Path, directory: Path, unit: str) -> None:
+def paired_unit(folder: Path) -> str:
+    return 'cloud-paired-trial-' + folder.name
+
+
+def discard_unowned_trial_archive(folder: Path, directory: Path) -> None:
     """Remove the package after systemd and the ledger confirm that it has no owner."""
     try:
-        reply = subprocess.run(['systemctl', '--user', 'show', unit,
+        reply = subprocess.run(['systemctl', '--user', 'show', paired_unit(folder),
             '--property=LoadState,ActiveState,ControlGroup,Job'], capture_output=True, text=True,
             timeout=cloud_gate.settings().number('api_timeout_s'), check=False)
         fields = dict(line.split('=', 1) for line in reply.stdout.splitlines() if '=' in line)
@@ -580,7 +586,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
     clone_url = ''
     expires = 0
     folder = directory / 'paired-trials' / uuid4().hex
-    unit = 'cloud-paired-trial-' + folder.name
+    unit = paired_unit(folder)
     folder_created = False
     submission_attempted = False
     status = 1
@@ -628,7 +634,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         with cancellation.defer_cleanup_signals():
             if folder_created and status and (folder / gate_source.SOURCE_ARCHIVE).is_file():
                 if submission_attempted:
-                    discard_unowned_trial_archive(folder, directory, unit)
+                    discard_unowned_trial_archive(folder, directory)
                 else:
                     cloud_gate.discard_source_archive(folder)
             if trial_id:
