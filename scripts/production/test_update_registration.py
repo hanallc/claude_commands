@@ -8,6 +8,7 @@ import io
 import fcntl
 import os
 import shutil
+import subprocess
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
@@ -26,6 +27,8 @@ from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, registration
+from scripts.console_text import check as console_text
+from scripts.console_text.test_support import real_review_question
 
 from scripts.production import footer_counts
 from scripts.production import next_item
@@ -95,6 +98,94 @@ class ProducerQuestionTests(RegistrationFixture):
                                     environment, self.checkout, production_state=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn("pass --unit", result.stdout)
+
+    def use_console_verdicts(self, *failed_lines: tuple[str, ...]) -> None:
+        replies = iter(failed_lines)
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = cast(dict[str, object], json.loads(prompt.split("\n", 2)[2]))
+            pending = cast(dict[str, object], request["parts"])
+            parts: list[dict[str, object]] = [
+                {"number": int(number), "questions": [], "failed_rules": []} for number in pending
+            ]
+            return review.StructuredCall("sonnet", review.StructuredAnswer({
+                "draft": {"questions": [], "failed_rules": [
+                    {"rule": "console-standard-4", "quote": line} for line in next(replies)
+                ]},
+                "parts": parts,
+            }))
+
+        def runner(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            text = "Question rules" if argv[0] == "zsh" else "agent=sonnet effort=high"
+            return subprocess.CompletedProcess(argv, 0, text, "")
+
+        def question_review(key: review.QuestionKey, draft: str, *, console_kind: str) -> review.QuestionOutcome:
+            return real_review_question(key, draft, runner=runner, console_kind=console_kind)
+
+        self.env["NOTIFY_STATE_DIR"] = str(self.state / "notify")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
+        _ = self.enterContext(mock.patch.object(review, "GUIDE", self.root))
+        _ = self.enterContext(mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")))
+        _ = self.enterContext(mock.patch.object(review, "reviewer_binary",
+                                                return_value=review.ResolvedReviewerBinary(self.root / "claude")))
+        _ = self.enterContext(mock.patch.object(review, "structured_call", side_effect=judge))
+        _ = self.enterContext(mock.patch.object(review, "review_question", side_effect=question_review))
+
+    def ask_with_review(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return invoke_cli(registration, registration.main, ["ask", *args], self.env, self.checkout,
+                          production_state=True)
+
+    def held_review_id(self, result: subprocess.CompletedProcess[str]) -> str:
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        _, hint, rest = result.stdout.rpartition("Use --revise ")
+        self.assertTrue(hint, result.stdout)
+        return rest.split()[0]
+
+    def test_ask_revision_preserves_passed_lines_and_rechecks_the_changed_title(self) -> None:
+        initial = "Try again?"
+        revised = "Retry the download?"
+        fact = "The download stopped."
+        self.use_console_verdicts((initial,), (revised, fact))
+
+        first = self.ask_with_review("--ask", initial, "--context", revised, "--item", fact)
+        review_id = self.held_review_id(first)
+        second = self.ask_with_review("--revise", review_id, "--ask", revised, "--item", fact)
+        self.assertEqual(self.held_review_id(second), review_id)
+        self.assertIn(f"console-standard-4: {revised}", second.stdout)
+        self.assertNotIn(f"console-standard-4: {fact}", second.stdout)
+
+    def test_ask_same_title_keeps_separate_draft_verdicts(self) -> None:
+        title = "Try again?"
+        shared = "The download stopped."
+        self.use_console_verdicts((title,), (shared,))
+
+        first = self.ask_with_review("--ask", title, "--context", shared, "--item", "The first file is new.")
+        second = self.ask_with_review("--ask", title, "--context", shared, "--item", "The second file is new.")
+        self.assertNotEqual(self.held_review_id(first), self.held_review_id(second))
+        self.assertIn(f"console-standard-4: {shared}", second.stdout)
+        self.assertEqual(len(list((review.state_path() / "question-verdicts").glob("*.json"))), 2)
+
+    def test_ask_migrates_the_verdict_from_the_previous_title(self) -> None:
+        initial = "Try again?"
+        revised = "Retry the download?"
+        fact = "The download stopped."
+        self.use_console_verdicts((initial,), (revised, fact), (fact,))
+        legacy = review.QuestionKey(self.producer.name, initial)
+        outcome = console_text.check(f"{initial}\n\n1. {fact}", "question", key=legacy, title=initial)
+        self.assertIsInstance(outcome, review.QuestionReviewFailed)
+        folder = review.state_path() / "question-verdicts"
+        legacy_path, = folder.glob("*.json")
+
+        migrated = self.ask_with_review("--revise-title", initial, "--ask", revised, "--item", fact)
+        _ = self.held_review_id(migrated)
+        self.assertIn(f"console-standard-4: {revised}", migrated.stdout)
+        self.assertNotIn(f"console-standard-4: {fact}", migrated.stdout)
+        self.assertFalse(legacy_path.exists())
+        self.assertEqual(len(list(folder.glob("*.json"))), 1)
+
+        new = self.ask_with_review("--ask", initial, "--item", fact)
+        _ = self.held_review_id(new)
+        self.assertIn(f"console-standard-4: {fact}", new.stdout)
 
     def test_the_producer_page_count_and_next_share_the_question_store(self) -> None:
         self.file_question()

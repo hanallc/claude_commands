@@ -28,6 +28,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast, overload
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from scripts.production.production_doc import (
@@ -1950,8 +1951,23 @@ class QuestionFromReview:
 
 
 @dataclass(frozen=True)
-class QuestionFromStaff:
+class NewQuestionDraft:
     pass
+
+
+@dataclass(frozen=True)
+class ReviseQuestionDraft:
+    review_id: UUID
+
+
+@dataclass(frozen=True)
+class ReviseTitleKeyedQuestion:
+    previous_title: str
+
+
+@dataclass(frozen=True)
+class QuestionFromStaff:
+    draft: NewQuestionDraft | ReviseQuestionDraft | ReviseTitleKeyedQuestion = NewQuestionDraft()
 
 
 @dataclass(frozen=True)
@@ -2033,10 +2049,25 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if not isinstance(outgoing, KeyedStaffQuestion) and any(
             entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+    from scripts.notify import review
+
+    if isinstance(outgoing, KeyedStaffQuestion):
+        key = review.QuestionKey(production.name, f"{text} [{outgoing.request_key}]", request_key=outgoing.request_key)
+    else:
+        draft = outgoing.draft
+        if isinstance(draft, ReviseQuestionDraft):
+            review_id, previous_title = draft.review_id, review.LegacyQuestionTitle.NONE
+        else:
+            review_id = uuid4()
+            previous_title = draft.previous_title if isinstance(draft, ReviseTitleKeyedQuestion) else text
+        key = review.QuestionKey(production.name, text, console_draft=review.ConsoleQuestionDraft(
+            production.owner.id, asker.id, review_id, previous_title))
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
-    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank), outgoing=outgoing)
+    accepted = review_open_question(key, QuestionForReview(text, "", question, rank))
     if isinstance(accepted, HeldRegistrationQuestion):
-        raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
+        retry = (f"\nUse --revise {key.console_draft.review_id} to revise this draft."
+                 if isinstance(key.console_draft, review.ConsoleQuestionDraft) else "")
+        raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}{retry}")
     now = datetime.now(production.zone)
     entry = OutstandingItem(since=now.strftime("%Y-%m-%dT%H:%M"), text=text, question=question,
                             asked_by=asker.id, parts=parts)
@@ -2698,17 +2729,11 @@ class ReviewUnavailableQuestion(NamedTuple):
 AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 
-def review_open_question(name: str, item: QuestionForReview, *,
-                         outgoing: QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF
-                         ) -> AcceptedQuestion | HeldRegistrationQuestion:
+def review_open_question(key: review.QuestionKey, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Import the reviewer only when the command files a full question.
     from scripts.console_text import check as console_text
     from scripts.notify import review
 
-    if isinstance(outgoing, KeyedStaffQuestion):
-        key = review.QuestionKey(name, f"{item.text} [{outgoing.request_key}]", request_key=outgoing.request_key)
-    else:
-        key = review.QuestionKey(name, item.text)
     outcome = console_text.check(item.question, "question", key=key, title=item.text)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)
@@ -2798,7 +2823,9 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
             if item.text in stored:
                 keep_layout_fields(entry, stored[item.text])
         elif isinstance(item, QuestionForReview):
-            accepted = review_open_question(production.name, item)
+            from scripts.notify import review
+
+            accepted = review_open_question(review.QuestionKey(production.name, item.text), item)
             if isinstance(accepted, ReviewedQuestion):
                 entry["question"], entry["reviewed"] = item.question, accepted.reviewed
                 pending.append(accepted)
@@ -2856,6 +2883,9 @@ def main() -> int:
             if action == "reply":
                 _ = subcommand.add_argument("--text", required=True, help="your reply to the user's follow-up")
         elif action == "ask":
+            revision = subcommand.add_mutually_exclusive_group()
+            _ = revision.add_argument("--revise", type=UUID, help="revise the draft with this review ID")
+            _ = revision.add_argument("--revise-title", help="revise an older draft stored under this former title")
             _ = subcommand.add_argument("--text", default="",
                                         help="the one-line item the count and lists name, at most question_title_max_chars characters (config/production.conf); the default is --ask")
             _ = subcommand.add_argument("--ask", required=True,
@@ -2909,8 +2939,15 @@ def main() -> int:
             asked = cast(str, args.ask)
             parts = QuestionParts(ask=asked, context=cast(str, args.context), items=cast(list[str], args.items),
                                   recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
+            revision_id = cast(UUID | None, args.revise)
+            previous_title = cast(str | None, args.revise_title)
+            draft = NewQuestionDraft()
+            if revision_id is not None:
+                draft = ReviseQuestionDraft(revision_id)
+            elif previous_title:
+                draft = ReviseTitleKeyedQuestion(previous_title)
             ask(scope, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
-                identities=identities)
+                identities=identities, outgoing=QuestionFromStaff(draft))
             if isinstance(scope, Production):
                 for line in adopt_moved_state(scope, record=identities.record):
                     report("state-dir", "ok", line)

@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
@@ -250,6 +250,18 @@ ReviewOutcome = Approved | Rewritten | Questions | Unreviewed | Failed | Withhel
 Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 
+class LegacyQuestionTitle(Enum):
+    NONE = "no prior title key"
+
+
+@dataclass(frozen=True)
+class ConsoleQuestionDraft:
+    owner: str
+    asker: str
+    review_id: UUID
+    previous_title: str | LegacyQuestionTitle
+
+
 @dataclass(frozen=True)
 class QuestionKey:
     name: str
@@ -258,6 +270,8 @@ class QuestionKey:
     # The source draft selects an approval within the request's verdict record.
     console_draft_digest: str = field(default="", compare=False, repr=False)
     console_title: str = field(default="", compare=False, repr=False)
+    console_draft: ConsoleQuestionDraft | Literal["use question key"] = field(
+        default="use question key", compare=False, repr=False)
 
     @property
     def digest(self) -> str:
@@ -1168,7 +1182,10 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
     prompt = system_prompt if whole else part_system_prompt
     fingerprint_schema = SCHEMA if whole else LEGACY_PART_REVIEW_SCHEMA
     scope = (key.name, "request", key.request_key) if key.request_key else (key.name, "title", key.text)
-    if not question:
+    console_draft = key.console_draft
+    if question and isinstance(console_draft, ConsoleQuestionDraft):
+        scope = ("staff-draft", console_draft.owner, console_draft.asker, console_draft.review_id.hex)
+    elif not question:
         scope = (*scope, context.console_kind)
     folder = state_path() / "question-verdicts"
     path = folder / f"{question_part_digest(scope)}.json"
@@ -1184,6 +1201,16 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
 
     try:
         with lock_question_verdicts(path, deadline):
+            if (question and isinstance(console_draft, ConsoleQuestionDraft)
+                    and isinstance(console_draft.previous_title, str) and not path.exists()):
+                old_scope = (key.name, "title", console_draft.previous_title)
+                legacy_path = folder / f"{question_part_digest(old_scope)}.json"
+                if legacy_path.is_file():
+                    with lock_question_verdicts(legacy_path, deadline):
+                        try:
+                            _ = legacy_path.replace(path)
+                        except FileNotFoundError:
+                            pass
             try:
                 saved = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
             except FileNotFoundError:
