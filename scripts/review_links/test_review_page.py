@@ -4644,7 +4644,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         manual = replace(automatic, key=f'action/{uuid4()}', completion='manual')
         rebuild = replace(automatic, key='rebuild/natedev', kind='rebuild')
         done_button = b'<button name="outcome" value="done"'
-        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((automatic, manual, rebuild), ())):
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((automatic, manual, rebuild), (), members=staff.snapshot())):
             snapshot = review_page.build_snapshot(self.root)
             markup = snapshot.body(automatic.key)
             self.assertIn(b'<dt>Completion</dt><dd>Automatic</dd>', markup)
@@ -4668,7 +4668,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                                    'The release check', '2026-11-17T15:00:00+00:00', 'open', 'manual', '')
         completed = replace(opened, key=f'action/{uuid4()}', title='Completed action', status='done')
         rebuild = replace(opened, key='rebuild/natedev', kind='rebuild', title='Rebuild natedev', completion='automatic')
-        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed, rebuild), ())):
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed, rebuild), (), members=staff.snapshot())):
             payload = console.for_you_payload()
             review = browser_markup(self.root)
         review = review.replace('<head>', r"""<head><script>
@@ -6025,7 +6025,7 @@ window.fetch=async(url,options)=>{
                    if item.key == other_question or item.type == review_items.ReviewType.CHANGE else item
                    for item in review_items.read(self.root)]
         with (patch.object(review_items, 'read', return_value=records),
-              patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed), ()))):
+              patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed), (), members=staff.snapshot()))):
             markup = browser_markup(self.root, show='all')
         probe = r'''<script>
 (async()=>{

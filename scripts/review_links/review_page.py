@@ -475,7 +475,9 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
                     Path(USER_ZONE_CONF)))
     zone = user_zone()
     token,initial = change_browser.browser_manifest(folder)
-    members = staff.snapshot()
+    sources.extend(for_you.source_paths())
+    actions = for_you.read()
+    members = actions.members
     names = staff_names.StaffNames(members)
     sources.extend(urgency.state_dir().glob('*.json'))
     records: dict[str, ReviewItem] = {}
@@ -485,8 +487,6 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     unavailable_cards: set[str] = set()
     status = change_page.DeliveryStatus(root)
     items = review_items.read(root, members=members, show='active', sources=sources, zone=zone)
-    sources.extend(for_you.source_paths())
-    actions = for_you.read(members=members)
     items.extend(review_items.for_you_item(row, members, zone=zone) for row in actions.rows)
     for item in items:
         path = review_items.source_path(item)

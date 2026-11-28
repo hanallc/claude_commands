@@ -57,12 +57,15 @@ The reader preserves `~/` for expansion on the target machine.
 The reader creates no second rebuild store.
 
 A stale comparison or failed machine probe cannot prove completion.
-The comparison cache records running-system probe availability for each machine.
-A legacy cache without that field leaves the comparison unavailable.
+The cache records each machine's probe outcome, last running path, and last evaluated path.
+A cache without the per-machine fields adds no rebuilds and becomes due for refresh.
+Each evaluated path includes its revision.
+An older revision's path gives an unknown comparison and preserves any saved rebuild need.
 The card says `The running revision is unknown.` when it cannot identify the running revision.
 `UnavailableSource` identifies each failed source.
 `KnownOpenCount` counts each open machine row and each open agent action once.
-`UnavailableOpenCount` retains the known open count without claiming a complete count.
+`UnavailableOpenCount` has no count.
+If the action store read fails and there is no saved action count, the server returns `available: false` and omits the count.
 
 
 The shell reads `/console/for-you.json` through the shared reader.
@@ -88,11 +91,15 @@ The shell accepts that message only from one of its page frames.
 If a read is in progress, the shell reads again when it ends.
 A refresh keeps focused commands and text selections until the user releases them.
 
-Before the first complete read, the badge shows `?` with an unavailable label.
-A transport failure keeps the last complete count and entries and marks them stale.
-The phone badge shows a dotted outline for a stale count in both navigation states.
-An explicit unavailable response clears the previous count, including with HTTP 503.
-At zero, the quiet button shows `For you 0`.
+Before the first count, the badge shows no number.
+When a probe fails and the machine has no usable comparison, the count uses the other comparisons and the readable requests.
+A comparison-only result shows the count without a state word or outline.
+The panel shows the entries without stale text.
+A transport failure keeps the newest complete count and entries and marks them stale.
+For a transport failure, the phone badge shows a dotted outline in both navigation states.
+A response without a count also keeps the newest complete count, including with HTTP 503.
+A partial count shows only until the next read result.
+A confirmed or comparison-only zero uses the quiet `For you 0` button.
 The panel says `No actions required.`
 
 The status line shows session review counts under `Review:`.
