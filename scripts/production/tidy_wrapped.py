@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, cast
 
 from scripts.lib import atomic_file  # noqa: E402
 from scripts.production import investigation, log_backup, record_store, showrunners, staff, unit_lookup  # noqa: E402
+from scripts.build_queue import admission_records  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from scripts.production.proposals_folder import issues_folder  # noqa: E402
@@ -371,7 +372,7 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
                      if identities.record.by_id(identity := staff.StaffId(path.stem)) is None)
         try:
             keep_open_review_items(row, tuple(sorted(units)), document, identities)
-        except (investigation.InvestigationError, RegistrationFailure, new_item_dialog.SubmissionError) as error:
+        except (investigation.InvestigationError, RegistrationFailure, record_store.SubmissionError) as error:
             raise TidyRefused(str(error)) from error
     if document is not None and can_hold_questions(document):
         try:
@@ -387,7 +388,7 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
     try:
         for owner in sorted(owners):
             copies.remove_trees(owner)
-    except copies.CopyError as error:
+    except admission_records.CopyError as error:
         raise TidyRefused(str(error)) from error
     roots = {root for kind in record_store.RecordKind
              for root in record_store.staff_store_folders(kind, members=identities.record)}

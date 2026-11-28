@@ -67,6 +67,7 @@ from scripts.buildlog import repository as build_repository
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
+from scripts.build_queue import admission_records
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
@@ -1406,7 +1407,7 @@ class RetirementKeptWork(Exception):
     """Keep the checkout and its branch refs."""
 
 
-RETIREMENT_IO_ERRORS = (OSError, ValueError, staff.StaffRefused, Refusal, copies.CopyError,
+RETIREMENT_IO_ERRORS = (OSError, ValueError, staff.StaffRefused, Refusal, admission_records.CopyError,
                         worktree_records.Refused, herdr_types.HerdrFailure, conf.Unusable, unit_config.ConfigRefused,
                         subprocess.SubprocessError)
 
@@ -2588,7 +2589,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
             return RetirementResult.PENDING
         print(f"refused: {error}")
         return RetirementResult.REFUSED
-    except copies.CopyError as error:
+    except admission_records.CopyError as error:
         report_retirement_cleanup(row, "Copy cleanup is incomplete", str(error))
         return RetirementResult.PENDING
     require_retirement_receipt(row, cleanup_token)
@@ -3114,7 +3115,7 @@ def retire_named_unit(name: str) -> int:
         except RetirementRace as error:
             print(error)
             return 1
-        except (RetirementRefused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable,
+        except (RetirementRefused, Refusal, ValueError, OSError, admission_records.CopyError, conf.Unusable,
                 unit_config.ConfigRefused, subprocess.SubprocessError) as error:
             print(f"retire: {error}")
             return 1
