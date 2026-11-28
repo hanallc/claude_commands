@@ -4859,6 +4859,25 @@ class WorkerCommandTests(unittest.TestCase):
         transport.assert_called_once()
         self.assertEqual(self.agent.answers, [])
 
+    def test_answer_keeps_a_pending_answer_after_task_started(self) -> None:
+        opened = self.answerable_worker()
+        answer = ("answer", "impl", "--text", "Use JSON.")
+        self.assertEqual(self.command(*answer), (0, "done\n", ""))
+        (pending,) = self.run_dir.glob(".*.pending-answer.json")
+        saved = pending.read_bytes()
+
+        self.agent.append_codex_record(opened.pane, {"type": "event_msg", "payload": {"type": "task_started"}})
+        world = self.fixture.world
+        world.locations[opened.pane]["agent_status"] = "idle"
+        with (patch.object(world, "prompt", wraps=world.prompt) as prompt,
+              patch.object(world, "answer_question", wraps=world.answer_question) as box):
+            code, output, error = self.command(*answer)
+        self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+        self.assertIn("an answer is pending for this input request", error)
+        self.assertEqual(pending.read_bytes(), saved)
+        prompt.assert_not_called()
+        box.assert_not_called()
+
     def test_answer_uses_a_normal_prompt_for_an_idle_open_call(self) -> None:
         opened = self.answerable_worker()
         self.agent.question_record(opened.pane, "format")
