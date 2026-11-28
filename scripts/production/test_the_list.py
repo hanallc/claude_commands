@@ -1076,7 +1076,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
         self.assertIs(closed.state, the_list.ItemState.CLOSED)
         self.assertIs(closed.run_deliveries[0].confirmation, the_list.AwaitingInstruction.OWNER)
 
-        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        with fixed_scheduled_clock():
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
         instructed = the_list.load(MORTY.id, item.id)
         run = instructed.run_deliveries[0]
         deadline = START + timedelta(minutes=2)
