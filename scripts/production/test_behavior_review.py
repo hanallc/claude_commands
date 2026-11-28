@@ -1,9 +1,10 @@
 """Verify the review command with private records and a fake reviewer."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import io
 import json
 import os
@@ -30,6 +31,16 @@ CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
 REVIEWER = "fixture-reviewer"
 MOVE_QUOTE = "Move at once. Use scripts/direct/assign.py to restart the work."
 MOVE_REQUEST = "Wait for the running step."
+MOVE_REASON = "The change makes the move wait for the current step."
+MOVE_FINDING: Mapping[str, str] = {
+    "test": "test_fixture.py::test_move",
+    "finding": "specified",
+    "quote": MOVE_QUOTE,
+    "date": "2026-11-23",
+    "change": "The move waits for the current step.",
+    "verdict": "against",
+    "reason": MOVE_REASON,
+}
 MOVE_QUESTION = update_registration.QuestionParts(
     ask="Allow a wait before an account move? (2026-11-23)",
     context="You set a rule for immediate moves and restarts. A wait lets the running build finish.",
@@ -165,7 +176,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
-        self.assertIn('Use "specified" when the change departs from those words or you cannot tell', prompt)
+        self.assertIn("saved question answer or feedback.", prompt)
+        self.assertIn('Use "specified" when you find words to assess', prompt)
+        for verdict in ("against", "follows", "different", "unclear"):
+            self.assertIn(f'Use "{verdict}" when', prompt)
+        self.assertIn('In "reason", write one plain line that explains the verdict.', prompt)
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
         self.assertEqual(behavior_check.record_path(key).with_suffix(".run").read_text().strip(), str(self.folder))
         self.assertFalse(list(behavior_check.record_path(key).parent.glob("*.part-*.run")))
@@ -454,8 +469,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 if isinstance(finding, behavior_review.NateRequest):
                     self.assertEqual(finding.day.isoformat(), "2026-11-23")
 
-    def test_an_unverified_request_requires_a_question(self) -> None:
-        args, key = self.changed_range()
+    def test_unverified_sources_cannot_prove_a_request(self) -> None:
         quote = MOVE_REQUEST
         notes = self.write(self.root / "decision.md", quote)
         _ = self.git("commit", "--allow-empty", "-m", quote)
@@ -466,7 +480,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             ("external JSONL", self.write(self.root / "fake.jsonl", json.dumps(typed))),
         ):
             with self.subTest(case=case):
-                self.assert_unverified_request(args, key, source, quote)
+                self.assertIsInstance(self.verify_requested(source, quote), behavior_review.NateSpecified)
         for case, turn in (
             ("assistant", {**typed, "type": "assistant"}),
             ("tool", {**typed, "message": {"role": "user", "content": [{"type": "tool_result", "content": quote}]}}),
@@ -486,43 +500,64 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             with self.subTest(case=case):
                 source = self.transcript(turn)
                 cited = {"sentence fragment": "move at once.", "abbreviation": "Move at once."}.get(case, quote)
-                self.assert_unverified_request(args, key, source, cited)
+                self.assertIsInstance(self.verify_requested(source, cited), behavior_review.NateSpecified)
 
-    def assert_unverified_request(self, args: list[str], key: str, source: Path, quote: str) -> None:
+    def test_an_unverified_request_requires_a_question(self) -> None:
+        args, key = self.changed_range()
+        source = self.write(self.root / "decision.md", MOVE_REQUEST)
+        self.reply(json.dumps([self.requested(source, MOVE_REQUEST)]))
         with (mock.patch.object(astra_review, "run_review", return_value=0),
-                  mock.patch.object(update_registration, "ask") as ask):
-            behavior_check.record_path(key).with_suffix(".run").unlink(missing_ok=True)
-            (self.folder / "completed-reply.txt").unlink(missing_ok=True)
-            self.reply(json.dumps([self.requested(source, quote)]))
+              mock.patch.object(update_registration, "ask") as ask):
             code, output = self.cli("run", *args)
-            self.assertEqual(code, 1)
-            self.assertIn(f"Nate's words (2000-01-01, {source}): {quote}", output)
+            self.assertEqual(code, 1, output)
+            self.assertIn("test_fixture.py::test_move unclear The cited source did not verify the quote.\n", output)
+            self.assertIn(f"Nate's words (2000-01-01, {source}): {MOVE_REQUEST}", output)
             self.assertIn("Nate was not asked.", output)
             ask.assert_not_called()
-            self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
-            self.assertEqual(self.cli("check", *args)[0], 1)
+        self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+        self.assertEqual(self.cli("check", *args)[0], 1)
+        _ = self.write(behavior_check.record_path(key), json.dumps({
+            "state": "clear",
+            "reply": str(self.folder / "completed-reply.txt"),
+            "unverified_requests": ["test_fixture.py::test_move"],
+        }))
+        self.assertEqual(self.cli("status", "--key", key), (1, f"{key}: the saved approval has no valid proof.\n"))
+        self.assertIn("no valid proof", self.cli("check", *args)[1])
+        draft = self.question_file({**MOVE_QUESTION, "ask": "Allow a wait before an account move? (2000-01-01)"})
 
-    def test_only_nates_answer_in_a_registered_question_can_clear_a_request(self) -> None:
+        def accept(_key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionAccepted:
+            self.assertEqual(console_kind, "question")
+            return review.QuestionAccepted(text)
+
+        with mock.patch.object(review, "review_question", side_effect=accept):
+            code, output = self.cli("run", *args, "--production", self.producer.name, "--question", str(draft))
+        self.assertEqual(code, 1, output)
+        self.assertIn("The land waits", output)
+        self.assertIsInstance(behavior_check.read_record(key), behavior_check.Waiting)
+
+    def test_only_nates_answer_or_feedback_in_a_registered_question_verifies_a_request(self) -> None:
         args, key = self.changed_range()
         source = self.root / "configured-questions" / "question-fixture.md"
         moment = datetime.fromisoformat("2026-11-26T10:00:00-08:00")
         answer = review_events.ReviewLog(moment, "producer", f"Answer: {MOVE_REQUEST}")
+        feedback_quote = "Wait for the current build to finish."
+        feedback = review_events.ReviewLog(moment, "producer", f"feedback sent: {feedback_quote}")
         question = update_registration.QuestionRecord(source, self.producer.id, self.producer.id, {
             "since": "2026-11-25T09:00", "text": "When should the move start?",
             "question": "Should the move wait?", "asked_by": self.producer.id,
-            "review_log": review_events.encode((answer,)),
+            "review_log": review_events.encode((answer, feedback)),
         }, "closed")
         update_registration.write_question_record(question, assign_id=True)
-        self.assert_unverified_request(args, key, source, MOVE_REQUEST)
-        question.item["review_log"] = review_events.encode((replace(answer, who="nate"),))
+        self.assertIsInstance(self.verify_requested(source, MOVE_REQUEST), behavior_review.NateSpecified)
+        self.assertIsInstance(self.verify_requested(source, feedback_quote), behavior_review.NateSpecified)
+        question.item["review_log"] = review_events.encode((replace(answer, who="nate"), replace(feedback, who="nate")))
         update_registration.write_question_record(question)
+        self.assertIsInstance(self.verify_requested(source, MOVE_REQUEST), behavior_review.NateRequest)
         copy = self.write(self.root / "question-copy.md", source.read_text())
-        self.assert_unverified_request(args, key, copy, MOVE_REQUEST)
-        behavior_check.record_path(key).with_suffix(".run").unlink()
-        (self.folder / "completed-reply.txt").unlink()
-        self.reply(json.dumps([self.requested(source, MOVE_REQUEST)]))
+        self.assertIsInstance(self.verify_requested(copy, feedback_quote), behavior_review.NateSpecified)
+        self.reply(json.dumps([self.requested(source, feedback_quote)]))
         with mock.patch.object(astra_review, "run_review", return_value=0):
-            output = f"{key} clear\ntest_fixture.py::test_move\nNate's request (2026-11-26, {source}): {MOVE_REQUEST}\n"
+            output = f"{key} clear\ntest_fixture.py::test_move\nNate's request (2026-11-26, {source}): {feedback_quote}\n"
             self.assertEqual(self.cli("run", *args), (0, output))
         self.assertEqual(self.cli("check", *args), (0, ""))
 
@@ -532,7 +567,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         source = self.transcript(self.typed_turn(f"{MOVE_QUOTE}\n{refresh_quote}"))
         self.reply(json.dumps([
             {"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
-             "source": str(source), "date": "2026-11-23", "change": "The move waits for the running step."},
+             "source": str(source), "date": "2026-11-23", "change": "The move waits for the running step.",
+             "verdict": "against", "reason": MOVE_REASON},
             {"test": "test_fixture.py::test_refresh", "finding": "requested", "quote": refresh_quote,
              "source": str(source), "date": "2026-11-25", "change": "An open item refreshes at once."},
         ]))
@@ -643,6 +679,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
             self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
                                     "source": str(self.root / "decision.md"), "date": "2026-11-23",
+                                    "verdict": "against", "reason": MOVE_REASON,
                                     "change": "The move now waits.\nAn extra line."}]))
             code, output = self.cli("run", *args)
             self.assertEqual(code, 1, output)
@@ -652,10 +689,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
         self.assertEqual(runner.call_count, 3)
 
-    def filed_question(self) -> tuple[list[str], str, behavior_check.Waiting, update_registration.QuestionRecord]:
+    def filed_question(self, finding: Mapping[str, str] = MOVE_FINDING,
+                       parts: update_registration.QuestionParts = MOVE_QUESTION,
+                       ) -> tuple[list[str], str, behavior_check.Waiting, update_registration.QuestionRecord]:
         args, key = self.changed_range()
-        self.specified_move_reply()
-        draft = self.question_file(MOVE_QUESTION)
+        self.specified_move_reply(finding)
+        draft = self.question_file(parts)
 
         def accept(_key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionAccepted:
             self.assertEqual(console_kind, "question")
@@ -682,18 +721,87 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
         self.assertEqual(len(records), 1)
         question = records[0]
-        self.assertEqual(question.item.get("parts"), MOVE_QUESTION)
-        self.assertIn(MOVE_QUOTE, (self.folder / "completed-reply.txt").read_text())
+        self.assertEqual(question.item.get("parts"), parts)
+        self.assertIn(finding["quote"], (self.folder / "completed-reply.txt").read_text())
         self.assertNotIn("scripts/direct/assign.py", question.item.get("question", ""))
         self.assertNotIn("test_move", question.item.get("question", ""))
         self.assertNotIn("test_fixture.py", question.item.get("question", ""))
         return args, key, waiting, question
 
-    def specified_move_reply(self) -> None:
-        source = self.write(self.root / "decision.md", MOVE_QUOTE)
-        self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
-                                "source": str(source), "date": "2026-11-23",
-                                "change": "The move waits for the current step."}]))
+    def specified_move_reply(self, finding: Mapping[str, str] = MOVE_FINDING) -> None:
+        source = self.write(self.root / "decision.md", finding["quote"])
+        self.reply(json.dumps([{**finding, "source": str(source)}]))
+
+    def test_against_verdict_files_the_author_draft(self) -> None:
+        source_change = {
+            **MOVE_FINDING,
+            "quote": "guided by history from model-study",
+            "date": "2026-10-17",
+            "change": "The last hour of use sets the wait.",
+            "reason": "The change replaces the named source for the wait.",
+        }
+        source_question = update_registration.QuestionParts(
+            ask="Use the last hour of use to set the wait before a move? (2026-10-17)",
+            context="You said the wait uses history from model-study.",
+            items=["The change uses the last hour of use."],
+            choices=["Yes (the change goes in with the last hour of use)", "No (the change stays out)"],
+            recommend="No, because the change replaces the source you named.",
+        )
+        for case, finding, parts in (
+            ("move timing", MOVE_FINDING, MOVE_QUESTION),
+            ("wait source", source_change, source_question),
+        ):
+            with self.subTest(case=case):
+                case_root = self.root / case
+                folder = case_root / "review"
+                folder.mkdir(parents=True)
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(case_root / "state")}),
+                      mock.patch.object(astra_review, "review_attempt_folder", return_value=folder),
+                      mock.patch.object(self, "folder", folder)):
+                    _ = self.filed_question(finding, parts)
+
+    def test_unclear_verdict_files_the_author_draft(self) -> None:
+        _ = self.filed_question({
+            **MOVE_FINDING, "verdict": "unclear", "reason": "The words do not give a time for a move during a build.",
+        })
+
+    def assert_clear_verdict(self, verdict: str, reason: str) -> None:
+        args, key = self.changed_range()
+        self.specified_move_reply({**MOVE_FINDING, "verdict": verdict, "reason": reason})
+        expected = f"{key} clear\ntest_fixture.py::test_move {verdict} {reason}\n"
+        with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
+              mock.patch.object(update_registration, "ask") as ask):
+            self.assertEqual(self.cli("run", *args, "--question", str(self.question_file(MOVE_QUESTION))), (0, expected))
+            self.assertEqual(self.cli("run", *args), (0, expected))
+            self.assertEqual(self.cli("status", "--key", key), (0, expected))
+            self.assertEqual(self.cli("check", *args), (0, ""))
+        runner.assert_called_once()
+        ask.assert_not_called()
+        self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
+        self.assertEqual((self.folder / "completed-reply.txt").read_bytes(), (self.folder / "review.md").read_bytes())
+
+    def test_follows_verdict_clears_and_stays_in_the_proof(self) -> None:
+        self.assert_clear_verdict("follows", "The restart still occurs after the move.")
+
+    def test_different_verdict_clears_and_stays_in_the_proof(self) -> None:
+        self.assert_clear_verdict("different", "The words describe restarts during an account move.")
+
+    def test_specified_findings_require_a_known_verdict_and_a_one_line_reason(self) -> None:
+        row: dict[str, object] = {"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
+                                  "source": str(self.root / "decision.md"), "date": "2026-11-23",
+                                  "change": "The move waits.", "verdict": "against", "reason": MOVE_REASON}
+        cases = (("verdict", "missing", "verdict"), ("verdict", "other", "verdict"),
+                 ("reason", "missing", "reason"), ("reason", 123, "reason"), ("reason", " ", "reason"),
+                 ("reason", "One line.\nAnother line.", "reason"), ("reason", "One line.\n", "reason"))
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                malformed = row.copy()
+                if value == "missing":
+                    _ = malformed.pop(field)
+                else:
+                    malformed[field] = value
+                with self.assertRaisesRegex(behavior_check.BehaviorCheckError, message):
+                    _ = behavior_review.read_findings(json.dumps([malformed]))
 
     def test_a_finding_without_a_question_reports_its_words_and_unit(self) -> None:
         args, key = self.changed_range(phase_merge=True)
@@ -702,6 +810,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
               mock.patch.object(update_registration, "ask") as ask):
             code, output = self.cli("run", *args)
         self.assertEqual(code, 1)
+        self.assertIn(f"test_fixture.py::test_move against {MOVE_REASON}\n", output)
         self.assertIn(f"Nate's words (2026-11-23, {self.root / 'decision.md'}): {MOVE_QUOTE}", output)
         self.assertIn("Change: The move waits for the current step.\nAsk moves (phase 7)\n", output)
         self.assertIn("Nate was not asked. Write the question for nate in the question template as JSON, "
@@ -728,6 +837,19 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertIn(f"{MOVE_QUOTE}\nChange: The move waits for the current step.\n"
                           + f"Ask the author of {head}\nNate was not asked.", output)
         runner.assert_called_once()
+
+    def test_four_findings_preserve_the_authors_three_facts(self) -> None:
+        parts: update_registration.QuestionParts = {
+            **MOVE_QUESTION, "items": [*MOVE_QUESTION["items"], "The account is idle.", "The move uses the current account."],
+        }
+        draft = self.question_file(parts)
+        evidence = [
+            behavior_review.NateSpecified(f"test_fixture.py::test_move_{number}", MOVE_QUOTE, self.root / "decision.md",
+                                          date(2026, 11, 23), "The move waits.", behavior_review.BehaviorVerdict.AGAINST,
+                                          "The flow in scripts/direct/assign.py waits for the build.")
+            for number in range(4)
+        ]
+        self.assertEqual(behavior_review.read_question(draft, evidence), parts)
 
     def test_a_question_requires_both_choice_starts_and_the_date(self) -> None:
         args, key = self.changed_range()
