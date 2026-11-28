@@ -438,8 +438,8 @@ If recovery refuses a record from another checkout, the gate reports its path an
 Each gate process reports a refused record once.
 The gate keeps that record and checks the remaining records.
 
-Run `./scripts/lib/py -m scripts.test_times.gate_record [ROOT]` from the checkout to read the suite folder report.
-The command reads direct suite folders with leases under ROOT or the configured gate root.
+Run `./scripts/lib/py -m scripts.test_times.gate_record ROOT` from the checkout to read the suite folder report.
+The command reads direct suite folders with leases under ROOT.
 It prints one JSON line per folder and leaves the files unchanged.
 The join uses the path, PID, process start, and boot identity.
 The report checks the lease owners before it reads the log.
@@ -795,7 +795,9 @@ The trial text table shows CPU use percent for each size and run.
 The admission, scheduling caches, and rerun rules below apply to `SharedMachine` and `HoldExemptNamedModuleMachine`.
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
-- Before any job starts it refuses (and the merge rolls back) if the test list is empty or `/dev/shm` is not writable. The nightly runner also requires the `scripts` folder.
+- The gate refuses an empty test list or an unwritable suite parent before it starts a job.
+  The merge rolls back on refusal.
+  The nightly runner also requires the `scripts` folder.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - **Shared admission.** `gate_reservation` obtains one `gate` reservation through `queue_place`.
   `SharedMachine` waits for the build hold to end before it requests admission.
@@ -850,11 +852,18 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Log errors report to stderr and preserve the gate verdict.
   If the fallback end write also fails, the gate reports the original error once.
   The timing index continues to accept older run lines and skips the folder event lines.
-  Both modes use the configured gate root for top-level runs.
-  If that root contains the calling module folder, the nested gate uses the module folder as its parent.
-  The outer gate removes the nested gate files when it removes the module folder.
+  Both gate modes use `<build root>/test-runs/<repo>/<unit>/<copy>` for numbered copies.
+  Worktrees use their output name in place of the copy number.
+  The main checkout uses `<build root>/test-runs/<repo>/main`.
+  The Mac Linux guest gate uses `/build/test-runs/<repo>/<unit>/<copy>`.
+  The guest runner reads `roots.gate.mac-linux` by its exact key. Bubblewrap binds the parent at the same path.
+  A gate without a modeled checkout uses `$TMPDIR/gate-test-runs`. Direct tests use `$TMPDIR/test-runs`.
+  Both routes reuse the temporary root when `DEVTOOLS_TEST_RUN_FOLDER` matches a `TMPDIR` run directly under either parent.
+  The gate refuses a parent inside a Git checkout.
+  The native Mac gate uses `/private/tmp` until it has a fixed build folder.
+  The gate keeps the folders and recovery records of earlier runs.
 
-  The short names leave room for Unix socket paths below `TMPDIR`.
+  Tests bind Unix sockets in a short folder under `roots.system` (`scripts/lib/socket_test_support.py`), not below `TMPDIR`, so the depth of the module folder does not change the socket length.
   The runner reads the output and removes the temporary folder when the job ends.
   At the first unittest load or run, the bootstrap disables bytecode writes for the test.
   Python child processes inherit `PYTHONDONTWRITEBYTECODE=1`.
@@ -873,8 +882,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
   The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
-  `gate.py --affected` uses the same test-folder context for its outer run.
-  A modeled checkout keeps each `r*` run folder in `test-runs` in its build output.
+  `gate.py --affected` uses the gate parent for its outer run.
+  A direct test in a modeled checkout keeps each `r*` run folder in `test-runs` in its build output.
   Worktree and main checkouts use their `target` link to the build output.
   On natedev, a modeled `~/.claude` uses `/build/claude/main/test-runs`.
   Numbered copies use their own `target` folder.
@@ -886,8 +895,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A new direct test run in that runner also puts its `TMPDIR` there.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, each run that prepares a `test-runs` parent sweeps its free folders, including older `test-run-*` folders.
-  This includes a direct run and the `gate.py --affected` outer run.
+  Before allocation, a direct run sweeps the free folders in its parent, including older `test-run-*` folders.
   `test_run_folder()` uses the checkout output even when TMPDIR names a gate module folder.
   The sweep does not wait for held folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.

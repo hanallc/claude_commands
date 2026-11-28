@@ -342,8 +342,6 @@ class AddUnitTestCase(ShutdownTestCase):
         )
         registry = home / ".claude/sessions"
         registry.mkdir()
-        listener = self.enterContext(socket.socket(socket.AF_UNIX))
-        listener.bind(str(self.root / "claude.sock"))
         self.state = self.root / "stub-state"
         _ = self.state.mkdir()
         _ = (self.state / "ready").touch()
@@ -365,7 +363,6 @@ class AddUnitTestCase(ShutdownTestCase):
                     "COPIES_CONFIG": str(copies_config),
                     "TOKIO_WORKER_THREADS": "1",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
-                    "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state),
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",

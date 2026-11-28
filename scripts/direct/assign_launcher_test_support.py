@@ -77,7 +77,6 @@ names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
-roots.gate=/dev/shm
 roots.build=~/build
 roots.scratch=~/scratch
 roots.copies=~/copies

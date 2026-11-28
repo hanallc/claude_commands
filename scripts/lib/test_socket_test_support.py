@@ -12,11 +12,50 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.lib import build_folders
-from scripts.lib.socket_test_support import PARENT, short_socket_directory
+from scripts.lib.socket_test_support import (
+    PARENT, ShortUnixSocket, browser_socket_environment, short_socket_directory, socket_address,
+)
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class ShortSocketDirectoryTests(unittest.TestCase):
+    def test_socket_address_counts_encoded_bytes_and_the_nul(self) -> None:
+        parent = Path("/")
+        leaf = "é" * 50 + "x"
+        self.assertEqual(socket_address(parent, leaf), parent / leaf)
+        longer = leaf + "x"
+        with self.assertRaisesRegex(ValueError, "104 bytes including NUL") as refused:
+            _ = socket_address(parent, longer)
+        self.assertIn(str(parent / longer), str(refused.exception))
+
+    def test_short_socket_binds_under_a_40_byte_system_root(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory) / ("x" * (39 - len(os.fsencode(directory))))
+            root.mkdir()
+            self.assertEqual(len(os.fsencode(root)), 40)
+            config = Path(directory) / "config"
+            _ = config_environment(config)
+            _ = write_config_fixture(config / "build_folders.conf", f"roots.system={root}\n")
+            with patch.dict(os.environ, {"CONF_DIR": str(config)}), ShortUnixSocket() as listener:
+                address = listener.bind_socket()
+                self.assertEqual(address.name, "s")
+                self.assertEqual(address.parent.parent, root / PARENT)
+                self.assertTrue(address.is_socket())
+            self.assertEqual(list((root / PARENT).iterdir()), [])
+
+    def test_browser_socket_refuses_a_long_root_and_releases_its_folder(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory) / ("x" * 80)
+            root.mkdir()
+            config = Path(directory) / "config"
+            _ = config_environment(config)
+            _ = write_config_fixture(config / "build_folders.conf", f"roots.system={root}\n")
+            with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                with self.assertRaisesRegex(ValueError, r"SingletonSocket: Unix socket address uses [0-9]+ bytes"):
+                    with browser_socket_environment():
+                        self.fail("the browser accepted an address above its limit")
+            self.assertEqual(list((root / PARENT).iterdir()), [])
+
     def test_socket_parent_uses_current_build_folder_configuration(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)

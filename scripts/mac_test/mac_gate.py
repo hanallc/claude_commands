@@ -635,6 +635,12 @@ def run_guest(folder: Path, *, full: bool) -> dict[str, object]:
         return run_guest_modules(folder, repo, full=full)
 
 
+def native_mac_gate_parent() -> gate.NativeMacGateParent:
+    # Remove this reader in the L365 follow-on.
+    root = conf.read_or_repository("build_folders").text("roots.gate.nates-macbook-pro-2023")
+    return gate.NativeMacGateParent(Path(root))
+
+
 def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, object]:
     request = cloud_gate.read(folder / 'request.json')
     commit, tree = gate.checked_git(repo, 'rev-parse', 'HEAD', 'HEAD^{tree}').splitlines()
@@ -643,7 +649,7 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
     timings = gate.read_measures(folder / 'module_seconds.json')
     with redirect_stdout(sys.stderr):
         run = gate.run_suites(repo, full=full, mode=gate.SuiteMode(ledger.text(request, 'mode')),
-                              machine=gate.WholeMachine(timings),
+                              machine=gate.WholeMachine(timings), suite_location=native_mac_gate_parent(),
                               module_time_limit_s=float(cast(float, request['module_time_limit_s'])),
                               time_limit=gate_record.NoGateTimeLimit('the Mac queue call has a time limit'),
                               selected=gate.SelectedModules(tuple(cast(list[str], request['modules']))))

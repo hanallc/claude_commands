@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import process_table
 from scripts.herdr import herdr_types
 from scripts.message import codex_daemon
@@ -322,7 +323,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(repr(sys.argv[1:]) + '\\n')\n"
             + "raise SystemExit(91)\n", encoding="utf-8")
         ssh.chmod(0o755)
-        self.socket_path = self.folder / "live.sock"
+        self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         listener.bind(str(self.socket_path))
         owned = OwnedTestProcesses()

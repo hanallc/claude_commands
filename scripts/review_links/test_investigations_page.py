@@ -1,5 +1,6 @@
 """Test investigation cards with private staff records and state folders."""
 from __future__ import annotations
+from scripts.lib.socket_test_support import browser_socket_environment
 from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -160,9 +161,10 @@ window.fetch=async(_path,options)=>{
 </script>'''
         fixture = self.root / "mark-read.html"
         _ = fixture.write_text(page.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
-        result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
-            '--user-data-dir=' + str(self.root / 'chrome'), '--virtual-time-budget=1000',
-            '--dump-dom', fixture.as_uri()], capture_output=True, text=True, timeout=20)
+        with browser_socket_environment() as browser_env:
+            result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+                '--user-data-dir=' + str(self.root / 'chrome'), '--virtual-time-budget=1000',
+                '--dump-dom', fixture.as_uri()], capture_output=True, text=True, timeout=20, env=browser_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('<p id="probe-result">PASS</p>', result.stdout)
 
