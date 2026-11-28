@@ -950,6 +950,7 @@ def _replay_completion(path: Path, record: RunRecord, *,
                     delivery = submitted.delivery if isinstance(submitted, ConfirmedPaneResult) else submitted
                 else:
                     delivery = deliver(record, command_result(record))
+                delivery = _record_finished_delivery(path, record, delivery)
                 if _worker_result_pending(delivery) and delivery not in (PARKED_WORKER_RESULT, WORKER_READINESS_PENDING):
                     return CompletionReplay.RETRY
             if (not record.get("ended_pass_result_released")
@@ -2437,6 +2438,7 @@ class WorkerResultInput(Enum):
     TYPE = "submit the result to an idle worker"
     WAIT_FOR_READINESS = "allow a wait for input readiness on an idle pane"
     TURN_ENDED = "allow a wait for a busy pane after a Stop"
+    VERIFY_DONE = "allow a wait for a busy pane during DONE verification"
 
 
 class WorkerResultTarget(Enum):
@@ -2560,6 +2562,7 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
                              resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
                              input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
                              pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
+                             worker_input: WorkerResultInput = WorkerResultInput.TYPE,
                              ) -> str | ConfirmedPaneResult | PreparedResultRelay:
     """Submit pane input under the worker lock and prepare relays for later."""
     runs = _runs_dir(record["session_dir"])
@@ -2765,8 +2768,9 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
             expected_delivery = current
             pane_checkpoint_saved = True
 
-        request = send.WorkerResultSubmission(worker_only=self_stop or pane_wait == CompletionPaneWait.READY_NOW,
-                                              before_input=before_input)
+        request = send.WorkerResultSubmission(
+            wait_for_idle=worker_input is WorkerResultInput.TURN_ENDED, before_input=before_input,
+            worker_only=self_stop or pane_wait == CompletionPaneWait.READY_NOW)
         try:
             ownership, passed = read_pass(worker, membership)
             require_owned_pass(ownership)
@@ -2884,6 +2888,11 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
             current = _save_delivery(path, submission.delivery, if_current=expected_delivery,
                                      worker_result_receipt=receipt)
             return submission if current == submission.delivery else current
+        if (pane_checkpoint_saved and assignment is ResultWithoutPass.OUTSIDE
+                and isinstance(delivery, send.PaneTextDelivered) and delivery.outcome == "sent"):
+            with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+                if _result_received(worker, membership, marker):
+                    return save_push(delivery, expected=expected_delivery)
         if pane_checkpoint_saved or isinstance(delivery, send.WorkerResultUnconfirmed):
             return save_outcome(UNCONFIRMED_WORKER_RESULT + delivery.detail)
         if delivery.outcome == "retry":
@@ -2991,7 +3000,7 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
             continue
         try:
             delivery = _prepare_result_delivery(record, command_result(record), resume_parked=resume_parked,
-                                                input_lock=input_lock, pane_wait=pane_wait)
+                                                input_lock=input_lock, pane_wait=pane_wait, worker_input=worker_input)
             if isinstance(delivery, PreparedResultRelay):
                 if not isinstance(input_lock, AcquireWorkerInputLock):
                     if (pane_wait is CompletionPaneWait.ALLOW and ownership is ResultPassOwnership.CURRENT
@@ -3029,7 +3038,8 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
 def _worker_delivery_replay(delivery: str, worker_input: WorkerResultInput,
                             resume_parked: Callable[[], bool] | ParkedWorkerDelivery,
                             ) -> WorkerResultReplay:
-    if (delivery == BUSY_WORKER_RESULT and worker_input is WorkerResultInput.TURN_ENDED
+    if (delivery == BUSY_WORKER_RESULT
+            and worker_input in (WorkerResultInput.TURN_ENDED, WorkerResultInput.VERIFY_DONE)
             or delivery == WORKER_READINESS_PENDING and worker_input is not WorkerResultInput.TYPE):
         return WorkerResultReplay.WAIT_FOR_INPUT
     if _worker_result_pending(delivery):
@@ -3354,6 +3364,14 @@ def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
             print(f"detached_runs: {path.stem}: result retry failed: {detail}", file=sys.stderr)
 
 
+def _record_finished_delivery(path: Path, record: RunRecord, delivery: str) -> str:
+    """Save a terminal transport outcome if the transport left the record unchanged."""
+    saved = record.get("delivery", "")
+    if saved in ("", ORPHAN_RESULT_PENDING) and delivery and not _worker_result_pending(delivery):
+        return _save_delivery(path, delivery, if_current=saved)
+    return delivery
+
+
 def command_deliver(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", ""))).resolve()
     record = _read_record(record_path)
@@ -3376,7 +3394,7 @@ def command_deliver(args: argparse.Namespace) -> int:
             return 1
     if _cancels_pass(record) and not _result_push_failed(record.get("delivery", "")):
         return int(_finish_record(record_path, record) == CompletionReplay.RETRY)
-    delivery = deliver(record, command_result(record))
+    delivery = _record_finished_delivery(record_path, record, deliver(record, command_result(record)))
     if _result_push_failed(delivery):
         print(f"detached_runs: {record['run_id']}: {delivery}", file=sys.stderr)
         return 1
@@ -3617,7 +3635,7 @@ def _finish_command_slice(path: Path, run_slice: process_stop.RunSliceIdentity) 
 
 
 def command_supervise(args: argparse.Namespace) -> int:
-    record_path = Path(str(getattr(args, "record", "")))
+    record_path = Path(str(getattr(args, "record", ""))).resolve()
     with (record_path.parent / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
         record = _read_record(record_path)
@@ -3693,8 +3711,10 @@ def command_supervise(args: argparse.Namespace) -> int:
                     if record["status"] == "running" and not _stopped_group_has_ended(record):
                         _wait_for_result_retry(retry_settings)
                         continue
-                elif not record.get("delivery"):
-                    # The delivery process saves a checkpoint before it starts a send.
+                elif not record.get("delivery") and (delivery_exit != 0
+                        or record_path.parent == _runs_dir(record["session_dir"]).resolve()
+                        or "pane_dispatch_id" in record):
+                    # Board records require a saved outcome. Older callers can own delivery outside the board.
                     detail = (f"delivery process exited {delivery_exit}" if delivery_exit
                               else "the delivery process saved no outcome")
                     _ = _save_delivery(record_path, _result_send_not_started(record, detail), if_current="")

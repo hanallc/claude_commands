@@ -1659,8 +1659,10 @@ def _handle_locked(event: WorkerEvent,
         if not verified_done and event.kind in (EventKind.TURN_END, EventKind.RUN_FINISHED):
             if ready_now or isinstance(result_target, ResultInputWait):
                 worker_input = detached_runs.WorkerResultInput.TYPE
-            elif event.kind == EventKind.TURN_END or needs_verification:
+            elif event.kind == EventKind.TURN_END:
                 worker_input = detached_runs.WorkerResultInput.TURN_ENDED
+            elif needs_verification:
+                worker_input = detached_runs.WorkerResultInput.VERIFY_DONE
             else:
                 worker_input = detached_runs.WorkerResultInput.WAIT_FOR_READINESS
             parked = progress_history.parked_worker_pass(passed)

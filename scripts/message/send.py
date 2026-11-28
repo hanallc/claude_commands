@@ -5890,7 +5890,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             submission = herdr.TrackedPromptSubmission(check_message_status)
 
             if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
-                wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
+                # The detached run waits outside the worker lock.
+                wait_for_idle = (isinstance(receipt, WorkerResultProbe) and receipt.wait_for_idle
+                                 and state.status == herdr.AgentStatus.WORKING)
                 can_prompt = state.status.idle or wait_for_idle
                 on_submission = require_idle
             else:
