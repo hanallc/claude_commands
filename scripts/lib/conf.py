@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+from importlib import import_module
 import math
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ import re
 import socket
 import sys
 from threading import Lock
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
 
 from scripts.lib import conf_reads
 
@@ -563,13 +564,17 @@ def _limits(limit: str, value: str, source: Path, key: str) -> None:
             raise ValueError(f"outside range {low}..{high}")
 
 
+class _AgentValueCheck(Protocol):
+    def check_agent_value(self, registry: Path, context: str, family: Literal["claude", "codex"],
+                          value: str) -> None: ...
+
+
 def _agent_limit(family: str, value: str, source: Path, key: str) -> None:
     if family not in ("claude", "codex"):
         raise ValueError(f"unknown agent family {family!r}")
 
     # The registry imports the configuration reader through build_folders.
-    from scripts.lib import models_registry
-
+    models_registry = cast(_AgentValueCheck, cast(object, import_module("scripts.lib.models_registry")))
     registry = path(_repository_override("models"))
     try:
         models_registry.check_agent_value(registry, f"{source.stem}.{key}", family, value)
