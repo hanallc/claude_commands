@@ -752,6 +752,7 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
+    gate_targets: NotRequired[placement.GateTargets]
     # The caller's own text for the work, such as the mac_queue_run --what text.
     what: NotRequired[str]
 
@@ -1325,6 +1326,7 @@ class WaitingStep:
     ci_job_start: CiJobStart = field(default=NO_JOB_START, kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
     # "failed" or "waiting": the run took the place of an older run of its unit (rules 13 and 20).
     took_place: str = field(default="", kw_only=True)
@@ -1356,6 +1358,7 @@ class RunningStep:
     assignment_host: str = ""
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
     confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
     counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
@@ -2226,14 +2229,12 @@ def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
 
 
 def folder_owner(worktree: Path) -> str:
-    """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
-    from scripts.copies import copies
-    from scripts.lib import scratch
+    """Read the owner from the worktree records without recovering a removal intent."""
+    from scripts.lib import copy_owner, scratch
 
     try:
-        # The queue request reads the owner only; it never clears a stale removal intent.
-        return copies.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
-    except (copies.CopyError, OSError):
+        return copy_owner.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
+    except (copy_owner.InvalidCopyOwner, OSError):
         return ""
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement, queue_place
 from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_targets.gate_targets import caller_gate_targets
 
 from scripts.agents import remote
 from scripts.build_hold import build_hold
@@ -375,10 +376,10 @@ class DirectGatePlacementTests(unittest.TestCase):
                     original = admission_wire.read_assignment(admitted.assignment_file).assignment
                     @contextmanager
                     def admit(_command: Sequence[str], checkout: Path, *,
-                              targets: tuple[str, ...],
+                              targets: placement.GateTargets,
                               place_unnamed_gate: bool = True) -> Generator[first_step.FirstStepAdmission]:
                         self.assertEqual(checkout, source)
-                        self.assertEqual(targets, ("mac-linux",))
+                        self.assertEqual(targets.names, ("mac-linux",))
                         self.assertTrue(place_unnamed_gate)
                         record_gate_event(source, "admit")
                         try:
@@ -400,7 +401,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                             raise admission_wire.AdmissionUnavailable("fixture settlement failure")
 
                     with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                          mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                          mock.patch.object(first_step, "gate_targets",
+                              return_value=caller_gate_targets(("mac-linux",))),
                           mock.patch.object(first_step, "admitted_run", side_effect=admit),
                           mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                           mock.patch.object(admission_client, "request_settlement", side_effect=settle),
@@ -438,7 +440,8 @@ class DirectGatePlacementTests(unittest.TestCase):
             armed = mac_linux.ArmedGuestAttempt("fixture-arm", "f" * 32, "boot-id", 10, "user", "/fixture")
             failure = mac_linux.GuestEndUnproven("fixture guest end remains unproven", armed)
             with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                  mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                  mock.patch.object(first_step, "gate_targets",
+                      return_value=caller_gate_targets(("mac-linux",))),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
                   mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                   mock.patch.object(conf, "read", return_value=mock.Mock(value=mock.Mock(return_value=True))),
@@ -508,7 +511,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                     detail = ("fixture guest took no run" if status == GATE_PRELAUNCH_REFUSED_STATUS
                               else "fixture guest end remains unproven")
                     with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                          mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                          mock.patch.object(first_step, "gate_targets",
+                              return_value=caller_gate_targets(("mac-linux",))),
                           mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(source / ".git")),
                           mock.patch.object(first_step, "_gate_request", return_value=owned.request),
                           mock.patch.object(first_step, "_placement_grant", return_value=owned.grant),
@@ -555,7 +559,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                           mock.patch.object(gate, "run_tests_only", return_value=0) as run,
                           redirect_stderr(io.StringIO()) as errors):
                         if flag == "--affected":
-                            with (mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+                            with (mock.patch.object(first_step, "gate_targets",
+                                                   return_value=caller_gate_targets(("natedev",))),
                                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(inherited))):
                                 result = self.run_affected_gate(source, arguments)
                         else:
@@ -602,14 +607,16 @@ class DirectGatePlacementTests(unittest.TestCase):
             admitted = self.admission(source, ("gate.py", *arguments))
             _ = (source / "edit.txt").write_text("Changed since placement.\n")
             with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                  mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                  mock.patch.object(first_step, "gate_targets",
+                      return_value=caller_gate_targets(("mac-linux",))),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as open_admission,
                   mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                   mock.patch.object(treekey, "tree_key", wraps=treekey.tree_key) as key,
                   mock.patch.object(gate, "run_tests_only", return_value=0) as run,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(gate.main(arguments), 1)
-            open_admission.assert_called_once_with(("gate.py", *arguments), source, targets=("mac-linux",))
+            open_admission.assert_called_once_with(("gate.py", *arguments), source,
+                                                   targets=caller_gate_targets(("mac-linux",)))
             key.assert_called_once_with(str(source))
             self.assertIn("source does not match", errors.getvalue())
             run.assert_not_called()
@@ -711,17 +718,18 @@ Path({str(marker)!r}).write_text(merge)
             return gate.GateRun((), 0, 0, tests_reused=True)
 
         @contextmanager
-        def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[object]:
+        def admit(command: Sequence[str], source: Path, *, targets: placement.GateTargets) -> Generator[object]:
             self.assertEqual(command[0], 'gate.py')
             self.assertEqual(source, self.checkout)
-            self.assertEqual(targets, ("natedev",))
+            self.assertEqual(targets.names, ("natedev",))
             self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
             self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
             yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.InheritedGatePlacement(assignment))
 
         assignment = placed('natedev')
         with (mock.patch.object(gate, "run_suites", side_effect=suites),
-              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "gate_targets",
+                  return_value=caller_gate_targets(("natedev",))),
               mock.patch.object(first_step, 'admitted_run', side_effect=admit) as admitted,
               mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment])):
             result = self.run_gate()
@@ -1044,7 +1052,8 @@ gate.run_gate_suites = fail_suites
                 raise OSError("fixture admission cleanup failed")
 
         with (mock.patch.object(gate, "current_gate_placement", side_effect=[gate.NO_GATE_ASSIGNMENT, grant]),
-              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "gate_targets",
+                  return_value=caller_gate_targets(("mac-linux",))),
               mock.patch.object(first_step, "admitted_run", return_value=admit()),
               mock.patch.object(admission_client, "request_settlement"),
               mock.patch.object(gate, "run_gate_suites", side_effect=pending) as run):

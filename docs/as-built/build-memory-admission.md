@@ -573,10 +573,16 @@ A waiting step's hover puts each field on its own line: the wait time, the reaso
 `can run on` is one line that names the targets that can take the step now.
 A local step shows `natedev or Mac`, `natedev only`, or `natedev only (Mac state unknown)`.
 `MacRoutes.fit()` in `target_availability.py` gives the Mac answer, and `memory_feed.local_runs_on()` makes the line.
-AWS runs only the ~/.claude test gate. A cloud gate shows `AWS (natedev only when AWS cannot start the gate)`.
-A step with a Mac Linux guest candidate names its placement candidates in `can run on`, from `memory_feed.gate_placement_notes()`.
-A candidate with a `FixedExclusion` is not named, because placement never uses it.
-When the guest has only a `FixedExclusion`, the line uses the route fit above.
+Claude gate rows show the reason for each excluded machine in the existing Because field.
+The feed reads the gate's target selection and the queue's eligibility for each candidate.
+The feed keeps a busy candidate in the waiting row and shows its reason.
+The feed omits candidates with a `FixedExclusion` from the list of machines.
+A running gate shows its actual machine in the Machine column.
+A named module gate that uses a parent reservation reports `GateTargets` from the gate process.
+The parent row shows natedev while the reporting socket is open.
+The Because field shows `the gate uses its parent reservation` for Mac Linux and AWS.
+The queue restores the parent's targets and reasons when the socket closes.
+The queue groups a wait for one remote gate target with that target.
 When memory holds the first step in line, its hover adds a `First in line` table.
 The table starts at free RAM and subtracts each term that is not zero: the safety net, swap coming back, build reserved, and RAM held for other waiting steps.
 It ends with free and the need.
