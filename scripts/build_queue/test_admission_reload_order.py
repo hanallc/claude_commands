@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import subprocess
@@ -13,11 +13,15 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records as records
-from scripts.build_queue.test_placement import PlacementFixture
+from scripts.build_queue import admission_service as service, placement
+from scripts.build_queue.test_placement import (
+    ManualEvidenceWorker, PlacementFixture, assignment_for, authorize_mac, local_cargo_request, mac_outage_report,
+    placement_request, publish_candidate,
+)
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.message.roster import UnitLabels
 from scripts.message.session_send_test_support import forbid_real_sender
 
@@ -68,6 +72,50 @@ def verify_client(checkout: Path, unit: str, args: list[str]) -> Generator[subpr
 
 class AdmissionReloadOrderTests(unittest.TestCase):
     maxDiff: int | None = None
+
+    def test_restart_keeps_a_lost_mac_run_at_the_head_until_a_fresh_answer(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
+            authorized = authorize_mac(fixture, request)
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.clock.advance(UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            older = replace(local_cargo_request(fixture), since=request.since - 1)
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.PlacementWait)
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            stale = publish_candidate(fixture, request)
+            waiting, = fixture.server.handle_request(request)
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual((waiting.position, waiting.since), (1, request.since))
+            self.assertEqual(waiting.wait, wire.PlacementResourceWait("mac", placement.MAC_OUTAGE_WAIT,
+                                                                   placement.ResourceHolderUnknown()))
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            line = view.reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+
+            fixture.restart()
+            fixture.server.publish_host_evidence(stale)
+            waiting, = fixture.server.handle_request(request)
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual((waiting.position, waiting.since), (1, request.since))
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([row.pid for row in view.reading.view.waiting], [request.owner.pid, older.owner.pid])
+            reloaded = view.reading.view.move_line
+            assert isinstance(reloaded, records.QueueMoveLine)
+            self.assertEqual(reloaded.members, line.members)
+            self.assertEqual(fixture.server.reservations, {})
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            replacement = assignment_for(fixture, request)
+            self.assertEqual(replacement.destination, authorized.assignment.destination)
+            self.assertNotEqual(replacement.attempt, authorized.assignment.attempt)
 
     def assert_client_exit(self, process: subprocess.Popen[str], expected: int) -> None:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
