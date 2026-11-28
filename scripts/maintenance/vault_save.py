@@ -38,6 +38,8 @@ ORIGIN_MAIN = "refs/remotes/origin/main"
 FIRST_SAVE_REF = "refs/vault-save/first-save"
 SUBJECT = "vault: Save text files"
 SCAN_FINDINGS_EXIT = 10
+SCAN_REPORT_ERROR = "Cannot read the Gitleaks JSON report. Vault save stopped."
+SCAN_REPORT_TEMPLATE = Path(__file__).with_name("vault_save_report.tmpl").resolve()
 
 
 class SaveError(ValueError):
@@ -317,16 +319,56 @@ def fetch_main(vault: Path) -> str:
     return checked(vault, "rev-parse", ORIGIN_MAIN).strip()
 
 
+@dataclass(frozen=True)
+class GitleaksFindingLocation:
+    file: str
+    line: int
+    rule_id: str
+
+    @classmethod
+    def from_report(cls, row: object) -> GitleaksFindingLocation:
+        if not isinstance(row, dict):
+            raise ValueError("Invalid Gitleaks finding.")
+        fields = cast(dict[str, object], row)
+        file, line, rule = fields.get("File"), fields.get("StartLine"), fields.get("RuleID")
+        if (fields.keys() != {"File", "StartLine", "RuleID"}
+                or not isinstance(file, str) or not file or type(line) is not int or line < 1
+                or not isinstance(rule, str) or not rule):
+            raise ValueError("Invalid Gitleaks finding location.")
+        return cls(file, line, rule)
+
+
+def scan_findings(report: bytes) -> list[GitleaksFindingLocation]:
+    try:
+        return [GitleaksFindingLocation.from_report(cast(object, json.loads(line)))
+                for line in report.splitlines()]
+    except (ValueError, RecursionError):
+        raise SaveError(SCAN_REPORT_ERROR) from None
+
+
+def scan_refusal(findings: list[GitleaksFindingLocation]) -> str:
+    lines = ["Gitleaks found a potential secret. Tell sdlc the redacted finding."]
+    for finding in findings:
+        file = finding.file if finding.file.isprintable() else repr(finding.file)
+        rule = finding.rule_id if finding.rule_id.isprintable() else repr(finding.rule_id)
+        lines.append(f"{file}:{finding.line}: {rule}")
+    return "\n".join(lines)
+
+
 def scan(vault: Path, *args: str) -> None:
     result = subprocess.run(
         ["nix", "shell", "nixpkgs#gitleaks", "--command", "gitleaks", *args,
-         "--redact=100", "--exit-code", str(SCAN_FINDINGS_EXIT)],
-        cwd=vault, check=False,
+         "--redact=100", "--exit-code", str(SCAN_FINDINGS_EXIT),
+         "--report-format", "template", "--report-template", str(SCAN_REPORT_TEMPLATE), "--report-path", "-"],
+        cwd=vault, check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
-    if result.returncode == SCAN_FINDINGS_EXIT:
-        raise SaveError("Gitleaks found a potential secret. Tell sdlc the redacted finding.")
-    if result.returncode:
+    if result.returncode not in (0, SCAN_FINDINGS_EXIT):
         raise SaveError(f"Gitleaks failed with exit {result.returncode}.")
+    findings = scan_findings(result.stdout)
+    if result.returncode == SCAN_FINDINGS_EXIT and not findings:
+        raise SaveError(SCAN_REPORT_ERROR)
+    if result.returncode == SCAN_FINDINGS_EXIT or findings:
+        raise SaveError(scan_refusal(findings))
 
 
 def scan_first_save(vault: Path, manifest: Path) -> None:

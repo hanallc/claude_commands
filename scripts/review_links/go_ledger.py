@@ -1,4 +1,4 @@
-"""Keep one ledger record for each Go that nate presses on the List page."""
+"""Keep one ledger record for each Go that nate presses in the Studio."""
 from __future__ import annotations
 
 import errno
@@ -9,14 +9,14 @@ import secrets
 import socket
 import threading
 from collections.abc import Generator, Iterable
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import atomic_file, file_lock
 from scripts.production import staff, the_list
-from scripts.review_links import change_page, review_link
+from scripts.review_links import change_page, new_item_dialog, review_link
 
 GO_PATH = f"/{change_page.CONSOLE_FOLDER}/list-go"
 GO_CHECK_PATH = f"/{change_page.CONSOLE_FOLDER}/go-check"
@@ -41,6 +41,10 @@ class GoRecord(TypedDict):
     used: bool
     sent: dict[str, bool]
     reported: dict[str, bool]
+    origin: NotRequired[Literal["Studio"]]
+    feedback: NotRequired[str]
+    target_name: NotRequired[str]
+    words_unconfirmed: NotRequired[list[str]]
 
 
 class GoCheckAnswer(TypedDict):
@@ -98,8 +102,14 @@ def _read(path: Path) -> GoRecord:
     value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     states = [fields.get(name) for name in ("sent", "reported")]
-    if (fields.keys() != GoRecord.__annotations__.keys() or not isinstance(fields["used"], bool)
-            or not all(isinstance(text, str) for name, text in fields.items() if name not in ("used", "sent", "reported"))
+    optional = {"origin", "feedback", "target_name", "words_unconfirmed"}
+    words_unconfirmed = fields.get("words_unconfirmed", [])
+    if (fields.keys() - optional != GoRecord.__annotations__.keys() - optional
+            or ("origin" in fields and fields["origin"] != "Studio") or not isinstance(fields["used"], bool)
+            or not isinstance(words_unconfirmed, list)
+            or not all(isinstance(recipient, str) for recipient in cast(list[object], words_unconfirmed))
+            or not all(isinstance(text, str) for name, text in fields.items()
+                       if name not in ("used", "sent", "reported", "words_unconfirmed"))
             or not all(isinstance(state, dict) and all(isinstance(name, str) and isinstance(done, bool)
                                                        for name, done in cast(dict[object, object], state).items())
                        for state in states)):
@@ -129,6 +139,11 @@ def read(root: Path, go_id: str) -> GoRecord:
     return _read(_path(root, go_id))
 
 
+def delivery_lock(root: Path, go_id: str) -> AbstractContextManager[file_lock.LockResult]:
+    """Protect the send and its confirmation without locking the Go check."""
+    return file_lock.exclusive(_path(root, go_id).with_suffix(".lock"))
+
+
 def closed_ask(entry: GoRecord) -> tuple[staff.StaffId, the_list.ListItem, the_list.Ask] | None:
     """Find the closed List ask that holds this go id with the same target and What."""
     keeper, _, identity = entry["item"].partition("/")
@@ -143,11 +158,16 @@ def closed_ask(entry: GoRecord) -> tuple[staff.StaffId, the_list.ListItem, the_l
 
 
 def record(root: Path, *, ask: the_list.Ask, item: str, recipients: Iterable[staff.StaffId], client: str, page: str,
-           moment: datetime) -> GoRecord:
+           moment: datetime, feedback: str = "", target_name: str = "") -> GoRecord:
     """Write the unused, unsent record before the List saves the Go."""
     entry: GoRecord = {"go_id": secrets.token_hex(16), "ask": ask.ask_id, "item": item, "target": ask.target,
                        "what": ask.what, "time": moment.isoformat(), "client": client, "page": page, "used": False,
-                       "sent": dict.fromkeys(recipients, False), "reported": dict.fromkeys(recipients, False)}
+                       "sent": dict.fromkeys(recipients, False), "reported": dict.fromkeys(recipients, False),
+                       "origin": "Studio"}
+    if feedback:
+        entry["feedback"] = feedback
+        if target_name:
+            entry["target_name"] = target_name
     path = _path(root, entry["go_id"])
     with locked(root):
         if not atomic_file.create_text_atomic(path, json.dumps(entry, ensure_ascii=False)):
@@ -161,24 +181,40 @@ def remove(root: Path, go_id: str) -> None:
         _path(root, go_id).unlink(missing_ok=True)
 
 
-def mark(root: Path, go_id: str, state: Literal["sent", "reported"], recipients: Iterable[staff.StaffId]) -> None:
-    """Keep the delivery state of each recipient: sent, or reported to nate as not delivered."""
+def mark_sent(root: Path, go_id: str, recipients: Iterable[staff.StaffId],
+              unconfirmed_words: set[staff.StaffId]) -> None:
+    """Save accepted Go sends and track which recipients still need words confirmation."""
     with locked(root):
         path = _path(root, go_id)
         entry = _read(path)
-        entry[state].update(dict.fromkeys(recipients, True))
+        sent = dict.fromkeys((str(recipient) for recipient in recipients), True)
+        entry["sent"].update(sent)
+        pending = set(entry.get("words_unconfirmed", ())).difference(sent).union(unconfirmed_words)
+        if pending:
+            entry["words_unconfirmed"] = sorted(pending)
+        else:
+            _ = entry.pop("words_unconfirmed", None)
+        atomic_file.write_text_atomic(path, json.dumps(entry, ensure_ascii=False))
+
+
+def mark_reported(root: Path, go_id: str, recipients: Iterable[staff.StaffId]) -> None:
+    """Mark each recipient that the server reported to nate as not delivered."""
+    with locked(root):
+        path = _path(root, go_id)
+        entry = _read(path)
+        entry["reported"].update(dict.fromkeys(recipients, True))
         atomic_file.write_text_atomic(path, json.dumps(entry, ensure_ascii=False))
 
 
 def unsent(root: Path) -> tuple[str, ...]:
-    """Find each Go whose message did not reach every recipient."""
+    """Find each Go with an unsent message or unconfirmed words."""
     found: list[str] = []
     for path in sorted((root / LEDGER_FOLDER).glob("*.json")):
         try:
             entry = read(root, path.stem)
         except (OSError, ValueError):
             continue
-        if not all(entry["sent"].values()):
+        if not all(entry["sent"].values()) or entry.get("words_unconfirmed"):
             found.append(entry["go_id"])
     return tuple(found)
 
@@ -205,11 +241,14 @@ def check(root: Path, go_id: str, caller: str) -> GoCheckAnswer:
         return {"ok": True, "text": entry["what"]}
 
 
-def message(item: the_list.ListItem, ask: the_list.Ask, go_id: str, agent: str) -> str:
+def message(item: the_list.ListItem, ask: the_list.Ask, entry: GoRecord, agent: str) -> str:
     """Name what nate approved; carry only the go id and the check command."""
     button = "Go" if ask.kind is the_list.AskKind.GO else "Approved"
-    return (f"List page: nate pressed {button} for item {item.number}.\n"
+    go_id = entry["go_id"]
+    agent = entry.get("target_name", agent)
+    message = (f"{entry.get('origin', 'List page')}: nate pressed {button} for item {item.number}.\n"
             + f"What: {ask.what}\n"
             + f"For: {agent}. Only {agent} can use it, once.\n"
             + f"Go id: {go_id}\n"
             + f"Run this check before you act: {CHECK_COMMAND} {go_id}")
+    return new_item_dialog.append_feedback(message, entry.get("feedback", ""))

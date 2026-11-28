@@ -30,6 +30,7 @@
 // Use --kill-both-shot with an output PNG path for the full Builds page.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
+import {gunzipSync} from 'node:zlib';
 import {accessSync, constants, statSync} from 'node:fs';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -2955,11 +2956,11 @@ try {
               const opened=await evaluate(`(() => {
                 const dialog=document.querySelector('#${action}-dialog'), body=dialog.querySelector('.console-dialog-body');
                 return {modal:dialog.matches(':modal'),right:dialog.getBoundingClientRect().right,
-                  capturePlace:pageCapturePlace(),
+                  captureWindows:pageCaptureWindows().map(window=>window.id),
                   sideways:body.scrollWidth-body.clientWidth};
               })()`);
               assert.ok(opened.modal, action+' does not open its dialog.');
-              assert.equal(opened.capturePlace, '/memory_live.html#console-window=' + action + '-dialog');
+              assert.deepEqual(opened.captureWindows, [action + '-dialog']);
               assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
               assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
               if (action==='builds-swap') {
@@ -5313,21 +5314,13 @@ try {
             return document.querySelector('#review-new-item').matches(':modal');
           })()`).then(open => assert.ok(open, 'New item does not open above Swap.')),
         ]);
-        assert.equal(captureRequest.place, '/memory_live.html#console-window=builds-swap-dialog');
-        const captureDialogs = await evaluate(`(async () => {
-          const frame = document.createElement('iframe');
-          frame.src = ${JSON.stringify(captureRequest.place)};
-          frame.style.cssText = 'position:fixed;left:-2000px;width:1400px;height:1100px';
-          const loaded = new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));
-          document.body.append(frame);
-          try {
-            await loaded;
-            return [...frame.contentDocument.querySelectorAll('dialog:modal')].map(dialog => dialog.id);
-          } finally {
-            frame.remove();
-          }
+        assert.equal(captureRequest.place, '/memory_live.html');
+        const snapshot = gunzipSync(Buffer.from(captureRequest.document_gzip, 'base64')).toString('utf8');
+        const captureDialogs = await evaluate(`(() => {
+          const copy = new DOMParser().parseFromString(${JSON.stringify(snapshot)}, 'text/html');
+          return [...copy.querySelectorAll('dialog[open][data-capture-modal]')].map(dialog => dialog.id);
         })()`);
-        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The screenshot address does not restore Swap.');
+        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The snapshot keeps Swap open and omits New item.');
 
         if (comparisonImages) {
           await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,

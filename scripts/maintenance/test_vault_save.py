@@ -4,14 +4,17 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import io
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
+from uuid import uuid4
 
 from scripts.lib import land_main
 from scripts.lib.git_test_support import fixture_git_environment
@@ -99,6 +102,41 @@ class VaultSaveTests(unittest.TestCase):
             code, output, errors = self.command("first-save", "scan")
         self.assertEqual(code, 0, errors)
         return output.splitlines()[-1].removeprefix("Manifest hash ")
+
+    def scan_with_gitleaks_report(self, mode: str, report: list[dict[str, object]] | str, *,
+                                  findings_exit: bool = True) -> tuple[int, str, str]:
+        tools = self.origin.parent / "scanner"
+        tools.mkdir()
+        scanner = tools / "nix"
+        _ = scanner.write_text("\n".join((
+            f"#!{sys.executable}",
+            "import re, sys",
+            "from pathlib import Path",
+            "args = sys.argv[1:]",
+            "assert '--redact=100' in args",
+            "assert args[args.index('--report-format') + 1] == 'template'",
+            "template = Path(args[args.index('--report-template') + 1])",
+            f"assert template == Path({str(vault_save.SCAN_REPORT_TEMPLATE)!r})",
+            "assert template.is_absolute()",
+            "fields = set(re.findall(r'[A-Z][A-Za-z]+', template.read_text()))",
+            "assert fields == {'File', 'StartLine', 'RuleID', 'Json'}",
+            "assert args[args.index('--report-path') + 1] == '-'",
+            f"if args[4] != {mode!r}:",
+            "    sys.exit(0)",
+            "report = sys.stdin.read()",
+            "sys.stdout.write(report)",
+            "print('Scanner diagnostic.', file=sys.stderr)",
+            f"sys.exit(int(args[args.index('--exit-code') + 1]) if {findings_exit!r} else 0)",
+            "",
+        )), encoding="utf-8")
+        scanner.chmod(0o700)
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.maintenance.vault_save", "--vault", str(self.vault), "first-save", "scan"],
+            env={**os.environ, "PATH": os.pathsep.join((str(tools), os.environ["PATH"]))},
+            input=report if isinstance(report, str) else "".join(json.dumps(row) + "\n" for row in report),
+            check=False, capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout, result.stderr
 
     def mark_first_save_published(self) -> None:
         _ = self.git("update-ref", vault_save.FIRST_SAVE_REF, "HEAD")
@@ -256,6 +294,58 @@ class VaultSaveTests(unittest.TestCase):
                 self.assertEqual(self.git(*list_objects), objects)
                 self.assertFalse(manifest.exists())
                 self.assertFalse(manifest.with_name("vault-save-work").exists())
+
+    def test_vault_save_scan_reports_redacted_finding_locations(self) -> None:
+        value = uuid4().hex.upper()
+        self.write("note.md", f"# Fixture\nfixture_label: {value}\n")
+        file = "files/note.md"
+        rules = ("fixture-rule", "second-rule")
+        code, output, errors = self.scan_with_gitleaks_report("dir", [
+            {"File": file, "StartLine": 2, "RuleID": rule}
+            for rule in rules
+        ])
+        self.assertEqual(code, 1)
+        self.assertTrue(output == "")
+        fragments = (value[index:index + 2] for index in range(len(value) - 1))
+        self.assertFalse(any(part in errors and part not in file and all(part not in rule for rule in rules)
+                             for part in fragments))
+        header, *findings = errors.splitlines()
+        self.assertTrue(header.startswith("Vault save failed: Gitleaks found a potential secret."))
+        self.assertTrue(findings == [f"{file}:2: {rule}" for rule in rules])
+
+    def test_vault_save_scan_uses_metadata_only_template(self) -> None:
+        file = "files/note\twith\na newline.md"
+        self.write(file.removeprefix("files/"), "A fixture note.\n")
+        code, output, errors = self.scan_with_gitleaks_report("dir", [
+            {"File": file, "StartLine": 3, "RuleID": "fixture-rule"},
+        ])
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertEqual(errors.splitlines()[1:], [f"{file!r}:3: fixture-rule"])
+
+    def test_vault_save_scan_refuses_an_unreadable_report_after_a_clean_exit(self) -> None:
+        self.write("note.md", "A fixture note.\n")
+        row = json.dumps({"File": "files/note.md", "StartLine": 1, "RuleID": "fixture-rule"})
+        report = row + "\nInvalid scanner output.\n"
+        code, output, errors = self.scan_with_gitleaks_report("dir", report, findings_exit=False)
+        self.assertEqual(code, 1)
+        self.assertTrue(output == "")
+        self.assertTrue(errors == "Vault save failed: " + vault_save.SCAN_REPORT_ERROR + "\n")
+
+    def test_vault_save_scan_refusal_does_not_read_source_files(self) -> None:
+        report = json.dumps({"File": "absent.md", "StartLine": 5, "RuleID": "fixture-rule"}).encode() + b"\n"
+        result = subprocess.CompletedProcess([], vault_save.SCAN_FINDINGS_EXIT, report)
+        with (patch.object(subprocess, "run", return_value=result) as scanner,
+              patch.object(subprocess, "Popen") as process,
+              patch.object(Path, "open") as open_path,
+              patch("builtins.open") as open_file):
+            with self.assertRaises(vault_save.SaveError) as refusal:
+                vault_save.scan(self.vault, "git", ".")
+        scanner.assert_called_once()
+        process.assert_not_called()
+        open_path.assert_not_called()
+        open_file.assert_not_called()
+        self.assertTrue(str(refusal.exception).splitlines()[-1] == "absent.md:5: fixture-rule")
 
     def test_vault_save_checks_first_push(self) -> None:
         origin = self.git("rev-parse", "origin/main")

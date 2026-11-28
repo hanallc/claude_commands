@@ -1,6 +1,7 @@
 """Publish complete file content and persist its directory entry."""
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import secrets
@@ -8,10 +9,29 @@ import sys
 import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
+from enum import Enum, auto
 from pathlib import Path
 from typing import BinaryIO, TextIO, cast
 
 TEMPORARY_NAME = re.compile(r"\.(?P<target>.+)\.(?P<pid>\d+)\.[^.]+\.tmp", re.DOTALL)
+
+
+class StagingFile(Enum):
+    UNIQUE = auto()
+    WRITER_LOCKED = auto()
+
+
+@contextmanager
+def existing_writer_lock(path: Path) -> Generator[None]:
+    """Hold a writer lock if its file exists. Leave a missing path alone."""
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        yield
+        return
+    with stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
 
 
 def temporary_target(name: str) -> str | None:
@@ -54,12 +74,18 @@ def remove_dead_temporary_files(path: Path) -> None:
 
 
 @contextmanager
-def _flushed_temporary_file(path: Path, content: str | bytes, *, mode: int = 0o600) -> Generator[Path]:
+def _flushed_temporary_file(path: Path, content: str | bytes, *, mode: int = 0o600,
+                            staging: StagingFile = StagingFile.UNIQUE) -> Generator[Path]:
     """Keep a complete, private sibling file until publication finishes."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    remove_dead_temporary_files(path)
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.{os.getpid()}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(name)
+    if staging is StagingFile.WRITER_LOCKED:
+        temporary = path.with_name(f".{path.name}.0.locked.tmp")
+        temporary.unlink(missing_ok=True)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    else:
+        remove_dead_temporary_files(path)
+        descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.{os.getpid()}.", suffix=".tmp", dir=path.parent)
+        temporary = Path(name)
     try:
         with cast(TextIO | BinaryIO, os.fdopen(
                 descriptor, "w" if isinstance(content, str) else "wb",
@@ -106,6 +132,11 @@ def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> N
     _write_atomic(path, data, mode=mode)
 
 
+def write_locked_atomic(path: Path, content: str | bytes, *, mode: int | None = None) -> None:
+    """Publish under the target's writer lock without scanning sibling files."""
+    _write_atomic(path, content, mode=mode, staging=StagingFile.WRITER_LOCKED)
+
+
 def _default_permissions(path: Path) -> int:
     """Read kernel-selected permissions from an empty sibling without changing the process umask."""
     while True:
@@ -123,11 +154,11 @@ def _default_permissions(path: Path) -> int:
 
 
 def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
-                  new_file_mode: int | None = None) -> None:
+                  new_file_mode: int | None = None, staging: StagingFile = StagingFile.UNIQUE) -> None:
     """Own the single replacement boundary for text and binary evidence."""
     replaced = False
     try:
-        with _flushed_temporary_file(path, content, mode=mode if mode is not None else 0o600) as temporary:
+        with _flushed_temporary_file(path, content, mode=mode if mode is not None else 0o600, staging=staging) as temporary:
             if mode is not None:
                 temporary.chmod(mode)
             elif path.exists():
