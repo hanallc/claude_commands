@@ -6196,10 +6196,21 @@ done
             for row in preview.rows:
                 if isinstance(row.admission, gate.ProposedAdmission):
                     local_starts.add(row.owner)
-                elif isinstance(hold := row.decision.order_hold, records.HeldBehindHead):
+                elif isinstance(hold := row.decision.order_hold, records.HeldBehindHead) and any(
+                        candidate.destination.provider == "scaler" and isinstance(candidate.eligibility, placement.AllowedHost)
+                        for candidate in choices.get(row.owner, ())):
                     head = records.waiter_owner(hold.waiter)
                     if gate.guest_reading_targets(preview_with_returns, head):
                         guest_order_holds[row.owner] = head
+            if guest_order_holds:
+                # Check whether local admission can start these rows without the guest reads.
+                guest_readers = {owner for owner in preview_with_returns.placement_candidates
+                                 if gate.guest_reading_targets(preview_with_returns, owner)}
+                local_preview = without_owners(preview_with_returns, guest_readers)
+                local_policy = gate.head_policy(local_preview, inputs.now, policy, gate.start_spacing_after(inputs.now, policy))
+                possible_starts = {records.waiter_owner(entry.waiter) for entry in local_policy.walk
+                                   if entry.decision.state == "admit"}
+                guest_order_holds = {owner: head for owner, head in guest_order_holds.items() if owner in possible_starts}
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
