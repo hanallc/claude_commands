@@ -23,6 +23,7 @@ from unittest import mock
 from scripts.disks import cleanup_old_folders
 from scripts.lib import build_folders, git_files, git_rescue, inotify, process_start, removal_guard, session_move
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lib.socket_test_support import descriptor_socket_path
 from scripts.lint import tmp_sweep
 from scripts.production import staff
 
@@ -666,10 +667,10 @@ assert not loaded, sorted(loaded)
     def test_move_count_line_counts_only_the_moving_folders(self) -> None:
         cleanup = cleanup_old_folders
         gib = 1 << 30
-        rows = (cleanup.Row(Path("/dev/shm/t-a"), 3 * gib // 2, cleanup.WouldMove(Path("/build/a"), "a")),
-                cleanup.Row(Path("/dev/shm/t-b"), gib // 2, cleanup.WouldMove(Path("/build/b"), "b")),
-                cleanup.Row(Path("/dev/shm/t-c"), None, cleanup.WouldMove(Path("/build/c"), "c")),
-                cleanup.Row(Path("/dev/shm/t-d"), 7 * gib, cleanup.WouldRemove("d")))
+        rows = (cleanup.Row(Path("/example/legacy/t-a"), 3 * gib // 2, cleanup.WouldMove(Path("/build/a"), "a")),
+                cleanup.Row(Path("/example/legacy/t-b"), gib // 2, cleanup.WouldMove(Path("/build/b"), "b")),
+                cleanup.Row(Path("/example/legacy/t-c"), None, cleanup.WouldMove(Path("/build/c"), "c")),
+                cleanup.Row(Path("/example/legacy/t-d"), 7 * gib, cleanup.WouldRemove("d")))
         local = cleanup.HostList(cleanup.Machine.NATEDEV, rows)
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(cleanup.finish_gate_move(
@@ -1318,7 +1319,7 @@ assert not loaded, sorted(loaded)
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         parent = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            listener.bind(f"/proc/self/fd/{parent}/{endpoint.name}")
+            listener.bind(descriptor_socket_path(parent, endpoint.name))
         finally:
             os.close(parent)
         recovery = self.gate_checkout_to_move("t-with-recovery")

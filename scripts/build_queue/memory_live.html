@@ -2027,9 +2027,12 @@ function detailRows(label, value, parts) {
   return phrase.length <= 30 ? [{...field(label, phrase), valueParts}]
     : [field(label, ''), {...field('', phrase, 'long'), valueParts}];
 }
+function hasGateReasons(row) {
+  return /^(natedev|mac-linux|aws): /.test(row.because || '');
+}
 function routeFields(row) {
   return [machineField('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
-    ...(row.runs_on === 'natedev or Mac' ? [] : detailRows('Because', row.because, row.because_parts))];
+    ...(row.runs_on === 'natedev or Mac' && !hasGateReasons(row) ? [] : detailRows('Because', row.because, row.because_parts))];
 }
 function runFolderFields(folder) {
   if (!folder) return [];
@@ -2075,8 +2078,9 @@ function stepTooltip(key, data) {
   const unavailableLocation = guest ? guestFields : folderFields;
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && (guest || namesGuest)
-    ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || ''),
-      ...detailRows('Because', row.because, row.because_parts)] : [];
+    ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || '')] : [];
+  const runningReasons = !waiting && (namedTargets.length || hasGateReasons(row))
+    ? detailRows('Because', row.because, row.because_parts) : [];
   const group = row.group ? data.stepReadings.get(row).used : null;
   const title = group ? field(row.name, group.text, 'title')
     : stepTitle(row, unavailable && !guestRow(row) ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
@@ -2089,8 +2093,10 @@ function stepTooltip(key, data) {
   if (macRow(row) && row.gate_label && !row.gate_label.startsWith('placement ')) {
     detailFields.push(field('Mac build', row.gate_label));
   }
-  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...unavailableLocation, ...namedTargets,
-    ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
+  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...unavailableLocation,
+    ...(!waiting && !guest && hasGateReasons(row) ? [machineField('Runs on', machine)] : []),
+    ...namedTargets, ...runningReasons,
+    ...(waiting && (namesGuest || hasGateReasons(row)) ? routeFields(row) : []), ...callFields];
   if (group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map((part, index) => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
@@ -2128,7 +2134,7 @@ function stepTooltip(key, data) {
       rows.push(...groupRows(need));
     }
   } else {
-    rows.push(...(guest ? guestFields : runningLocation), ...namedTargets);
+    rows.push(...(guest ? guestFields : runningLocation), ...namedTargets, ...runningReasons);
     if (row.kind === 'cloud') {
       if (row.location) rows.push(field('Where', row.location));
       if (row.stage === undefined && row.activity) rows.push(field('Status', row.activity));
@@ -2785,7 +2791,7 @@ function limitTooltipRows(key, limits) {
   if (kind === "unplaced") return limitWaitFields(limits.unplaced);
   const data = limits[machine];
   if (!data) return [];
-  const name = {natedev: words.local, mac: words.mac, aws: words.aws}[machine];
+  const name = {natedev: words.local, mac: words.mac, mac_linux: "mac-linux", aws: words.aws}[machine];
   const identity = parts.join(":");
   if (kind === "machine") {
     return [...(data.unattributed_note ? [field("Repository counts", data.unattributed_note)] : []),
@@ -2823,11 +2829,12 @@ function renderBuildLimits(limits) {
   const container = $("build-limits-content");
   const machines = [["natedev", words.local]];
   if (limits.mac) machines.push(["mac", words.mac]);
+  if (limits.mac_linux) machines.push(["mac_linux", "mac-linux"]);
   machines.push(["aws", words.aws]);
   const headings = machines.map(([key, name]) => {
     const data = limits[key];
     const {unattributed, unattributed_kept = 0} = data;
-    return `<th scope="col"${data.unattributed_note ? ` data-tip="limit:machine:${key}"` : ""}><span class="machine" data-machine="${key}">${esc(name)}</span>
+    return `<th scope="col"${data.unattributed_note ? ` data-tip="limit:machine:${key}"` : ""}><span class="machine" data-machine="${key === "mac_linux" ? name : key}">${esc(name)}</span>
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
     ${data.facts ? `<div class="build-limit-facts">${esc(data.facts)}</div>` : ""}
     ${!unattributed ? "" : key === "mac"

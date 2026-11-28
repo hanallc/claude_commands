@@ -193,6 +193,19 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
     if (path !== 'before.html') assert.ok(!kinds.has('tools'), `Running shows a Build tools row at ${width} px.`);
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
+    if (path === 'memory_live.html') {
+      const gateReasons = [
+        ['wait:gate-proof-caller', 'mac-linux: requested by the caller · aws: requested by the caller'],
+        ['wait:gate-proof-aws-off', 'aws: cloud gates are off (cloud_gate.conf enabled=off)'],
+        ['wait:gate-proof-guest-wait', 'natedev: requested by the caller · mac-linux: the target is busy · aws: requested by the caller'],
+        ['row:gate-proof-running', 'mac-linux: the target is busy · aws: the daily spending limit is reached'],
+      ];
+      for (const [key, reason] of gateReasons) {
+        const row = shown.rows.find(row => row.key === key);
+        assert.ok(row, `Missing ${key} at ${width} px.`);
+        assert.equal(row.hover.split(reason).length - 1, 1, `${key} at ${width} px: ${row.hover}`);
+      }
+    }
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
     assert.ok(shown.rows.some(row => row.smallLines.some(([kind]) => kind === 'wait-note')),
       `The real-shape rows show no waiting note at ${width} px.`);
@@ -275,10 +288,12 @@ async function assertRowCenters(evaluate) {
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  const fixtureOutput = liveAwsCostSource ? '' : execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture())); from scripts.review_links import new_item_dialog, page_frame; from scripts.production import staff; page = Path(sys.argv[1]) / "memory_live.html"; page.write_bytes(page_frame.with_owner(page.read_bytes(), "builds", page_frame.NoShownOwner(), staff.StaffSnapshot(()), new_item_dialog.render))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
+  const writeFixture = 'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture())); from scripts.review_links import new_item_dialog, page_frame; from scripts.production import staff; page = Path(sys.argv[1]) / "memory_live.html"; page.write_bytes(page_frame.with_owner(page.read_bytes(), "builds", page_frame.NoShownOwner(), staff.StaffSnapshot(()), new_item_dialog.render))';
+  const readSocketSettings = 'from pathlib import Path; from scripts.lib import conf; from scripts.lib.socket_test_support import PROOF_CHROME_PREFIX, PROOF_CHROME_TEMP, proof_chrome_socket_address; root = Path(conf.read_or_repository("build_folders").text("roots.system")).expanduser(); proof_chrome_socket_address(root); print(json.dumps([str(root), PROOF_CHROME_PREFIX, PROOF_CHROME_TEMP]))';
+  const [systemTemporaryRoot, chromePrefix, chromeTemp] = liveAwsCostSource
+    ? [tmpdir(), 'memory-proof-chrome-', 'tmp']
+    : JSON.parse(execFileSync(process.env.PYTHON || 'python3', ['-c', writeFixture + '; ' + readSocketSettings, folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}));
   const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
   const beforePath = queueRowsProof || standingProof || outsideQueueProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
@@ -632,15 +647,15 @@ try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     // Chrome needs a short path for its Unix sockets.
-    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
+    const profile = await mkdtemp(join(systemTemporaryRoot, chromePrefix));
     try {
-      const temporary = join(profile, 'tmp');
+      const temporary = join(profile, chromeTemp);
       await mkdir(temporary);
       const chrome = spawn(chromePath, [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
+      ], {env:{...process.env,TMPDIR:temporary,MAC_CHROMIUM_TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);

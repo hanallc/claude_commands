@@ -38,7 +38,7 @@ UNSHIPPED_IMPORTS = {
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
     'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
     'buildlog/step_context.py': {'lib/cargo_target_config.py'},
-    'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
+    'copies/copies.py': {'lint/tmp_sweep.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
     'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
@@ -308,9 +308,12 @@ class HanaRenderTests(unittest.TestCase):
                 'import sys; sys.path.insert(0, sys.argv[1]); '
                 + 'from scripts.aws_target import hana_runner, hana_protocol; '
                 + 'from scripts.build_queue import queue_wait; '
+                + 'from scripts.copies import copies; '
                 + 'from scripts.lib import build_copies, git_rescue; '
+                + 'assert copies.checked_owner("hana") == "hana"; '
                 + 'assert not any(name in sys.modules for name in '
-                + '("scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", "scripts.aws_target.hana_box", '
+                + '("scripts.agents.remote", "scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", '
+                + '"scripts.aws_target.hana_box", '
                 + '"scripts.aws_target.hana_placement", "scripts.buildlog.transfer_bytes"))',
                 str(runtime)], cwd=runtime, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)

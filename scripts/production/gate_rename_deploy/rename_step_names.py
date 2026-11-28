@@ -677,7 +677,7 @@ def default_wait_roots() -> tuple[Path, ...]:
     """Find the tool folders that hold placement assignments."""
     settings = conf.read_or_repository("build_folders")
     folders = (session_folder.configured_root(), Path(settings.text("roots.system")),
-               Path(settings.text("roots.gate")), Path(settings.text("roots.scratch")),
+               Path(settings.text("roots.scratch")),
                build_folders.inherited_temporary_parent())
     parents = tuple(dict.fromkeys(folder.expanduser().resolve() for folder in folders))
     found = {Path.home() / mac_queue_run.RECEIPTS}

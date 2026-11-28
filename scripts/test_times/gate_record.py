@@ -626,14 +626,11 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
-    from scripts.lib.build_folders import configured_gate_root
-
     parser = argparse.ArgumentParser(description="Read suite folders and their gate outcomes.")
-    _ = parser.add_argument("root", nargs="?", type=Path, help="suite parent (default: the configured gate root)")
+    _ = parser.add_argument("root", type=Path, help="suite parent")
     args = parser.parse_args(argv)
     try:
-        root = cast(Path | None, args.root)
-        for status in gate_folder_status(configured_gate_root() if root is None else root):
+        for status in gate_folder_status(cast(Path, args.root)):
             print(json.dumps(status))
     except (OSError, ValueError) as error:
         print(f"gate folder status: {error}", file=sys.stderr)
