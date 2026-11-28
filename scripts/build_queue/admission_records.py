@@ -2251,10 +2251,32 @@ class CopyError(Exception):
     exit_code: int = COPY_ERROR_STATUS
 
 
+class CopyAdmissionRefused(CopyError):
+    """The staff authority did not admit the copy owner."""
+
+
 def checked_owner(owner: str) -> str:
     if not OWNER.fullmatch(owner):
         raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
     return owner
+
+
+def precheck_copy_owner(owner: str) -> None:
+    """Check current copy ownership without taking the staff slot."""
+    try:
+        staff.precheck_copy_owner(owner)
+    except (staff.StaffRefused, staff.StaffUnreadable) as error:
+        raise CopyAdmissionRefused(str(error)) from error
+
+
+@contextmanager
+def copy_owner_admission(owner: str) -> Generator[None]:
+    """Check ownership and keep any acquired staff slot through publication."""
+    try:
+        with staff.copy_owner_admission(owner):
+            yield
+    except (staff.StaffRefused, staff.StaffUnreadable) as error:
+        raise CopyAdmissionRefused(str(error)) from error
 
 
 def recorded_owner(source: Path, *,

@@ -27,7 +27,8 @@ from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.mac_test import floor_claims
 from scripts.mac_test.offload_test_commands import write_shell
 from scripts.mac_test.mac_transport import MacPlacement, RemoteRun, RemoteState
-from scripts.production import hand_made, hand_made_mac
+from scripts.production import hand_made, hand_made_mac, staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.hand_made_mac import START, MacLines, MacTransport, MirrorUse
 from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineFailed, MachineRun, Placed,
                                                 Program)
@@ -600,6 +601,7 @@ class CopiedCheckoutTests(unittest.TestCase):
         _ = (repo / "secret.sh").write_text("echo natedev only\n")
         settings = eligibility.SshConnectionSettings("mac-host", 7.0, 30.0, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         copied: list[tuple[list[str], str]] = []
+        register_remote = copies.register_remote
 
         def rsync(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             excludes = next(word.removeprefix("--exclude-from=") for word in argv if word.startswith("--exclude-from="))
@@ -620,6 +622,53 @@ class CopiedCheckoutTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-e") + 1], shlex.join(["ssh", *offload.ssh_options(settings)]))
         self.assertIn("ConnectTimeout=7", argv[argv.index("-e") + 1])
         self.assertIn("/secret.sh\n", excludes.splitlines(keepends=True))
+
+        with self.subTest(owner="retired owner"), mock.patch.dict(os.environ, {
+            "STAFF_FILE": str(repo / "private-staff.json"),
+        }), mock.patch.object(copies, "source_owner", return_value="00000000-0000-4000-8000-000000000001"), \
+                mock.patch.object(subprocess, "run", side_effect=rsync):
+            _ = (repo / "private-staff.json").write_text('{"schema": 2, "rows": []}\n')
+            copied.clear()
+            with self.assertRaisesRegex(MachineFailed, "copy owner is absent from staff"):
+                with hand_made_mac.copied_checkout(repo, "mac-host"):
+                    pass
+            self.assertEqual(copied, [])
+
+        with self.subTest(owner="owner retires after transfer"):
+            from scripts.agents import remote
+            from scripts.copies.copies_test_support import copies_environment
+
+            root = repo.parent
+            mirror_path = root / "unpublished-mirror"
+            environment = copies_environment(root)
+            staff_file = root / "staff.json"
+            with (isolated_staff_file(staff_file, environment),
+                  mock.patch.dict(os.environ, environment)):
+                parent = fixture_member("showrunner", name="hand-made-owner-parent")
+                before = staff_file.read_bytes()
+                owner = fixture_member("unit", name="hand-made-owner", parent=parent.id,
+                                       worktree=staff.PresentWorktree("natedev", repo))
+
+                def transfer(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    result = rsync(argv, **options)
+                    mirror_path.mkdir()
+                    copies.mark_mirror(mirror_path, owner.id, "repo", "fixture-session")
+                    _ = staff_file.write_bytes(before)
+                    return result
+
+                with (mock.patch.object(remote, "local_machine", return_value="natedev"),
+                      mock.patch.object(copies, "source_owner", return_value=owner.id),
+                      mock.patch.object(offload, "remote_mirror", return_value=str(mirror_path)),
+                      mock.patch.object(copies, "register_remote", new=register_remote),
+                      mock.patch.object(copies, "remove_remote_mirror") as remove_peer,
+                      mock.patch.object(subprocess, "run", side_effect=transfer)):
+                    with self.assertRaisesRegex(MachineFailed, "copy owner is absent from staff") as refusal:
+                        with hand_made_mac.copied_checkout(repo, "mac-host"):
+                            pass
+                self.assertIn(f"mac-host:{mirror_path}", str(refusal.exception))
+                self.assertTrue(mirror_path.is_dir())
+                remove_peer.assert_not_called()
+                self.assertEqual(copies.owned_remote_mirrors(owner.id), [])
 
 
 @final

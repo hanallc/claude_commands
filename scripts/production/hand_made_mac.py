@@ -102,7 +102,8 @@ def copied_checkout(repo: Path, host: str) -> Generator[MirrorUse]:
             options = offload.ssh_options(eligibility.read_connection_settings())
             mirror = copies.RemoteMirror(copies.source_owner(repo), copies.SelectedRepository(repository.name), host,
                                          offload.remote_mirror(repository), offload.holder_session())
-            lease.enter_context(copies.remote_lease(mirror))
+            copies.precheck_copy_owner(mirror.owner)
+            _ = lease.enter_context(copies.remote_lease(mirror))
             with offload.mirror_exclude_file(ignored) as excludes:
                 arguments = offload.mac_floor_rsync(mirror.path, copies.remote_rsync(repo, mirror, excludes, options))
                 copy = subprocess.run(arguments,

@@ -508,6 +508,31 @@ def checkout_cleanup_command(root: str, stop: str, checkout: str) -> str:
             f'else rm -rf -- {root} && {fallback}; fi')
 
 
+def interrupted_checkout_is_published(host: str, checkout: str, task: str,
+                                      lease_file: Path, cleanup_locks: ExitStack) -> bool:
+    """Check the interrupted attempt's exact record before stopping it."""
+    record = copies.remote_registry() / (copies.remote_key(host, checkout) + '.json')
+    try:
+        _ = record.lstat()
+    except FileNotFoundError:
+        return False
+
+    lease = record.with_suffix('.lease')
+    try:
+        saved_lease = lease_file.read_text().strip()
+    except FileNotFoundError:
+        # Earlier attempts can have a registry record without a lease sidecar.
+        _ = cleanup_locks.enter_context(copies.remote_mirror_lease(host, lease))
+    else:
+        # The queue holds the sidecar lease through the callback.
+        if Path(saved_lease) != lease:
+            raise GateRefused(f'{host}:{checkout}: the lease does not match the Mac gate checkout')
+    mirror = copies.read_remote_mirror(record)
+    if (mirror.host, mirror.path, mirror.task) != (host, checkout, task):
+        raise GateRefused(f'{host}:{checkout}: the registry record does not match the Mac gate checkout')
+    return True
+
+
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     source_attempt = attempt_name(folder)
     attempt_file = argv_file.with_suffix('.json.attempt')
@@ -527,34 +552,57 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
+    unpublished = argv_file.with_suffix('.json.unpublished')
+    lease_file = argv_file.with_suffix('.json.lease')
     if phase in ('cleanup', 'cleanup-ended'):
-        try:
-            checkout = checkout_file.read_text()
-        except FileNotFoundError:
-            checkout = ''
-        if phase == 'cleanup-ended':
-            from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
+        with ExitStack() as cleanup_locks:
+            try:
+                try:
+                    checkout = checkout_file.read_text()
+                except FileNotFoundError:
+                    checkout = ''
+                try:
+                    marker = unpublished.read_text().removesuffix('\n')
+                except FileNotFoundError:
+                    pass
+                else:
+                    marked_checkout = marker.removeprefix(f'{host}:')
+                    if (marked_checkout == marker or not Path(marked_checkout).is_absolute()
+                            or '\n' in marked_checkout or (checkout and checkout != marked_checkout)):
+                        raise GateRefused('The publication marker does not match the Mac gate checkout')
+                    checkout = marked_checkout
+                    if not interrupted_checkout_is_published(host, checkout, checkout_task(Path(remote)),
+                                                             lease_file, cleanup_locks):
+                        return 0
+            except (OSError, UnicodeError, copies.CopyError, GateRefused) as error:
+                detail = ' '.join(str(error).split())
+                print(f'{CLEANUP_ERROR_PREFIX}{folder.name}:{detail}', flush=True)
+                return 1
 
-            cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
-            if Path(checkout).is_absolute():
-                cleanup += ' ' + shlex.join(['--checkout', checkout])
-        else:
-            cleanup = checkout_cleanup_command(root, stop, checkout)
-        result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
-        outcome = result.stdout.strip()
-        if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
-            detail = ' '.join(result.stderr.split()) or 'The Mac did not confirm checkout cleanup'
-            print(f'{CLEANUP_ERROR_PREFIX}{folder.name}:{detail}', flush=True)
-            return 1
-        if result.stderr:
-            print(result.stderr, end='', file=sys.stderr)
-        if outcome == CheckoutCleanup.REMOVED and Path(checkout).is_absolute():
-            copies.unregister_remote(host, checkout)
-        return 0
+            if phase == 'cleanup-ended':
+                from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
+
+                cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
+                if Path(checkout).is_absolute():
+                    cleanup += ' ' + shlex.join(['--checkout', checkout])
+            else:
+                cleanup = checkout_cleanup_command(root, stop, checkout)
+            result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
+            outcome = result.stdout.strip()
+            if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
+                detail = ' '.join(result.stderr.split()) or 'The Mac did not confirm checkout cleanup'
+                print(f'{CLEANUP_ERROR_PREFIX}{folder.name}:{detail}', flush=True)
+                return 1
+            if result.stderr:
+                print(result.stderr, end='', file=sys.stderr)
+            if outcome == CheckoutCleanup.REMOVED and Path(checkout).is_absolute():
+                copies.unregister_remote(host, checkout)
+            return 0
 
     request = cloud_gate.read(folder / 'request.json')
     local_repo = Path((folder / 'local-repo').read_text())
     owner = copies.source_owner(local_repo)
+    copies.precheck_copy_owner(owner)
     repository = copies.repository_name(local_repo)
     session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID') or attempt_name(folder)
     files = [folder / 'request.json', folder / 'module_seconds.json']
@@ -570,12 +618,15 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     checkout = response.strip().removeprefix('mac_gate_checkout=')
     if not response.startswith('mac_gate_checkout=') or not Path(checkout).is_absolute() or '\n' in checkout:
         raise GateRefused('The Mac did not confirm the gate checkout')
+    write_text_atomic(unpublished, f'{host}:{checkout}\n')
     write_text_atomic(checkout_file, checkout)
     _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, stop, checkout))
     mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
                                  task=checkout_task(Path(remote)))
-    _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
-    copies.register_remote(mirror)
+    with copies.remote_lease(mirror):
+        write_text_atomic(lease_file, str(copies.remote_lease_path(mirror)))
+        copies.register_remote(mirror)
+    unpublished.unlink()
     copies.reconcile_remote_mirrors(host, is_mac_gate_checkout)
     files.extend(checkout_bundle(ssh, checkout, local_repo, folder, request))
     _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', *map(str, files), f'{host}:{remote}/'], check=True)

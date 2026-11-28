@@ -266,7 +266,14 @@ class RemoteCopiesTests(unittest.TestCase):
                     copies.SelectedRepository(self.source.name), "remote-host", "mirror/" + identity,
                     holder.current_session)
                 _ = contexts.enter_context(copies.remote_lease(mirror))
-                copies.register_remote(mirror)
+                if identity == missing_owner:
+                    copies.register_remote(replace(mirror, owner=owner.id))
+                    path = copies.remote_record_path(mirror)
+                    record = cast(dict[str, object], json.loads(path.read_text()))
+                    record["owner"] = missing_owner
+                    write_text_atomic(path, json.dumps(record))
+                else:
+                    copies.register_remote(mirror)
                 if identity == str(owner.id):
                     _ = staff.rename(owner.id, "renamed-owner")
                 if identity == "staff-read-error":

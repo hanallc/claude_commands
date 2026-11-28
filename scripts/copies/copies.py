@@ -33,7 +33,6 @@ import time
 from types import MappingProxyType
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
-from uuid import UUID
 
 
 from scripts.lib import (
@@ -52,8 +51,10 @@ from scripts.lib.build_copies import CopyGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.build_queue.admission_records import (
     ACTIVE_GATES as ACTIVE_GATES, COPY_ERROR_STATUS as COPY_ERROR_STATUS, OWNER,
-    ActiveGate, CopyError as CopyError, checked_owner, recorded_owner as recorded_owner,
+    ActiveGate, CopyAdmissionRefused as CopyAdmissionRefused, CopyError as CopyError, checked_owner,
+    copy_owner_admission, precheck_copy_owner as precheck_copy_owner, recorded_owner as recorded_owner,
 )
+from scripts.production.staff import CopyOwner, RoleCopyOwner, StaffCopyOwner, copy_owner
 from scripts.lib.build_steps import (
     GATE_SCRIPTS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
@@ -98,40 +99,14 @@ class GitExit(CopyError):
         self.returncode: int = returncode
 
 
-@dataclass(frozen=True)
-class StaffOwner:
-    """A fixed staff row owns the copy."""
-
-    row_id: str
-
-
-@dataclass(frozen=True)
-class RoleOwner:
-    """A fixed role owns the copy without a staff row."""
-
-    name: str
-
-
-CopyOwner = StaffOwner | RoleOwner
-
-
-def copy_owner(text: str) -> CopyOwner:
-    """Read a row identity or a fixed role at the text boundary."""
-    try:
-        identity = str(UUID(text))
-    except ValueError:
-        return RoleOwner(text)
-    return StaffOwner(identity)
-
-
 def owner_name(owner: CopyOwner) -> str:
     """Read the current name without changing the copy's folder."""
-    if isinstance(owner, RoleOwner):
+    if isinstance(owner, RoleCopyOwner):
         return owner.name
     from scripts.production import staff
 
     try:
-        row = staff.local_snapshot().by_id(staff.StaffId(owner.row_id))
+        row = staff.local_snapshot().by_id(owner.row_id)
     except staff.StaffUnreadable:
         row = None
     return row.name if row is not None else owner.row_id
@@ -189,7 +164,7 @@ class ListStaffNames:
 
 def list_owner_name(owner: CopyOwner, staff_names: ListStaffNames) -> OwnerDisplay:
     """Resolve an owner for display without changing its stored identity or folder name."""
-    if isinstance(owner, RoleOwner):
+    if isinstance(owner, RoleCopyOwner):
         return RoleOwnerName(owner.name)
     from scripts.production import staff
 
@@ -724,12 +699,13 @@ def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, 
 
 
 def clone(source: Path, task: str = "", word: str = "hana", now: float | None = None, *,
-          owner: str = "", repository: str = "hana", session: str = "",
-    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+          owner: str = "", repository: str = "hana", session: str = "", register_mirror: bool = False,
+          scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     """Create a task-owned clone. Keep partial files owned if Git fails."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    precheck_copy_owner(checked_owner(owner) if owner else owner)
     moment = time.time() if now is None else now
     task = scratch.task_or_default(task, moment, scratch_settings=scratch_settings)
     destination = scratch.target(task, word, scratch_settings=scratch_settings)
@@ -763,24 +739,34 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                 initialize_git(path, source.resolve())
                 scratch.exclude_copy_metadata(path, additional=floor_claims.MIRROR_METADATA if owner else ())
                 _ = git(path, "reset", "--hard", "--quiet")
-                register_scratch_clone(path, CloneSourceCommit(str(source.resolve()), commit_at(path, "HEAD")),
-                                       scratch_settings=scratch_settings)
-                from scripts.accounts import accounts
-
-                if accounts.source_has_claude_trust(source):
-                    _ = scratch.update_record(path, lambda record: {
-                        **(record.fields if isinstance(record, copy_record.Registered) else {}),
-                        "claude_trust_folder": str(path.resolve()),
-                    }, scratch_settings=scratch_settings)
-                    trust = accounts.set_claude_folder_trust(path, trusted=True)
-                    if isinstance(trust, accounts.FolderTrustFailed):
-                        trust.report()
+                completed_source = CloneSourceCommit(str(source.resolve()), commit_at(path, "HEAD"))
             # The claim began before .git existed; later claims lock .git/.claude-busy.
             (path / scratch.BUSY).unlink(missing_ok=True)
-            if owner:
-                record_clone_setup_lease(path, released=True)
         except (OSError, CopyError) as error:
             raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
+
+        if not register_mirror:
+            try:
+                with copy_owner_admission(owner):
+                    register_scratch_clone(path, completed_source, scratch_settings=scratch_settings)
+            except CopyAdmissionRefused as refusal:
+                raise CopyAdmissionRefused(f"localhost:{path}: {refusal}") from refusal
+        else:
+            with local_mirror_lease(path, session):
+                register_remote(RemoteMirror(owner, SelectedRepository(repository), "localhost", str(path), session))
+            register_scratch_clone(path, completed_source, scratch_settings=scratch_settings)
+        from scripts.accounts import accounts
+
+        if accounts.source_has_claude_trust(source):
+            _ = scratch.update_record(path, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                "claude_trust_folder": str(path.resolve()),
+            }, scratch_settings=scratch_settings)
+            trust = accounts.set_claude_folder_trust(path, trusted=True)
+            if isinstance(trust, accounts.FolderTrustFailed):
+                trust.report()
+        if owner:
+            record_clone_setup_lease(path, released=True)
     return path
 
 
@@ -960,8 +946,10 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                                               repository_identity=identity)
 
                 if isinstance(record, copy_record.Registered):
-                    expected = {"owner_unit": owner, "source_path": str(source), "source_commit": base}
-                    if any(record.fields.get(key) != value for key, value in expected.items()):
+                    expected = {"source_path": str(source), "source_commit": base}
+                    recorded = record.fields.get("owner_unit")
+                    if (not isinstance(recorded, str) or copy_owner(recorded) != copy_owner(owner)
+                            or any(record.fields.get(key) != value for key, value in expected.items())):
                         raise CopyError(f"{tree}: workspace belongs to another request")
                 elif legacy:
                     if not isinstance(record, copy_record.NotRegistered):
@@ -976,7 +964,9 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                         raise CopyError(f"{tree}: workspace branch changed")
                     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
                         raise CopyError(f"{tree}: workspace must own its Git directory")
-                    register(commit_at(tree, "HEAD"))
+                    copy_commit = commit_at(tree, "HEAD")
+                    with copy_owner_admission(owner):
+                        register(copy_commit)
                     record = scratch.task_of(tree)
                 else:
                     raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
@@ -1418,7 +1408,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         unit = owner
         caller = copy_owner(owner)
         showrunner = owner
-        if isinstance(caller, StaffOwner):
+        if isinstance(caller, StaffCopyOwner):
             try:
                 rows = staff.local_snapshot()
                 member = rows.owner_of(caller.row_id)
@@ -1703,6 +1693,7 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES, *,
     held = scratch.holds()
     paths.update(Path(path) for path in held)
     found: list[tuple[Path, copy_record.Registered]] = []
+    selected_owner = copy_owner(owner)
     for tree in sorted(paths):
         record = scratch.task_of(tree)
         if isinstance(record, copy_record.NotRegistered):
@@ -1716,7 +1707,7 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES, *,
                 raise CopyError(record.reason)
             print(f"copies: {' '.join(record.reason.splitlines())}", file=sys.stderr)
             continue
-        if copy_owner(str(record.fields.get("owner_unit", ""))) != copy_owner(owner):
+        if copy_owner(str(record.fields.get("owner_unit", ""))) != selected_owner:
             continue
         if isinstance(scope, SelectedRepository) and workspace_repository(record) != scope.name:
             continue
@@ -1817,7 +1808,16 @@ class RemoteMirrorKept(CopyError):
     """A remote mirror needs another cleanup attempt before retirement."""
 
 
-def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
+@dataclass(frozen=True)
+class OrdinaryCopyRemoval:
+    """The request does not use a retirement receipt."""
+
+
+ORDINARY_COPY_REMOVAL = OrdinaryCopyRemoval()
+
+
+def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES, *,
+                 retirement: staff.RetiredCopyCleanupRequest | OrdinaryCopyRemoval = ORDINARY_COPY_REMOVAL) -> None:
     """Remove an owner's idle trees within the selected repository scope."""
     scope = repository_scope(repo)
     workspaces = owned_workspaces(owner, scope)
@@ -1843,11 +1843,19 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
             try:
                 if mirror.host not in unreachable_hosts:
                     try:
-                        remove_remote_mirror(mirror)
+                        if isinstance(retirement, OrdinaryCopyRemoval):
+                            remove_remote_mirror(mirror)
+                        else:
+                            remove_remote_mirror(mirror, retirement=retirement)
                         continue
                     except RemoteHostUnreachable:
                         unreachable_hosts.add(mirror.host)
-                defer_remote_removal(mirror)
+                if isinstance(retirement, OrdinaryCopyRemoval):
+                    defer_remote_removal(mirror)
+                else:
+                    defer_remote_removal(mirror, retirement=retirement)
+                    failures.append(f"{mirror.host}:{mirror.path}: mirror removal is deferred")
+                    failure_type = RemoteMirrorKept
             except (CopyError, OSError, subprocess.SubprocessError) as error:
                 failures.append(str(error))
                 failure_type = RemoteMirrorKept
@@ -1889,6 +1897,7 @@ class RemoteMirror:
     session: str
     removal: RemoteRemoval = RemoteRemoval.KEEP
     task: str = ""
+    retirement: staff.RetiredCopyCleanupRequest | OrdinaryCopyRemoval = ORDINARY_COPY_REMOVAL
 
 
 @dataclass(frozen=True)
@@ -2007,7 +2016,6 @@ def register_remote(mirror: RemoteMirror) -> None:
     """Publish ownership while the caller holds the mirror lease."""
     _ = checked_owner(mirror.owner)
     _ = repository_scope(mirror.repository)
-    remote_registry().mkdir(parents=True, exist_ok=True)
     fields: dict[str, object] = {
         "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
         "host": mirror.host, "path": mirror.path, "session": mirror.session,
@@ -2015,19 +2023,29 @@ def register_remote(mirror: RemoteMirror) -> None:
     }
     if mirror.task:
         fields["task"] = mirror.task
-    with file_lock.exclusive(remote_registry() / "records.lock"):
-        write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
+    registry = remote_registry()
+    registry.mkdir(parents=True, exist_ok=True)
+    try:
+        with copy_owner_admission(mirror.owner):
+            with file_lock.exclusive(registry / "records.lock"):
+                write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
+    except CopyAdmissionRefused as refusal:
+        raise CopyAdmissionRefused(f"{mirror.host}:{mirror.path}: {refusal}") from refusal
     remove_deferred_mirrors(mirror.host)
 
 
-def defer_remote_removal(mirror: RemoteMirror) -> None:
-    """Keep the removal request until the next use of the host."""
+def defer_remote_removal(mirror: RemoteMirror, *,
+                         retirement: staff.RetiredCopyCleanupRequest | OrdinaryCopyRemoval = ORDINARY_COPY_REMOVAL) -> None:
+    """Keep the removal request for a later attempt."""
     with file_lock.exclusive(remote_registry() / "records.lock"):
         path = remote_record_path(mirror)
         fields = cast(dict[str, object], json.loads(path.read_text()))
         fields["removal"] = RemoteRemoval.DEFERRED.value
+        if not isinstance(retirement, OrdinaryCopyRemoval):
+            fields["retirement_cleanup"] = {"token": retirement.token, "machine": retirement.machine}
         write_text_atomic(path, json.dumps(fields) + "\n")
-    print(f"{mirror.host}:{mirror.path}: removal deferred; removal runs at the next use of the host")
+    if isinstance(retirement, OrdinaryCopyRemoval):
+        print(f"{mirror.host}:{mirror.path}: removal deferred; removal runs at the next use of the host")
 
 
 def remove_deferred_mirrors(host: str) -> None:
@@ -2039,7 +2057,7 @@ def remove_deferred_mirrors(host: str) -> None:
                 continue
             with remote_lease(mirror):
                 current = read_remote_mirror(path)
-                if current.removal is RemoteRemoval.DEFERRED:
+                if current.removal is RemoteRemoval.DEFERRED and isinstance(current.retirement, OrdinaryCopyRemoval):
                     remove_remote_mirror(current)
         except (CopyError, OSError, subprocess.SubprocessError) as error:
             print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
@@ -2047,9 +2065,18 @@ def remove_deferred_mirrors(host: str) -> None:
 
 def unregister_remote(host: str, path: str) -> None:
     """Remove the registry record after confirmed mirror cleanup."""
-    with file_lock.exclusive(remote_registry() / "records.lock"):
+    registry = remote_registry()
+    with ExitStack() as locks:
+        try:
+            _ = locks.enter_context(file_lock.exclusive(registry / "records.lock"))
+        except FileNotFoundError:
+            try:
+                _ = registry.lstat()
+            except FileNotFoundError:
+                return
+            raise
         key = remote_key(host, path)
-        (remote_registry() / (key + ".json")).unlink(missing_ok=True)
+        (registry / (key + ".json")).unlink(missing_ok=True)
 
 
 def decode_remote_mirror(record: str) -> RemoteMirror:
@@ -2064,8 +2091,15 @@ def decode_remote_mirror(record: str) -> RemoteMirror:
     if not isinstance(task, str):
         raise ValueError("invalid remote mirror task")
     unit, repo, host, remote, session = cast(list[str], values)
+    retirement: staff.RetiredCopyCleanupRequest | OrdinaryCopyRemoval = ORDINARY_COPY_REMOVAL
+    if "retirement_cleanup" in fields:
+        match fields["retirement_cleanup"]:
+            case {"token": str(token), "machine": str(machine)}:
+                retirement = retirement_mirror_request(unit, token, machine)
+            case _:
+                raise ValueError("invalid deferred mirror cleanup authorization")
     return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
-                        RemoteRemoval(fields.get("removal", "keep")), task=task)
+                        RemoteRemoval(fields.get("removal", "keep")), task=task, retirement=retirement)
 
 
 def read_remote_mirror(path: Path) -> RemoteMirror:
@@ -2086,7 +2120,10 @@ def remote_mirrors(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirr
 
 
 def owned_remote_mirrors(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
-    return [mirror for mirror in remote_mirrors(scope) if copy_owner(mirror.owner) == copy_owner(owner)] if owner else []
+    if not owner:
+        return []
+    selected_owner = copy_owner(owner)
+    return [mirror for mirror in remote_mirrors(scope) if copy_owner(mirror.owner) == selected_owner]
 
 
 def clone_owner_prefix(owner: str) -> str:
@@ -2171,12 +2208,18 @@ def mac_clone_processes() -> dict[int, process_start.Started | process_start.Zom
 
 def owner_clone_paths(owner: str) -> Iterator[Path]:
     """List only paths with the selected owner's clone name prefix."""
-    pattern = clone_owner_prefix(checked_owner(owner)) + "*"
-    yield from copy_record.root().glob(pattern)
+    selected = copy_owner(checked_owner(owner))
+    directories = [copy_record.root()]
     if (root := session_folder.session_root()) is not None:
-        for directory in root.iterdir():
-            if directory.is_dir() and not directory.is_symlink():
-                yield from directory.glob(pattern)
+        directories.extend(directory for directory in root.iterdir() if directory.is_dir() and not directory.is_symlink())
+    for directory in directories:
+        if isinstance(selected, RoleCopyOwner):
+            yield from directory.glob(clone_owner_prefix(selected.name) + "*")
+            continue
+        for path in directory.glob("clone-*.*"):
+            saved, _, _ = path.name.removeprefix("clone-").partition(".")
+            if OWNER.fullmatch(saved) and copy_owner(saved) == selected:
+                yield path
 
 
 def local_clone_registration(path: Path, owner: str) -> RemoteMirror:
@@ -2184,27 +2227,33 @@ def local_clone_registration(path: Path, owner: str) -> RemoteMirror:
     checkout = path.resolve(strict=True)
     task = copy_record.read_record(checkout / copy_record.RECORD)
     if (not isinstance(task, copy_record.Registered) or task.fields.get("test_hana_clone") is not True
-            or task.fields.get("clone_path") != str(checkout) or task.fields.get("clone_owner") != owner):
+            or task.fields.get("clone_path") != str(checkout)):
+        raise ValueError("not a recorded clone of this owner")
+    task_owner = task.fields.get("clone_owner")
+    selected_owner = copy_owner(owner)
+    if not isinstance(task_owner, str) or copy_owner(task_owner) != selected_owner:
         raise ValueError("not a recorded clone of this owner")
     repository, session = task.fields.get("clone_repository"), task.fields.get("clone_session")
     if not isinstance(repository, str) or not isinstance(session, str):
         raise ValueError("incomplete clone registration")
-    identity = RemoteMirror(owner, SelectedRepository(repository), "localhost", str(path), session)
+    identity = RemoteMirror(task_owner, SelectedRepository(repository), "localhost", str(path), session)
     _ = repository_scope(identity.repository)
     marker = cast(object, json.loads(read_clone_metadata(checkout / floor_claims.MIRROR_RECORD)))
     if not isinstance(marker, dict):
         raise ValueError("invalid clone marker")
     fields = cast(dict[str, object], marker)
-    if (fields.get("kind"), fields.get("owner"), fields.get("repo"), fields.get("session")) != (
-            "remote-mirror", owner, repository, session):
+    marker_owner = fields.get("owner")
+    if (not isinstance(marker_owner, str) or copy_owner(marker_owner) != selected_owner
+            or (fields.get("kind"), fields.get("repo"), fields.get("session")) != ("remote-mirror", repository, session)):
         raise ValueError("clone marker differs from the task record")
     try:
         registration = decode_remote_mirror(read_clone_metadata(remote_record_path(identity)))
     except (FileNotFoundError, NotADirectoryError, PermissionError):
         pass
     else:
-        if (registration.owner, registration.repository, registration.host, registration.path, registration.session) != (
-                identity.owner, identity.repository, identity.host, identity.path, identity.session):
+        if (copy_owner(registration.owner) != selected_owner
+                or (registration.repository, registration.host, registration.path, registration.session)
+                != (identity.repository, identity.host, identity.path, identity.session)):
             raise ValueError("clone registry identity changed")
     return identity
 
@@ -2220,6 +2269,7 @@ def refuse_dead_clones(owner: str, source: Path) -> None:
     mac_processes: dict[int, process_start.Started | process_start.Zombie] = {}
     read_mac_processes = False
     dead: list[RemoteMirror] = []
+    selected_owner = copy_owner(owner)
     for path in sorted(paths):
         try:
             if not stat.S_ISDIR(path.lstat().st_mode):
@@ -2233,7 +2283,9 @@ def refuse_dead_clones(owner: str, source: Path) -> None:
                 mirror = local_clone_registration(path, owner)
                 fields = clone_lease_fields(checkout)
                 pid, start, timestamp = fields.get("pid"), fields.get("process_start"), fields.get("start_time")
-                if (fields.get("unit") != owner or fields.get("released", False) is not False
+                lease_owner = fields.get("unit")
+                if (not isinstance(lease_owner, str) or copy_owner(lease_owner) != selected_owner
+                        or fields.get("released", False) is not False
                         or type(pid) is not int or pid <= 0 or not isinstance(timestamp, str)
                         or datetime.fromisoformat(timestamp).tzinfo is None):
                     continue
@@ -2664,8 +2716,22 @@ class RemoteHostUnreachable(CopyError):
     """The removal command could not connect to the mirror host."""
 
 
-def remove_remote_mirror(mirror: RemoteMirror) -> None:
-    command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
+def retirement_mirror_request(owner: str, token: str, machine: str) -> staff.RetiredCopyCleanupRequest:
+    from scripts.production import staff
+
+    selected = copy_owner(owner)
+    if isinstance(selected, RoleCopyOwner):
+        raise ValueError("retired copy cleanup requires a staff owner")
+    return staff.RetiredCopyCleanupRequest(selected.row_id, token, machine)
+
+
+def remove_remote_mirror(mirror: RemoteMirror, *,
+                         retirement: staff.RetiredCopyCleanupRequest | OrdinaryCopyRemoval = ORDINARY_COPY_REMOVAL) -> None:
+    request = mirror.retirement if isinstance(retirement, OrdinaryCopyRemoval) else retirement
+    options = ["--host", mirror.host]
+    if not isinstance(request, OrdinaryCopyRemoval):
+        options.extend(["--cleanup-token", request.token, "--cleanup-machine", request.machine])
+    command = remote_copies_command("mirror-remove", mirror, *options)
     command += '; copies_status=$?; printf "\\nrc=%s\\n" "$copies_status"; exit "$copies_status"'
     try:
         answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
@@ -2740,6 +2806,15 @@ def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
+            if args.cleanup_token or args.cleanup_machine:
+                from scripts.production import staff
+
+                try:
+                    request = retirement_mirror_request(args.owner, args.cleanup_token, args.cleanup_machine)
+                except ValueError as error:
+                    raise CopyError(str(error)) from error
+                if request.current_receipt(staff.mirror_authority_snapshot()) is None:
+                    raise CopyError(f"{tree}: copy cleanup authorization is no longer current")
             if (not tree.exists() and not authority.exists() and not scratch.removal_mark(tree).exists()
                     and not scratch.cargo_removal_mark(tree).exists()):
                 return 0
@@ -2748,7 +2823,9 @@ def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
                 raise CopyError(f"{tree}: busy; held by session {args.session}")
             record = tree / floor_claims.MIRROR_RECORD
             raw = floor_claims.read_mirror_record(record if record.exists() else authority)
-            if copy_owner(str(raw.get("owner", ""))) != copy_owner(args.owner) or raw.get("repo") != args.repository:
+            marker_owner = raw.get("owner")
+            if (not isinstance(marker_owner, str) or copy_owner(marker_owner) != copy_owner(args.owner)
+                    or raw.get("repo") != args.repository):
                 raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
             if authority.exists():
                 pending = floor_claims.read_mirror_record(authority) if record.exists() else raw
@@ -2756,7 +2833,8 @@ def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
             if tree.exists():
                 task_record = copy_record.record_path(tree)
                 clone_path = (args.host == "localhost" and OWNER.fullmatch(args.owner) is not None
-                              and tree.name.startswith(clone_owner_prefix(args.owner))
+                              and (tree.name.startswith(clone_owner_prefix(args.owner))
+                                   or tree.name.startswith(clone_owner_prefix(marker_owner)))
                               and (tree.resolve().parent == copy_record.root().resolve() or scratch.in_session_folder(tree)))
                 if task_record is None and scratch.in_session_folder(tree):
                     candidate = tree / copy_record.RECORD
@@ -2768,9 +2846,10 @@ def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
                     task = scratch.task_of(tree)
                     if (tree.is_symlink() or not isinstance(task, copy_record.Registered)
                             or task.fields.get("test_hana_clone") is not True
-                            or (task.fields.get("clone_path"), task.fields.get("clone_owner"),
-                                task.fields.get("clone_repository"), task.fields.get("clone_session"), raw.get("session"))
-                            != (str(tree.resolve()), args.owner, args.repository, args.session, args.session)):
+                            or (task.fields.get("clone_path"), task.fields.get("clone_repository"),
+                                task.fields.get("clone_session"), raw.get("session"))
+                            != (str(tree.resolve()), args.repository, args.session, args.session)
+                            or copy_owner(str(task.fields.get("clone_owner", ""))) != copy_owner(args.owner)):
                         raise CopyError(f"{tree}: clone registration changed")
                     task_record = tree / copy_record.RECORD
                 write_text_atomic(authority, json.dumps(raw) + "\n")
@@ -2779,6 +2858,11 @@ def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
                     scratch.remove_marked(task_record.parent)
                     # A task clone is its task folder, so its lock files sit in the scratch root.
                     if task_record.parent == tree.resolve():
+                        released = build_folders.release_removed_folder(tree.resolve())
+                        if released not in (build_folders.FolderPairRelease.RELEASED,
+                                            build_folders.FolderPairRelease.PAIR_ABSENT,
+                                            build_folders.FolderPairRelease.PARENT_ABSENT):
+                            raise CopyError(f"{tree}: {released.value}")
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
                             lock.unlink(missing_ok=True)
                 else:
@@ -3256,6 +3340,8 @@ class CopyArguments(argparse.Namespace):
     session: str = ""
     action: str = ""
     owner: str = ""
+    cleanup_token: str = ""
+    cleanup_machine: str = ""
     repo: str | None = None
     commit: str = ""
     apply_uncommitted: str | None = None
@@ -3285,6 +3371,8 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
         remote = commands.add_parser(action)
         if action == "mirror-remove":
             _ = remote.add_argument("--host", default="")
+            _ = remote.add_argument("--cleanup-token", default="")
+            _ = remote.add_argument("--cleanup-machine", default="")
         _ = remote.add_argument("--path", required=True)
         _ = remote.add_argument("--owner", required=True)
         _ = remote.add_argument("--repository", required=True)
@@ -3345,12 +3433,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_copy_arguments(argv)
         if args.action in ("register-remote", "unregister-remote"):
-            remote_registry().mkdir(parents=True, exist_ok=True)
             if args.action == "unregister-remote":
                 unregister_remote(args.host, args.path)
             else:
                 mirror = RemoteMirror(args.owner, SelectedRepository(args.repository), args.host, args.path, args.session)
                 if args.shell_lease:
+                    remote_registry().mkdir(parents=True, exist_ok=True)
                     print(remote_lease_path(mirror))
                 else:
                     register_remote(mirror)
@@ -3388,17 +3476,13 @@ def main(argv: list[str] | None = None) -> int:
                 except CopyError:
                     pass
             source = Path(args.source)
-            if owner:
-                refuse_dead_clones(owner, source)
             session = args.session
             if not args.owner and not session:
                 session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-            checkout = clone(source, task, args.name, owner=owner, repository=args.repository, session=session)
-            if args.owner:
-                with local_mirror_lease(checkout, args.session):
-                    mark_mirror(checkout, args.owner, args.repository, args.session)
-                    register_remote(RemoteMirror(args.owner, SelectedRepository(args.repository),
-                                                "localhost", str(checkout), args.session))
+            if owner:
+                refuse_dead_clones(owner, source)
+            checkout = clone(source, task, args.name, owner=owner, repository=args.repository, session=session,
+                             register_mirror=bool(args.owner))
             print(checkout)
             return 0
         if args.action == "run":

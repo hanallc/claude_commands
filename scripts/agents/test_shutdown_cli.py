@@ -40,7 +40,7 @@ from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import (
     atomic_file, build_folder_lock, build_folders, build_copies, build_copies_test_support, conf, git_files, origin_deletion, process_group, process_start,
-    socket_test_support, unit_runs,
+    scratch, socket_test_support, unit_runs,
 )
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -55,6 +55,7 @@ from scripts.production import (
     unit_lookup, unit_move, staff, staff_test_support, unit_config, worker,
     production_admission, production_doc, production_lifecycle, rename_unit_test_support, update_registration,
 )
+from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.add_showrunner_test_support import write_guard_proof
 from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD
@@ -731,7 +732,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 self.assertEqual(self.stops(), [])
 
     def test_showrunner_retirement_checks_and_removes_its_old_unit_records(self) -> None:
-        for scenario in ("unmerged local tip", "merged tips"):
+        for scenario in ("unmerged local tip", "merged tips", "child changes before removal", "child cleanup remains pending"):
             with self.subTest(scenario=scenario), ExitStack() as cleanup:
                 case = RetireUnitTests()
                 _ = cleanup.callback(case.doCleanups)
@@ -745,11 +746,22 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 parent = record.parent_of(unit)
                 assert parent is not None
                 workers = record.find(kind="worker", parent=unit.id)
+                branch_refusals = shutdown.retired_branch_refusals
+
+                def rename_before_removal(checked: shutdown.RetiringUnit, tips: shutdown.RetirementBranchTips,
+                                          targets: shutdown.RetirementBranchTips, *,
+                                          settings: conf.ConfigRead) -> list[str]:
+                    reasons = branch_refusals(checked, tips, targets, settings=settings)
+                    _ = staff.rename(checked.staff_member.id, "renamed-alpha")
+                    return reasons
+
                 if scenario == "unmerged local tip":
                     _ = git(case.checkout, "checkout", "alpha-branch")
                     _ = (case.checkout / "work.txt").write_text("Unmerged unit work\n", encoding="utf-8")
                     _ = git(case.checkout, "commit", "-qam", "Unmerged unit work")
                     _ = git(case.checkout, "checkout", "main")
+                if scenario == "child changes before removal":
+                    _ = cleanup.enter_context(mock.patch.object(shutdown, "retired_branch_refusals", rename_before_removal))
                 with copies.standing(str(unit.id), case.checkout, copies.CommittedSource("HEAD")) as tree:
                     kept_file = tree / case.doc.name
                     contents = kept_file.read_bytes()
@@ -757,13 +769,39 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     before = case.staff.staff_file.read_bytes()
                     local_refs = git(case.checkout, "for-each-ref")
                     origin_refs = git(case.root / "origin.git", "for-each-ref")
-                    code, output = case.retire(reference=parent.id)
+                    if scenario == "child cleanup remains pending":
+                        seed = ImmutableGitSeed.create(case.root / "child-source", "main", "Fixture",
+                                                       "fixture@example.invalid", {"work.txt": "child copy\n"})
+                        with registered_workspace(unit.id, seed.checkout, "HEAD", name="child", branch="child") as workspace:
+                            code, output = case.retire(reference=parent.id)
+                            self.assertNotEqual(code, 0, output)
+                            self.assertIn("cleanup pending", output)
+                            current = staff.authority_snapshot()
+                            self.assertIsNone(current.by_id(unit.id))
+                            self.assertEqual(current.by_id(parent.id), parent)
+                            receipt = current.retirement_cleanup.get(unit.id)
+                            self.assertIsInstance(receipt, staff.RetiredUnitCopyCleanup)
+                            self.assertEqual(case.stops()[first_stop:], [])
+                        code, output = case.retire(reference=parent.id)
+                        self.assertIn(f"removed {workspace}", output)
+                        self.assertNotIn(unit.id, staff.authority_snapshot().retirement_cleanup)
+                        self.assertFalse(workspace.exists())
+                    else:
+                        code, output = case.retire(reference=parent.id)
                     current = staff.authority_snapshot()
                     if scenario == "unmerged local tip":
                         self.assertNotEqual(code, 0, output)
                         self.assertIn(unit.name, output)
                         self.assertIn("unmerged", output)
                         self.assertEqual(case.staff.staff_file.read_bytes(), before)
+                        self.assertEqual(case.stops()[first_stop:], [])
+                    elif scenario == "child changes before removal":
+                        self.assertNotEqual(code, 0, output)
+                        self.assertIn(f"{parent.name}: cannot remove retired unit {unit.name} ({unit.id}).", output)
+                        self.assertIn(f"Run agents retire {unit.id} again.", output)
+                        self.assertNotIn("Traceback", output)
+                        self.assertEqual(current.by_id(parent.id), parent)
+                        self.assertEqual(current.by_id(unit.id), replace(unit, name="renamed-alpha"))
                         self.assertEqual(case.stops()[first_stop:], [])
                     else:
                         self.assertEqual(code, 0, output)
@@ -1534,26 +1572,197 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(git(self.checkout, "rev-parse", branch), tip)
         self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
 
-    def test_retired_record_removal_preserves_a_tree_kept_while_busy(self) -> None:
-        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
-            row = staff.by_id(self.unit_staff_id)
-            assert row is not None
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree,
-                staff.ParkedBranch("alpha-branch")), expected=row.worktree)
-            self.assert_slot_held(tree)
-        _ = self.stop_session(DIRECTOR)
-        _ = self.stop_session(SEAT)
-        with mock.patch.object(copies, "remove_trees") as remove_trees:
-            code, output = self.retire()
-            self.assertEqual(code, 1, output)
-            self.assertIn(f"checkout {self.worktree} still exists", output)
-            self.assertIsInstance(self.unit_worktree(), staff.RemovedWorktree)
-            _ = git(self.checkout, "worktree", "remove", "--force", str(self.worktree))
-            code, output = self.retire()
-        self.assertEqual(code, 0, output)
-        self.assertIn("retired record removed", output)
-        remove_trees.assert_not_called()
-        self.assertTrue(tree.exists())
+    def test_retired_record_removal_waits_for_busy_trees(self) -> None:
+        cases = (
+            ("local idle tree", False, False),
+            ("a numbered copy stays held", False, True),
+            ("local busy tree", False, True),
+            ("peer busy tree", True, True),
+            ("idle tree is removed while another copy is busy", False, True),
+            ("local staff row changed", False, False),
+            ("peer staff row changed", True, False),
+            ("authority already removed the row", False, False),
+            ("peer worker lock is busy", True, False),
+            ("parent moves before the authority write", False, False),
+            ("worker lock is busy only on the authority", True, False),
+            ("worker lock is busy only on the worktree host", True, False),
+        )
+        for scenario, on_peer, still_busy in cases:
+            with self.subTest(scenario=scenario):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    row = staff.by_id(case.unit_staff_id)
+                    assert row is not None
+                    machine = "mac" if on_peer else remote.local_machine()
+                    retired = staff.set_worktree(row.id, staff.RemovedWorktree(machine, case.worktree,
+                        staff.ParkedBranch("alpha-branch")), expected=row.worktree)
+                    _ = case.stop_session(DIRECTOR)
+                    _ = case.stop_session(SEAT)
+                    if scenario == "a numbered copy stays held":
+                        with copies.standing(row.id, case.checkout, copies.CommittedSource("HEAD")) as numbered:
+                            with mock.patch.object(copies, "remove_trees", wraps=copies.remove_trees) as remove_trees:
+                                code, output = case.retire()
+                                case.assertEqual(code, 1, output)
+                                case.assertIn(f"checkout {case.worktree} still exists", output)
+                                case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                                remove_trees.assert_not_called()
+                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
+                            code, output = case.retire()
+                            case.assertEqual(code, 0, output)
+                            case.assertIn("retired record removed", output)
+                            case.assert_slot_held(numbered)
+                            case.assertTrue(numbered.exists())
+                        continue
+                    copy_environment = {
+                        "SCRATCH_COPIES_ROOT": str(case.root / "peer-copies"),
+                        "SCRATCH_HOLDS": str(case.root / "peer-holds.json"),
+                    } if on_peer else {}
+                    caller_environment = {key: os.environ[key] for key in copy_environment}
+                    renamed = "renamed-alpha"
+                    branch_refusals = shutdown.retired_branch_refusals
+
+                    def change_local_authority(unit: shutdown.RetiringUnit, tips: shutdown.RetirementBranchTips,
+                                               targets: shutdown.RetirementBranchTips, *,
+                                               settings: conf.ConfigRead) -> list[str]:
+                        reasons = branch_refusals(unit, tips, targets, settings=settings)
+                        if scenario == "local staff row changed":
+                            _ = staff.rename(retired.id, renamed)
+                        else:
+                            origin = staff.RetiredUnitOrigin(remote.local_machine(), case.checkout, tips.commits["origin"])
+                            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                                removed = staff.remove_retired_unit(retired, origin)
+                            case.assertIsInstance(removed, staff.RetiredUnitRemoved)
+                            case.assertIsNone(staff.by_id(retired.id))
+                            if retired.id in staff.authority_snapshot().retirement_cleanup:
+                                code, output = case.retire()
+                                case.assertEqual(code, 0, output)
+                                case.assertIn("copy cleanup complete", output)
+                            with registered_workspace(str(retired.id), case.checkout, "HEAD", name="worker", branch="worker"):
+                                pass
+                        return reasons
+
+                    def peer_request(args: list[str], stdin: str = "",
+                                     limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT, *,
+                                     propagate_timeout: bool = False) -> tuple[int, str]:
+                        with mock.patch.dict(os.environ, copy_environment):
+                            result = case.remote_call(args, stdin, limit, propagate_timeout=propagate_timeout)
+                        if scenario == "peer staff row changed" and args == ["_unit-local"] and result[0] == 0:
+                            request = cast(dict[str, object], json.loads(stdin))
+                            if request["action"] == "retired-check":
+                                _ = staff.rename(retired.id, renamed)
+                        return result
+
+                    if on_peer:
+                        base = git(case.checkout, "rev-parse", "main")
+                        worktrees.write_record(worktrees.new_record(
+                            case.worktree, "alpha-branch", case.checkout, base, "alpha", "main"))
+                        _ = case.enterContext(mock.patch.object(shutdown, "run_remote", side_effect=peer_request))
+                        _ = case.enterContext(mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], [])))
+                    row_lock = cast(Callable[[str], tuple[Path, str]], getattr(staff, "_row_lock"))
+                    peer_slots = case.root / "peer-staff" / "rows"
+                    if scenario.startswith("worker lock is busy only"):
+                        def slot_on_machine(identity: str) -> tuple[Path, str]:
+                            path, variable = row_lock(identity)
+                            return (peer_slots / path.name if remote.local_machine() == "mac" else path), variable
+
+                        _ = case.enterContext(mock.patch.object(staff, "_row_lock", slot_on_machine))
+
+                    idle_tree = copies.workspace_path(row.id, case.checkout, "idle")
+                    with (mock.patch.dict(os.environ, copy_environment),
+                          registered_workspace(str(row.id), case.checkout, "HEAD", name="worker", branch="worker") as tree):
+                        with scratch.judgment_lock(tree) as idle:
+                            case.assertFalse(idle)
+                        with mock.patch.dict(os.environ, caller_environment):
+                            code, output = case.retire()
+                            case.assertEqual(code, 1, output)
+                            case.assertIn(f"checkout {case.worktree} still exists", output)
+                            case.assertEqual(staff.by_id(row.id), retired)
+                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
+                            if still_busy:
+                                if scenario == "idle tree is removed while another copy is busy":
+                                    with registered_workspace(row.id, case.checkout, "HEAD", name="idle", branch="idle") as idle:
+                                        idle_tree = idle
+                                code, output = case.retire()
+                                case.assertEqual(code, 0, output)
+                                case.assertIn(f"{tree}: busy", output)
+                                case.assertIn("cleanup pending", output)
+                                case.assertIn(f"Run agents retire {row.id} again.", output)
+                                case.assertIsNone(staff.by_id(row.id))
+                                receipt = staff.snapshot().retirement_cleanup.get(row.id)
+                                case.assertIsInstance(receipt, staff.RetiredUnitCopyCleanup)
+                                case.assertTrue(tree.exists())
+                                if scenario == "idle tree is removed while another copy is busy":
+                                    case.assertIn(f"removed {idle_tree}", output)
+                                    case.assertFalse(idle_tree.exists())
+
+                    if scenario in ("local staff row changed", "authority already removed the row"):
+                        _ = case.enterContext(mock.patch.object(shutdown, "retired_branch_refusals", change_local_authority))
+                    if scenario == "peer worker lock is busy" or scenario.startswith("worker lock is busy only"):
+                        worker, = staff.snapshot().find(kind="worker", parent=row.id)
+                        worktree_only = scenario.endswith("only on the worktree host")
+                        lock = peer_slots / f"{worker.id}.lock" if worktree_only else row_lock(worker.id)[0]
+                        lock.parent.mkdir(parents=True, exist_ok=True)
+                        with lock.open("a") as stream:
+                            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            code, output = case.retire()
+                        case.assertNotIn(f"removed {tree}", output)
+                        case.assertEqual(code, 0, output)
+                        if worktree_only:
+                            case.assertIn("cleanup pending", output)
+                            case.assertIn(worker.id, output)
+                            case.assertIsNone(staff.by_id(row.id))
+                            case.assertIsInstance(staff.snapshot().retirement_cleanup.get(row.id), staff.RetiredUnitCopyCleanup)
+                        else:
+                            case.assertIn("Retirement is incomplete", output)
+                            case.assertEqual(staff.by_id(row.id), retired)
+                        case.assertIn(f"Run agents retire {row.id} again.", output)
+                        case.assertEqual(git(tree, "rev-parse", "HEAD"), git(case.checkout, "rev-parse", "HEAD"))
+
+                    if scenario == "parent moves before the authority write":
+                        destination = fixture_member("showrunner", name="destination")
+                        new_parent = staff.ReportsTo(destination.id)
+                        remove_retired_unit = staff.remove_retired_unit
+
+                        def move_before_write(expected: staff.StaffRow, origin: staff.RetiredUnitOrigin) -> staff.RetiredUnitRemoval:
+                            with staff.operation():
+                                _ = staff.move(expected.id, new_parent)
+                            return remove_retired_unit(expected, origin)
+
+                        _ = case.enterContext(mock.patch.object(staff, "remove_retired_unit", move_before_write))
+                        code, output = case.retire()
+                        case.assertNotIn(f"removed {tree}", output)
+                        case.assertEqual(code, 1, output)
+                        case.assertIn(f"Run agents retire {row.id} again.", output)
+                        case.assertEqual(staff.by_id(row.id), replace(retired, parent=new_parent))
+                        case.assertEqual(git(tree, "rev-parse", "HEAD"), git(case.checkout, "rev-parse", "HEAD"))
+                        continue
+
+                    code, output = case.retire()
+                    if scenario in ("local staff row changed", "peer staff row changed"):
+                        case.assertNotIn(f"removed {tree}", output)
+                        case.assertEqual(code, 1, output)
+                        case.assertIn("The unit changed before retirement. Retirement removed nothing.", output)
+                        case.assertEqual(staff.by_id(row.id), replace(retired, name=renamed))
+                        case.assertEqual(git(tree, "rev-parse", "HEAD"), git(case.checkout, "rev-parse", "HEAD"))
+                        continue
+                    if scenario == "authority already removed the row":
+                        case.assertNotIn(f"removed {tree}", output)
+                        case.assertEqual(code, 0, output)
+                        case.assertIn("staff record is absent", output)
+                        case.assertIsNone(staff.by_id(row.id))
+                        case.assertEqual(git(tree, "rev-parse", "HEAD"), git(case.checkout, "rev-parse", "HEAD"))
+                        continue
+                    case.assertEqual(code, 0, output)
+                    if still_busy or scenario.endswith("only on the worktree host"):
+                        case.assertIn("copy cleanup complete", output)
+                    else:
+                        case.assertIn("retired record removed", output)
+                    case.assertFalse(tree.exists())
+                    case.assertIsNone(staff.by_id(row.id))
+                    case.assertNotIn(row.id, staff.snapshot().retirement_cleanup)
+                finally:
+                    case.doCleanups()
 
     def test_retired_record_removal_checks_each_branch_tip_and_preserves_refs(self) -> None:
         cases = (
@@ -1581,6 +1790,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             ("local origin timeout keeps the rows", "Origin branch alpha-branch check did not finish in time"),
             ("remote origin timeout keeps the rows", "Origin branch alpha-branch check did not finish in time"),
             ("peer checkout timeout keeps the rows", "Checkout absence check did not finish in time"),
+            ("peer copy cleanup timeout leaves a receipt", ""),
             ("caller times out after record removal", ""),
             ("caller loses SSH after record removal", ""),
             ("caller receives invalid JSON after record removal", ""),
@@ -1605,6 +1815,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     already_removed = scenario == "retry reaches the authority after record removal"
                     short_staff_timeout = scenario == "record removal uses a ten second staff timeout"
                     slow_final_check = scenario.endswith("timeout keeps the rows")
+                    cleanup_timeout = scenario == "peer copy cleanup timeout leaves a receipt"
                     peer_checkout = scenario.startswith("peer") or scenario == "remote origin timeout keeps the rows"
                     checkout_remains = scenario.startswith("peer checkout remains")
                     journal = case.root / "remote-shutdown/retire-worktrees" / f"{case.unit_staff_id}.json"
@@ -1631,7 +1842,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             _ = git(origin, "update-ref", "-d", ref, tip)
                             worktrees.write_record(worktrees.new_record(
                                 case.worktree, "alpha-branch", peer, base, "alpha", "main"))
-                        elif checkout_returns or origin_changes_during_checkout or slow_final_check:
+                        elif checkout_returns or origin_changes_during_checkout or slow_final_check or cleanup_timeout:
                             worktrees.write_record(worktrees.new_record(
                                 case.worktree, "alpha-branch", case.checkout, base, "alpha", "main"))
                         elif missing_peer_record:
@@ -1701,6 +1912,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                      limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT, *,
                                      propagate_timeout: bool = False) -> tuple[int, str]:
                         del propagate_timeout
+                        if cleanup_timeout and args[0] == "_retired-copy-cleanup":
+                            return 255, ""
                         result = case.remote_call(args, stdin=stdin, limit=limit)
                         if origin_changes_during_checkout and args[0] == "_retired-checkout-absent":
                             change_origin()
@@ -1739,7 +1952,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                 side_effect=change_facts_after_stop_check))
                         if peer_checkout and (
                             checkout_returns or origin_changes_during_checkout or slow_final_check
-                            or scenario == "peer journal unlink fails"
+                            or cleanup_timeout or scenario == "peer journal unlink fails"
                         ):
                             _ = checks.enter_context(mock.patch.object(roster, "peer_snapshot",
                                 return_value=roster.Roster([], [])))
@@ -1755,6 +1968,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.assertEqual(code, expected_code, output)
                     if missing_peer_record:
                         guess_clone.assert_not_called()
+                    if unconfirmed_removal:
+                        case.assertIn("copy cleanup complete", output)
                     confirmed = "staff record is absent" if unconfirmed_removal or already_removed else "retired record removed"
                     case.assertIn(refusal or confirmed, output)
                     if slow_final_check:
@@ -1782,6 +1997,17 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         case.assertIn("retirement journal removed", output)
                         case.assertIn("staff record is absent", output)
                         case.assertFalse(journal.exists())
+                    if cleanup_timeout:
+                        case.assertIn("cleanup pending", output)
+                        case.assertIn("mac: copy cleanup result is not confirmed", output)
+                        case.assertIn(f"Run agents retire {case.unit_staff_id} again.", output)
+                        case.assertIsInstance(staff.snapshot().retirement_cleanup.get(case.unit_staff_id),
+                                              staff.RetiredUnitCopyCleanup)
+                        with mock.patch.object(shutdown, "run_remote", side_effect=case.remote_call):
+                            code, output = case.retire()
+                        case.assertEqual(code, 0, output)
+                        case.assertIn("copy cleanup complete", output)
+                        case.assertNotIn(case.unit_staff_id, staff.snapshot().retirement_cleanup)
                     case.assertEqual(case.calls, [])
                 finally:
                     case.doCleanups()
@@ -1806,7 +2032,11 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         writer_id = fixture_runtime_id("other-staff-writer")
         local_origin = scenario.startswith("local")
         remote_origin = scenario.startswith("remote")
-        peer_command = "_retired-checkout-absent" if scenario.startswith("peer") else "_retired-origin-tip"
+        match scenario:
+            case "peer checkout timeout keeps the rows":
+                peer_command = "_retired-checkout-absent"
+            case _:
+                peer_command = "_retired-origin-tip"
         peer_limits: dict[str, float] = {}
 
         def slow_reply(argv: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
@@ -1890,6 +2120,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 case "caller receives an invalid result after record removal":
                     return subprocess.CompletedProcess(argv, 0, "{}", "")
                 case "retry reaches the authority after record removal":
+                    with mock.patch.object(staff, "is_owner", return_value=True):
+                        receipt = staff.authority_snapshot().retirement_cleanup.get(self.unit_staff_id)
+                        if receipt is not None and not isinstance(receipt, str):
+                            staff.finish_unit_retirement(self.unit_staff_id, receipt.token)
                     return authority_reply(argv, input)
                 case _:
                     return reply
@@ -1904,6 +2138,14 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             config = self.root / "short-staff.conf"
             write_text_atomic(config, SHUTDOWN_FIXTURE_SETTINGS["staff"].replace("remote_seconds=20", "remote_seconds=10"))
             environment["STAFF_CONFIG"] = str(config)
+        tree = Path()
+        copy_tip = ""
+        if scenario.startswith("caller "):
+            seed = ImmutableGitSeed.create(self.root / "copy-source", "main", "Fixture",
+                                           "fixture@example.invalid", {"work.txt": "registered copy\n"})
+            with registered_workspace(self.unit_staff_id, seed.checkout, "HEAD", name="lost-reply", branch="editor") as workspace:
+                tree = workspace
+                copy_tip = git(tree, "rev-parse", "HEAD")
         with (mock.patch.dict(os.environ, environment),
               mock.patch.object(staff, "remove_retired_unit", side_effect=remove_through_authority)):
             code, output = self.retire()
@@ -1912,8 +2154,14 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn(f"retired record removal result is not confirmed. Run agents retire {self.unit_staff_id} again.", output)
         self.assertIsNone(staff.by_id(self.unit_staff_id))
+        self.assertTrue(tree.is_dir(), output)
+        self.assertEqual(git(tree, "rev-parse", "HEAD"), copy_tip)
+        self.assertIsInstance(staff.snapshot().retirement_cleanup.get(self.unit_staff_id), staff.RetiredUnitCopyCleanup)
         with mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call):
-            return self.retire()
+            code, output = self.retire()
+        self.assertIn(f"removed {tree}", output)
+        self.assertFalse(tree.exists())
+        return code, output
 
     def test_retirement_refuses_a_failed_worktree_scan_before_inspecting_git_files(self) -> None:
         def fail_scan(argv: list[str], cwd: Path | None = None, *,
@@ -2324,13 +2572,17 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(admitted.worktree, claimed)
 
     def test_local_retirement_reuses_the_journal_after_an_authority_write_fails(self) -> None:
-        for scenario in ("present worktree", "removed worktree with a saved token", *self.RETIRED_JOURNAL_CASES):
+        copy_failures = ("copy receipt publication fails before replace", "copy receipt durability is unconfirmed")
+        for scenario in ("present worktree", "removed worktree with a saved token", *copy_failures, *self.RETIRED_JOURNAL_CASES):
             with self.subTest(scenario=scenario):
                 separate_case = scenario != "present worktree"
                 case = RetireUnitTests() if separate_case else self
                 if separate_case:
                     case.setUp()
                 try:
+                    if scenario in copy_failures:
+                        case.check_copy_receipt_write_failure(replaced=scenario == copy_failures[1])
+                        continue
                     removed = scenario == "removed worktree with a saved token"
                     if removed:
                         case.park_without_worktree()
@@ -2379,6 +2631,51 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 finally:
                     if separate_case:
                         case.doCleanups()
+
+    def check_copy_receipt_write_failure(self, *, replaced: bool) -> None:
+        self.park_without_worktree()
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        _ = self.stop_session(DIRECTOR)
+        _ = self.stop_session(SEAT)
+        with registered_workspace(row.id, self.checkout, "HEAD", name="editor", branch="editor") as tree:
+            pass
+        original_replace = os.replace
+        original_sync = atomic_file.sync_folder
+        failed = False
+
+        def replace_record(source: str | Path, destination: str | Path) -> None:
+            if Path(destination) == self.staff.staff_file:
+                raise OSError("fixture replace failed")
+            original_replace(source, destination)
+
+        def sync_receipt(directory: Path) -> None:
+            nonlocal failed
+            if directory == self.staff.staff_file.parent and not failed and staff.by_id(row.id) is None:
+                failed = True
+                raise OSError("fixture staff folder sync failed")
+            original_sync(directory)
+
+        failure = (mock.patch.object(atomic_file, "sync_folder", sync_receipt) if replaced
+                   else mock.patch.object(os, "replace", replace_record))
+        with failure:
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("fixture staff folder sync failed" if replaced else "fixture replace failed", output)
+        self.assertNotIn(f"removed {tree}", output)
+        self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "HEAD"))
+        record = staff.authority_snapshot()
+        self.assertEqual(record.by_id(row.id), None if replaced else row)
+        if replaced:
+            self.assertIsInstance(record.retirement_cleanup.get(row.id), staff.RetiredUnitCopyCleanup)
+        else:
+            self.assertNotIn(row.id, record.retirement_cleanup)
+        self.assertFalse(shutdown.retirement_journal(row).exists())
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"removed {tree}", output)
+        self.assertFalse(tree.exists())
+        self.assertNotIn(row.id, staff.authority_snapshot().retirement_cleanup)
 
     def test_retirement_keeps_a_worker_added_after_the_cleanup_snapshot(self) -> None:
         row = staff.by_id(self.unit_staff_id)
@@ -3692,14 +3989,24 @@ fi
                 case.assertEqual(git(case.checkout, "status", "--porcelain", "--untracked-files=no"), "")
 
     def test_remote_retirement_retries_failed_steps_before_or_after_row_removal(self) -> None:
+        delayed = ("delayed copy helper after owner reuse", "delayed copy helper after a new receipt")
+        deferred = ("mirror host is unreachable during receipt cleanup",
+                    "mirror owner is stored without UUID dashes",
+                    "Linux mirror host reads the staff authority over SSH")
         for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal", "journal removal",
                         "authority write", "legacy authority write", "authority response",
                         "removed worktree with a saved token", "pane-only cleanup with a saved token",
-                        *self.RETIRED_JOURNAL_CASES):
+                        *delayed, *deferred, *self.RETIRED_JOURNAL_CASES):
             with self.subTest(failure=failure):
                 case = RetireUnitTests()
                 case.setUp()
                 try:
+                    if failure in delayed:
+                        case.check_delayed_copy_cleanup(new_receipt=failure == delayed[1])
+                        continue
+                    if failure in deferred:
+                        case.check_deferred_retired_mirror(dashless=failure == deferred[1], linux_receiver=failure == deferred[2])
+                        continue
                     row = case.move_to_other_machine()
                     journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
                     if failure in self.RETIRED_JOURNAL_CASES:
@@ -3854,6 +4161,140 @@ fi
                     case.assertFalse(journal.exists())
                 finally:
                     case.doCleanups()
+
+    def check_delayed_copy_cleanup(self, *, new_receipt: bool) -> None:
+        self.park_without_worktree()
+        row = self.move_to_other_machine()
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("mac", self.worktree, staff.ParkedBranch("alpha-branch")),
+                                 expected=row.worktree)
+        parent = staff.snapshot().parent_of(row)
+        assert parent is not None
+        base = git(self.checkout, "rev-parse", "main")
+        worktrees.write_record(worktrees.new_record(self.worktree, "alpha-branch", self.checkout, base, "alpha", "main"))
+        _ = self.stop_session(DIRECTOR)
+        _ = self.stop_session(SEAT)
+        with registered_workspace(row.id, self.checkout, "HEAD", name="peer-editor", branch="editor") as tree:
+            pass
+        delayed: list[list[str]] = []
+
+        def lose_cleanup_request(args: list[str], stdin: str = "",
+                                 limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT, *,
+                                 propagate_timeout: bool = False) -> tuple[int, str]:
+            if args[0] == "_retired-copy-cleanup":
+                delayed.append(args)
+                return 255, ""
+            return self.remote_call(args, stdin, limit, propagate_timeout=propagate_timeout)
+
+        with mock.patch.object(shutdown, "run_remote", side_effect=lose_cleanup_request):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn("cleanup pending", output)
+        self.assertIn(f"Run agents retire {row.id} again.", output)
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertTrue(tree.is_dir())
+        self.assertFalse(shutdown.retirement_journal(row).exists())
+        self.assertFalse((self.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json").exists())
+        old_request, = delayed
+        old_record = staff.authority_snapshot()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"removed {tree}", output)
+        replacement = fixture_member("unit", name="replacement", parent=parent.id, runtime_id=row.id,
+                                     worktree=row.worktree)
+        with registered_workspace(row.id, self.checkout, "HEAD", name="replacement", branch="editor") as new_tree:
+            pass
+        if new_receipt:
+            with mock.patch.object(shutdown, "run_remote", side_effect=lose_cleanup_request):
+                code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assertIn("cleanup pending", output)
+            self.assertIsNone(staff.by_id(row.id))
+        before = staff.snapshot()
+        code, output = self.remote_call(old_request)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn(f"removed {new_tree}", output)
+        self.assertEqual(git(new_tree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "HEAD"))
+        self.assertEqual(staff.snapshot(), before)
+        if new_receipt:
+            with redirect_stdout(io.StringIO()) as output:
+                code = shutdown.retirement_completion_for_reference(row.id, old_record)
+            self.assertEqual(code, 0, output.getvalue())
+            self.assertIn("superseded", output.getvalue())
+            self.assertNotIn("copy cleanup complete", output.getvalue())
+            self.assertEqual(staff.authority_snapshot(), before)
+        if new_receipt:
+            code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assertIn(f"removed {new_tree}", output)
+            self.assertFalse(new_tree.exists())
+        else:
+            self.assertEqual(staff.by_id(row.id), replacement)
+
+    def check_deferred_retired_mirror(self, *, dashless: bool, linux_receiver: bool) -> None:
+        self.park_without_worktree()
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        _ = self.stop_session(DIRECTOR)
+        _ = self.stop_session(SEAT)
+        owner = row.id.replace("-", "") if dashless else row.id
+        mirror = copies.RemoteMirror(owner, copies.SelectedRepository("hana"), "linux-mirror" if linux_receiver else "mac",
+                                     str(self.root / "mirrors/retired-unit"), "alpha-session")
+        run = subprocess.run
+        requests: list[list[str]] = []
+
+        def unavailable(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "ssh" and "mirror-remove" in command[-1]:
+                requests.append(command)
+                return subprocess.CompletedProcess(command, 255, "", "ssh: connect to host mac: timed out")
+            return cast(Callable[..., subprocess.CompletedProcess[str]], run)(command, **kwargs)
+
+        with local_remote_transport(self.root):
+            _ = write_config_fixture(self.root / ".claude/config/mac_test.conf", "mirror_root=~/mirrors\n")
+            self.assertEqual(publish_mirror(mirror), 0)
+            with mock.patch.object(subprocess, "run", unavailable):
+                code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assertIn("cleanup pending", output)
+            self.assertIn("mirror removal is deferred", output)
+            self.assertIsNone(staff.by_id(row.id))
+            receipt = staff.snapshot().retirement_cleanup.get(row.id)
+            assert isinstance(receipt, staff.RetiredUnitCopyCleanup)
+            deferred_mirror = copies.read_remote_mirror(copies.remote_record_path(mirror))
+            self.assertIs(deferred_mirror.removal, copies.RemoteRemoval.DEFERRED)
+            self.assertEqual(deferred_mirror.retirement, staff.RetiredCopyCleanupRequest(row.id, receipt.token, receipt.machine))
+            command, = requests
+            self.assertIn(receipt.token, command[-1])
+            if linux_receiver:
+                staff_file = os.environ["STAFF_FILE"]
+
+                def receiver_ssh(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                    if args[:4] == ["ssh", "-o", "BatchMode=yes", "natedev"] and "staff.py show" in args[-1]:
+                        with mock.patch.dict(os.environ, {"STAFF_FILE": staff_file}):
+                            with redirect_stdout(io.StringIO()) as reply:
+                                status = staff.main(["show", "--snapshot", "--json"])
+                        return subprocess.CompletedProcess(args, status, reply.getvalue(), "")
+                    return cast(Callable[..., subprocess.CompletedProcess[str]], run)(args, **kwargs)
+
+                with (mock.patch.dict(os.environ), mock.patch.object(remote, "local_machine", return_value="linux-mirror"),
+                      mock.patch.object(subprocess, "run", side_effect=receiver_ssh), redirect_stderr(io.StringIO()) as errors):
+                    del os.environ["STAFF_FILE"]
+                    receiver_code = copies.main(["mirror-remove", "--path", mirror.path, "--owner", owner, "--repository", "hana",
+                        "--session", mirror.session, "--host", mirror.host,
+                        "--cleanup-token", receipt.token, "--cleanup-machine", receipt.machine])
+                self.assertEqual(receiver_code, 0, errors.getvalue())
+                self.assertFalse(Path(mirror.path).exists())
+            code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assertIn("copy cleanup complete", output)
+            self.assertFalse(Path(mirror.path).exists())
+            self.assertFalse(copies.remote_record_path(mirror).exists())
+            self.assertNotIn(row.id, staff.snapshot().retirement_cleanup)
+            _ = fixture_member("unit", name=row.name, parent=row.parent, worktree=row.worktree, runtime_id=row.id)
+            self.assertEqual(publish_mirror(mirror), 0)
+            reply = run(command, text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertNotEqual(reply.returncode, 0, reply.stdout)
+            self.assertIn("copy cleanup authorization is no longer current", reply.stderr)
+            self.assertTrue(Path(mirror.path).is_dir())
 
     def outside_director(self) -> Path:
         self.claude = []

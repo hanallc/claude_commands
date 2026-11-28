@@ -3249,6 +3249,7 @@ def claimed_run(
         linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
         if linux and request.verb == "mend-fix":
             return declined("target does not permit this command", started)
+        copies.precheck_copy_owner(request.owner)
         if linux:
             expected = expected_linux_parity(controller, config)
             if isinstance(expected, UnavailableToolParity):
@@ -3261,6 +3262,7 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+            copies.register_remote(request_mirror(config, request, repository))
             release_allowed = False
             probe = probe_mac(controller, config, repository, request.target, request.slot)
             if isinstance(probe, UnresolvedSlotStartup):
@@ -3301,6 +3303,7 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+            copies.register_remote(request_mirror(config, request, repository))
         try:
             history_key = evidence.repository_key
             step_command = remote_test_command(config, request, repository, copied.tree_key,
@@ -3317,7 +3320,6 @@ def claimed_run(
         if linux:
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
-        copies.register_remote(request_mirror(config, request, repository))
         routed_mac_command = not linux and isinstance(request.placement, AssignedOffloadRequest)
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire

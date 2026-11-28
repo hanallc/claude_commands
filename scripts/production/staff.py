@@ -7,6 +7,12 @@ try:
 except FileNotFoundError:
     pass
 
+if __name__ == "__main__":
+    # The CLI and its runtime readers use the same staff types.
+    from scripts.production import staff as staff_cli
+
+    raise SystemExit(staff_cli.main())
+
 import fcntl
 import json
 import os
@@ -24,14 +30,11 @@ from functools import cached_property
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast, override
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from scripts.lib import git_files
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 
-if __name__ == "__main__":
-    # Lazy runtime readers share these exact row and exception classes in the CLI.
-    sys.modules["scripts.production.staff"] = sys.modules[__name__]
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
     import argparse
@@ -212,7 +215,11 @@ class StaffRefused(Exception):
         self.holder: str = holder
 
 
-class UpkeepRowBusy(StaffRefused):
+class StaffSlotBusy(StaffRefused):
+    """Another operation holds the member slot."""
+
+
+class UpkeepRowBusy(StaffSlotBusy):
     """Herdr upkeep did not release the row within the wait time."""
 
 
@@ -277,8 +284,25 @@ class ShowrunnerRetirementReceipt:
         return {"token": self.token, "showrunner_machine": self.machine}
 
 
+@dataclass(frozen=True)
+class RetiredUnitCopyCleanup:
+    token: str
+    machine: str
+    members: tuple[StaffId, ...]
+    sessions: tuple[StaffId, ...]
+    parent: StaffId
+
+    @property
+    def reserved_ids(self) -> frozenset[StaffId]:
+        return frozenset((*self.members, *self.sessions))
+
+    def to_json(self) -> dict[str, object]:
+        return {"token": self.token, "copy_machine": self.machine, "members": list(self.members),
+                "sessions": list(self.sessions), "parent": self.parent}
+
+
 # Older receipts carry only the token.
-RetirementCleanupReceipt = RetirementCheckoutClaim | ShowrunnerRetirementReceipt | str
+RetirementCleanupReceipt = RetirementCheckoutClaim | ShowrunnerRetirementReceipt | RetiredUnitCopyCleanup | str
 
 
 @dataclass(frozen=True)
@@ -1137,7 +1161,7 @@ def _upkeep_pid(holder: tuple[int, str]) -> int | None:
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Literal["no_wait"] = "no_wait") -> None:
+def _acquire_slot(lock: IO[bytes], name: str, *, wait_deadline: float | Literal["no_wait"] = "no_wait") -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1147,11 +1171,11 @@ def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Litera
             return
         except BlockingIOError as error:
             holder = _slot_holder(lock)
-            if layout_deadline != "no_wait":
+            if wait_deadline != "no_wait":
                 from scripts.agents import worker_lifecycle
 
                 try:
-                    worker_lifecycle.acquire_flock(lock, deadline=layout_deadline)
+                    worker_lifecycle.acquire_flock(lock, deadline=wait_deadline)
                 except worker_lifecycle.OperationDeadlineExpired:
                     holder = _slot_holder(lock) or holder
                 else:
@@ -1166,7 +1190,7 @@ def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Litera
                     time.sleep(min(0.05, remaining))
                     continue
             named = f"pid {holder[0]}: {holder[1]}" if holder else ""
-            raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
+            raise StaffSlotBusy(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
                                holder=named) from error
 
 
@@ -1200,17 +1224,22 @@ def session_operation(session: str, *, native_key: str) -> Generator[StaffSnapsh
         yield record
 
 
-@contextmanager
 def slot_operation(key: str, name: str, *, join: bool = True,
-                   layout_deadline: float | Literal["no_wait"] = "no_wait") -> Generator[None]:
-    """Lock a slot across inherited children. Only the layout slot can wait for any holder."""
+                   layout_deadline: float | Literal["no_wait"] = "no_wait") -> AbstractContextManager[None]:
+    """Lock a slot across inherited children."""
+    return _slot_operation(key, name, join=join, wait_deadline=layout_deadline)
+
+
+@contextmanager
+def _slot_operation(key: str, name: str, *, join: bool = True,
+                    wait_deadline: float | Literal["no_wait"] = "no_wait") -> Generator[None]:
     path, variable = _row_lock(key)
     if join and _joined_operation(path, variable):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name, layout_deadline=layout_deadline)
+        _acquire_slot(lock, name, wait_deadline=wait_deadline)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
@@ -1222,6 +1251,73 @@ def slot_operation(key: str, name: str, *, join: bool = True,
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@dataclass(frozen=True)
+class StaffCopyOwner:
+    """A staff row owns the copy."""
+
+    row_id: StaffId
+
+
+@dataclass(frozen=True)
+class RoleCopyOwner:
+    """A fixed role owns the copy without a staff row."""
+
+    name: str
+
+
+CopyOwner = StaffCopyOwner | RoleCopyOwner
+
+
+def copy_owner(text: str) -> CopyOwner:
+    """Read a staff UUID or a fixed role from a copy owner name."""
+    try:
+        return StaffCopyOwner(StaffId(str(UUID(text))))
+    except ValueError:
+        return RoleCopyOwner(text)
+
+
+def _require_copy_owner(selected: StaffCopyOwner, *, warn_if_unreadable: bool) -> None:
+    identity = selected.row_id
+    try:
+        record = authority_snapshot()
+    except (OSError, StaffRefused, StaffNotFound, UnicodeError) as error:
+        if warn_if_unreadable:
+            reason = " ".join(str(error).split())
+            print(f"warning: {identity}: cannot read the staff owner for copy publication: {reason}", file=sys.stderr)
+        return
+    if identity in record.retirement_cleanup:
+        raise StaffRefused(f"{identity}: copy cleanup pending. Run agents retire {identity} again.")
+    if record.by_id(identity) is None:
+        raise StaffRefused(f"{identity}: copy owner is absent from staff")
+
+
+def precheck_copy_owner(owner: str) -> None:
+    """Check for a retirement receipt or an absent owner before copy creation."""
+    selected = copy_owner(owner)
+    if isinstance(selected, StaffCopyOwner):
+        _require_copy_owner(selected, warn_if_unreadable=False)
+
+
+@contextmanager
+def copy_owner_admission(owner: str) -> Generator[None]:
+    """Wait briefly for the staff slot before checking ownership and publishing."""
+    selected = copy_owner(owner)
+    if isinstance(selected, RoleCopyOwner):
+        yield
+        return
+
+    from scripts.agents import worker_lifecycle
+
+    deadline = worker_lifecycle.effective_deadline(time.monotonic() + _seconds("operation_lock_seconds"))
+    with ExitStack() as lock:
+        try:
+            _ = lock.enter_context(_slot_operation(selected.row_id, selected.row_id, wait_deadline=deadline))
+        except StaffSlotBusy:
+            pass
+        _require_copy_owner(selected, warn_if_unreadable=True)
+        yield
 
 
 @dataclass(frozen=True)
@@ -1635,7 +1731,10 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
     for identity, receipt in cast(dict[str, object], raw_cleanup).items():
         if not _valid_id(identity):
             raise StaffUnreadable("invalid retirement cleanup receipt")
-        cleanup[StaffId(identity)] = _retirement_receipt(receipt)
+        decoded = _retirement_receipt(receipt)
+        if isinstance(decoded, RetiredUnitCopyCleanup) and StaffId(identity) not in decoded.members:
+            raise StaffUnreadable("invalid retired unit copy cleanup owner")
+        cleanup[StaffId(identity)] = decoded
     return StaffSnapshot(tuple(rows),
                          tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
                          tuple(cast(list[str], inputs)), cast(int, fields.get("schema", 2)),
@@ -1646,7 +1745,21 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
 def _retirement_receipt(value: object) -> RetirementCleanupReceipt:
     if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value):
         return value
-    match value:
+    if not isinstance(value, dict):
+        raise StaffUnreadable("invalid retirement cleanup receipt")
+    fields = cast(dict[str, object], value)
+    match fields:
+        case {"token": str(token), "copy_machine": str(machine), "members": members,
+              "sessions": sessions, "parent": str(parent)} if isinstance(members, list) and isinstance(sessions, list):
+            removed = cast(list[object], members)
+            native = cast(list[object], sessions)
+            if (re.fullmatch(r"[0-9a-f]{32}", token) and machine and machine == worktree_host(machine)
+                    and _valid_id(parent) and removed and len(native) == len(removed)
+                    and all(isinstance(item, str) and _valid_id(item) for item in (*removed, *native))):
+                member_ids = tuple(StaffId(item) for item in cast(list[str], removed))
+                session_ids = tuple(StaffId(item) for item in cast(list[str], native))
+                if len(set(member_ids)) == len(member_ids) and len(set(session_ids)) == len(session_ids):
+                    return RetiredUnitCopyCleanup(token, machine, member_ids, session_ids, StaffId(parent))
         case {"token": str(token), "machine": str(machine), "path": str(path), "recorded_path": str(recorded)}:
             if (re.fullmatch(r"[0-9a-f]{32}", token) and machine and machine == machine.strip()
                     and Path(path).is_absolute() and Path(recorded).is_absolute()):
@@ -1694,10 +1807,14 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
         if time.monotonic() >= worker_lifecycle.effective_deadline():
             raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
         raise StaffUnreadable(f"{machine} not reached") from error
+    if done.returncode and removes_retired_unit:
+        raise RetiredUnitRemovalUnconfirmed()
     reason = done.stderr.strip()
     if done.returncode == 1 and reason.startswith("staff member not found: "):
         raise StaffNotFound(StaffId(reason.removeprefix("staff member not found: ")))
     if done.returncode == 2:
+        if reason.startswith("StaffSlotBusy: "):
+            raise StaffSlotBusy(reason.removeprefix("StaffSlotBusy: "))
         if reason.startswith("StaffRefused: "):
             raise StaffRefused(reason.removeprefix("StaffRefused: "))
         if reason.startswith("StaffAbsent: "):
@@ -1707,8 +1824,6 @@ def _remote(arguments: list[str], *, input_text: str | None = None, machine: str
         if reason.startswith("OperationDeadlineExpired: "):
             raise StaffUnreadable(reason)
     if done.returncode != 0:
-        if removes_retired_unit:
-            raise RetiredUnitRemovalUnconfirmed()
         raise StaffUnreadable(f"{machine} not reached" if done.returncode == 255 or not reason else reason)
     if done.stderr:
         print(done.stderr, end="", file=sys.stderr)
@@ -1816,6 +1931,19 @@ def authority_snapshot() -> StaffSnapshot:
     """Read the current staff record from its authority."""
     if is_owner():
         return replace(_load(), production=not _file_override())
+    return _authority_snapshot_over_ssh()
+
+
+def mirror_authority_snapshot() -> StaffSnapshot:
+    """Read the staff authority from a workstation or a remote mirror host."""
+    from scripts.agents import remote
+
+    if _file_override() or worktree_host(remote.local_machine()) == OWNER_MACHINE:
+        return replace(_load(), production=not _file_override())
+    return _authority_snapshot_over_ssh()
+
+
+def _authority_snapshot_over_ssh() -> StaffSnapshot:
     value = _remote(["show", "--snapshot"])
     if not isinstance(value, dict):
         raise StaffUnreadable("staff snapshot must be an object")
@@ -2056,7 +2184,7 @@ mv -f "$temporary" "$directory/staff.json"
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
 
-def _checkout_machine(name: str) -> str:
+def worktree_host(name: str) -> str:
     from scripts.agents import remote
 
     host = name.split(".", 1)[0].casefold()
@@ -2067,13 +2195,13 @@ def _checkout_machine(name: str) -> str:
 def _checkout_path(location: PresentWorktree | RemovedWorktree) -> Path:
     from scripts.agents import remote
 
-    if _checkout_machine(location.machine) == _checkout_machine(remote.local_machine()):
+    if worktree_host(location.machine) == worktree_host(remote.local_machine()):
         return location.path.resolve()
     return Path(os.path.normpath(location.path))
 
 
 def _claim_holds_worktree(claim: RetirementCheckoutClaim, worktree: PresentWorktree) -> bool:
-    return (_checkout_machine(worktree.machine) == claim.machine
+    return (worktree_host(worktree.machine) == claim.machine
             and (_checkout_path(worktree) == claim.path or worktree.path == claim.recorded_path))
 
 
@@ -2095,9 +2223,18 @@ def _require_unclaimed_worktrees(rows: list[StaffRow], original: StaffSnapshot,
                                    "The hold ends automatically when that retire finishes.")
 
 
+def _require_unreserved_identities(rows: list[StaffRow], cleanup: Mapping[StaffId, RetirementCleanupReceipt]) -> None:
+    reserved = {member: owner for owner, receipt in cleanup.items() if isinstance(receipt, RetiredUnitCopyCleanup)
+                for member in receipt.reserved_ids}
+    for row in rows:
+        for identity in (row.id, row.current_session):
+            if identity in reserved:
+                raise StaffRefused(f"{identity}: copy cleanup is pending. Run agents retire {reserved[identity]} again.")
+
+
 def _record_transaction(
         edit: Callable[[list[StaffRow], set[StaffId], dict[StaffId, RetirementCleanupReceipt]], _Result],
-        *, before_replace: Callable[[], None] | None = None) -> _Result:
+        *, before_replace: Callable[[], None] | None = None, report_unchanged: bool = True) -> _Result:
     from scripts.lib import atomic_file
     from scripts.agents import worker_lifecycle
 
@@ -2114,6 +2251,7 @@ def _record_transaction(
             cleanup = dict(original.retirement_cleanup)
             result = edit(proposed, pending, cleanup)
             _require_unclaimed_worktrees(proposed, original, cleanup)
+            _require_unreserved_identities(proposed, cleanup)
             if path.resolve() == _default_file().resolve():
                 previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
@@ -2129,7 +2267,8 @@ def _record_transaction(
                     and pending == set(original.pending_retire) and cleanup == original.retirement_cleanup):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
-                print("unchanged", file=sys.stderr)
+                if report_unchanged:
+                    print("unchanged", file=sys.stderr)
             else:
                 _store(proposed, pending, cleanup, before_replace=before_replace)
             return result
@@ -2783,7 +2922,7 @@ def remove_unit_for_retirement(unit: StaffRow, parent: StaffRow, workers: Sequen
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise StaffRefused("invalid retirement cleanup token")
     location = unit.worktree
-    claim = (RetirementCheckoutClaim(token, _checkout_machine(location.machine),
+    claim = (RetirementCheckoutClaim(token, worktree_host(location.machine),
                                     location.path.resolve() if claim_path is None else claim_path, location.path)
              if not isinstance(location, WorktreeUnfilled) else token)
     if not is_owner():
@@ -2857,6 +2996,11 @@ def remove_showrunner_for_retirement(showrunner: StaffRow, workers: Sequence[Sta
             retired = sorted(row.name for row in rows if row.kind == "unit" and row.reports_to(showrunner.id))
             if retired:
                 raise StaffRefused(f"{showrunner.name}: retired unit records remain: {', '.join(retired)}")
+            pending_copies = sorted(identity for identity, pending_receipt in cleanup.items()
+                                    if isinstance(pending_receipt, RetiredUnitCopyCleanup)
+                                    and pending_receipt.parent == showrunner.id)
+            if pending_copies:
+                raise StaffRefused(f"{showrunner.name}: copy cleanup pending for {', '.join(pending_copies)}")
             actual = {row.id: row.to_json() for row in rows if row.kind == "worker" and row.reports_to(showrunner.id)}
             if actual != {worker.id: worker.to_json() for worker in workers}:
                 raise StaffRefused(f"{showrunner.name}: the showrunner's workers changed before retirement")
@@ -2868,6 +3012,84 @@ def remove_showrunner_for_retirement(showrunner: StaffRow, workers: Sequence[Sta
             cleanup[showrunner.id] = receipt
 
         _record_transaction(edit)
+
+
+@dataclass(frozen=True)
+class RetiredCopyCleanupRequest:
+    owner: StaffId
+    token: str
+    machine: str
+
+    def __post_init__(self) -> None:
+        if (not _valid_id(self.owner) or not re.fullmatch(r"[0-9a-f]{32}", self.token)
+                or not self.machine or self.machine != worktree_host(self.machine)):
+            raise ValueError("invalid retired copy cleanup request")
+
+    def current_receipt(self, record: StaffSnapshot) -> RetiredUnitCopyCleanup | None:
+        receipt = record.retirement_cleanup.get(self.owner)
+        if (isinstance(receipt, RetiredUnitCopyCleanup) and receipt.token == self.token
+                and receipt.machine == self.machine and self.owner in receipt.members
+                and not any({row.id, row.current_session} & receipt.reserved_ids for row in record.all_rows)):
+            return receipt
+        return None
+
+    def state(self, record: StaffSnapshot) -> CopyCleanupState:
+        if self.current_receipt(record) is not None:
+            return CopyCleanupState.CURRENT
+        if self.owner not in record.retirement_cleanup and record.by_id(self.owner) is None:
+            return CopyCleanupState.COMPLETE
+        return CopyCleanupState.SUPERSEDED
+
+
+class CopyCleanupState(Enum):
+    CURRENT = "current"
+    COMPLETE = "complete"
+    SUPERSEDED = "superseded"
+
+
+class _CopyCleanupNoLongerCurrent(Exception):
+    """The authority no longer has the request's receipt."""
+
+    def __init__(self, state: CopyCleanupState) -> None:
+        super().__init__(state.value)
+        self.state: CopyCleanupState = state
+
+
+def confirm_retired_copy_cleanup(request: RetiredCopyCleanupRequest) -> CopyCleanupState:
+    """Confirm the receipt and sync its publication before any copy removal."""
+    return _retired_copy_cleanup_transaction(request, "confirm-copy")
+
+
+def finish_retired_copy_cleanup(request: RetiredCopyCleanupRequest) -> CopyCleanupState:
+    """Clear the matching receipt and report the result of that transaction."""
+    return _retired_copy_cleanup_transaction(request, "finish-copy")
+
+
+def _retired_copy_cleanup_transaction(
+    request: RetiredCopyCleanupRequest, action: Literal["confirm-copy", "finish-copy"],
+) -> CopyCleanupState:
+    if not is_owner():
+        response = _remote(["retirement-cleanup", request.owner, action, request.token,
+                            "--cleanup-machine", request.machine])
+        try:
+            return CopyCleanupState(response)
+        except ValueError as error:
+            raise StaffUnreadable("invalid copy cleanup result") from error
+
+    def edit(rows: list[StaffRow], pending: set[StaffId],
+             cleanup: dict[StaffId, RetirementCleanupReceipt]) -> CopyCleanupState:
+        state = request.state(StaffSnapshot(tuple(rows), tuple(sorted(pending)), retirement_cleanup=cleanup))
+        if state is not CopyCleanupState.CURRENT:
+            raise _CopyCleanupNoLongerCurrent(state)
+        if action == "finish-copy":
+            del cleanup[request.owner]
+            return CopyCleanupState.COMPLETE
+        return state
+
+    try:
+        return _record_transaction(edit, report_unchanged=False)
+    except _CopyCleanupNoLongerCurrent as error:
+        return error.state
 
 
 def finish_unit_retirement(identity: StaffId, token: str, *, restart_members: Sequence[StaffId] = ()) -> None:
@@ -2889,7 +3111,7 @@ def finish_unit_retirement(identity: StaffId, token: str, *, restart_members: Se
             if receipt != cleaned_receipt:
                 raise StaffRefused(f"{identity}: the showrunner cleanup receipt does not match")
             del cleanup[identity]
-        elif (receipt.token if isinstance(receipt, RetirementCheckoutClaim) else receipt) == token:
+        elif (receipt.token if isinstance(receipt, (RetirementCheckoutClaim, RetiredUnitCopyCleanup)) else receipt) == token:
             del cleanup[identity]
 
     _record_transaction(edit)
@@ -2922,16 +3144,82 @@ class RetiredUnitOrigin:
     tip: str | OriginBranchAbsent
 
 
-class RetiredUnitRemoval(Enum):
-    REMOVED = "removed"
-    ALREADY_ABSENT = "absent"
+class RetiredUnitRemovalFailure(Enum):
+    MEMBERS_CHANGED = "members-changed"
+    MEMBER_BUSY = "member-busy"
+    CHECK_FAILED = "check-failed"
+    WRITE_UNCONFIRMED = "write-unconfirmed"
+
+
+@dataclass(frozen=True)
+class RetiredUnitRemovalRefused:
+    reason: RetiredUnitRemovalFailure
+    detail: str
+
+    def to_json(self) -> dict[str, object]:
+        return {"state": self.reason.value, "detail": self.detail}
+
+
+@dataclass(frozen=True)
+class RetiredUnitRemoved:
+    cleanup: RetiredUnitCopyCleanup
+
+    def to_json(self) -> dict[str, object]:
+        return {"state": "cleanup-pending", "receipt": self.cleanup.to_json()}
+
+
+@dataclass(frozen=True)
+class RetiredUnitAlreadyAbsent:
+    def to_json(self) -> dict[str, object]:
+        return {"state": "complete"}
+
+
+RetiredUnitRemoval = RetiredUnitRemoved | RetiredUnitAlreadyAbsent | RetiredUnitRemovalRefused
+
+
+def _read_retired_unit_removal(identity: StaffId, response: object) -> RetiredUnitRemoval:
+    if not isinstance(response, dict):
+        raise RetiredUnitRemovalUnconfirmed()
+    fields = cast(dict[str, object], response)
+    match fields:
+        case {"state": "complete"}:
+            return RetiredUnitAlreadyAbsent()
+        case {"state": "cleanup-pending", "receipt": raw}:
+            receipt = _retirement_receipt(raw)
+            if isinstance(receipt, RetiredUnitCopyCleanup) and identity in receipt.members:
+                return RetiredUnitRemoved(receipt)
+        case {"state": str(state), "detail": str(detail)}:
+            return RetiredUnitRemovalRefused(RetiredUnitRemovalFailure(state), detail)
+        case _:
+            pass
+    raise RetiredUnitRemovalUnconfirmed()
+
+
+class _RetiredUnitMembersChanged(StaffRefused):
+    """The unit or its workers changed before publication."""
 
 
 def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> RetiredUnitRemoval:
-    """Confirm absence or remove the unit and its stopped workers in one staff write."""
+    """Remove the rows and publish the copy cleanup receipt in one staff write."""
+    from scripts.agents import worker_lifecycle
+
+    try:
+        return _remove_retired_unit(expected, origin)
+    except _RetiredUnitMembersChanged as error:
+        return RetiredUnitRemovalRefused(RetiredUnitRemovalFailure.MEMBERS_CHANGED, str(error))
+    except StaffSlotBusy as error:
+        return RetiredUnitRemovalRefused(RetiredUnitRemovalFailure.MEMBER_BUSY, str(error))
+    except StaffRefused as error:
+        return RetiredUnitRemovalRefused(RetiredUnitRemovalFailure.CHECK_FAILED, str(error))
+    except (ValueError, StaffUnreadable, worker_lifecycle.OperationDeadlineExpired) as error:
+        detail = str(error) if isinstance(error, StaffUnreadable) else str(RetiredUnitRemovalUnconfirmed())
+        return RetiredUnitRemovalRefused(RetiredUnitRemovalFailure.WRITE_UNCONFIRMED, detail)
+
+
+def _remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> RetiredUnitRemoval:
     location = expected.worktree
     if (expected.kind != "unit" or not isinstance(location, RemovedWorktree)
-            or not isinstance(location.branch, ParkedBranch)):
+            or not isinstance(location.branch, ParkedBranch) or not isinstance(expected.parent, ReportsTo)):
         raise StaffRefused(f"{expected.name}: removal requires a retired unit with a recorded branch")
     branch = location.branch
     if not is_owner():
@@ -2939,22 +3227,25 @@ def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> Retire
             "row": expected.to_json(), "machine": origin.machine, "checkout": str(origin.checkout),
             "tip": origin.tip if isinstance(origin.tip, str) else None,
         }))
-        try:
-            return RetiredUnitRemoval(reply)
-        except ValueError as error:
-            raise RetiredUnitRemovalUnconfirmed() from error
+        return _read_retired_unit_removal(expected.id, reply)
 
     with operation(), slot_operation(expected.id, expected.name), ExitStack() as locks:
         record = authority_snapshot()
         unit = record.by_id(expected.id)
         if unit is None:
-            return RetiredUnitRemoval.ALREADY_ABSENT
+            receipt = record.retirement_cleanup.get(expected.id)
+            if isinstance(receipt, RetiredUnitCopyCleanup):
+                return RetiredUnitRemoved(receipt)
+            return RetiredUnitAlreadyAbsent()
         if unit.to_json() != expected.to_json():
-            raise StaffRefused(f"{expected.name}: the unit changed before removal")
+            raise _RetiredUnitMembersChanged(f"{expected.name}: the unit changed before removal")
         workers = record.find(kind="worker", parent=unit.id)
         for worker in workers:
             _ = locks.enter_context(slot_operation(worker.id, worker.name))
-        members = {member.id: member.to_json() for member in (unit, *workers)}
+        removed = (unit, *workers)
+        members = {member.id: member.to_json() for member in removed}
+        receipt = RetiredUnitCopyCleanup(uuid4().hex, worktree_host(location.machine), tuple(members),
+                                         tuple(member.current_session for member in removed), expected.parent.id)
         for identity in members:
             require_stopped(identity)
 
@@ -2963,22 +3254,22 @@ def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> Retire
                 raise StaffRefused(f"{unit.name}: a retirement cleanup receipt already exists")
             current = {row.id: row.to_json() for row in rows if row.id == unit.id or row.reports_to(unit.id)}
             if current != members:
-                raise StaffRefused(f"{unit.name}: the unit or its workers changed before removal")
+                raise _RetiredUnitMembersChanged(f"{unit.name}: the unit or its workers changed before removal")
             rows[:] = [row for row in rows if row.id not in members]
             pending.difference_update(members)
+            cleanup[unit.id] = receipt
 
         def recheck() -> None:
             from scripts.agents import worker_lifecycle
 
             check = cast(Callable[[StaffId, ParkedBranch, RetiredUnitOrigin, RemovedWorktree], None],
                 import_module("scripts.agents.shutdown").require_retired_record_unchanged)
-            # Reserve half the lock wait limit for the staff write and cleanup.
             with worker_lifecycle.operation_deadline(timeout=_seconds("operation_lock_seconds") / 2):
                 check(unit.id, branch, origin, location)
 
         _record_transaction(edit, before_replace=recheck)
     _forget_restart(list(members))
-    return RetiredUnitRemoval.REMOVED
+    return RetiredUnitRemoved(receipt)
 
 
 def _forget_restart(staff_ids: list[StaffId], *, require_success: bool = False) -> None:
@@ -3286,6 +3577,7 @@ class _Arguments:
     expected_workers: str = ""
     cleanup_action: str = ""
     cleanup_token: str = ""
+    cleanup_machine: str = ""
     restart_member: list[str] = []
     creation_action: str = ""
     marker: str = ""
@@ -3436,8 +3728,9 @@ def _parser() -> argparse.ArgumentParser:
     _ = remove_unit.add_argument("--json", action="store_true")
     cleanup = verbs.add_parser("retirement-cleanup", help=argparse.SUPPRESS)
     _ = cleanup.add_argument("target")
-    _ = cleanup.add_argument("cleanup_action", choices=("remove", "remove-showrunner", "finish"))
+    _ = cleanup.add_argument("cleanup_action", choices=("remove", "remove-showrunner", "finish", "confirm-copy", "finish-copy"))
     _ = cleanup.add_argument("cleanup_token")
+    _ = cleanup.add_argument("--cleanup-machine", default="")
     _ = cleanup.add_argument("--restart-member", action="append")
     _ = cleanup.add_argument("--json", action="store_true")
 
@@ -3606,6 +3899,16 @@ def _main(arguments: _Arguments) -> int:
     if arguments.verb == "retirement-cleanup":
         if not is_owner():
             raise StaffRefused("the staff owner must write the retirement cleanup receipt")
+        if arguments.cleanup_action in ("confirm-copy", "finish-copy"):
+            try:
+                request = RetiredCopyCleanupRequest(StaffId(arguments.target), arguments.cleanup_token,
+                                                    arguments.cleanup_machine)
+            except ValueError as error:
+                raise StaffRefused(str(error)) from error
+            state = (confirm_retired_copy_cleanup(request) if arguments.cleanup_action == "confirm-copy"
+                     else finish_retired_copy_cleanup(request))
+            print(json.dumps(state.value))
+            return 0
         if arguments.cleanup_action in ("remove", "remove-showrunner"):
             raw = _decode(sys.stdin.read())
             if not isinstance(raw, dict):
@@ -3715,12 +4018,12 @@ def _main(arguments: _Arguments) -> int:
         raise StaffRefused("row writes are for worker admission and retirement")
     seed_text = sys.stdin.read() if arguments.verb in ("apply-seed", "remove-retired-unit") else ""
     use_operation = is_owner() and not arguments.row_write and arguments.verb not in (
-        "set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer")
+        "set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer", "remove-retired-unit")
     with operation() if use_operation else nullcontext():
         result = _mutate(arguments, seed_text)
-    if isinstance(result, RetiredUnitRemoval):
+    if isinstance(result, (RetiredUnitRemoved, RetiredUnitAlreadyAbsent, RetiredUnitRemovalRefused)):
         if arguments.json:
-            print(json.dumps(result.value))
+            print(json.dumps(result.to_json()))
         return 0
     if isinstance(result, tuple):
         print(json.dumps(result))
@@ -3760,7 +4063,3 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _Arguments()
     _ = _parser().parse_args(argv, namespace=arguments)
     return cli_result(lambda: _main(arguments))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

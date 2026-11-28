@@ -14,6 +14,7 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, chdir, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
@@ -30,8 +31,10 @@ from scripts.agents import remote, shutdown, status_entry, stop_resume, restart_
 from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.copies import copies
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, foreign_hostname, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
@@ -573,6 +576,10 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
             f'"current_session": "{new_id}"'.encode(), 1))
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         self.assertEqual(staff.update_current_session(unit.id, new_id), changed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        with self.subTest(scenario="the authority slot is busy"), staff.slot_operation(unit.id, unit.name), self.machine("mac"):
+            with self.assertRaises(staff.StaffSlotBusy):
+                _ = staff.update_current_session(unit.id, staff.native_id(fixture_runtime_id("new-busy-session")))
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_running_session_lookup_after_clear_does_not_match_the_fixed_first_session(self) -> None:
@@ -1478,6 +1485,166 @@ class StaffTests(StaffCommandTestCase):
             staff.finish_unit_retirement(unit.id, token)
             self.assertEqual(staff.authority_snapshot().retirement_cleanup, {})
         self.assertFalse(self.mac_file.exists())
+
+    def test_remove_retired_unit_reserves_members_and_checks_the_receipt_token(self) -> None:
+        parent, unit, worker = self.tree()
+        unit = staff.rename(unit.id, "alpha: cleanup")
+        native = staff.native_id(fixture_runtime_id("replacement-session"))
+        worker = staff.update_current_session(worker.current_session, native)
+        location = staff.RemovedWorktree("natedev", self.root / "old", staff.ParkedBranch("models"))
+        unit = staff.set_worktree(unit.id, location, expected=unit.worktree)
+        seed = ImmutableGitSeed.create(self.root / "retired", "main", "Staff Test",
+                                       "staff@example.invalid", {"work.txt": "merged\n"})
+        origin = staff.RetiredUnitOrigin("natedev", seed.checkout, staff.OriginBranchAbsent())
+        with self.subTest(publication="live owner on the other workstation"):
+            mirror = copies.RemoteMirror(unit.id, copies.SelectedRepository("models"), "mac", "models/peer", "fixture")
+            with mock.patch.object(remote, "local_machine", return_value="mac"):
+                copies.precheck_copy_owner(unit.id)
+                copies.register_remote(mirror)
+            self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(mirror)), mirror)
+            copies.unregister_remote(mirror.host, mirror.path)
+
+        with self.subTest(publication="authority does not respond"):
+            mirror = copies.RemoteMirror(unit.id, copies.SelectedRepository("models"), "mac", "models/offline", "fixture")
+            failure = staff.StaffUnreadable("natedev not reached\nfixture detail")
+            with (mock.patch.object(staff, "authority_snapshot", side_effect=failure) as read,
+                  redirect_stderr(io.StringIO()) as errors):
+                copies.precheck_copy_owner(unit.id)
+                copies.register_remote(mirror)
+            self.assertEqual(read.call_count, 2)
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("natedev not reached fixture detail", errors.getvalue())
+            self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(mirror)), mirror)
+            copies.unregister_remote(mirror.host, mirror.path)
+
+        for releases in (False, True):
+            with self.subTest(publication="busy slot", releases=releases):
+                mirror = copies.RemoteMirror(unit.id, copies.SelectedRepository("models"), "mac",
+                                             f"models/busy-{releases}", "fixture")
+                lock_path = self.staff_file.parent / "rows" / f"{unit.id}.lock"
+                lock_path.parent.mkdir(exist_ok=True)
+                acquire = worker_lifecycle.acquire_flock
+                read_owner = staff.authority_snapshot
+                with (lock_path.open("a+b") as holder,
+                      worker_lifecycle.operation_deadline(timeout=2 if releases else 0.1) as limit):
+                    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                    def wait_for_slot(handle: int | worker_lifecycle.LockFileDescriptor, *,
+                                      deadline: float) -> None:
+                        self.assertEqual(deadline, limit)
+                        if releases:
+                            fcntl.flock(holder, fcntl.LOCK_UN)
+                        acquire(handle, deadline=deadline)
+
+                    def write_mirror(path: Path, text: str) -> None:
+                        if releases:
+                            with self.assertRaises(staff.StaffSlotBusy):
+                                with staff.slot_operation(unit.id, unit.name, join=False):
+                                    self.fail("publication released the staff slot")
+                        else:
+                            self.assertNotIn(f"STAFF_ROW_FD_{unit.id}", os.environ)
+                        write_text_atomic(path, text)
+
+                    def read_after_wait() -> staff.StaffSnapshot:
+                        wait.assert_called_once()
+                        return read_owner()
+
+                    with (mock.patch.object(worker_lifecycle, "acquire_flock", side_effect=wait_for_slot) as wait,
+                          mock.patch.object(staff, "authority_snapshot", side_effect=read_after_wait) as read,
+                          mock.patch.object(copies, "write_text_atomic", side_effect=write_mirror)):
+                        copies.register_remote(mirror)
+                    read.assert_called_once()
+                self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(mirror)), mirror)
+                copies.unregister_remote(mirror.host, mirror.path)
+
+        with self.subTest(publication="retirement unregisters another mirror during the slot wait"):
+            publishing = copies.RemoteMirror(unit.id, copies.SelectedRepository("models"), "mac",
+                                             "models/publishing", "fixture")
+            retiring = replace(publishing, path="models/retiring")
+            with copies.remote_lease(retiring):
+                copies.register_remote(retiring)
+            slot_path = self.staff_file.parent / "rows" / f"{unit.id}.lock"
+            acquire = worker_lifecycle.acquire_flock
+
+            def unregister() -> None:
+                with copies.remote_lease(retiring):
+                    copies.unregister_remote(retiring.host, retiring.path)
+
+            with (ThreadPoolExecutor(max_workers=1) as retirement,
+                  slot_path.open("a+b") as slot,
+                  worker_lifecycle.operation_deadline(timeout=10)):
+                fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                def wait_for_slot(handle: int | worker_lifecycle.LockFileDescriptor, *, deadline: float) -> None:
+                    try:
+                        retirement.submit(unregister).result(timeout=5)
+                    except TimeoutError:
+                        self.fail("retirement could not unregister its mirror before releasing the staff slot")
+                    self.assertFalse(copies.remote_record_path(retiring).exists())
+                    fcntl.flock(slot, fcntl.LOCK_UN)
+                    acquire(handle, deadline=deadline)
+
+                with (copies.remote_lease(publishing),
+                      mock.patch.object(worker_lifecycle, "acquire_flock", side_effect=wait_for_slot) as wait):
+                    copies.register_remote(publishing)
+                wait.assert_called_once()
+            self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(publishing)), publishing)
+            copies.unregister_remote(publishing.host, publishing.path)
+
+        before = self.staff_file.read_bytes()
+        with self.subTest(scenario="unit name contains a colon"), staff.slot_operation(unit.id, unit.name), self.machine("mac"):
+            busy = staff.remove_retired_unit(unit, origin)
+            self.assertEqual(self.staff_file.read_bytes(), before)
+            self.assertIsInstance(busy, staff.RetiredUnitRemovalRefused)
+            assert isinstance(busy, staff.RetiredUnitRemovalRefused)
+            self.assertEqual(busy.reason, staff.RetiredUnitRemovalFailure.MEMBER_BUSY)
+            self.assertIn(unit.name, busy.detail)
+
+        with self.machine("mac"):
+            removed = staff.remove_retired_unit(unit, origin)
+            record = staff.authority_snapshot()
+            self.assertIsNone(record.by_id(unit.id), removed)
+            self.assertIsNone(record.by_id(worker.id))
+            self.assertIn(unit.id, record.retirement_cleanup)
+            self.assertIsInstance(removed, staff.RetiredUnitRemoved)
+            assert isinstance(removed, staff.RetiredUnitRemoved)
+            receipt = removed.cleanup
+            self.assertEqual(record.retirement_cleanup[unit.id], receipt)
+            self.assertEqual(receipt.machine, "natedev")
+            self.assertCountEqual(receipt.members, (unit.id, worker.id))
+            self.assertCountEqual(receipt.sessions, (unit.current_session, worker.current_session))
+            self.assertEqual(receipt.parent, parent.id)
+            self.assertEqual(staff.remove_retired_unit(unit, origin), removed)
+            for identity in (unit.id, worker.id, worker.current_session):
+                with self.subTest(identity=identity):
+                    with self.assertRaisesRegex(staff.StaffRefused, "copy cleanup is pending"):
+                        _ = staff.ensure("unit", name="replacement", parent=staff.ReportsTo(parent.id), runtime_id=identity)
+                    with self.assertRaisesRegex(staff.StaffRefused, "copy cleanup is pending"):
+                        _ = staff.update_current_session(parent.current_session, identity)
+            staff.finish_unit_retirement(unit.id, "0" * 32)
+            self.assertEqual(staff.authority_snapshot().retirement_cleanup[unit.id], receipt)
+
+        mirror = copies.RemoteMirror(unit.id, copies.SelectedRepository("models"), "mac", "models/mirror", "fixture")
+        with self.assertRaisesRegex(copies.CopyError, "copy cleanup pending"):
+            copies.register_remote(mirror)
+        self.assertEqual(copies.owned_remote_mirrors(unit.id), [])
+        dashless = replace(mirror, owner=unit.id.replace("-", ""))
+        with self.subTest(owner="the same reserved UUID without dashes"):
+            with self.assertRaisesRegex(copies.CopyError, "copy cleanup pending"):
+                copies.register_remote(dashless)
+            self.assertEqual(copies.owned_remote_mirrors(unit.id), [])
+        staff.finish_unit_retirement(unit.id, receipt.token)
+        self.assertNotIn(unit.id, staff.authority_snapshot().retirement_cleanup)
+        with self.assertRaisesRegex(copies.CopyError, "copy owner is absent"):
+            copies.register_remote(mirror)
+        replacement = staff.ensure("unit", name="replacement", parent=staff.ReportsTo(parent.id), runtime_id=unit.id)
+        self.assertEqual(replacement.id, unit.id)
+        with self.subTest(owner="selection uses both spellings of the UUID"):
+            copies.register_remote(dashless)
+            self.assertEqual(copies.owned_remote_mirrors(unit.id), copies.owned_remote_mirrors(dashless.owner))
+            self.assertEqual([saved.path for saved in copies.owned_remote_mirrors(unit.id)], [mirror.path])
+        self.assertEqual(staff.update_current_session(parent.current_session, worker.current_session).current_session,
+                         worker.current_session)
 
     def test_pending_retirement_keeps_ids_and_edges_and_waits_for_workers_and_known_locations(self) -> None:
         runner = self.retirement_document(fixture_member("showrunner", name="sdlc"), self.root / "doc.md")

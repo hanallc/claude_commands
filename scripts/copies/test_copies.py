@@ -744,6 +744,72 @@ source_check_seconds=1
         self.assertTrue(checkout.is_dir())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
 
+        with self.subTest(holder="retired explicit owner"):
+            folder = scratch.target("gate:camera", "retired-owner").parent
+            before = set(folder.iterdir())
+            missing_owner = "00000000-0000-4000-8000-000000000001"
+            refused = self.cli(*arguments, "--name", "retired-owner", "--owner", missing_owner)
+            self.assertEqual(set(folder.iterdir()), before, refused.stderr)
+            self.assertNotEqual(refused.returncode, 0, refused.stdout)
+            self.assertIn("copy owner is absent from staff", refused.stderr)
+
+        with self.subTest(holder="implicit Mac clone has a natedev owner"):
+            from scripts.agents import remote
+
+            row = staff.by_id(staff.StaffId(self.owner_id))
+            assert row is not None
+            staff_file = Path(os.environ["STAFF_FILE"])
+            saved = staff_file.read_bytes()
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source), expected=row.worktree)
+            try:
+                with mock.patch.object(remote, "local_machine", return_value="mac"):
+                    result = self.cli(*arguments, "--name", "peer-owner")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((Path(result.stdout.strip()) / "tracked.txt").read_text(), "source HEAD\n")
+            finally:
+                _ = staff_file.write_bytes(saved)
+
+        for explicit in (True, False):
+            with self.subTest(holder="owner disappears during clone", explicit=explicit):
+                staff_file = Path(os.environ["STAFF_FILE"])
+                saved = staff_file.read_bytes()
+                initialize = copies.initialize_git
+                created: list[Path] = []
+
+                def retire_during_clone(path: Path, source: Path) -> None:
+                    initialize(path, source)
+                    created.append(path)
+                    _ = staff_file.write_text('{"schema": 2, "rows": []}\n')
+
+                try:
+                    with mock.patch.object(copies, "initialize_git", side_effect=retire_during_clone):
+                        result = self.cli(*arguments, "--name", "owner-lost",
+                                          *(("--owner", self.owner_id) if explicit else ()))
+                finally:
+                    _ = staff_file.write_bytes(saved)
+                (created_path,) = created
+                self.assertEqual((created_path / "tracked.txt").read_text(), "source HEAD\n")
+                self.assertIsInstance(scratch.task_of(created_path), copy_record.Registered)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("copy owner is absent from staff", result.stderr)
+                self.assertIn(f"localhost:{created_path}", result.stderr)
+
+        dashless = self.owner_id.replace("-", "")
+        partly_dashed = self.owner_id.replace("-", "", 1)
+        for maker_owner, caller_owner in ((self.owner_id, dashless), (dashless, self.owner_id),
+                                          (partly_dashed, self.owner_id), (partly_dashed, partly_dashed)):
+            with self.subTest(maker=maker_owner, caller=caller_owner), \
+                    tempfile.TemporaryDirectory(prefix="clone-spelling-", dir=checkout.parent) as directory, \
+                    mock.patch.dict(os.environ, {copy_record.ROOT_ENV: directory}):
+                with self.clone_lease_fixture(Path(directory), maker_owner, "fixture", [], second=False) as (maker, trees):
+                    assert maker.stdin is not None
+                    maker.stdin.close()
+                    self.assertEqual(maker.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                    result = self.cli(*arguments, "--name", "new-clone", "--owner", caller_owner)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("The holder ended for these clones.", result.stderr)
+                    self.assertIn(str(trees[0]), result.stderr)
+
         for holder in ("gone", "implicit owner", "live", "registration exited", "another owner",
                        "another host", "reused", "unreadable", "malformed start", "replaced clone",
                        "protected checkout", "wrong clone path", "invalid repository", "same owner replacement",
