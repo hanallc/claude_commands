@@ -342,7 +342,6 @@ names.suffix_length=8
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system={self.root / 'system'}
-roots.gate={self.root / 'gates'}
 roots.build={self.root / 'build'}
 roots.temporary=${{TMPDIR}}/builds
 roots.scratch={self.root / 'scratch'}

@@ -315,6 +315,8 @@ class ProtocolTests(unittest.TestCase):
                     expected = json.dumps({"v": wire.VERSION, "type": name,
                         "data": codec.snapshot_value(reply)}, separators=(",", ":"),
                         ensure_ascii=False, allow_nan=False) + "\n"
+                    # Older replies omit the field when the step has no gate targets.
+                    expected = expected.replace(',"gate_targets":null', "")
                     self.assertEqual(wire.encode_reply(reply), expected)
                     self.assertEqual(wire.parse_reply(expected), reply)
             self.assertIsInstance(grant, wire.Admitted)

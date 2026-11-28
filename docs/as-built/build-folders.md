@@ -321,7 +321,19 @@ On natedev it also reads the Mac list over SSH. When SSH fails, the command show
 The Mac slot folder is list-only. Bob handles its removal by hand.
 `/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
 
-The command lists each direct entry under `roots.gate`.
+Gate suites use `<build root>/test-runs/<repo>/<unit>/<copy>` for numbered copies.
+Worktrees use their output name in place of the copy number.
+The main checkout uses `<build root>/test-runs/<repo>/main`.
+The Mac Linux guest gate uses `/build/test-runs/<repo>/<unit>/<copy>`.
+The guest runner reads `roots.gate.mac-linux` by its exact key. Bubblewrap binds the parent at the same path.
+Direct tests on a guest numbered copy use `<copy>/target/test-runs`.
+A gate without a modeled checkout uses `$TMPDIR/gate-test-runs`. Direct tests use `$TMPDIR/test-runs`.
+Both routes reuse the temporary root when `DEVTOOLS_TEST_RUN_FOLDER` matches a `TMPDIR` run directly under either parent.
+The native Mac gate uses `/private/tmp` until it has a fixed build folder.
+The gate keeps the folders and recovery records of earlier runs.
+The next process’s first socket allocation sweeps unlocked entries in `test-sockets` (`scripts/lib/socket_test_support.py`, `socket_parent`).
+
+The command lists each direct entry under the legacy root `roots.gate`.
 The list shows `t-` and `targeted-test-` rows first.
 A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
 The newest time includes the lock and lease files.

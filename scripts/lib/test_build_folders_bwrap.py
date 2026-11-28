@@ -22,6 +22,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import build_folders, removal_guard
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.process_start import Gone, Started, Unreadable, proc_table_start
 from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox, mac_profile
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_OUTSIDE
@@ -417,6 +418,7 @@ class ToolFolderRemovalTests(ToolFolderRemovalFixture):
         assert bubblewrap is not None
         templates = " ".join(str(candidate.parents[2].joinpath(*form.value)) for form in removal_guard.Form)
         config = sandbox.host_path(sandbox.home / "config" / "build_folders.conf")
+        write_private_build_roots(config, sandbox.fixture, "natedev")
         key = "removal.path_templates.natedev"
         source, replaced = re.subn(rf"(?m)^{re.escape(key)}=.*$", f"{key}={templates}", config.read_text())
         self.assertEqual(replaced, 1)

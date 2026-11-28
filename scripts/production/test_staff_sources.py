@@ -283,7 +283,7 @@ class StaffSourcesTests(StaffTestCase):
 
 
     def assert_no_system_inputs(self, inputs: list[str]) -> None:
-        # The test's own temp root may sit under /dev/shm (the gate sets TMPDIR there).
+        # The gate can set TMPDIR to a folder inside test-runs.
         root = f"{self.root}/"
         for path in inputs:
             if path.startswith(root):

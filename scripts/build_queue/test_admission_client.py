@@ -31,7 +31,7 @@ from scripts.message import roster
 from scripts.message.session_send import session_send_argv
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
-from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.socket_test_support import OUTAGE_DAEMON_SOCKET_LEAF, short_socket_directory, socket_address
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
@@ -532,11 +532,11 @@ class ClientTests(unittest.TestCase):
                 executable = binaries / name
                 _ = executable.write_text("#!/bin/sh\nexit 0\n")
                 executable.chmod(0o755)
-            home = root / "home"
-            daemon_home = home / ".codex"
+            address = socket_address(root, OUTAGE_DAEMON_SOCKET_LEAF)
+            daemon_home = address.parent.parent
+            home = daemon_home.parent
             notes = root / "notes"
             write_codex_account(daemon_home, notes, "codex1")
-            address = daemon_home / "app-server-control/control.sock"
             address.parent.mkdir()
             sessions = root / "sessions"
             sessions.mkdir()

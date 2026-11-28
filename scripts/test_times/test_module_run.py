@@ -291,7 +291,7 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     _ = (folder / "test_fixture.py").write_text(textwrap.dedent(source), encoding="utf-8")
     output = root / f"{name}.json"
     _ = output.write_text("stale output\n", encoding="utf-8")
-    env = dict(os.environ)
+    env = direct_test_fixture_environment(root)
     for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS", "TEST_SENDER_GUARD"):
         _ = env.pop(key, None)
     temporary = root / f"{name}_temporary"
@@ -804,7 +804,7 @@ class ModuleRunnerTests(unittest.TestCase):
         folder.mkdir()
         _ = (folder / "test_boundaries.py").write_text(DISCOVERY_BOUNDARIES, encoding="utf-8")
         cls.discovery_output = root / "discovery.json"
-        env = {**os.environ, "TEST_TIMES_OUT": str(cls.discovery_output),
+        env = {**direct_test_fixture_environment(root), "TEST_TIMES_OUT": str(cls.discovery_output),
                "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1"}
         env["PYTHONPATH"] = os.pathsep.join((str(root), str(folder)))
@@ -969,7 +969,8 @@ shutil.rmtree(path)""", []),
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
             _ = (outside / "outside.txt").write_text("fixture\n")
-            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
+            environment = {**direct_test_fixture_environment(outside), "HOME": str(outside / "home"),
+                           "PYTHONPATH": str(library / "python_startup"),
                            "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
             for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
                 _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
@@ -1219,7 +1220,7 @@ class FixtureCPU(unittest.TestCase):
                 + "        self.assertNotIn('test_package_name', sys.modules)\n"
                 + "        self.assertEqual(sibling.VALUE, 42)\n", encoding="utf-8")
             output = root / "times.json"
-            environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(folder), str(root))),
+            environment = {**direct_test_fixture_environment(root), "PYTHONPATH": os.pathsep.join((str(folder), str(root))),
                            "TEST_TIMES_OUT": str(output)}
             for working_directory in (root, folder, Path("/home")):
                 with self.subTest(case="package name", cwd=working_directory):
@@ -1448,10 +1449,8 @@ class InheritedSignal(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
 """,
             encoding="utf-8")
-        environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+        environment = {**direct_test_fixture_environment(root), "HOME": str(root / "home"),
                        "BUILDLOG_DIR": str(root / "buildlog")}
-        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
-            _ = environment.pop(name, None)
         environment["PYTHONPATH"] = str(root)
         launcher = ("import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
                     "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])")

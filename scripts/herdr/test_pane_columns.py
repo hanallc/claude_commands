@@ -4,13 +4,13 @@ from __future__ import annotations
 import json
 import os
 import socket
-import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts.herdr import herdr
+from scripts.lib.socket_test_support import short_socket_directory
 
 LAYOUT = {"result": {"type": "pane_layout", "layout": {"panes": [
     {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0, "width": 88, "height": 40}},
@@ -22,7 +22,7 @@ class PaneColumnsTests(unittest.TestCase):
 
     def serve(self, reply: bool) -> Path:
         """Answer one pane.layout request on a socket, or hold it without a reply."""
-        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        folder = Path(self.enterContext(short_socket_directory()))
         path = folder / "herdr.sock"
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(server.close)
