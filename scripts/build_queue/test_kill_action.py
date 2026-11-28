@@ -771,6 +771,12 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             raise
 
     def test_kill_leaves_the_live_supervisor_to_finish_the_record(self) -> None:
+        self.check_live_supervisor_completion(finish_during_stop=False)
+
+    def test_kill_reads_the_result_when_the_supervisor_finishes_during_stop(self) -> None:
+        self.check_live_supervisor_completion(finish_during_stop=True)
+
+    def check_live_supervisor_completion(self, *, finish_during_stop: bool) -> None:
         path, supervisor, connection = self.launch_live_run(
             detached_runs.DirectorCaller("impl3", staff.StaffId("fixture")))
         target, events = self.live_target(path)
@@ -784,14 +790,27 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             self.assertEqual(connection.recv(1), b"")
             _ = events.write_text("populated 0\n")
 
+        request_stop = kill_action.request_stop
+
+        def stop_and_finish(action: kill_action.SavedKillAction) -> bool:
+            requested = request_stop(action)
+            # The stop releases the slice lock before the supervisor finishes.
+            self.assertEqual(supervisor.wait(TEST_HANG_GUARD_SECS), 0, path.with_suffix(".log").read_text())
+            return requested
+
         with (patch.object(kill_action, "live_targets", return_value={reference: target}),
               patch.object(kill_action, "stop_route", return_value=target.route),
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(process_stop, "_term_slice", side_effect=term) as stopped,
               patch.object(detached_runs, "reap_orphan") as reaped,
+              patch.object(kill_action, "request_stop", new=stop_and_finish) if finish_during_stop else nullcontext(),
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as sent):
             offers, _ = actions.options(15)
-            _ = actions.stop(reference, offers[reference]["handle"], "")
+            outcome = actions.stop(reference, offers[reference]["handle"], "")
+            if finish_during_stop:
+                assert isinstance(outcome, dict)
+                self.assertEqual((outcome["stop"], outcome["delivery"]),
+                                 (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
             self.assertEqual(supervisor.wait(TEST_HANG_GUARD_SECS), 0, path.with_suffix(".log").read_text())
             record = worker_lifecycle.read_json_object(path)
             self.assertEqual((record["status"], record["exit_code"]), ("finished", 128 + signal.SIGTERM))
