@@ -26,7 +26,7 @@ If Send loses its reply, reopen New item in the same tab. Select Retry to recove
    Use the current year if the start omits the year.
    `/new_item scheduled natedev Check the account predictions. Start Mon Nov 30 09:00. Repeat every 2 weeks on Monday and Thursday.`
 4. On exit 0 for `scheduled`, show the filing receipt and any notice warning. Then stop.
-   For other types, send nate the output as is. With an extra, add one line that says how you read it. Then do step 8.
+   For other types, send nate the filing receipt. With an extra, add one line that says how you read it. Then do step 8.
    The Review item is saved if the output says "no List item exists" or "exists without its Review link".
    A second run files a second item. Do not run the CLI again.
 5. Exit 3: the output asks which producer. Nothing is filed. Send nate the output as is and wait for his answer. Save it with his exact words:
@@ -36,3 +36,5 @@ If Send loses its reply, reopen New item in the same tab. Select Retry to recove
 7. Exit 1 or 2: show nate the error line and stop.
 8. If the result line says "this session", do the work now. Send no "On deck" line.
    Else go back to the open point. Name it in one full sentence, in nate's words. Ask one question with one answer word, for example: Say "show it". Do not repeat the choice words of an item that is not on the screen.
+
+The owner receives the private reply command through Review delivery. Keep it in the owner session.

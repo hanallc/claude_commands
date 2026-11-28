@@ -71,11 +71,13 @@ def filter_facets(fields: Mapping[str, str]) -> tuple[FilterFacet, ...]:
 
 def count_filter_row(facets: tuple[FilterFacet, ...], data: Mapping[str, str],
                      selected: Mapping[str, str], counts: Mapping[str, Counter[str]], *,
-                     staff_filters: tuple[str, ...]) -> bool:
-    """Count an eligible row for every facet and return whether it matches."""
+                     staff_filters: tuple[str, ...], count_eligible: bool = True) -> bool:
+    """Return whether the row matches the facets. Count it if eligible."""
     excluded = sum(bit for name, field, bit, _ in facets
                    if (choice := selected.get(name)) and choice != data[field]
                    and (name != "show" or choice != "all"))
+    if not count_eligible:
+        return not excluded
     for name, field, _, count_mask in facets:
         if excluded & count_mask:
             continue
@@ -88,7 +90,7 @@ def count_filter_row(facets: tuple[FilterFacet, ...], data: Mapping[str, str],
 
 
 OWNER_QUERY_KEYS = ("owner", "showrunner")
-LIST_QUERY_FIELDS = ("show", "unread", *OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
+LIST_QUERY_FIELDS = ("show", "unread", *OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state", "tag")
 
 
 def identity_attribute(value: str) -> str:
@@ -306,7 +308,7 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 .list-panel a,.list-counts a{color:var(--accent)}.list-panel ol.list-log{list-style:none;padding:0;font-size:13px}
 .list-log-panel{contain:size;display:flex;flex-direction:column;min-width:0;min-height:0}
 .list-log-panel h3{flex:none}
-.list-log-scroll{min-height:0;overflow-y:auto}
+.list-log-scroll{min-height:0;overflow-y:auto;scrollbar-color:var(--ink-3) transparent}
 .list-log-scroll .list-log{margin-bottom:0}
 .list-log li{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .list-log time,.list-log small{color:var(--ink-3)}.list-log small{display:inline;font-size:inherit}
@@ -1042,9 +1044,23 @@ function filterSelection(name){
   };
  }
  const control=content.querySelector('#list-'+name);
- return {
+ if(control.matches('input[type="checkbox"]')) return {
   set(value){control.checked=value===control.value;return control.checked ? control.value : '';},
   bind(change){control.addEventListener('change',()=>change(control.checked ? control.value : ''));}
+ };
+ const attribute='data-'+name+'-chip';
+ return {
+  set(value){
+   for(const button of control.querySelectorAll('['+attribute+']'))
+    button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value));
+   return value;
+  },
+  bind(change){
+   control.addEventListener('click',event=>{
+    const button=event.target.closest('['+attribute+']');
+    if(button) change(button.getAttribute(attribute));
+   });
+  }
  };
 }
 function placeParams(){

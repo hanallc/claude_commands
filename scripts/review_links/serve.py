@@ -32,7 +32,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Literal, NamedTuple, NotRequired, TypedDict, cast, override
-from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
 
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
@@ -43,7 +43,7 @@ from scripts.build_queue import admission_client, admission_protocol as admissio
 from scripts.lib import atomic_file, conf, scratch, session_folder
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
-from scripts.production import change_routing, change_review, record_store, staff, the_list, tidy_wrapped
+from scripts.production import change_routing, change_review, investigation, record_store, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
@@ -53,7 +53,8 @@ from scripts.whoami import usage_store
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 # Allow page state and rows in addition to the existing words and image budget.
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
-                     + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
+                     + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES
+                     + new_item_dialog.MAX_LIVE_CAPTURE_BASE64_LENGTH)
 QUEUE_MOVE_PATH = "/console/builds/queue-move"
 # A send to one of these pages, or to a change browser, can wait for Undo. The largest is a New item with its images.
 HELD_SEND_PATHS = frozenset((review_page.PAGE_PATH, list_page.PAGE_PATH, studio_page.PAGE_PATH,
@@ -115,17 +116,17 @@ def published_console_page(root: Path, path: str) -> str:
 
 
 CONSOLE_DOCUMENTS = {
-    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
+    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "studio",
     review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
-    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
+    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "studio",
 }
 
-# Each List view answers its page, its item-state reads and its item actions at its own path.
-LIST_VIEWS = {view.path: view for view in (list_page.LIST_VIEW, studio_page.STUDIO_VIEW)}
+# Keep the old action path for open tabs and held sends.
+LIST_ACTION_PATHS = frozenset((list_page.PAGE_PATH, studio_page.PAGE_PATH))
 
 
 def capture_page_key(root: Path, place: str) -> str:
-    """Identify a console document that Firefox can open."""
+    """Identify the console document that supplied the snapshot."""
     route = urlsplit(place)
     if route.netloc or route.scheme:
         return ""
@@ -135,16 +136,9 @@ def capture_page_key(root: Path, place: str) -> str:
     return key
 
 
-def deferred_capture_request(root: Path, page: str, value: object
-                             ) -> new_item_dialog.PageCaptureRequest | new_item_dialog.UnavailableCapture:
-    """Check if the saved item can get a screenshot."""
-    try:
-        request = new_item_dialog.read_page_capture(value)
-        if capture_page_key(root, request.place) == page:
-            return request
-    except ValueError:
-        pass
-    return new_item_dialog.UnavailableCapture.UNAVAILABLE
+def capture_matches_page(root: Path, place: str, page: str) -> bool:
+    """Match a capture to its page, including old List requests."""
+    return capture_page_key(root, place) == ("studio" if page == "list" else page)
 
 
 def owned_document(content: bytes, page: str) -> bytes:
@@ -174,11 +168,104 @@ def gzip_content(content: bytes) -> bytes:
 _cached_gzip_content = lru_cache(maxsize=8)(gzip_content)
 
 
-def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCaptureRequest) -> bytes:
-    """Capture the console page in a clean Firefox profile."""
+_LAYOUT_CAPTURE = """
+function prepare(snapshot, source, depth = 0) {
+ const captured = new DOMParser().parseFromString(snapshot, 'text/html');
+ captured.querySelectorAll('script,base,meta[http-equiv],frame,object,embed,template,link:not([rel~="stylesheet"])')
+  .forEach(node => node.remove());
+ const base = captured.createElement('base');
+ base.href = source;
+ captured.head.prepend(base);
+ for (const frame of captured.querySelectorAll('iframe')) {
+  const document = frame.getAttribute('srcdoc');
+  const path = frame.dataset.captureFramePath;
+  frame.removeAttribute('src');
+  frame.removeAttribute('srcdoc');
+  if (!document || !path || depth >= 3) continue;
+  let address;
+  try { address = new URL(path, source); } catch (_) { continue; }
+  if (address.origin !== new URL(source).origin) continue;
+  frame.setAttribute('sandbox', 'allow-same-origin');
+  frame.removeAttribute('loading');
+  frame.srcdoc = prepare(document, address.href, depth + 1);
+ }
+ return '<!doctype html>' + captured.documentElement.outerHTML;
+}
+
+function layout(frame, main = false) {
+ const view = frame.contentWindow, doc = frame.contentDocument;
+ if (!doc) return;
+ if (main) {
+  const background = view.getComputedStyle(doc.body).backgroundColor;
+  frame.style.backgroundColor = background === 'rgba(0, 0, 0, 0)'
+   ? view.getComputedStyle(doc.documentElement).backgroundColor : background;
+  doc.documentElement.style.setProperty('scrollbar-color', 'transparent transparent');
+ }
+ const position = element => (element.dataset.captureScroll ?? '0 0').split(' ').map(Number);
+ const restore = () => {
+  for (const element of doc.querySelectorAll('[data-capture-scroll]')) {
+   if (element === doc.documentElement) continue;
+   const [left, top] = position(element);
+   element.scrollTo({left, top, behavior:'instant'});
+  }
+  const [left, top] = position(doc.documentElement);
+  view.scrollTo({left, top, behavior:'instant'});
+ };
+ const windows = [...doc.querySelectorAll('dialog[data-capture-modal][open]')];
+ windows.sort((first, second) => first.dataset.captureModal - second.dataset.captureModal);
+ for (const dialog of windows) {
+  dialog.removeAttribute('open');
+  dialog.showModal();
+ }
+ for (const input of doc.querySelectorAll('input[data-capture-indeterminate]')) input.indeterminate = true;
+ for (const child of doc.querySelectorAll('iframe[srcdoc]')) layout(child);
+ restore();
+ void doc.fonts.ready.then(restore);
+}
+
+function restoreFocus(frame) {
+ const target = frame.contentDocument?.querySelector('[data-capture-focus]');
+ if (!target) return;
+ target.focus({preventScroll:true, focusVisible:target.dataset.captureFocus === 'visible'});
+ if (target.matches('iframe[srcdoc]')) restoreFocus(target);
+}
+
+const frame = document.createElement('iframe');
+frame.setAttribute('sandbox', 'allow-same-origin');
+frame.addEventListener('load', () => {
+ layout(frame, true);
+ restoreFocus(frame);
+}, {once:true});
+frame.srcdoc = prepare(snapshot, source);
+document.body.append(frame);
+"""
+
+def _capture_markup(base: str, snapshot: str, dark: bool) -> str:
+    """Keep the supplied document in a frame that cannot run scripts."""
+    address = urlsplit(base)
+    origin = f"{address.scheme}://{address.netloc}"
+    nonce = secrets.token_urlsafe(16)
+    policy = (f"default-src 'none'; script-src 'nonce-{nonce}'; base-uri {origin}; "
+              f"img-src {origin} data:; font-src {origin} data:; style-src {origin} 'unsafe-inline'; "
+              "frame-src 'self'; form-action 'none'")
+    source, document = (json.dumps(value).replace("<", "\\u003c") for value in (base, snapshot))
+    theme = "dark" if dark else "light"
+    return ('<!doctype html><meta charset="utf-8">'
+            f'<meta name="color-scheme" content="{theme}">'
+            f'<meta http-equiv="Content-Security-Policy" content="{html.escape(policy)}">'
+            '<style>body{margin:0}iframe{display:block;width:100vw;height:100vh;border:0}</style>'
+            f'<body><script nonce="{nonce}">const source={source},snapshot={document};'
+            f'{_LAYOUT_CAPTURE}</script>')
+
+
+def page_screenshot(firefox: str, base: str, capture: new_item_dialog.LivePageCapture) -> bytes:
+    """Render the live snapshot at its original viewport size."""
+    request = capture.request
     with tempfile.TemporaryDirectory(prefix="console-capture-") as folder:
         profile = Path(folder)
         output = profile / "page.png"
+        document = profile / "page.html"
+        _ = document.write_text(_capture_markup(base, capture.document, request.dark), encoding="utf-8")
         theme = int(request.dark)
         _ = (profile / "user.js").write_text(
             f'user_pref("ui.systemUsesDarkTheme", {theme});\n'
@@ -186,7 +273,7 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
             + 'user_pref("ui.prefersReducedMotion", 1);\n'
             + 'user_pref("network.proxy.type", 0);\n', encoding="utf-8")
         run_process_group([firefox, "--headless", "--no-remote", "--profile", folder,
-                           "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
+                           "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), document.as_uri()],
                           timeout=15).check_returncode()
         with output.open("rb") as stream:
             image = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
@@ -205,12 +292,12 @@ PAGE_ATTACHMENT_RETRY_SECONDS = 5
 
 @dataclass(frozen=True)
 class PageCapturePending:
-    request: new_item_dialog.PageCaptureRequest
+    capture: new_item_dialog.LivePageCapture
 
 
 @dataclass(frozen=True)
 class PageCaptureToResume:
-    request: new_item_dialog.PageCaptureRequest
+    capture: new_item_dialog.LivePageCapture
 
 
 class NoPageCaptureToResume(Enum):
@@ -284,7 +371,12 @@ class PageCaptures:
                             | new_item_dialog.FiledPageScreenshot | UnavailableBoundCapture)
                     match values.get("kind"):
                         case "pending":
-                            state = PageCaptureToResume(new_item_dialog.read_page_capture(values.get("request")))
+                            request = new_item_dialog.read_page_capture(values.get("request"))
+                            document = stream.read(new_item_dialog.MAX_LIVE_CAPTURE_DOCUMENT_BYTES + 1)
+                            if len(document) > new_item_dialog.MAX_LIVE_CAPTURE_DOCUMENT_BYTES or not document.strip():
+                                raise ValueError("Invalid saved live page.")
+                            capture = new_item_dialog.LivePageCapture(request, document.decode("utf-8"))
+                            state = PageCaptureToResume(capture)
                         case "ready":
                             viewport = new_item_dialog.read_capture_viewport(values.get("viewport"))
                             png = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
@@ -325,11 +417,12 @@ class PageCaptures:
             target = capture.target
             header["target"] = new_item_dialog.submission_key(
                 target.kind, target.recipient_id, target.item_id, target.request_id)
-        png = b""
+        payload = b""
         match state:
-            case PageCapturePending(request) | PageCaptureToResume(request):
-                header.update(kind="pending", request=asdict(request))
-            case new_item_dialog.PageScreenshot(png, viewport):
+            case PageCapturePending(live) | PageCaptureToResume(live):
+                header.update(kind="pending", request=asdict(live.request))
+                payload = live.document.encode("utf-8")
+            case new_item_dialog.PageScreenshot(payload, viewport):
                 header.update(kind="ready", viewport=asdict(viewport))
             case new_item_dialog.FiledPageScreenshot(digest):
                 header.update(kind="filed", digest=digest)
@@ -340,7 +433,7 @@ class PageCaptures:
                 return
         try:
             self._folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-            atomic_file.write_bytes_atomic(self._folder / key, json.dumps(header).encode() + b"\n" + png, mode=0o600)
+            atomic_file.write_bytes_atomic(self._folder / key, json.dumps(header).encode() + b"\n" + payload, mode=0o600)
         except OSError as error:
             print(f"review-links page capture save: {error}", file=sys.stderr)
 
@@ -364,12 +457,12 @@ class PageCaptures:
         with self._lock:
             self._expire()
 
-    def start(self, request: new_item_dialog.PageCaptureRequest) -> str:
+    def start(self, capture: new_item_dialog.LivePageCapture) -> str:
         """Reserve space for a dialog capture."""
         key = secrets.token_hex(16)
-        return key if self.reserve(key, request) is CaptureReservation.STARTED else ""
+        return key if self.reserve(key, PageCapturePending(capture)) is CaptureReservation.STARTED else ""
 
-    def reserve(self, key: str, request: new_item_dialog.PageCaptureRequest) -> CaptureReservation:
+    def reserve(self, key: str, pending: PageCapturePending | PageCaptureToResume) -> CaptureReservation:
         """Reserve one worker for the key from the dialog."""
         with self._lock:
             self._expire()
@@ -379,7 +472,7 @@ class PageCaptures:
                 capture.state, (new_item_dialog.FiledPageScreenshot, UnavailableBoundCapture)))
             if active >= MAX_PAGE_CAPTURES:
                 return CaptureReservation.FULL
-            capture = self._sessions[key] = PageCapture(time.time() + PAGE_CAPTURE_TTL_SECONDS, PageCapturePending(request))
+            capture = self._sessions[key] = PageCapture(time.time() + PAGE_CAPTURE_TTL_SECONDS, pending)
             self._save(key, capture)
             return CaptureReservation.STARTED
 
@@ -390,14 +483,15 @@ class PageCaptures:
             return capture.target if capture is not None else new_item_dialog.NoBoundCaptureTarget.UNBOUND
 
     def bind(self, key: str, submitted_draft_id: str,
-             target: new_item_dialog.ScopedSubmissionKey) -> new_item_dialog.SubmissionScreenshot:
+             target: new_item_dialog.ScopedSubmissionKey
+             ) -> new_item_dialog.SubmissionScreenshot | UnavailableBoundCapture:
         """Keep the item with the capture so the worker can attach the screenshot."""
         if not new_item_dialog.capture_key_matches_draft(key, submitted_draft_id):
             raise record_store.SubmissionConflict("The screenshot belongs to another draft.")
         with self._lock:
             capture = self._active(key)
             if capture is None:
-                return new_item_dialog.NO_PAGE_SCREENSHOT
+                return UnavailableBoundCapture.UNAVAILABLE
             if capture.target not in (new_item_dialog.NoBoundCaptureTarget.UNBOUND, target):
                 raise record_store.SubmissionConflict("This screenshot belongs to another item.")
             if capture.target is new_item_dialog.NoBoundCaptureTarget.UNBOUND:
@@ -465,7 +559,7 @@ class PageCaptures:
             if capture is None or not isinstance(capture.state, PageCaptureToResume):
                 return NoPageCaptureToResume.ABSENT
             resume = capture.state
-            capture.state = PageCapturePending(resume.request)
+            capture.state = PageCapturePending(resume.capture)
             return resume
 
     def discard(self, key: str) -> None:
@@ -1455,6 +1549,12 @@ class ReviewSaveFailureFields(TypedDict):
     bug: NotRequired[FiledReviewSaveBug]
 
 
+def words_delivery_result(outcome: change_page.DeliveryOutcome) -> dict[str, object]:
+    state = ("delivered" if isinstance(outcome, change_page.DeliveryConfirmed) else
+             "failed" if isinstance(outcome, change_page.FailedDelivery) else "unconfirmed")
+    return {"words_receipt": True, "words_delivery": state, **held_delivery_result(outcome)}
+
+
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
 
@@ -1463,9 +1563,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         root = server.root
         route = urlsplit(self.path)
-        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
+        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query in ("page=studio", "page=list")
         held = route.path.startswith(send_hold.HOLD_PATH + "/")
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options and not held:
+        fixture_page = route.path in LIST_ACTION_PATHS or route.path.startswith(f"{studio_page.AVATAR_PATH}/")
+        if server.mode is ServerMode.LIST_FIXTURE and not fixture_page and not fixture_options and not held:
             self.send_error(404)
             return None
         if held:
@@ -1570,8 +1671,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 else:
                     filters = parse_qs(route.query, keep_blank_values=True)
                     show = filters.get('show', filters.get('state', ['open']))[0]
-                    kind = filters.get('type', [''])[0]
-                    content = snapshot.render(show=show or 'open', kind=kind)
+                    content = snapshot.render(show=show or 'open')
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
@@ -1580,8 +1680,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             prepared = snapshot.page_gzip if content is snapshot.page and owned is content else b""
             self.encoded_response(200, owned, "text/html; charset=utf-8", {}, prepared, cache_gzip=True)
             return None
-        if route.path in LIST_VIEWS:
-            self.list_document(route.query, LIST_VIEWS[route.path])
+        if route.path in LIST_ACTION_PATHS:
+            self.list_document(route.path, route.query)
             return None
         if route.path.startswith(f"{studio_page.AVATAR_PATH}/"):
             return self.studio_avatar(route.path.removeprefix(f"{studio_page.AVATAR_PATH}/"))
@@ -1809,7 +1909,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
         route = urlsplit(self.path)
-        if (server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH
+        if (server.mode is ServerMode.LIST_FIXTURE and route.path not in LIST_ACTION_PATHS
                 and not route.path.startswith(send_hold.HOLD_PATH + "/")):
             self.send_error(404)
             return
@@ -1880,9 +1980,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == investigations_page.PAGE_PATH:
             self._write_post(self.investigation_post)
             return
-        if route.path in LIST_VIEWS:
-            view = LIST_VIEWS[route.path]
-            self._write_post(lambda: self.list_post(view))
+        if route.path in LIST_ACTION_PATHS:
+            self._write_post(self.list_post)
             return
         if route.path == go_ledger.GO_PATH:
             self._write_post(self.go_post)
@@ -1946,7 +2045,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 location = change_page.publish_next(page, body)
                 self.redirect(location)
                 return
-            delivery = change_page.submit(page, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery = change_page.submit(page, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.failed_answer(page, body, 503, "The verdict was written. Durability is unconfirmed.", error)
@@ -2031,7 +2131,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if length <= 0:
                 raise ValueError("empty answer")
             body = self.rfile.read(length).decode("utf-8")
-            delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.browser_failure(503, "The verdict was written. Durability is unconfirmed.", error)
@@ -2279,9 +2380,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                          valid_token: bool, claims: ExitStack) -> None:
         try:
             draft = fields.get("request_id")
-            list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
+            list_page_request = new_item_dialog.is_list_submission_page(fields.get("page"))
+            list_draft_id = (draft if list_page_request and isinstance(draft, str)
                              and review_submissions.is_draft_id(draft) else "")
-            browser_draft = fields.get("page") != "list" and review_submissions.is_draft_id(draft)
+            browser_draft = not list_page_request and review_submissions.is_draft_id(draft)
             # A restart retry can use the token saved with the draft.
             if not valid_token and (
                     "capture_key" not in fields or "page_capture" in fields or "discard_capture" in fields
@@ -2292,7 +2394,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return
             if "page_capture" in fields:
                 key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-                self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]), key)
+                self.new_item_capture(new_item_dialog.read_live_page_capture(fields["page_capture"]), key)
                 return
             if "discard_capture" in fields:
                 server.page_captures.discard(new_item_dialog.read_capture_key(fields["discard_capture"]))
@@ -2336,13 +2438,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if len(key) > 32 or has_capture_metadata:
                     page = fields.get("page")
                     if (not isinstance(draft, str)
-                            or not (review_submissions.is_draft_id(draft) or page == "list"
+                            or not (review_submissions.is_draft_id(draft) or list_page_request
                                     and review_submissions.DRAFT_ID.fullmatch(draft))
                             or not new_item_dialog.capture_key_matches_draft(key, draft)):
                         raise record_store.SubmissionError("The screenshot belongs to another draft.")
                     if has_capture_metadata and isinstance(page, str) and page in page_frame.OWNER_PAGES:
                         deferred = new_item_dialog.DeferredCaptureIntent(
-                            key, draft, deferred_capture_request(server.root, page, fields["defer_capture"]))
+                            key, draft, server.stage_page_capture(key, page, fields["defer_capture"]))
             except record_store.SubmissionError as error:
                 if not list_draft_id:
                     raise
@@ -2355,7 +2457,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and request.page != "list"
+        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and not list_page_request
                              and review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None)
         authorization = None
         if browser_draft and isinstance(token, str):
@@ -2435,7 +2537,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     if edited:
                         warnings.append("The item keeps the values from the first Send.")
                     response["attachment_warning"] = "\n".join(warnings)
-                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
+                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and list_page_request
                 if list_draft_id and edited:
                     request = None
                     screenshot = new_item_dialog.NO_PAGE_SCREENSHOT
@@ -2443,7 +2545,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         and review_submissions.PAGE_SCREENSHOT in details.images):
                     server.page_captures.mark_filed(key, screenshot)
                 main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
-                    request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
+                    list_page_request or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
                 has_saved_evidence = ((legacy_page_draft and key) or details.images or details.page_state is not None
                                       or (main_request is not None and main_request.page_state is not None)
                                       or isinstance(details.evidence, new_item_dialog.PageDataEvidence)
@@ -2452,17 +2554,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 status = server.delivery_status
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
                     try:
-                        delivery = review_actions.prepare_submission_delivery(
+                        deliveries = review_actions.prepare_submission_deliveries(
                             saved, saved.words, status, evidence_page=evidence_page, members=created.members,
                             claims=claims)
                     except review_actions.SubmissionDeliveryPending:
-                        delivery = change_page.NoMessageDelivery()
-                    if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
-                            request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
-                        number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
-                        if isinstance(number, int):
-                            response["list_number"] = number
-                if pending or (main_request is not None and main_request.page == "list"
+                        deliveries = review_actions.SubmissionDeliveries()
+                    record = saved.record
+                    if ((isinstance(record, investigation.Investigation) and record.belongs_on_list) or on_list
+                            or isinstance(request, new_item_dialog.NewItemRequest)
+                            and request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
+                        response.update(review_actions.submission_list_receipt(saved, created.members))
+                if pending or (main_request is not None and list_page_request
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:
                         screenshot = server.page_captures.file(key, saved, allow_pending=pending)
@@ -2499,8 +2601,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
         respond_first = on_list or main_request is not None
+        delivery = deliveries.primary
         claim = delivery if isinstance(delivery, change_page.MessageDelivery) else None
-        send = partial(self.deliver_review, server, delivery, report_outcome=True) if claim is not None else None
+        send = (partial(self.deliver_new_item, server, deliveries)
+                if claim is not None or isinstance(deliveries.assignee, change_page.MessageDelivery) else None)
         try:
             try:
                 if respond_first:
@@ -2512,7 +2616,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         server.attach_page_screenshot(saved, screenshot.png)
                 if saved.kind == new_item_dialog.SubmissionKind.BUG and (
                         details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
-                    server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
+                    server.finish_bug_evidence(created, main_request, screenshot)
             if not respond_first:
                 self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
         finally:
@@ -2553,8 +2657,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         response: dict[str, object] = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
                                        "receipt": new_item.filing_receipt(claim.assignment, saved.id),
                                        "readback": claim.readback, "notice_warning": claim.notice_warning}
-        send = (partial(new_item.deliver_scheduled_notices, review_link.review_root(), request.request_id)
-                if saved.pending_notices else None)
+        def send() -> None:
+            with server.list_store_access(), server.staff_read_scope():
+                try:
+                    if saved.pending_notices:
+                        new_item.deliver_scheduled_notices(review_link.review_root(), request.request_id)
+                finally:
+                    _ = list_page.deliver_scheduled_assignee_copy(claim.keeper, saved.id, request.request_id)
+
         self.new_item_saved(response, saved.id, False, deliver=send)
 
     def pending_draft_response(self) -> None:
@@ -2576,10 +2686,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server = cast(ReviewLinksServer, self.server)
                 _ = server.start_new_item_delivery(deliver, claim=claim)
 
-    def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest, key: str) -> None:
+    def new_item_capture(self, capture: new_item_dialog.LivePageCapture, key: str) -> None:
         """Start a screenshot only for a known page on this server."""
         server = cast(ReviewLinksServer, self.server)
-        if not capture_page_key(server.root, capture.place):
+        if not capture_page_key(server.root, capture.request.place):
             self.json_response(400, {"error": "Select a console document."})
             return
         if key:
@@ -2635,15 +2745,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         return self.attachment_response(content, media)
 
-    def list_document(self, query: str, view: list_page.ListView) -> None:
-        """Answer a List view: the page, or the List counts and item state it reads."""
+    def list_document(self, path: str, query: str) -> None:
+        """Serve the Studio document and the List read routes."""
         server = cast(ReviewLinksServer, self.server)
         if query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
             self.list_counts(include_linked_reviews=query == list_page.COUNTS_AND_LINKS_QUERY)
             return
         fields = parse_qs(query)
         if "item-state" in fields:
-            self.list_action_state(fields, view)
+            self.list_action_state(fields)
+            return
+        if path == list_page.PAGE_PATH:
+            self.redirect(studio_page.PAGE_PATH + (f"?{query}" if query else ""))
+            return
+        if "tag-fields" in fields:
+            self.list_tag_fields(fields)
             return
         delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
         try:
@@ -2654,12 +2770,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            status=server.delivery_status, query=query,
                                            review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                            if live and reviews is list_page.LinkedReviewRead.FROM_DISK
-                                                           else reviews),
-                                           view=view)
-                content = owned_document(content, "list")
+                                                           else reviews))
+                content = owned_document(content, "studio")
         except (OSError, ValueError) as error:
-            print(f"review-links {view.log_name}: {error}", file=sys.stderr)
-            self.html_response(503, change_page.document(f"<p>{html.escape(view.title)} page is not available.</p>"))
+            print(f"review-links studio: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document(f"<p>{studio_page.TITLE} page is not available.</p>"))
             return
         self.html_response(200, content, delivery_pending=delivery)
 
@@ -2707,7 +2822,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if isinstance(item, the_list.ListItem):
                 result['bug'] = FiledReviewSaveBug(
                     label=new_item.filing_number_label(item.number, label="Bug"),
-                    href=list_page.PAGE_PATH + list_page.item_link(keeper, item.number, only_item=True),
+                    href=studio_page.PAGE_PATH + list_page.item_link(keeper, item.number, only_item=True),
                 )
                 server.review_cache.invalidate()
         except Exception as error:
@@ -2961,7 +3076,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         pending = isinstance(saved.delivery, change_page.MessageDelivery)
         response_send = (pending and saved.submitted_type == review_items.ReviewType.RESPONSE
                          and self.headers.get(send_hold.HOLD_HEADER) == "1")
-        report_delivery = self.headers.get(send_hold.REPLAY_HEADER) == "1" or response_send
+        action_feedback = (fields.get('feedback_retry') == ['1'] or (
+            isinstance(saved.delivery, change_page.MessageDelivery)
+            and isinstance(saved.delivery.page, change_page.ReviewMessagePage)
+            and 'action_feedback' in saved.delivery.page.saved))
+        replay = self.headers.get(send_hold.REPLAY_HEADER) == "1"
+        report_delivery = replay or response_send or action_feedback
         receipt = SavedReviewAttempt(saved.words_saved, hold_id)
         failure_attempt = attempt or secrets.token_hex(16)
         if isinstance(delivery := saved.delivery, change_page.MessageDelivery):
@@ -2987,20 +3107,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             result['detail_unavailable'] = True
         if isinstance(saved.item, review_items.ReviewItem):
             later = saved.item.times.later
-            result.update(state=saved.item.state, type=saved.item.type,
+            state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
+            result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         if report_delivery:
             delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
+            outcome: change_page.DeliveryOutcome = change_page.DeliveryConfirmed()
             if pending:
                 outcome = self.deliver_review(server, delivery, report_outcome=True)
                 receipt = self.record_review_delivery(server, attempt, receipt, outcome, failure_attempt)
-        if report_delivery:
+            if action_feedback:
+                result.update(words_delivery_result(outcome), action_feedback=True)
             result['delivery_pending'] = False
             if pending:
                 self.publish_review_delivery(server, key)
             else:
                 result['no_message'] = True
-            if isinstance(hold_id, str) and self.headers.get(send_hold.REPLAY_HEADER) == "1":
+            if isinstance(hold_id, str) and replay:
                 result = {'review_save_record': True, **result}
             else:
                 result.update(receipt.reply_fields())
@@ -3037,6 +3160,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             server.review_cache.publish_delivery_result(key)
         except (OSError, ValueError, RuntimeError) as error:
             print(f"review-links Review delivery refresh {key}: {error}", file=sys.stderr)
+
+    def deliver_new_item(self, server: ReviewLinksServer, deliveries: review_actions.SubmissionDeliveries) -> None:
+        try:
+            _ = self.deliver_review(server, deliveries.primary, report_outcome=True)
+        finally:
+            with ExitStack() as claims:
+                assignee = review_actions.claim_saved_assignee_copy(
+                    deliveries.assignee, server.delivery_status, claims=claims)
+                _ = self.deliver_review(server, assignee, report_outcome=True)
 
     def deliver_review(self, server: ReviewLinksServer,
                        delivery: change_page.MessageDelivery | change_page.NoMessageDelivery, *,
@@ -3236,18 +3368,48 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     content += '<template data-list-review-read-error></template>'
             self.html_response(200, content.encode())
 
-    def list_action_state(self, fields: dict[str, list[str]], view: list_page.ListView) -> None:
+    def list_tag_fields(self, fields: dict[str, list[str]]) -> None:
+        """Sign the tag request for an open List item."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            (identity,) = fields["tag-fields"]
+            (keeper,) = fields.get("keeper", [])
+            with server.list_store_access():
+                signed = list_page.signed_tag_request(server.root, staff.StaffId(keeper), identity)
+        except ValueError as error:
+            self.browser_failure(400, "The List item is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The List item cannot be read. Try again.", error)
+        else:
+            self.json_response(200, signed)
+
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
         """Read the current item after an action response is lost."""
         server = cast(ReviewLinksServer, self.server)
         try:
+            if fields.get("words-status") == ["1"]:
+                self.list_words_result(server, fields, retry=False)
+                return
+            if fields.get("words-retries") == ["1"]:
+                with server.list_store_access(), server.staff_read_scope():
+                    retries = list_page.saved_words_retries(server.root, server.store_folder, fields)
+                self.json_response(200, {"words_retries": retries})
+                return
             (identity,) = fields["item-state"]
             (keeper,) = fields.get("keeper", [])
             (park_request,) = fields.get("park-request", [""])
+            (not_fixed_request,) = fields.get("not-fixed-request", [""])
+            tag_removal: list_page.TagRemoval | list_page.NoTagRemoval = list_page.NoTagRemoval.CHECK_CURRENT_TAGS
+            if "tag-removal-request" in fields:
+                (request,) = fields["tag-removal-request"]
+                (tag,) = fields.get("tag-removal", [])
+                tag_removal = list_page.TagRemoval(request, the_list.Tag(tag))
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request, include_detail=True,
+                                                       not_fixed_request=not_fixed_request,
                                                        review_records=server.list_review_records(),
-                                                       top_priority=view.top_priority)
+                                                       top_priority=list_page.TopPriority.SHOWN, tag_removal=tag_removal)
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
         except OSError as error:
@@ -3255,51 +3417,106 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, current)
 
-    def list_post(self, view: list_page.ListView) -> None:
-        """Save a List view's item action before the shared sender starts."""
+    def list_post(self) -> None:
+        """Save a List item action before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
         fixture = server.mode is ServerMode.LIST_FIXTURE
+        fields: dict[str, list[str]] = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 100000:
                 raise ValueError("invalid List request size")
             body = self.rfile.read(length).decode("utf-8")
             fields = parse_qs(body)
+            if not fixture and fields.get("action") == ["retry-words"]:
+                self.list_words_result(server, fields, retry=True)
+                return
             if fixture and fields.get("action") != ["remove"]:
                 raise ValueError("Only Remove is available in this demo.")
             with server.list_store_access():
                 submission, current = list_page.save_action(
                     server.root, body, server.delivery_status,
                     review_records=server.list_review_records(), include_detail=True,
-                    top_priority=view.top_priority)
+                    top_priority=list_page.TopPriority.SHOWN)
+        except the_list.RepairCheckRefused as error:
+            if fields.get("action") == [the_list.ReportVerdict.NOT_FIXED]:
+                receipt = list_page.NotFixedReceipt(request=error.request, state=list_page.NotFixedReceiptState.REFUSED)
+                self.json_response(400, {"reason": str(error), "not_fixed_receipt": receipt})
+            else:
+                self.browser_failure(400, str(error), error)
+            return
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
         except OSError as error:
-            self.browser_failure(503, "The List request could not be saved. Try again.", error)
+            if fields.get("action") == ["top"] and any(words.strip() for words in fields.get("words", ())):
+                print(f"review-links priority words save: {error}", file=sys.stderr)
+                self.json_response(503, {"priority_outcome": "unknown",
+                                         "reason": "The server has not confirmed the priority save."})
+            else:
+                self.browser_failure(503, "The List request could not be saved. Try again.", error)
             return
         saved_fields: dict[str, object] = {"detail_unavailable": True} if current is None else dict(current)
         if fixture:
             self.json_response(200, {"state": "saved", "delivery_pending": False, **saved_fields})
             return
+        if isinstance(submission, list_page.RefusedPriorityWords):
+            self.json_response(409, {"priority_outcome": submission.value, "priority_request": fields["request"][0],
+                                     "reason": "The priority request did not save."})
+            return
+        if isinstance(submission, list_page.PriorityWordsDelivery):
+            with server.item_delivery(submission.send_pending) as check:
+                try:
+                    self.json_response(200, {"state": "saved", "delivery_pending": False, **saved_fields,
+                                             "priority_outcome": submission.outcome, "priority_request": fields["request"][0],
+                                             "words_receipt": True, "delivery": check})
+                finally:
+                    if submission.send_pending:
+                        try:
+                            list_page.deliver(submission)
+                        except OSError as error:
+                            print(f"review-links priority words delivery: {error}", file=sys.stderr)
+            return
         action = fields["action"][0]
-        delivery = submission.delivery if isinstance(submission, list_page.ListUnparkSubmission) else submission
+        original = submission.action if isinstance(submission, list_page.ListActionWithWords) else submission
+        delivery = original.delivery if isinstance(original, list_page.ListUnparkSubmission) else original
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
-        state = {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
+        repair_feedback = action == the_list.ReportVerdict.NOT_FIXED
+        has_words = isinstance(submission, list_page.ListActionWithWords)
+        state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved",
+                 list_page.ListTagAction.ADD: "saved", list_page.ListTagAction.REMOVE: "saved"}.get(action, "sent")
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
-        if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
-            reply["unpark_outcome"] = submission.response_outcome(current).value
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+        if isinstance(submission, list_page.ListActionWithWords):
+            reply["words_receipt"] = True
+        if current is not None and isinstance(original, list_page.ListUnparkSubmission):
+            reply["unpark_outcome"] = original.response_outcome(current).value
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:
             try:
-                outcome = list_page.deliver_with_outcome(submission)
+                outcome = list_page.deliver_with_outcome(original)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
                 outcome = change_page.DeliveryUnconfirmed()
             reply.update(held_delivery_result(outcome, not pending))
             reply["delivery_pending"] = False
-            self.json_response(200, reply)
+            if repair_feedback and isinstance(delivery, list_page.ListFeedbackDelivery):
+                receipt_state = (list_page.NotFixedReceiptState.DELIVERED
+                                 if isinstance(outcome, change_page.DeliveryConfirmed)
+                                 else list_page.NotFixedReceiptState.ACCEPTED)
+                reply["not_fixed_receipt"] = list_page.NotFixedReceipt(request=delivery.request, state=receipt_state)
+            more = isinstance(submission, list_page.ListActionWithWords) and submission.words != delivery
+            with server.item_delivery(more) as check:
+                if check:
+                    reply["delivery"] = check
+                try:
+                    self.json_response(200, reply)
+                finally:
+                    if more and isinstance(submission, list_page.ListActionWithWords):
+                        try:
+                            list_page.deliver(submission.words)
+                        except OSError as error:
+                            print(f"review-links List words delivery: {error}", file=sys.stderr)
             return
-        with server.item_delivery(pending) as check:
+        with server.item_delivery(pending or has_words) as check:
             try:
                 if check:
                     reply["delivery"] = check
@@ -3309,6 +3526,42 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     list_page.deliver(submission)
                 except OSError as error:
                     print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def list_words_result(self, server: ReviewLinksServer, fields: dict[str, list[str]], *, retry: bool) -> None:
+        if not retry:
+            server.await_item_delivery(fields.get("delivery", [""])[0])
+        with server.list_store_access():
+            address = list_page.ListActionRequest.read(server.root, fields)
+            unprepared: the_list.UnpreparedPriorityWords | the_list.RefuseUnpreparedPriorityWords = (
+                the_list.UnpreparedPriorityWords.KEEP_UNKNOWN)
+            if retry and fields.get("priority-words") == ["1"]:
+                words = new_item_dialog.optional_feedback(fields.get("words", [""])[0])
+                if words:
+                    unprepared = the_list.RefuseUnpreparedPriorityWords(words)
+            notice = address.words_notice(unprepared=unprepared)
+            if not isinstance(notice, the_list.PageFeedback):
+                self.json_response(200, {"words_receipt": False, "words_delivery": "absent", "priority_outcome": "unknown"})
+                return
+            priority = notice.priority
+            if isinstance(priority, the_list.PriorityWordsRequest) and not notice.can_deliver():
+                outcome = "not_saved" if priority.save is the_list.PriorityWordsSave.NOT_SAVED else "unknown"
+                self.json_response(200, {"words_receipt": False, "words_delivery": "absent",
+                                         "priority_outcome": outcome, "priority_request": fields["request"][0]})
+                return
+            delivery = list_page.ListFeedbackDelivery(address.keeper, address.identity, notice.request)
+            outcome = (list_page.deliver_with_outcome(delivery, retry_words=True) if retry
+                       else list_page.words_delivery_status(delivery))
+            result = words_delivery_result(outcome)
+            if isinstance(priority, the_list.PriorityWordsRequest):
+                result["priority_outcome"] = "saved"
+                result["priority_request"] = fields["request"][0]
+            if not isinstance(outcome, change_page.DeliveryConfirmed):
+                item = the_list.load(delivery.keeper, delivery.identity)
+                notice = the_list.feedback_requests(item).get(delivery.request)
+                if notice is not None:
+                    members = list_page.words_preview_members()
+                    result["words_retry_preview"] = list_page.list_words_preview(delivery.keeper, notice, members)
+        self.json_response(200, result)
 
     def go_post(self) -> None:
         """Refuse a Go from natedev; else write the ledger record, close the ask and send the Go."""
@@ -3327,8 +3580,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 100000:
                 raise ValueError("invalid List Go size")
             body = self.rfile.read(length).decode("utf-8")
+            fields = parse_qs(body, keep_blank_values=True)
+            mode = fields.get("delivery-mode", [""])[0]
+            if mode in ("status", "retry"):
+                if mode == "status":
+                    server.await_item_delivery(fields.get("delivery", [""])[0])
+                with server.list_store_access():
+                    go_id = list_page.saved_go_words(server.root, server.store_folder, body)
+                    outcome = (list_page.deliver_go(server.store_folder, go_id, retry_words=True) if mode == "retry"
+                               else list_page.go_words_status(server.store_folder, go_id))
+                    result = words_delivery_result(outcome)
+                    if not isinstance(outcome, change_page.DeliveryConfirmed):
+                        entry = go_ledger.read(server.store_folder, go_id)
+                        result["words_retry_preview"] = list_page.go_words_preview(entry, list_page.words_preview_members())
+                self.json_response(200, result)
+                return
+            carries_words = bool(new_item_dialog.optional_feedback(fields.get("words", [""])[0]))
             with server.list_store_access():
-                go_id, current = list_page.save_go(server.root, server.store_folder, body, client, views=LIST_VIEWS,
+                go_id, current = list_page.save_go(server.root, server.store_folder, body, client,
                                                    review_records=server.list_review_records())
         except ValueError as error:
             self.browser_failure(400, str(error), error)
@@ -3339,13 +3608,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The Go could not be saved. Try again.", error)
             return
-        try:
-            self.json_response(200, {"state": "sent", **({"detail_unavailable": True} if current is None else current)})
-        finally:
+        reply: dict[str, object] = {"state": "sent", **({"detail_unavailable": True} if current is None else current)}
+        with server.item_delivery(carries_words) as check:
+            if check:
+                reply.update(words_receipt=True, delivery=check)
             try:
-                list_page.deliver_go(server.store_folder, go_id)
-            except (OSError, ValueError) as error:
-                print(f"review-links List Go delivery: {error}", file=sys.stderr)
+                self.json_response(200, reply)
+            finally:
+                try:
+                    _ = list_page.deliver_go(server.store_folder, go_id)
+                except (OSError, ValueError) as error:
+                    print(f"review-links List Go delivery: {error}", file=sys.stderr)
 
     def go_check(self, query: str) -> None:
         """Answer go_check.py: accept one use of a Go by its target session."""
@@ -3433,10 +3706,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     elif page.items is images.waiting_images:
                         page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
                     pages.append(page)
-                # Rebuilds has no navigation entry, so its request uses an empty name.
-                if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                if len(opened) != 1:
                     raise ValueError("name one console page or none")
-                fresh = console.news(server.root, tuple(pages), opened[0])
+                identities = {page.identity for page in pages}
+                identity = opened[0]
+                if identity == "list" and "list" not in identities and "studio" in identities:
+                    identity = "studio"
+                # Rebuilds has no navigation entry, so its request uses an empty name.
+                if identity and identity not in identities:
+                    raise ValueError("name one console page or none")
+                fresh = console.news(server.root, tuple(pages), identity)
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
@@ -3594,9 +3873,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if result is send_hold.HoldState.PENDING:
             self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
         elif result is send_hold.HoldState.UNDONE:
-            self.json_response(404, {"reason": "This send was undone.", "hold_state": result.value})
+            self.json_response(404, {"reason": "This send was undone.", "hold_state": result.value},
+                               hold_outcome="undone")
         elif result is send_hold.HoldState.MISSING:
-            self.json_response(404, {"reason": "This send was undone or its result expired.", "hold_state": result.value})
+            self.json_response(404, {"reason": "This send was undone or its result expired.", "hold_state": result.value},
+                               hold_outcome="missing")
         else:
             if result.body.startswith(b'{"review_save_record": true'):
                 fields = cast(dict[str, object], json.loads(result.body))
@@ -3623,11 +3904,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             _ = self.wfile.write(result.body)
 
     def json_response(self, status: int, fields: Mapping[str, object], *,
-                      hold: send_hold.HoldHeader | None = None) -> None:
+                      hold: send_hold.HoldHeader | None = None,
+                      hold_outcome: Literal["undone", "missing"] | None = None) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         if hold is not None:
             self.send_header("X-Send-Hold", hold.value)
+        if hold_outcome is not None:
+            self.send_header("X-Send-Hold-Outcome", hold_outcome)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
@@ -3682,7 +3966,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.verified_tailscale_address: str = ""
         self._tailscale_address_lock: threading.Lock = threading.Lock()
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
-        self._item_deliveries: set[str] = set()
+        self._item_deliveries: dict[str, threading.Event] = {}
         self._item_delivery_lock: threading.Lock = threading.Lock()
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
@@ -3734,6 +4018,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
             with reply_tokens.serving(self.store_folder):
                 try:
+                    recover("List report", review_actions.recover_interrupted_list_reports)
                     recover("delivery", partial(recover_changes, self.delivery_status))
                     recover("first message", partial(
                         review_actions.recover_submission_deliveries, self.delivery_status, review_page.PAGE_PATH))
@@ -3824,17 +4109,26 @@ class ReviewLinksServer(ThreadingHTTPServer):
             yield ''
             return
         check = secrets.token_urlsafe()
+        done = threading.Event()
         with self._item_delivery_lock:
-            self._item_deliveries.add(check)
+            self._item_deliveries[check] = done
         try:
             yield check
         finally:
             with self._item_delivery_lock:
-                self._item_deliveries.remove(check)
+                done.set()
+                del self._item_deliveries[check]
 
     def item_delivery_pending(self, check: str) -> bool:
         with self._item_delivery_lock:
             return check in self._item_deliveries
+
+    def await_item_delivery(self, check: str) -> None:
+        """Allow a words receipt to report the result of the first send."""
+        with self._item_delivery_lock:
+            done = self._item_deliveries.get(check)
+        if done is not None:
+            _ = done.wait(conf.read("review_links").whole("page_request_timeout_seconds"))
 
     def list_review_records(self) -> list_page.ImmediateReviewRecords:
         cache = self.review_cache
@@ -3842,19 +4136,36 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return cache.linked_records()
         return list_page.LinkedReviewRead.FROM_DISK
 
-    def ensure_page_capture(self, key: str, request: new_item_dialog.PageCaptureRequest) -> bool:
+    def ensure_page_capture(self, key: str, capture: new_item_dialog.LivePageCapture) -> bool:
         """Start the capture once, even if Send arrives first."""
         firefox = shutil.which("firefox")
         if not firefox:
             return False
-        match self.page_captures.reserve(key, request):
+        match self.page_captures.reserve(key, PageCapturePending(capture)):
             case CaptureReservation.STARTED:
-                return self.launch_page_capture(key, firefox, request, queued=not self.capture_slot.acquire(blocking=False))
+                return self.launch_page_capture(key, firefox, capture, queued=not self.capture_slot.acquire(blocking=False))
             case CaptureReservation.PRESENT:
                 self.resume_page_capture(key)
             case CaptureReservation.FULL:
                 return False
         return True
+
+    def stage_page_capture(self, key: str, page: str, value: object
+                           ) -> new_item_dialog.PageCaptureRequest | new_item_dialog.UnavailableCapture:
+        """Keep a pending document outside the native item before Send files it."""
+        try:
+            if isinstance(value, dict) and "document_gzip" not in value and "document" not in value:
+                legacy = new_item_dialog.read_page_capture(cast(dict[str, object], value))
+                if capture_matches_page(self.root, legacy.place, page):
+                    return legacy
+            else:
+                capture = new_item_dialog.read_live_page_capture(cast(object, value))
+                if capture_matches_page(self.root, capture.request.place, page):
+                    _ = self.page_captures.reserve(key, PageCaptureToResume(capture))
+                    return capture.request
+        except ValueError:
+            pass
+        return new_item_dialog.UnavailableCapture.UNAVAILABLE
 
     def process_committed_capture(self, target: new_item_dialog.ScopedSubmissionKey,
                                   intent: new_item_dialog.DeferredCaptureIntent, *, attached: bool) -> None:
@@ -3869,23 +4180,13 @@ class ReviewLinksServer(ThreadingHTTPServer):
             if attached and self.page_captures.target(key) is new_item_dialog.NoBoundCaptureTarget.UNBOUND:
                 image = review_submissions.read_attached_page_screenshot(target, request)
                 self.page_captures.restore_ready(key, target, image)
-            match self.page_captures.reserve(key, request):
-                case CaptureReservation.STARTED:
-                    _ = self.page_captures.bind(key, draft, target)
-                    firefox = shutil.which("firefox")
-                    if not firefox or not capture_page_key(self.root, request.place):
-                        self.page_captures.unavailable(key, target)
-                        return
-                    queued = not self.capture_slot.acquire(blocking=False)
-                    _ = self.launch_page_capture(key, firefox, request, queued=queued)
-                case CaptureReservation.PRESENT:
-                    image = self.page_captures.bind(key, draft, target)
-                    if isinstance(image, new_item_dialog.PageScreenshot):
-                        self.launch_bound_attachment(key, target, image)
-                    else:
-                        self.resume_page_capture(key)
-                case CaptureReservation.FULL:
+            match self.page_captures.bind(key, draft, target):
+                case new_item_dialog.PageScreenshot() as image:
+                    self.launch_bound_attachment(key, target, image)
+                case UnavailableBoundCapture.UNAVAILABLE:
                     self.page_captures.unavailable(key, target)
+                case _:
+                    self.resume_page_capture(key)
         except (OSError, ValueError, RuntimeError) as error:
             print(f"review-links screenshot for {target.item_id}: {error}", file=sys.stderr)
 
@@ -3894,18 +4195,19 @@ class ReviewLinksServer(ThreadingHTTPServer):
         capture = self.page_captures.resume(key)
         if isinstance(capture, PageCaptureToResume):
             firefox = shutil.which("firefox")
-            if firefox and capture_page_key(self.root, capture.request.place):
-                _ = self.launch_page_capture(key, firefox, capture.request, queued=True)
+            if firefox and capture_page_key(self.root, capture.capture.request.place):
+                _ = self.launch_page_capture(key, firefox, capture.capture, queued=True)
             else:
                 _ = self.page_captures.complete(key, new_item_dialog.NO_PAGE_SCREENSHOT)
 
-    def launch_page_capture(self, key: str, firefox: str, capture: new_item_dialog.PageCaptureRequest, *,
+    def launch_page_capture(self, key: str, firefox: str, capture: new_item_dialog.LivePageCapture, *,
                             queued: bool = False) -> bool:
         """Start the capture worker with a reserved slot or wait for a slot."""
-        url = f"http://{self.bound_address}:{self.server_port}{capture.place}"
+        path = urlsplit(capture.request.place).path
+        base = f"http://{self.bound_address}:{self.server_port}{path}"
         worker = self.capture_queued_page if queued else self.capture_page
         try:
-            threading.Thread(target=worker, args=(key, firefox, url, capture), daemon=True).start()
+            threading.Thread(target=worker, args=(key, firefox, base, capture), daemon=True).start()
         except (OSError, RuntimeError) as error:
             if not queued:
                 self.capture_slot.release()
@@ -3914,8 +4216,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return False
         return True
 
-    def capture_queued_page(self, key: str, firefox: str, url: str,
-                            capture: new_item_dialog.PageCaptureRequest) -> None:
+    def capture_queued_page(self, key: str, firefox: str, base: str,
+                            capture: new_item_dialog.LivePageCapture) -> None:
         """Use the capture slot when Firefox becomes free."""
         if not self.capture_slot.acquire(timeout=PAGE_CAPTURE_TTL_SECONDS):
             _ = self.page_captures.complete(key, new_item_dialog.NO_PAGE_SCREENSHOT)
@@ -3923,13 +4225,14 @@ class ReviewLinksServer(ThreadingHTTPServer):
         if not self.page_captures.queued(key):
             self.capture_slot.release()
             return
-        self.capture_page(key, firefox, url, capture)
+        self.capture_page(key, firefox, base, capture)
 
-    def capture_page(self, key: str, firefox: str, url: str, capture: new_item_dialog.PageCaptureRequest) -> None:
+    def capture_page(self, key: str, firefox: str, base: str, capture: new_item_dialog.LivePageCapture) -> None:
         image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
         try:
-            png = page_screenshot(firefox, url, capture)
-            image = new_item_dialog.PageScreenshot(png, new_item_dialog.PageViewport(capture.width, capture.height, capture.dark))
+            png = page_screenshot(firefox, base, capture)
+            request = capture.request
+            image = new_item_dialog.PageScreenshot(png, new_item_dialog.PageViewport(request.width, request.height, request.dark))
         except (OSError, subprocess.SubprocessError):
             pass
         finally:
@@ -3969,7 +4272,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 print(f"review-links screenshot for {target.item_id}: {error}", file=sys.stderr)
 
     def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
-                            host: str, screenshot: new_item_dialog.SubmissionScreenshot) -> None:
+                            screenshot: new_item_dialog.SubmissionScreenshot) -> None:
         """Save Bug evidence before notice delivery and after an early receipt."""
         saved = created.saved
         if (request is not None and request.page_state is not None
@@ -3977,10 +4280,10 @@ class ReviewLinksServer(ThreadingHTTPServer):
             request = replace(request, page_state=replace(
                 request.page_state, viewport=screenshot.viewport, include_screenshot=True))
 
-        def capture(page: str, state: new_item_dialog.BugPageState) -> bool:
+        def capture(_page: str, _state: new_item_dialog.BugPageState) -> bool:
             if isinstance(screenshot, new_item_dialog.PageScreenshot):
                 return self.review_cache.attach_page_screenshot(saved, screenshot.png)
-            return request is not None and self.capture_bug_screenshot(saved, page, state, host)
+            return False
 
         try:
             if review_submissions.save_bug_page_state(saved, created.key, request, capture):
@@ -3988,37 +4291,6 @@ class ReviewLinksServer(ThreadingHTTPServer):
         except Exception as error:
             self.review_cache.invalidate()
             print(f"review-links Bug evidence for {saved.id}: {' '.join(str(error).splitlines())}", file=sys.stderr)
-
-    def capture_bug_screenshot(self, saved: review_submissions.SavedSubmission, page: str,
-                               state: new_item_dialog.BugPageState, host: str) -> bool:
-        """Capture the reported viewport before the case record becomes visible."""
-        if state.viewport is None:
-            return False
-        try:
-            address = urlsplit(state.url)
-            if (address.scheme not in ("http", "https") or not address.hostname or address.username is not None
-                    or address.netloc.casefold() != host.casefold() or re.search(r"[\\\x00-\x20\x7f]", state.url)):
-                return False
-            place = urlunsplit(("", "", address.path, address.query, address.fragment))
-            capture = new_item_dialog.read_page_capture({
-                "place": place, "width": state.viewport.width, "height": state.viewport.height,
-                "dark": state.viewport.dark,
-            })
-        except ValueError:
-            return False
-        if capture_page_key(self.root, capture.place) != page:
-            return False
-        firefox = shutil.which("firefox")
-        if not firefox or not self.capture_slot.acquire(blocking=False):
-            return False
-        try:
-            url = f"http://{self.bound_address}:{self.server_port}{capture.place}"
-            image = page_screenshot(firefox, url, capture)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        finally:
-            self.capture_slot.release()
-        return self.review_cache.attach_page_screenshot(saved, image)
 
     def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> None:
         try:

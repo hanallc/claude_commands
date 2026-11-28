@@ -13,9 +13,10 @@ import subprocess
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from sys import platform
+from typing import NewType
 
 from scripts.lib.atomic_file import sync_folder
 from scripts.lib.file_lock import exclusive
@@ -31,12 +32,53 @@ class UnavailableReplyToken(OSError):
     """The server cannot mint or derive a reply token."""
 
 
+RawReplyToken = NewType("RawReplyToken", str)
+SavedReplyHash = NewType("SavedReplyHash", str)
+ReplyExchangeId = NewType("ReplyExchangeId", str)
+
+
+@dataclass(frozen=True)
+class LegacyTokenReference:
+    token: RawReplyToken = field(repr=False)
+
+
+@dataclass(frozen=True)
+class LegacyHashReference:
+    digest: SavedReplyHash = field(repr=False)
+
+
+@dataclass(frozen=True)
+class InvalidReplyReference:
+    """The delivery reference has no recognized format."""
+
+
+type ReplyDeliveryReference = LegacyTokenReference | LegacyHashReference | ReplyExchangeId | InvalidReplyReference
+
+
 @dataclass(frozen=True)
 class ReplyTokenProof:
-    """The note fields for deriving and verifying one reply token."""
+    """The nonce and hash for one reply token."""
 
-    nonce: str
-    sha256: str
+    nonce: str = field(repr=False)
+    sha256: SavedReplyHash = field(repr=False)
+
+
+@dataclass(frozen=True)
+class LegacyReplyProof:
+    """Verify a reply token issued without a nonce."""
+
+    sha256: SavedReplyHash = field(repr=False)
+
+
+@dataclass(frozen=True)
+class MissingReplyProof:
+    """The store has no proof for this reply."""
+
+
+type StoredReplyProof = ReplyTokenProof | LegacyReplyProof
+type ReplyProof = StoredReplyProof | MissingReplyProof
+
+MISSING_REPLY_PROOF = MissingReplyProof()
 
 
 @dataclass(frozen=True)
@@ -94,18 +136,41 @@ def valid(token: str) -> bool:
     return re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is not None
 
 
-def digest(token: str) -> str:
-    return hashlib.sha256(token.encode("ascii")).hexdigest()
+def digest(token: RawReplyToken) -> SavedReplyHash:
+    return SavedReplyHash(hashlib.sha256(token.encode("ascii")).hexdigest())
 
 
-def matches(expected: str, token: str) -> bool:
+def valid_hash(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def matches(expected: SavedReplyHash, token: RawReplyToken) -> bool:
     return valid(token) and hmac.compare_digest(expected, digest(token))
 
 
-def matches_reference(expected: str, reference: str) -> bool:
-    """Check a saved hash or an older raw delivery reference."""
-    return matches(expected, reference) or (
-        re.fullmatch(r"[0-9a-f]{64}", reference) is not None and hmac.compare_digest(expected, reference))
+def exchange_id(expected: SavedReplyHash) -> ReplyExchangeId:
+    """Identify a wait without storing its proof in a delivery record."""
+    value = hashlib.sha256(b"review-reply-exchange:" + expected.encode("ascii")).hexdigest()
+    return ReplyExchangeId("reply-" + value)
+
+
+def matches_reference(expected: SavedReplyHash, reference: ReplyDeliveryReference) -> bool:
+    if isinstance(reference, LegacyTokenReference):
+        return matches(expected, reference.token)
+    if isinstance(reference, LegacyHashReference):
+        return hmac.compare_digest(expected, reference.digest)
+    return not isinstance(reference, InvalidReplyReference) and hmac.compare_digest(exchange_id(expected), reference)
+
+
+def read_reference(value: str) -> ReplyDeliveryReference:
+    """Read a delivery reference, including those from before the store move."""
+    if valid(value):
+        return LegacyTokenReference(RawReplyToken(value))
+    if valid_hash(value):
+        return LegacyHashReference(SavedReplyHash(value))
+    if re.fullmatch(r"reply-[0-9a-f]{64}", value):
+        return ReplyExchangeId(value)
+    return InvalidReplyReference()
 
 
 def _read_key(key_path: Path) -> bytes:
@@ -170,9 +235,9 @@ def valid_nonce(nonce: str) -> bool:
     return re.fullmatch(r"[0-9a-f]{32}", nonce) is not None
 
 
-def _token(key: bytes, nonce: str) -> str:
+def _token(key: bytes, nonce: str) -> RawReplyToken:
     code = hmac.digest(key, bytes.fromhex(nonce), "sha256")
-    return "r" + base64.urlsafe_b64encode(code).decode("ascii")[:42]
+    return RawReplyToken("r" + base64.urlsafe_b64encode(code).decode("ascii")[:42])
 
 
 def mint() -> ReplyTokenProof:
@@ -182,10 +247,10 @@ def mint() -> ReplyTokenProof:
     return ReplyTokenProof(nonce, digest(_token(key, nonce)))
 
 
-def derive(proof: ReplyTokenProof) -> str:
-    """Return the token only when the key and nonce reproduce the note hash."""
+def derive(proof: ReplyTokenProof) -> RawReplyToken:
+    """Return the token only when the key and nonce reproduce the saved hash."""
     if not valid_nonce(proof.nonce):
-        raise UnavailableReplyToken("The note has no valid reply nonce.")
+        raise UnavailableReplyToken("The proof has no valid reply nonce.")
     key_path = path()
     if platform == "darwin":
         key = _ensure_key(key_path)
@@ -196,5 +261,5 @@ def derive(proof: ReplyTokenProof) -> str:
             raise UnavailableReplyToken("The local reply key is missing.") from error
     token = _token(key, proof.nonce)
     if not matches(proof.sha256, token):
-        raise UnavailableReplyToken("The local reply key does not match the note.")
+        raise UnavailableReplyToken("The local reply key does not match the saved proof.")
     return token

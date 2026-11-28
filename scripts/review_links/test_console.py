@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from scripts.console_text.test_support import accepting_console_text
 from scripts.agents.remote import local_machine
@@ -33,6 +34,7 @@ from scripts.review_links import (
 from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_for_you import comparison_cache_details
 from scripts.statusline import rebuild_row
+from scripts.review_links.test_page_frame import window_probe_results
 
 
 class ConsoleMarkup(HTMLParser):
@@ -74,8 +76,8 @@ class ConsoleTests(unittest.TestCase):
             + "page.disks.url=python:scripts.disks.disks_page:page_url\n"
             + "page.images.label=Images\npage.images.title=Images\npage.images.icon=image\n"
             + "page.images.url=python:scripts.review_links.images:page_url\n"
-            + "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
-            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
+            + "page.studio.label=Studio\npage.studio.icon=clapperboard\npage.studio.title=The Studio\n"
+            + "page.studio.url=python:scripts.review_links.studio_page:page_url\n"
             + "page.review.label=Review\npage.review.icon=inbox\npage.review.title=Review\n"
             + "page.review.url=python:scripts.review_links.review_page:page_url\n"
             + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
@@ -182,9 +184,9 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
                              current_session=staff.StaffId("aws-session"),
                              unit_type=staff.UnitDetails("direct"))
         _ = write_config_fixture(self.configuration / "console.conf",
-                                 f"page.aws_machines.owner={aws.id}\npage.list.owner={morty.id}\n")
+                                 f"page.aws_machines.owner={aws.id}\npage.studio.owner={morty.id}\n")
         pages = (console.ConsolePage("aws_machines", "AWS Machines", "server", "AWS Machines", console.UnavailablePage()),
-                 console.ConsolePage("list", "List", "list-checks", "The List", console.UnavailablePage()))
+                 console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.UnavailablePage()))
         members = staff.StaffSnapshot((aws, builds, sdlc, morty, dwight))
         with patch.object(staff, "local_snapshot", return_value=members):
             source = console.render(pages, console.UnavailablePage())
@@ -241,17 +243,17 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
   check(recipients.querySelector('input:checked')?.value==='dwight-staff',
         'A producer chip changes the selected recipient.');
   dialog.querySelector('[data-close]').click();
-  document.querySelector('[data-page=list]').click();
-  const listOwner=pane.querySelector('[data-page-owner=list]');
+  document.querySelector('[data-page=studio]').click();
+  const listOwner=pane.querySelector('[data-page-owner=studio]');
   check(!control.getClientRects().length && listOwner.getClientRects().length,
         'The owner changes with the selected unavailable page.');
   const listOptions=loaded();
   listOwner.querySelector('[data-owner-new]').click();
   await listOptions;
-  check(requests.join()==='?page=aws_machines,?page=list' &&
+  check(requests.join()==='?page=aws_machines,?page=studio' &&
         recipients.querySelector('input:checked')?.value==='morty-staff',
-        'The List dialog selects its owner.');
-  check(choices()==='builds,dwight,morty,sdlc', 'The List dialog offers the same recipients.');
+        'The Studio dialog selects its owner.');
+  check(choices()==='builds,dwight,morty,sdlc', 'The Studio dialog offers the same recipients.');
  } catch(error) {failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace(b"__PAGE_OPTIONS__", json.dumps(options).encode())
@@ -271,13 +273,13 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "studio",
+        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "studio",
                                         "review", "placement_disk"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 29)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 11)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 10)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 27)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 10)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 9)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
@@ -288,7 +290,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         self.assertIn(f'data-url="{changes}" data-title="Review"', source)
         self.assertNotIn('data-page="questions"', source)
         self.assertNotIn('data-page="investigations"', source)
-        self.assertIn('data-url="/console/list.html" data-title="The List"', source)
+        self.assertIn('data-url="/console/studio.html" data-title="The Studio"', source)
         self.assertIn('data-page="review"', source)
         self.assertIn(f'data-url="{base}/{change_page.REBUILDS_NAME}" data-title="Rebuilds needed" hidden>', source)
         retry = conf.read("review_links").number("frame_retry_seconds")
@@ -302,7 +304,8 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
 
         self.assertIn("const placeKey = identity => 'at.' + identity;", source)
-        self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
+        self.assertIn("const path = new URL(base, location.href).pathname;", source)
+        self.assertIn("target.origin === location.origin && (target.pathname === path || target.pathname === oldPath)", source)
         self.assertIn("event.data !== 'console-place'", source)
         self.assertIn("if (opened) frame.contentWindow.postMessage('console-shown', location.origin);", source)
         self.assertIn("frame.contentWindow.postMessage('console-space', location.origin);", source)
@@ -334,7 +337,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
         settings = conf.read(path).values()
         pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
-        self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
+        self.assertEqual(pages | {"list", "rebuilds"}, page_frame.OWNER_PAGES)
         for page in page_frame.OWNER_PAGES:
             with self.subTest(page=page):
                 self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
@@ -350,11 +353,14 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         self.assertTrue((page_frame.ICONS / "torus.svg").is_file())
         self.assertIn('class="lucide lucide-torus"', console.icon_svg("torus"))
 
-    def test_repository_config_puts_the_studio_after_the_list_with_the_list_owner(self) -> None:
+    def test_repository_config_puts_the_studio_in_the_list_menu_position(self) -> None:
         path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
         settings = conf.read(path).values()
         pages = [key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")]
-        self.assertEqual(pages[pages.index("list") + 1], "studio")
+        self.assertEqual(pages[pages.index("images") + 1], "studio")
+        self.assertNotIn("list", pages)
+        self.assertNotIn("page.list.items", settings)
+        self.assertEqual(settings["page.studio.items"], "python:scripts.review_links.list_page:waiting_updates")
         self.assertEqual((settings["page.studio.label"], settings["page.studio.title"]), ("Studio", "The Studio"))
         self.assertEqual(settings["page.studio.url"], "python:scripts.review_links.studio_page:page_url")
         self.assertEqual(settings["page.studio.owner"], settings["page.list.owner"])
@@ -362,6 +368,81 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         self.assertIn(settings["page.studio.icon"], console.ICON_NAMES)
         self.assertTrue((page_frame.ICONS / "clapperboard.svg").is_file())
         self.assertIn('class="lucide lucide-clapperboard"', console.icon_svg("clapperboard"))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for this browser test.")
+    def test_retired_list_bookmark_uses_the_list_place_before_the_studio_place(self) -> None:
+        studio = console.ConsolePage("studio", "Studio", "clapperboard", "The Studio",
+                                    console.AvailablePage("/console/studio.html"))
+        review = console.ConsolePage("review", "Review", "inbox", "Review",
+                                    console.AvailablePage("/console/review.html"))
+        source = console.render((studio, review), console.UnavailablePage())
+        studio_home = "/console/studio.html"
+        studio_place = studio_home + "#show=working&q=new&item=L35"
+        list_suffix = "?unread=1#show=parked&q=old&item=L20"
+        probe = b"""<script>
+const failures=[];
+const address=new URL(location.href).searchParams;
+const frame=document.querySelector('iframe[title="The Studio"]');
+const expected=EXPECTED_PLACE;
+if(address.get('page')!=='studio' || address.has('at.list') || address.get('at.studio')!==expected)
+ failures.push('The address has the expected Studio place.');
+if(frame?.getAttribute('src')!==expected)
+ failures.push('The Studio frame opens at the expected place.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>"""
+        cases = (
+            ("/console/list.html" + list_suffix, studio_place, studio_home + list_suffix),
+            ("", studio_place, studio_place),
+            ("/console/review.html#item=C1", studio_place, studio_place),
+            ("/console/review.html", "https://elsewhere.invalid/console/studio.html", studio_home),
+        )
+        for list_bookmark, studio_bookmark, expected in cases:
+            with self.subTest(list_bookmark=list_bookmark, studio_bookmark=studio_bookmark):
+                query = urlencode({"page": "list", "at.list": list_bookmark, "at.studio": studio_bookmark})
+                script = probe.replace(b"EXPECTED_PLACE", json.dumps(expected).encode())
+                page = source.replace(b"</body>", script + b"</body>")
+                self.assertEqual(window_probe_results({
+                    "/console/": page, studio_home: b"<title>Studio fixture</title>",
+                }, "/console/?" + query, "firefox"), [[]])
+
+        with self.subTest(open_studio=True):
+            probe = b"""<script>
+addEventListener('load', async () => {
+ const failures=[];
+ const studio=document.querySelector('iframe[data-console-page="studio"]');
+ const studioDocument=studio.contentDocument;
+ const words=studioDocument.querySelector('textarea');
+ const draft='Keep these unsent Tell words.';
+ words.value=draft;
+ const place=studio.contentWindow.location.hash;
+ const reviewTab=document.querySelector('[data-page="review"]');
+ reviewTab.click();
+ const review=document.querySelector('iframe[data-console-page="review"]');
+ await new Promise(resolve=>review.addEventListener('load',resolve,{once:true}));
+ for(const link of review.contentDocument.querySelectorAll('a')){
+  reviewTab.click();
+  link.click();
+  if(studio.hidden || new URL(location.href).searchParams.get('page')!=='studio')
+   failures.push(link.textContent+' must show the Studio.');
+  if(studio.contentDocument!==studioDocument || studio.contentWindow.location.hash!==place ||
+     studio.contentDocument.querySelector('textarea')?.value!==draft)
+   failures.push(link.textContent+' must keep the open Studio place and Tell draft.');
+ }
+ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+},{once:true});
+</script>"""
+            page = source.replace(b"</body>", probe + b"</body>")
+            review_links = (
+                b'<a target="_top" href="/console/?page=list">List link without a place</a>'
+                b'<a target="_top" href="/console/?page=list&amp;at.list=%2Fconsole%2Freview.html'
+                b'&amp;at.studio=%2Fconsole%2Fchanges.html">List link with invalid places</a>'
+            )
+            query = urlencode({"page": "studio", "at.studio": studio_place})
+            self.assertEqual(window_probe_results({
+                "/console/": page,
+                studio_home: b'<textarea name="words" aria-label="Tell draft"></textarea>',
+                "/console/review.html": review_links,
+            }, "/console/?" + query, "firefox"), [[]])
 
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
@@ -380,15 +461,15 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["placement_disk", "review", "studio", "list", "images", "disks",
+        self.assertEqual([page.identity for page in pages], ["placement_disk", "review", "studio", "images", "disks",
                                                              "builds", "aws_machines", "aws", "accounts"])
-        self.assertIsInstance(pages[4].destination, console.AvailablePage)
-        self.assertIsInstance(pages[6].destination, console.UnavailablePage)
+        self.assertIsInstance(pages[3].destination, console.AvailablePage)
+        self.assertIsInstance(pages[5].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
         self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
-        self.assertEqual(markup.pages, ["placement_disk", "review", "studio", "list", "images", "disks", "builds", "aws_machines",
+        self.assertEqual(markup.pages, ["placement_disk", "review", "studio", "images", "disks", "builds", "aws_machines",
                                         "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
@@ -401,8 +482,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json')
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list",
-                                                             "studio", "review", "placement_disk"])
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "studio", "review", "placement_disk"])
         self.assertIsInstance(pages[3].destination, console.UnavailablePage)
         self.assertIsInstance(pages[-2].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
@@ -636,7 +716,7 @@ window.fetch=(url,options)=>{
 def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
     settings = Path(__file__).resolve().parents[2] / "config"
-    pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
+    pages = (console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage("/page")),
              console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
              console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))
     with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
@@ -784,7 +864,7 @@ try{
   'An incomplete read keeps the last count of zero.');
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const link=panel.querySelector('[data-for-you-card]');
- check(new URL(link.href).searchParams.get('at.list')==='/page?filter=mine','the card href keeps the saved List location');
+ check(new URL(link.href).searchParams.get('at.studio')==='/page?filter=mine','the card href keeps the saved List location');
  link.click();
  const reviewFrame=document.querySelector('[data-console-page=review]');
  await new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
@@ -792,7 +872,7 @@ try{
  check(url.searchParams.get('page')==='review' && place.searchParams.get('type')==='for-you' &&
  place.searchParams.get('item')==='rebuild/natedev','a card opens Review with the reserved parameters and key');
  check(panel.hidden,'a card closes the panel');
- check(url.searchParams.get('at.list')==='/page?filter=mine' && url.searchParams.get('extra')==='kept',
+ check(url.searchParams.get('at.studio')==='/page?filter=mine' && url.searchParams.get('extra')==='kept',
   'opening a card preserves unrelated console parameters');
  const original=reviewFrame.contentDocument;
  trigger.click();await flush();
@@ -803,7 +883,7 @@ try{
  const child=new URL(reviewFrame.contentWindow.location.href);
  check(reviewFrame.contentDocument!==original && child.search===footerPlace.search,
   'The footer reloads the fixture at the recorded query.');
- check(footerURL.searchParams.get('at.list')==='/page?filter=mine' && footerURL.searchParams.get('extra')==='kept' &&
+ check(footerURL.searchParams.get('at.studio')==='/page?filter=mine' && footerURL.searchParams.get('extra')==='kept' &&
   footerPlace.searchParams.get('type')==='for-you' && !footerPlace.searchParams.has('item'),
   'opening the footer preserves unrelated parameters and clears the card key');
  if(innerWidth>680){document.getElementById('nav-toggle').click();await flush();
@@ -868,7 +948,7 @@ try{
   const cleared=new Promise(resolve=>list.addEventListener('hashchange',resolve,{once:true}));
   list.location.hash='q=';
   await cleared;
-  const saved=new URL(location.href).searchParams.get('at.list');
+  const saved=new URL(location.href).searchParams.get('at.studio');
   check(saved==='/page?filter=mine&restart=1#q=','The console saves the cleared List address.');
   const failedLoad=listLoaded();
   frame.src='data:text/html,Unavailable';
@@ -926,7 +1006,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme",1);')
             result = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                      '--window-size', f'{width},800', '--screenshot', str(Path(temporary) / 'page.png'),
-                                     f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept'],
+                                     f'http://127.0.0.1:{server.server_port}/?page=studio&at.studio=%2Fpage%3Ffilter%3Dmine&extra=kept'],
                                     timeout=40)
             case.assertEqual(result.returncode, 0, result.stderr)
         finally:

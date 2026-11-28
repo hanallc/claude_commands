@@ -23,7 +23,7 @@ from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
-from scripts.review_links import list_draft, question_record, review_events
+from scripts.review_links import list_draft, question_record, reply_proofs, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -40,8 +40,9 @@ MOVE_QUESTION = update_registration.QuestionParts(
 
 
 class BehaviorReviewTests(ScriptRepositoryTestCase):
-    producer: staff.StaffRow = staff.StaffRow(staff.StaffId("e31b40f3-fd25-4c3c-97e3-f80783736401"), "producer",
-                                             "fixture", staff.STAFF_ROOT, current_session=staff.StaffId("claude-fixture"))
+    producer_id: staff.StaffId = staff.StaffId("e31b40f3-fd25-4c3c-97e3-f80783736401")
+    producer: staff.StaffRow = staff.StaffRow(producer_id, "producer", "fixture", staff.STAFF_ROOT,
+                                             current_session=producer_id)
     identities: update_registration.QuestionStaff = update_registration.QuestionStaff(
         staff.StaffSnapshot((producer,)), session_staff.MemberSources(()))
     folder: Path = Path()
@@ -120,8 +121,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return finding
 
     def new_list_record(self) -> tuple[record_store.NumberedRecords, str]:
-        keeper = replace(self.producer, name="morty")
-        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
+        keeper = self.producer
+        _ = self.write(self.home / ".claude/config/console.conf", f"page.list.owner={keeper.id}\n")
+        staff_file = self.write(self.root / "staff.json", json.dumps({"schema": 2, "rows": [keeper.to_json()]}))
+        with (mock.patch.dict(os.environ, {"STAFF_FILE": str(staff_file)}),
+              staff.supplied_snapshot(staff.StaffSnapshot((keeper,)))):
             item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
         return list_draft.list_records(keeper.id), item.id
 
@@ -759,11 +763,32 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         scope = update_registration.ProducerQuestions(self.producer)
         records = update_registration.native_question_records(scope, self.identities, strict=True)
         by_id = {record.item.get("review_id"): record for record in records}
-        self.assertEqual(by_id[first.question_id].item.get("request_key"), key)
-        self.assertEqual(by_id[second.question_id].item.get("request_key"), second_key)
+        self.assertTrue(update_registration.question_request(by_id[first.question_id]) == key)
+        self.assertTrue(update_registration.question_request(by_id[second.question_id]) == second_key)
+        self.assertTrue(all("request_key" not in record.path.read_text() for record in records))
         self.assertEqual(by_id[second.question_id].item["text"], title)
         self.assertTrue(all(record.status == "open" for record in records))
 
+
+    def test_move_restores_staff_question_retry_and_answer(self) -> None:
+        _, key, waiting, question = self.filed_question()
+        clean = question.path.read_text()
+        identity = reply_proofs.StaffQuestionIdentity(question.owner, waiting.question_id)
+        reply_proofs.path_for(identity).unlink()
+        old = clean.replace("registration: {", "registration: {" + json.dumps({"request_key": key})[1:-1] + ", ", 1)
+        _ = question.path.write_text(old)
+        with self.assertRaisesRegex(behavior_check.BehaviorCheckError, "Cannot read the behavior question"):
+            _ = behavior_review.question_answer(key, waiting.owner, waiting.question_id)
+        preview = reply_proofs.ProofMoveRun(True, record_store.configured_review_vaults)
+        self.assertEqual(update_registration.move_reply_proof(question.path, run=preview), 1)
+        self.assertTrue(question.path.read_text() == old)
+        self.assertFalse(reply_proofs.path_for(identity).exists())
+        move = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
+        self.assertEqual(update_registration.move_reply_proof(question.path, run=move), 1)
+        self.assertEqual(update_registration.move_reply_proof(question.path, run=move), 0)
+        self.assertFalse("request_key" in question.path.read_text())
+        self.assertEqual(behavior_review.ask(key, MOVE_QUESTION, self.producer.name), waiting)
+        self.assertEqual(behavior_review.question_answer(key, waiting.owner, waiting.question_id), waiting)
 
     def test_yes_requires_the_original_closed_question_and_the_users_yes(self) -> None:
         args, key, waiting, question = self.filed_question()

@@ -14,10 +14,19 @@ from scripts.production import record_store, staff
 
 
 class NumberedRecordsTests(unittest.TestCase):
-    def test_list_sequence_starts_from_records_and_the_migration_log(self) -> None:
+    def list_directory(self, keeper: staff.StaffId) -> Path:
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory)}))
-        store = record_store.NumberedRecords(staff.StaffId("keeper"), "list", "L", "list item", ValueError)
+        configuration = directory / "config"
+        configuration.mkdir()
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={keeper}\n")
+        self.enterContext(patch.dict(os.environ, {
+            "SHOWRUNNER_STATE_DIR": str(directory), "CONF_DIR": str(configuration)}))
+        return directory
+
+    def test_list_sequence_starts_from_records_and_the_migration_log(self) -> None:
+        keeper = staff.StaffId("keeper")
+        directory = self.list_directory(keeper)
+        store = record_store.NumberedRecords(keeper, "list", "L", "list item", ValueError)
         morty = staff.StaffRow(store.owner, "producer", "morty", staff.StaffRoot(), current_session=store.owner)
         self.enterContext(staff.supplied_snapshot(staff.StaffSnapshot((morty,))))
         former = directory / "former-keeper" / "list"
@@ -43,9 +52,8 @@ class NumberedRecordsTests(unittest.TestCase):
                 _ = store.next_number()
 
     def test_second_keeper_cannot_allocate_a_list_number(self) -> None:
-        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory)}))
         keeper = staff.StaffId("keeper")
+        _ = self.list_directory(keeper)
         second = staff.StaffId("second")
         members = staff.StaffSnapshot((
             staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper),

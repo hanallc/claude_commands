@@ -301,6 +301,16 @@ class AnswerTimeFromLog(StrEnum):
     USE_LOG = 'use log'
 
 
+class QuestionAnswerStatus(StrEnum):
+    NATE_OWES_ANSWER = 'Nate owes an answer'
+    NO_ANSWER_DUE = 'no answer due'
+
+
+@dataclass(frozen=True)
+class StaffAnswerDue:
+    recipient: staff.StaffId
+
+
 @dataclass(frozen=True)
 class ReviewItem:
     key: str
@@ -325,10 +335,11 @@ class ReviewItem:
     response: review_submissions.QuestionResponse | None = None
     answer_time: question_path.AnswerTime | AnswerTimeFromLog = AnswerTimeFromLog.USE_LOG
     body_answer_events: frozenset[int] = frozenset()
+    question_answer_due: QuestionAnswerStatus | StaffAnswerDue = QuestionAnswerStatus.NO_ANSWER_DUE
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
-        return self.queue_at(now) is question_path.Queue.NEEDS_ME
+        return not on_list(self) and self.queue_at(now) is question_path.Queue.NEEDS_ME
 
     def hidden_until(self, now: datetime) -> bool:
         return self.queue_at(now) is question_path.Queue.LATER
@@ -705,6 +716,22 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, do
     return found
 
 
+def pending_question_answer(record: update_registration.QuestionRecord, pending: update_registration.PendingFollowup,
+                            members: staff.StaffSnapshot) -> StaffAnswerDue | QuestionAnswerStatus:
+    """Use the saved recipient or resolve the relay for an older follow-up."""
+    if 'recipient' in pending:
+        return StaffAnswerDue(pending['recipient'])
+    if 'review_submission' in record.item:
+        return StaffAnswerDue(record.owner)
+    try:
+        scope = update_registration.question_scope(record.owner, members)
+    except (Refusal, update_registration.RegistrationFailure):
+        return QuestionAnswerStatus.NO_ANSWER_DUE
+
+    relay = update_registration.question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
+    return StaffAnswerDue(relay.recipient_or_owner(record.owner))
+
+
 def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
                   unowned: bool = False, zone: ZoneInfo | None = None) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
@@ -767,8 +794,9 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
         body_log_positions.update(index for index, event in legacy_events.items()
                                   if event.time == response.answered_at and event.who == owner
                                   and event.words == 'Answer: ' + response.answer)
-    if isinstance(parsed.timing, update_registration.AwaitingReply) and 'followup' in fields:
-        prompt = fields['followup']['text']
+    pending = fields.get('followup')
+    if isinstance(parsed.timing, update_registration.AwaitingReply) and pending is not None:
+        prompt = pending['text']
         encoded_prompts = {prefix + prompt.casefold() for prefix in prompt_prefixes}
         if not any(event.words.casefold() in encoded_prompts for event in saved_log):
             logs.append(ReviewLog(aware(parsed.timing.sent, zone), 'nate', prompt))
@@ -784,11 +812,18 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     kind = ReviewType.QUESTION if response is None else ReviewType.RESPONSE
     actions = ('answer', 'feedback', 'question') if response is None else ('read', 'question')
+    answer_due: QuestionAnswerStatus | StaffAnswerDue = QuestionAnswerStatus.NO_ANSWER_DUE
+    if not unowned and kind is ReviewType.QUESTION:
+        if state is ReviewState.WAITING and pending is not None:
+            answer_due = pending_question_answer(record, pending, members)
+        elif state is ReviewState.OPEN and 'review_submission' not in fields:
+            answer_due = QuestionAnswerStatus.NATE_OWES_ANSWER
     return ReviewItem(key, identity, kind, owner, asker, fields['text'], state,
         ReviewTimes(filed, max(event.time for event in logs), later), tuple(logs),
         actions if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
-        review_events.waiting_why(fields.get('waiting_why', '')), response, status_time, frozenset(body_answer_events))
+        review_events.waiting_why(fields.get('waiting_why', '')), response, status_time, frozenset(body_answer_events),
+        question_answer_due=answer_due)
 
 
 def store_paths(folders: tuple[Path, ...], sources: list[Path] | None) -> Iterator[Path]:
@@ -940,6 +975,94 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
 
 def investigation_type(record: investigation.Investigation) -> ReviewType:
     return ReviewType.BUG if record.kind == investigation.InvestigationKind.BUG else ReviewType.INVESTIGATION
+
+
+def on_list(item: ReviewItem) -> bool:
+    """Check if the source record belongs to a List item."""
+    source = item.source
+    if isinstance(source, InvestigationSource) and source.record.belongs_on_list:
+        return True
+    return any(list_move_event(event) for event in item.log)
+
+
+def list_move_event(event: ReviewLog) -> bool:
+    words = cast(object, event.words)
+    return (event.who == 'nate' and isinstance(words, str)
+            and re.fullmatch(r'moved to List item [1-9][0-9]*', words) is not None)
+
+
+def change_on_list(row: dict[str, str]) -> bool:
+    return any(list_move_event(event) for event in review_events.decode(row.get('Review log', '')))
+
+
+def can_move_wait(item: ReviewItem) -> bool:
+    return (item.type != ReviewType.FOR_YOU and item.state in (ReviewState.WAITING, ReviewState.VALIDATING)
+            and not on_list(item))
+
+
+def list_reply(item: ReviewItem) -> str:
+    """Read the latest reply from the native evidence for the List."""
+    source = item.source
+    if isinstance(source, ChangeSource):
+        question = source.slots.question
+        return question.answer if isinstance(question, delivery_state.AnsweredQuestion) else ''
+    for index in reversed(range(len(item.log))):
+        words = item.log[index].words
+        if words.startswith('Answer: '):
+            return words.removeprefix('Answer: ')
+        if index in item.body_answer_events:
+            return words
+    return ''
+
+
+@dataclass(frozen=True)
+class ValidationLogStart:
+    first_result_index: int
+
+
+class LegacyValidationLog(StrEnum):
+    MOVE_MARKER = 'use the List move entry'
+
+
+def validation_request_words(feedback: str) -> str:
+    return 'validate' + (': ' + feedback if feedback else '')
+
+
+def validation_log_start(row: dict[str, str], pending_request: str = '') -> ValidationLogStart:
+    """Start at the next log entry after the validation request."""
+    events = review_events.decode(row.get('Review log', ''))
+    if pending_request and not any(
+            (event.who, event.words, event.feedback_request_id) == ('nate', pending_request, '')
+            for event in events[-1:]):
+        return ValidationLogStart(len(events)+1)
+    return ValidationLogStart(len(events))
+
+
+def validation_problem(item: ReviewItem, list_number: int, start: ValidationLogStart | LegacyValidationLog) -> str:
+    """Read the problem for the validation that moved to this List item."""
+    source = item.source
+    if not isinstance(source, ChangeSource):
+        return ''
+    log = review_events.decode(source.row.get('Review log', ''))
+    if isinstance(start, ValidationLogStart):
+        events = iter(log[start.first_result_index:])
+    else:
+        marker = f'moved to List item {list_number}'
+        events = iter(log)
+        for event in events:
+            if event.who == 'nate' and event.words == marker:
+                break
+        else:
+            return ''
+
+    prefix = 'Check found a problem: '
+    problem = ''
+    for event in events:
+        if event.words.partition(':')[0] == 'validate':
+            break
+        if event.words.startswith(prefix):
+            problem = event.words.removeprefix(prefix)
+    return problem
 
 
 def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path, *,
@@ -1619,16 +1742,43 @@ def investigations(doc: Path, record: staff.StaffSnapshot, *, source: str = '', 
     return count_items(items,datetime.now(zone),source)
 
 
-def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
-                    source: str = '') -> tuple[int,str]:
-    """Count Questions in the same zone as Review and /next."""
+@dataclass(frozen=True)
+class QuestionWork:
+    for_nate: int = 0
+    for_session: int = 0
+    deadline: str = ''
+
+
+def question_work(owner: staff.StaffRow, identities: QuestionStaff, sources: list[Path] | None,
+                  source: str = '') -> QuestionWork:
+    """Count open questions for Nate and for the session footer."""
     if sources is not None and not os.environ.get('USER_ZONE'):
         sources.append(Path(user_zone_config.CONF))
     zone = user_zone()
-    items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
+    items = read_kind(ReviewType.QUESTION, owner, identities.record, sources=sources, show='active', zone=zone)
     now = datetime.now(zone)
-    return (sum(item.for_you(now) and (not source or item.source_unit == source) for item in items),
-            question_path.next_later_deadline((item.times.later for item in items), now))
+    for_nate = for_session = 0
+    deadlines: list[question_path.Later] = []
+    session_staff = source or owner.id
+    for item in items:
+        due = item.question_answer_due
+        if isinstance(due, StaffAnswerDue) and due.recipient == session_staff:
+            for_session += item.queue_at(now) is question_path.Queue.WAITING_FOR_ANSWER
+        elif due is QuestionAnswerStatus.NATE_OWES_ANSWER and (not source or item.source_unit == source):
+            if item.for_you(now):
+                for_nate += 1
+                for_session += 1
+        else:
+            continue
+        deadlines.append(item.times.later)
+    return QuestionWork(for_nate, for_session, question_path.next_later_deadline(deadlines, now))
+
+
+def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
+                    source: str = '') -> tuple[int,str]:
+    """Count questions that wait for Nate in the Review time zone."""
+    work = question_work(owner, identities, sources, source)
+    return work.for_nate, work.deadline
 
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:
