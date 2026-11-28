@@ -1440,7 +1440,7 @@ def require_retired_record_unchanged(identity: staff.StaffId, branch: staff.Park
     except (worker_lifecycle.OperationDeadlineExpired, subprocess.TimeoutExpired) as error:
         raise retired_check_timeout(identity, "Checkout absence check") from error
     except (OSError, ValueError, RetirementRefused, subprocess.SubprocessError) as error:
-        raise staff.StaffRefused(f"cannot confirm checkout absence: {error}") from error
+        raise staff.StaffRefused(f"cannot confirm checkout absence: {error}. Run agents retire {identity} again.") from error
     try:
         if unit_machine_is_local(checked.machine):
             tip = retired_origin_tip_at(checked.checkout, branch.value)
@@ -1454,7 +1454,7 @@ def require_retired_record_unchanged(identity: staff.StaffId, branch: staff.Park
     except (worker_lifecycle.OperationDeadlineExpired, subprocess.TimeoutExpired) as error:
         raise retired_check_timeout(identity, f"Origin branch {branch.value} check") from error
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        raise staff.StaffRefused(f"cannot recheck origin branch {branch.value}: {error}") from error
+        raise staff.StaffRefused(f"cannot recheck origin branch {branch.value}: {error}. Run agents retire {identity} again.") from error
     if tip != checked.tip:
         raise staff.StaffRefused(f"origin branch {branch.value} changed before record removal")
 
