@@ -8,9 +8,7 @@ import json
 import os
 import re
 import shlex
-import select
 import shutil
-import socket
 import subprocess
 import tempfile
 import threading
@@ -18,7 +16,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator, Mapping
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,7 +33,7 @@ from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import conf, file_lock
-from scripts.lib.process_group import run_process_group, stop_process_group
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
@@ -48,7 +46,7 @@ from scripts.review_links import (browser_test_support, console, go_ledger, list
                                   studio_page)
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_link, review_page, search_fold, send_hold
-from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
+from scripts.review_links.browser_test_support import Chrome, Firefox, UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_record_table import save_notice_failures
@@ -175,332 +173,12 @@ def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bo
     return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
 
 
-class _Browser:
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
-        self.process: subprocess.Popen[bytes] = process
-        self.closed: bool = False
-        self.resources: ExitStack = ExitStack()
-        _ = self.resources.callback(stop_process_group, process)
-
-    def close(self) -> None:
-        if not self.closed:
-            self.closed = True
-            self.resources.close()
-
-    @contextmanager
-    def stop_on_error(self) -> Generator[None]:
-        try:
-            yield
-        except BaseException as error:
-            try:
-                self.close()
-            except BaseException as cleanup_error:
-                error.add_note(f"Browser cleanup failed: {cleanup_error}")
-            raise
-
-
-class _ChromeCommandError(RuntimeError):
-    def __init__(self, method: str, error: dict[str, object]) -> None:
-        super().__init__(f"{method}: {error}")
-        self.error: dict[str, object] = error
-
-
-class _Chrome(_Browser):
-    """Keep one fixture tab and close the extra tabs after each test."""
-
-    def __init__(self, root: Path) -> None:
-        self.root: Path = root
-        self.pending: bytearray = bytearray()
-        self.loaded: set[tuple[str, str]] = set()
-        self.origins: set[str] = set()
-        self.sequence: int = 0
-        self.blank: bool = True
-        self.session_storage_written: bool = False
-        with (root / "chrome.log").open("wb") as log:
-            process = subprocess.Popen(
-                ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
-                 "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
-                 "--no-first-run", "--allow-file-access-from-files", "--remote-debugging-pipe",
-                 f"--user-data-dir={root / 'chrome'}", "about:blank"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0,
-                start_new_session=True)
-        super().__init__(process)
-        with self.stop_on_error():
-            writer = process.stdin
-            assert writer is not None
-            os.set_blocking(writer.fileno(), False)
-            self.context: str = cast(str, self.command("Target.createBrowserContext", {})["browserContextId"])
-            self.target: str
-            self.session: str
-            self.open_fixture_tab()
-            # The fixture tab keeps Chrome open after the startup tab closes.
-            for tab in self.tabs():
-                if tab["targetId"] != self.target:
-                    self.close_tab(tab["targetId"])
-
-    def open_fixture_tab(self) -> None:
-        target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": self.context})
-        self.target = cast(str, target["targetId"])
-        self.session = cast(str, self.command("Target.attachToTarget",
-            {"targetId": self.target, "flatten": True})["sessionId"])
-        _ = self.command("Page.enable", {}, self.session)
-        _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
-        _ = self.command("DOMStorage.enable", {}, self.session)
-        self.blank = True
-
-    def tabs(self) -> list[dict[str, str]]:
-        targets = cast(list[dict[str, str]], self.command("Target.getTargets", {})["targetInfos"])
-        return [target for target in targets if target["type"] == "page"]
-
-    def close_tab(self, target: str) -> None:
-        try:
-            _ = self.command("Target.closeTarget", {"targetId": target})
-        except _ChromeCommandError as error:
-            if error.error.get("code") != -32602 or error.error.get("message") != "No target with given id found":
-                raise
-
-    def close_test_pages(self) -> None:
-        if self.closed:
-            return
-        with self.stop_on_error():
-            for opened in self.tabs():
-                if opened["targetId"] != self.target:
-                    self.close_tab(opened["targetId"])
-            if not self.blank:
-                self.navigate("about:blank")
-            if self.session_storage_written:
-                # Closing the tab discards session storage for all its documents.
-                old_target = self.target
-                self.open_fixture_tab()
-                self.close_tab(old_target)
-            _ = self.command("Page.resetNavigationHistory", {}, self.session)
-            _ = self.command("Emulation.clearDeviceMetricsOverride", {}, self.session)
-            _ = self.command("Emulation.setEmulatedMedia", {"media": "", "features": []}, self.session)
-            _ = self.command("Network.clearBrowserCookies", {}, self.session)
-            _ = self.command("Network.clearBrowserCache", {}, self.session)
-            for origin in sorted(self.origins):
-                _ = self.command("Storage.clearDataForOrigin",
-                                 {"origin": origin, "storageTypes": "all"}, self.session)
-            self.origins.clear()
-            self.loaded.clear()
-            self.session_storage_written = False
-
-    def read(self, deadline: float) -> dict[str, object]:
-        reader = self.process.stdout
-        assert reader is not None
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Chrome did not answer")
-            end = self.pending.find(b"\0")
-            if end >= 0:
-                reply = cast(dict[str, object], json.loads(self.pending[:end]))
-                del self.pending[:end + 1]
-                method = reply.get("method")
-                if method == "Page.lifecycleEvent":
-                    lifecycle = cast(dict[str, str], reply["params"])
-                    if lifecycle["name"] == "DOMContentLoaded":
-                        self.loaded.add((cast(str, reply["sessionId"]), lifecycle["loaderId"]))
-                elif method == "Page.frameNavigated":
-                    navigation = cast(dict[str, dict[str, str]], reply["params"])
-                    origin = navigation["frame"]["securityOrigin"]
-                    if urlsplit(origin).scheme in {"http", "https", "file"}:
-                        self.origins.add(origin)
-                elif method in {"DOMStorage.domStorageItemAdded", "DOMStorage.domStorageItemUpdated"}:
-                    storage = cast(dict[str, dict[str, bool]], reply["params"])
-                    if not storage["storageId"]["isLocalStorage"]:
-                        self.session_storage_written = True
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Chrome did not answer")
-                return reply
-            if not select.select([reader], [], [], remaining)[0]:
-                raise TimeoutError("Chrome did not answer")
-            chunk = os.read(reader.fileno(), 65536)
-            if not chunk:
-                raise RuntimeError((self.root / "chrome.log").read_text(errors="replace"))
-            self.pending.extend(chunk)
-
-    def command(self, method: str, parameters: dict[str, object], session: str = "", *,
-                timeout: float = 20) -> dict[str, object]:
-        self.sequence += 1
-        request: dict[str, object] = {"id": self.sequence, "method": method, "params": parameters}
-        if session:
-            request["sessionId"] = session
-        writer = self.process.stdin
-        assert writer is not None
-        data = memoryview(json.dumps(request).encode() + b"\0")
-        deadline = time.monotonic() + timeout
-        while data:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([], [writer], [], remaining)[1] or time.monotonic() >= deadline:
-                raise TimeoutError(f"{method}: Chrome did not accept the command")
-            try:
-                written = os.write(writer.fileno(), data)
-            except BlockingIOError:
-                continue
-            data = data[written:]
-        while True:
-            reply = self.read(deadline)
-            if reply.get("id") == self.sequence:
-                if "error" in reply:
-                    raise _ChromeCommandError(method, cast(dict[str, object], reply["error"]))
-                return cast(dict[str, object], reply["result"])
-
-    def navigate(self, destination: str) -> None:
-        self.blank = False
-        self.loaded.clear()
-        navigation = self.command("Page.navigate", {"url": destination}, self.session)
-        if "errorText" in navigation:
-            raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
-        load = (self.session, cast(str, navigation["loaderId"]))
-        deadline = time.monotonic() + 20
-        while load not in self.loaded:
-            _ = self.read(deadline)
-        self.blank = destination == "about:blank"
-
-    def dom(self, page: Path | str, marker: str, *, reduced_motion: bool,
-            window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
-        with self.stop_on_error():
-            session = self.session
-            if window_size is not None:
-                width, height = window_size
-                _ = self.command("Emulation.setDeviceMetricsOverride",
-                    {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
-            else:
-                _ = self.command("Emulation.clearDeviceMetricsOverride", {}, session)
-            features = [{"name": "prefers-reduced-motion", "value": "reduce"}] if reduced_motion else []
-            _ = self.command("Emulation.setEmulatedMedia", {"features": features}, session)
-            destination = page.as_uri() if isinstance(page, Path) else page
-            # Evaluate the promise in the new document, after the navigation.
-            marker_literal = json.dumps(marker)
-            script = (
-                "try { sessionStorage.clear(); localStorage.clear(); }"
-                "catch (error) { if (error.name !== 'SecurityError') throw error; }"
-                "globalThis.fixtureDOM = new Promise(resolve => {"
-                "const observer = new MutationObserver(() => {"
-                f"const result = document.getElementById({marker_literal});"
-                "if (result) { observer.disconnect(); resolve(document.documentElement.outerHTML); }"
-                "});"
-                "observer.observe(document, {childList: true, subtree: true});"
-                "});"
-            )
-            hook = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
-            self.navigate(destination)
-            try:
-                response = self.command("Runtime.evaluate",
-                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session,
-                    timeout=TEST_HANG_GUARD_SECS)
-            except TimeoutError as error:
-                raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
-            result = cast(dict[str, object], response["result"])
-            _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
-            self.navigate("about:blank")
-            return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
-
-
-class _Firefox(_Browser):
-    """Keep Firefox open and control its private profile through Marionette."""
-
-    def __init__(self, root: Path) -> None:
-        profile = root / "firefox"
-        profile.mkdir()
-        _ = (profile / "user.js").write_text(
-            'user_pref("marionette.port", 0);\n'
-            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n')
-        with (root / "firefox.log").open("wb") as log:
-            process = subprocess.Popen(
-                ["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                 "--marionette", "--remote-allow-system-access", "about:blank"],
-                stdout=log, stderr=log, start_new_session=True)
-        super().__init__(process)
-        with self.stop_on_error():
-            port_file = profile / "MarionetteActivePort"
-            deadline = time.monotonic() + 30
-            while not port_file.exists():
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError((root / "firefox.log").read_text(errors="replace"))
-                time.sleep(0.02)
-            address = ("127.0.0.1", int(port_file.read_text()))
-            self.connection: socket.socket = self.resources.enter_context(socket.create_connection(address, timeout=45))
-            self.stream: BinaryIO = self.resources.enter_context(self.connection.makefile("rb"))
-            _ = self.read()
-            self.sequence: int = 0
-            _ = self.command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "none"}}})
-            initial = cast(dict[str, str], self.command("WebDriver:GetWindowHandle"))
-            self.initial: str = initial["value"]
-
-    def read(self) -> object:
-        size = bytearray()
-        while (byte := self.stream.read(1)) != b":":
-            if not byte or not byte.isdigit():
-                raise RuntimeError("Firefox closed the Marionette connection")
-            size.extend(byte)
-        return cast(object, json.loads(self.stream.read(int(size))))
-
-    def command(self, method: str, parameters: dict[str, object] | None = None) -> object:
-        self.sequence += 1
-        message = json.dumps([0, self.sequence, method, parameters or {}]).encode()
-        self.connection.sendall(str(len(message)).encode() + b":" + message)
-        kind, sequence, error, result = cast(list[object], self.read())
-        if kind != 1 or sequence != self.sequence or error is not None:
-            raise RuntimeError(f"{method}: {error}")
-        return result
-
-    def script(self, source: str, arguments: list[object]) -> object:
-        result = cast(dict[str, object], self.command("WebDriver:ExecuteScript", {"script": source, "args": arguments}))
-        return result["value"]
-
-    @contextmanager
-    def page(self, destination: str, width: int, height: int, *, dark: bool = False,
-             reduced_motion: bool = False) -> Generator[None]:
-        with self.stop_on_error():
-            _ = self.command("Marionette:SetContext", {"value": "chrome"})
-            cleared = cast(dict[str, object], self.command("WebDriver:ExecuteAsyncScript", {
-                "script": """
-Services.prefs.setIntPref("ui.systemUsesDarkTheme", arguments[0]);
-Services.prefs.setIntPref("ui.prefersReducedMotion", arguments[1]);
-const flags = Ci.nsIClearDataService;
-Services.clearData.deleteData(
-    flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | flags.CLEAR_ALL_CACHES | flags.CLEAR_HISTORY,
-    arguments[2]);
-""", "args": [int(dark), int(reduced_motion)],
-            }))
-            if cleared["value"] != 0:
-                raise RuntimeError(f"Firefox could not clear profile data: {cleared['value']}")
-            _ = self.command("Marionette:SetContext", {"value": "content"})
-            window = cast(dict[str, str], self.command("WebDriver:NewWindow", {"type": "tab", "focus": True}))
-            # If the switch fails, close the group to close the new tab.
-            _ = self.command("WebDriver:SwitchToWindow", {"handle": window["handle"]})
-            dimensions = cast(list[int], self.script("return [outerWidth - innerWidth, outerHeight - innerHeight];", []))
-            _ = self.command("WebDriver:SetWindowRect", {"width": width + dimensions[0], "height": height + dimensions[1]})
-            _ = self.command("WebDriver:Navigate", {"url": destination})
-            yield
-            _ = self.command("WebDriver:CloseWindow")
-            _ = self.command("WebDriver:SwitchToWindow", {"handle": self.initial})
-
-    def screenshot(self, path: Path) -> None:
-        result = cast(dict[str, str], self.command("WebDriver:TakeScreenshot", {"full": False}))
-        _ = path.write_bytes(base64.b64decode(result["value"]))
-
-    def wait_for_load(self, destination: str) -> None:
-        deadline = time.monotonic() + 45
-        while time.monotonic() < deadline:
-            if self.script("""
-// The console can change the query with history.replaceState.
-const navigation = performance.getEntriesByType('navigation')[0];
-return navigation?.name.split('#', 1)[0] === arguments[0] && document.readyState === 'complete';
-""", [destination.partition("#")[0]]) is True:
-                return
-            time.sleep(0.02)
-        raise TimeoutError(f"Firefox did not load {destination}")
-
-
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
     browser_root: ClassVar[Path]
-    _chrome: ClassVar[_Chrome | None] = None
-    _test_chrome: _Chrome | None = None
-    _firefox: ClassVar[_Firefox | None] = None
+    _chrome: ClassVar[Chrome | None] = None
+    _test_chrome: Chrome | None = None
+    _firefox: ClassVar[Firefox | None] = None
 
     @classmethod
     @override
@@ -547,14 +225,14 @@ class ListPageTests(unittest.TestCase):
             + "# range: 0.001..86400\nstatus.list.age_limit_seconds=45\n"
             + "# range: 0.001..86400\nstatus.review.age_limit_seconds=45\n")
 
-    def chrome(self) -> _Chrome:
+    def chrome(self) -> Chrome:
         cls = type(self)
         browser = cls._chrome
         if browser is None or browser.closed or browser.process.poll() is not None:
             if browser is not None:
                 browser.close()
             root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
-            browser = _Chrome(root)
+            browser = Chrome(root)
             cls._chrome = browser
             cls.addClassCleanup(browser.close)
         if self._test_chrome is not browser:
@@ -563,13 +241,13 @@ class ListPageTests(unittest.TestCase):
         return browser
 
     @classmethod
-    def firefox(cls) -> _Firefox:
+    def firefox(cls) -> Firefox:
         if cls._firefox is not None:
             if not cls._firefox.closed and cls._firefox.process.poll() is None:
                 return cls._firefox
             cls._firefox.close()
         root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="firefox-"))
-        cls._firefox = _Firefox(root)
+        cls._firefox = Firefox(root)
         cls.addClassCleanup(cls._firefox.close)
         return cls._firefox
 

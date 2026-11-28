@@ -17,6 +17,7 @@ import ipaddress
 import json
 import gzip
 import os
+import queue
 import re
 import secrets
 import select
@@ -60,6 +61,7 @@ from scripts.build_queue import admission_wire, kill_action, memory_feed, memory
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
+from scripts.review_links.browser_test_support import Chrome, Firefox
 from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
@@ -91,26 +93,37 @@ ROLE_COLOR_CONFIG = (
 )
 
 
-VERSION_BROWSER_PROBE = br"""<script>
+def version_probe(actions: bytes) -> bytes:
+    return br"""<script>
 (async()=>{
- const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const failures=[],check=(ok,message)=>{if(!ok) throw new Error(message);};
+ const step=async message=>{
+  const response=await fetch('/version-step',{method:'POST',body:message});
+  check(response.ok,'The fixture could not record the probe step.');
+ };
+ const until=async(test,message)=>{
+  await step(message);
+  while(!test()) await new Promise(resolve=>requestAnimationFrame(resolve));
+ };
+ const publish=async()=>{
+  await step('Publish the notice.');
+  check((await fetch('/version-publish')).ok,'The fixture could not publish the notice.');
+  window.dispatchEvent(new Event('focus'));
+ };
+ try{
+""" + actions + br"""
+ }catch(error){failures.push(String(error));}
+ finally{await fetch('/version-results',{method:'POST',body:JSON.stringify(failures)});}
+})();
+</script>"""
+
+
+VERSION_BROWSER_PROBE = version_probe(br"""
  const notice=document.querySelector('.version-notice');
  const links=()=>[...notice.querySelectorAll('li a')];
  const list=()=>document.querySelector('iframe[data-console-page="list"]');
  const frame=()=>document.querySelector('iframe[data-version-card]');
  const overlay=()=>frame()?.contentDocument.querySelector('[data-version-list-dialog][open] [data-list]');
- const publish=async()=>{
-  if(!(await fetch('/version-publish')).ok) throw new Error('The fixture could not publish the notice.');
-  window.dispatchEvent(new Event('focus'));
- };
- const until=async(test,label)=>{
-  const end=performance.now()+7000;
-  while(!test()){
-   if(performance.now()>end) throw new Error(label);
-   await new Promise(resolve=>requestAnimationFrame(resolve));
-  }
- };
- try{
   await until(()=>list()?.contentDocument.querySelector('[data-list-count]')?.textContent,'The List did not load.');
   const page=list().contentDocument;
   const proof=new URLSearchParams(location.search).has('shot');
@@ -198,39 +211,20 @@ VERSION_BROWSER_PROBE = br"""<script>
   notice.querySelector('header button').click();
   await until(()=>notice.hidden && links().length===0,'Clear all did not remove the populated notice.');
   check(list().contentDocument===page,'Clear all leaves the List page open.');
- }catch(error){failures.push(String(error));}
- finally{await fetch('/version-results',{method:'POST',body:JSON.stringify(failures)});}
-})();
-</script><img hidden src="/version-complete">"""
+""")
 
 
 def version_card_probe(actions: bytes) -> bytes:
-    return br"""<script>
-(async()=>{
- const failures=[];
+    return version_probe(br"""
  const banner=number=>document.querySelector('.version-notice a[data-version-item$="/L'+number+'"]');
  const frame=()=>document.querySelector('iframe[data-version-card]');
  const item=number=>frame()?.contentDocument.querySelector('[data-version-list-dialog][open] [data-number="'+number+'"]');
- const until=async(test,message)=>{
-  const end=performance.now()+6000;
-  while(!test()){
-   if(performance.now()>end) throw new Error(message);
-   await new Promise(resolve=>requestAnimationFrame(resolve));
-  }
- };
- const check=(test,message)=>{if(!test) throw new Error(message);};
- try{
-  check((await fetch('/version-publish')).ok,'The fixture publishes the notice.');
-  window.dispatchEvent(new Event('focus'));
+  await publish();
   await until(()=>banner(504),'The notice did not load.');
   banner(504).click();
   await until(()=>item(504),'The notice item did not open.');
   const card=frame(),page=card.contentDocument;
-""" + actions + br"""
- }catch(error){failures.push(String(error));}
- finally{await fetch('/version-results',{method:'POST',body:JSON.stringify(failures)});}
-})();
-</script><img hidden src="/version-complete">"""
+""" + actions)
 
 
 def png_chunk(kind: bytes, data: bytes) -> bytes:
@@ -1381,8 +1375,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
     def test_browser_settings_retries_sync_and_reports_uncertainty(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
         sync_folder = atomic_file.sync_folder
         failures = 2
@@ -1394,7 +1386,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 raise OSError("Directory sync failed.")
             sync_folder(folder)
 
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(atomic_file, "sync_folder", side_effect=sync) as sync_mock):
@@ -1439,10 +1431,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
     def test_browser_settings_can_undo_an_unconfirmed_save_until_expiry(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         failure = OSError("Directory sync failed.")
         with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
@@ -1514,11 +1504,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the sidebar label test.")
     def test_collapsed_labels_are_visible_beside_the_scrolling_sidebar(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         pages = tuple(console.ConsolePage(f"page{index}", f"Page {index}", "inbox", f"Page {index}",
                                           console.UnavailablePage()) for index in range(16))
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         _ = browser.command("Emulation.setDeviceMetricsOverride",
                             {"width": 1440, "height": 700, "deviceScaleFactor": 1, "mobile": False}, browser.session)
@@ -1564,11 +1552,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the sidebar label test.")
     def test_collapsed_keyboard_focus_replaces_the_pointer_label(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         pages = tuple(console.ConsolePage(f"page{index}", f"Page {index}", "inbox", f"Page {index}",
                                           console.UnavailablePage()) for index in range(4))
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(console, "read_pages", return_value=pages),
@@ -1629,10 +1615,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
     def test_browser_settings_shows_saved_after_undo_expires(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
             browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
@@ -1667,8 +1651,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
     def test_browser_settings_undo_uses_the_time_left_after_save(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
         elapsed = 0
         sync_folder = atomic_file.sync_folder
@@ -1681,7 +1663,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         def undo_clock() -> int:
             return time.time_ns() + elapsed
 
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(settings_page, "time", SimpleNamespace(time_ns=undo_clock)),
@@ -1721,10 +1703,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
     def test_browser_opens_settings_and_saves_with_undo_in_dark_mode(self) -> None:
-        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
-
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=20\n")
-        browser = _Chrome(self.root.parent)
+        browser = Chrome(self.root.parent)
         self.addCleanup(browser.close)
         session = browser.session
         _ = browser.command("Emulation.setDeviceMetricsOverride",
@@ -5956,6 +5936,32 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(version_notice.read(root), cleared)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
+    def test_browser_version_notice_reads_again_after_focus_during_a_read(self) -> None:
+        setup = br"""<script>
+ const staleNotice=Promise.withResolvers();
+ let noticeReads=0;
+ {
+  const fetchPage=window.fetch;
+  window.fetch=(url,options)=>{
+   if(new URL(url,location.href).pathname===VERSION_PATH && ++noticeReads===1) return staleNotice.promise;
+   return fetchPage(url,options);
+  };
+ }
+</script>""".replace(b"VERSION_PATH", json.dumps(version_notice.PATH).encode())
+        _ = self.check_version_notice_browser(version_probe(br"""
+  await until(()=>noticeReads===1,'Start the first notice read.');
+  await publish();
+  window.dispatchEvent(new Event('focus'));
+  check(noticeReads===1,'Focus does not start a concurrent read.');
+  staleNotice.resolve({ok:true,json:async()=>({changes:[]})});
+  // Let refresh read the response and then its JSON.
+  await Promise.resolve();
+  await Promise.resolve();
+  check(noticeReads===2,'Focus during the first read starts one more read.');
+  await until(()=>document.querySelectorAll('.version-notice li').length===3,'Show the new notice after focus.');
+"""), setup=setup)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the version notice.")
     def test_browser_version_notice_keeps_the_review_send_available_for_undo(self) -> None:
         with capture_sender("send_message") as send:
             _ = self.check_version_notice_browser(version_card_probe(br"""
@@ -6030,9 +6036,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 """), linked_items=True)
 
     def check_version_notice_browser(self, probe: bytes, *, allow_proof: bool = False, hold_review: bool = False,
-                                     linked_items: bool = False) -> tuple[version_notice.Notice, Path]:
-        firefox = shutil.which("firefox")
-        assert firefox is not None
+                                     linked_items: bool = False, setup: bytes = b"") -> tuple[version_notice.Notice, Path]:
         self.server.verified_tailscale_address = "127.0.0.1"
         case = self.review_fixture(changes=1)
         keeper = fixture_member("producer", name="morty")
@@ -6042,7 +6046,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(self.server, "review_cache", cache))
         _ = self.enterContext(patch.object(self.server, "delivery_status", case.status))
         if hold_review:
-            _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+            # Keep the server hold and its Undo toast active past the result deadline.
+            _ = self.enterContext(patch.object(settings_page, "undo_seconds", return_value=2 * TEST_HANG_GUARD_SECS))
         change = next(item for item in cache.get().records.values() if item.type == review_items.ReviewType.CHANGE)
         if linked_items:
             blocker = the_list.add(keeper.id, "The closed blocker", number=491, owner=the_list.UnassignedOwner.NATE,
@@ -6067,10 +6072,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             changes.append(version_notice.Change(number, f"{keeper.id}/{item.id}", title))
         notice = version_notice.Notice("b" * 40, tuple(reversed(changes)))
         state = case.root / version_notice.FILE
-        results: list[list[str]] = []
-        complete = threading.Event()
+        results: queue.Queue[list[str] | int] = queue.Queue()
+        step = "Load the console."
         root = case.root
-        shell = self.request("/console/").body
+        shell = self.request("/console/").body.replace(b"</head>", setup + b"</head>", 1)
+        page = shell.replace(b"</body>", probe + b"</body>", 1)
         self.assertEqual(self.request(list_page.PAGE_PATH + "?version-card=1&item=missing").status, 404)
 
         class VersionBrowser(serve.ReviewLinksHandler):
@@ -6078,49 +6084,63 @@ class ReviewLinksServerTests(unittest.TestCase):
             def send_head(self) -> BinaryIO | None:
                 route = urlsplit(self.path)
                 if route.path == "/version-browser":
-                    complete.clear()
                     if parse_qs(route.query).get("shot") == ["1"]:
                         atomic_file.write_text_atomic(state, json.dumps(asdict(notice)))
-                    self.html_response(200, shell.replace(b"</body>", probe + b"</body>"))
+                    self.html_response(200, page)
                     return None
                 if route.path == "/version-publish":
                     atomic_file.write_text_atomic(state, json.dumps(asdict(notice)))
-                    self.json_response(200, {})
-                    return None
-                if route.path == "/version-complete":
-                    _ = complete.wait(12)
                     self.json_response(200, {})
                     return None
                 return super().send_head()
 
             @override
             def do_POST(self) -> None:
-                if self.path == "/version-results":
-                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                nonlocal step
+                if self.path in ("/version-step", "/version-results"):
+                    payload = self.rfile.read(int(self.headers["Content-Length"]))
+                    if self.path == "/version-step":
+                        step = payload.decode("utf-8")
+                    else:
+                        results.put(cast(list[str], json.loads(payload)))
                     self.json_response(200, {})
-                    complete.set()
                     return
                 super().do_POST()
 
         proof = os.environ.get("VERSION_NOTICE_PROOF") if allow_proof else None
         route = "/version-browser?page=list"
 
-        def capture(place: str) -> bytes:
-            return serve.page_screenshot(firefox, origin + place, new_item_dialog.PageCaptureRequest(place, 1440, 900, True))
-
         origin = f"http://127.0.0.1:{self.port}"
-        self.server.RequestHandlerClass = VersionBrowser
-        try:
-            if proof:
-                screenshot = capture(route + "&shot=1")
-                self.assertEqual(results, [[]])
-                _ = Path(proof).write_bytes(screenshot)
-                results.clear()
-                state.unlink()
-            _ = capture(route)
-        finally:
-            self.server.RequestHandlerClass = serve.ReviewLinksHandler
-        self.assertEqual(results, [[]])
+        with tempfile.TemporaryDirectory(prefix="version-notice-browser-") as folder:
+            browser = Firefox(Path(folder), timeout=TEST_HANG_GUARD_SECS)
+            exited = threading.Thread(target=lambda: results.put(browser.process.wait()), daemon=True)
+
+            def run(place: str, picture: Path | None = None) -> None:
+                nonlocal step
+                step = "Load the console."
+                with browser.page(origin + place, 1440, 900, dark=True, reduced_motion=True):
+                    try:
+                        result = results.get(timeout=TEST_HANG_GUARD_SECS)
+                    except queue.Empty:
+                        self.fail(f"The version notice probe stopped at this step. {step}")
+                    if isinstance(result, int):
+                        log = (Path(folder) / "firefox.log").read_text(errors="replace")
+                        self.fail(f"Firefox exited with status {result} during this step. {step}\n{log}")
+                    self.assertEqual(result, [])
+                    if picture is not None:
+                        browser.screenshot(picture)
+
+            self.server.RequestHandlerClass = VersionBrowser
+            exited.start()
+            try:
+                if proof:
+                    run(route + "&shot=1", Path(proof))
+                    state.unlink()
+                run(route)
+            finally:
+                self.server.RequestHandlerClass = serve.ReviewLinksHandler
+                browser.close()
+                exited.join(TEST_HANG_GUARD_SECS)
         return notice, root
 
     def test_console_page_gzip_matches_identity(self) -> None:

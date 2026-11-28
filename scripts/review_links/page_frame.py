@@ -441,6 +441,7 @@ _VERSION_SCRIPT = r'''(() => {
  const frames=document.querySelector('.frame-area'),shell=document.querySelector('#console-shell');
  const listDrafts=new Map();
  let current,visible='',reading=false,clearing=false,card,selected='',opener='',requested='',edit=0;
+ let refreshPending=false;
  const itemLink=key=>rows.querySelector('a[data-version-item="'+CSS.escape(key)+'"]');
  const itemURL=key=>new URL('/console/list.html?'+new URLSearchParams({item:key,reveal:'1'}),location.href);
  const cardBusy=()=>card?.contentDocument?.versionListBusy?.();
@@ -495,7 +496,10 @@ _VERSION_SCRIPT = r'''(() => {
   notice.hidden=false;
  }
  async function refresh(){
-  if(reading || clearing || document.visibilityState!=='visible') return;
+  if(document.visibilityState!=='visible') return;
+  if(reading){refreshPending=true;return;}
+  if(clearing) return;
+  refreshPending=false;
   const started=edit;
   reading=true;
   try{
@@ -504,7 +508,10 @@ _VERSION_SCRIPT = r'''(() => {
     const data=await response.json();
     if(started===edit) render(data);
    }
-  }catch(_){}finally{reading=false;}
+  }catch(_){}finally{
+   reading=false;
+   if(refreshPending) void refresh();
+  }
  }
  form.addEventListener('submit',async event=>{
   event.preventDefault();
@@ -520,7 +527,10 @@ _VERSION_SCRIPT = r'''(() => {
    render(data);
   }catch(error){
    reportFailure(error instanceof SyntaxError ? 'The change could not clear. Try again.' : error.message);
-  }finally{clearing=false;}
+  }finally{
+   clearing=false;
+   if(refreshPending && !reading) void refresh();
+  }
  });
  function openCard(key){
   if(cardBusy() || key===requested) return false;
