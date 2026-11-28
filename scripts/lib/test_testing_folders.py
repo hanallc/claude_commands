@@ -39,7 +39,6 @@ class Fixture(unittest.TestCase):
     def test_folder(self):
         print('TMPDIR=' + os.environ['TMPDIR'], flush=True)
         self.assertNotIn('GATE_PARENT_PID', os.environ)
-        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
         for name in ('CONF_READ_LOG', 'SCRATCH_ROOT', 'ASTRA_REVIEW_DIR'):
             self.assertEqual(Path(os.environ[name]).parent.parent, Path(os.environ['TMPDIR']))
 """

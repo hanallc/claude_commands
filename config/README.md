@@ -87,7 +87,7 @@ Both callers read the value when they use it.
 
 ## gate.conf
 
-`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
+`merge_gate.conf` links to `gate.conf`.
 
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.

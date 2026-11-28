@@ -26,7 +26,7 @@ from importlib import import_module
 from pathlib import Path
 import sys
 import tempfile
-from threading import Lock
+from threading import Lock, Thread, current_thread
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, cast, final, overload, override
 
@@ -868,6 +868,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_lock_owners: dict[int, Thread] = {}
 _inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
@@ -921,8 +922,20 @@ def build_folder_lock_fd(path: Path) -> int:
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all build locks in source and command subprocesses."""
-    return (*_inherited_build_locks.get(), *_locks)
+    """Pass inherited locks and locks that this thread holds to child processes."""
+    owner = current_thread()
+    owned = (descriptor for descriptor, thread in _lock_owners.copy().items() if thread is owner)
+    return (*_inherited_build_locks.get(), *owned)
+
+
+def _register_build_lock(descriptor: int, path: Path) -> None:
+    _locks[descriptor] = path
+    _lock_owners[descriptor] = current_thread()
+
+
+def _forget_build_lock(descriptor: int) -> None:
+    _ = _lock_owners.pop(descriptor, None)
+    _ = _locks.pop(descriptor, None)
 
 
 @contextmanager
@@ -944,10 +957,203 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
     if _locks.get(descriptor) != path:
         return
     try:
-        _ = _locks.pop(descriptor, None)
+        _forget_build_lock(descriptor)
     finally:
         # Closing preserves a child's inherited hold on the same lock.
         os.close(descriptor)
+
+
+class MacFloorLeaseFile(Enum):
+    GROUP = ".floor-group"
+    WAITERS = ".floor-waiters"
+
+
+def _mac_floor_lease_path(mirror: Path, kind: MacFloorLeaseFile) -> Path:
+    from scripts.mac_test import floor_claims
+
+    lease = floor_claims.mirror_lock_path(mirror)
+    return lease.with_name(lease.name + kind.value)
+
+
+@contextmanager
+def _mac_floor_lease_file(mirror: Path, kind: MacFloorLeaseFile) -> Generator[int]:
+    """Open the existing repository lease or its waiter file."""
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    path = _mac_floor_lease_path(mirror, kind)
+    descriptor = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or not os.path.samestat(info, path.lstat()):
+            raise OSError(f"{path}: the Mac floor lease changed")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+class NoInheritedMacFloorLease(Enum):
+    MISSING = "no inherited Mac floor lease"
+
+
+def _inherited_mac_floor_lease(mirror: Path) -> int | NoInheritedMacFloorLease:
+    """Find the inherited descriptor for this mirror's floor lease."""
+    from scripts.mac_test import floor_claims
+
+    try:
+        identity = _mac_floor_lease_path(mirror, MacFloorLeaseFile.GROUP).lstat()
+    except FileNotFoundError:
+        return NoInheritedMacFloorLease.MISSING
+    if stat.S_ISREG(identity.st_mode):
+        for descriptor in floor_claims.inherited_mirror_descriptors():
+            with suppress(OSError, OverflowError):
+                if os.path.samestat(os.fstat(descriptor), identity):
+                    return descriptor
+    return NoInheritedMacFloorLease.MISSING
+
+
+@contextmanager
+def _mac_floor_removal_lease(mirror: Path) -> Generator[int]:
+    """Take the mirror lease exclusive when no run is waiting."""
+    with _mac_floor_lease_file(mirror, MacFloorLeaseFile.GROUP) as group:
+        fcntl.flock(group, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with _mac_floor_lease_file(mirror, MacFloorLeaseFile.WAITERS) as waiters:
+            fcntl.flock(waiters, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield group
+
+
+@contextmanager
+def _upgrade_mac_floor_lease(mirror: Path, descriptor: int) -> Generator[int]:
+    """Hold the run's floor lease exclusive during removal."""
+    with _mac_floor_lease_file(mirror, MacFloorLeaseFile.WAITERS) as waiters:
+        fcntl.flock(waiters, fcntl.LOCK_SH)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not os.path.samestat(os.fstat(descriptor), _mac_floor_lease_path(mirror, MacFloorLeaseFile.GROUP).lstat()):
+                raise OSError(f"{mirror}: the Mac floor lease changed")
+            yield descriptor
+        finally:
+            # A failed flock conversion can drop the shared hold.
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+
+
+@dataclass(frozen=True)
+class MacFloorWaitDeadline:
+    monotonic_seconds: float
+
+
+MAC_FLOOR_WAIT_TIMEOUT = "mac_test: timed out waiting for the Mac floor sweep"
+
+
+@contextmanager
+def _mac_floor_shared_lease(mirror: Path, deadline: MacFloorWaitDeadline | UseConfiguredValue) -> Generator[int]:
+    """Hold the repository lease shared through the work."""
+    from scripts.lib import conf
+
+    with _mac_floor_lease_file(mirror, MacFloorLeaseFile.GROUP) as group:
+        if not build_folder_lock.take_lock(group, fcntl.LOCK_SH, build_folder_lock.NO_WAIT):
+            if isinstance(deadline, UseConfiguredValue):
+                deadline = MacFloorWaitDeadline(time.monotonic() + conf.read("mac_test").number("floor_sweep_timeout_s"))
+            if deadline.monotonic_seconds <= time.monotonic():
+                raise TimeoutError(MAC_FLOOR_WAIT_TIMEOUT)
+            print("mac_test: waiting for the Mac floor sweep to finish one removal group",
+                  file=sys.stderr, flush=True)
+            retry = _probe_timing().retry_seconds
+            with _mac_floor_lease_file(mirror, MacFloorLeaseFile.WAITERS) as waiters:
+                for descriptor in (waiters, group):
+                    timing = build_folder_lock.ProbeTiming(max(0.0, deadline.monotonic_seconds - time.monotonic()), retry)
+                    if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_SH, timing):
+                        raise TimeoutError(MAC_FLOOR_WAIT_TIMEOUT)
+        yield group
+
+
+class MacMirrorHold(Enum):
+    """How a process holds the one lease of a Mac mirror folder."""
+
+    SHARED = "use the mirror"
+    EXCLUSIVE = "remove from the mirror"
+    UPGRADE = "remove from the mirror under the shared hold of the caller"
+
+
+class CallerSharedHold(Enum):
+    INHERITED = "the shared hold that the parent process passed down"
+
+
+@dataclass(frozen=True)
+class NotInMacMirror:
+    """The path is outside every Mac mirror folder, so it takes no mirror lease."""
+
+    path: Path
+
+
+def mac_mirror_folder(path: Path, *, root: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path | NotInMacMirror:
+    """Return the resolved mirror folder that holds this path.
+
+    A caller that received the mirror root from natedev passes it; others use the configured root.
+    """
+    from scripts.lib import conf
+    from scripts.mac_test.mirror_root import MacMirrorRoot
+
+    if isinstance(root, UseConfiguredValue):
+        root = MacMirrorRoot.read(conf.read_or_repository("mac_test")).local_path()
+    root = root.expanduser().resolve()
+    resolved = path.expanduser().resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        return NotInMacMirror(path)
+    return root / resolved.relative_to(root).parts[0]
+
+
+@contextmanager
+def mac_mirror_hold(
+    path: Path, hold: MacMirrorHold, *, deadline: MacFloorWaitDeadline | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    root: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    shared: int | CallerSharedHold = CallerSharedHold.INHERITED,
+) -> Generator[int | NotInMacMirror]:
+    """Hold the one lease of the mirror folder that holds this path.
+
+    Every mirror user and every remover goes through here. A user holds it shared
+    for the whole use. A remover reads its checks and removes inside one exclusive hold.
+    UPGRADE converts the caller's shared hold: `shared`, or the one its parent passed down.
+    """
+    mirror = mac_mirror_folder(path, root=root)
+    if isinstance(mirror, NotInMacMirror):
+        yield mirror
+        return
+    inherited = _inherited_mac_floor_lease(mirror)
+    if hold is MacMirrorHold.EXCLUSIVE:
+        with _mac_floor_removal_lease(mirror) as group:
+            yield group
+    elif hold is MacMirrorHold.UPGRADE:
+        held = shared if isinstance(shared, int) else inherited
+        if isinstance(held, NoInheritedMacFloorLease):
+            raise OSError(f"{mirror}: {held.value}")
+        with _upgrade_mac_floor_lease(mirror, held) as group:
+            yield group
+    elif isinstance(inherited, int):
+        yield inherited
+    else:
+        with _mac_floor_shared_lease(mirror, deadline) as group:
+            yield group
+
+
+def mac_build_host() -> bool:
+    return sys.platform == "darwin"
+
+
+@contextmanager
+def mac_numbered_copy_lease(repository: str) -> Generator[tuple[int, ...]]:
+    """Keep the Mac floor lease in the copy and its child processes."""
+    if not mac_build_host():
+        yield ()
+        return
+    from scripts.lib import conf
+    from scripts.mac_test.mirror_root import MacMirrorRoot
+
+    mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path() / _form_name(repository)
+    with mac_mirror_hold(mirror, MacMirrorHold.SHARED) as descriptor:
+        if isinstance(descriptor, NotInMacMirror):
+            yield ()
+            return
+        with inherit_build_lock(descriptor):
+            yield (descriptor,)
 
 
 COPY_USE_STAMP = ".lint-sweep-used"
@@ -1510,6 +1716,7 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
     with ExitStack() as stack:
         try:
             form = _record_numbered_copy_path(path)
+            floor = stack.enter_context(mac_numbered_copy_lease(form.repo))
             claims = stack.enter_context(build_folder_use(path))
             directory = stack.enter_context(build_folder_lock.folder_parent(path, build_root(), create=False))
             inherited = next((str(fd) for fd, held in _locks.items() if held == path),
@@ -1530,7 +1737,7 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
                     or (not has_inherited_lock and _copy_is_kept(path, directory))
                     or _read_folder_lease(path, directory).get("ready") is not True):
                 raise ValueError(f"{path}: no available numbered copy source")
-            result = NumberedCopyUseLease(record, (descriptor, *claims))
+            result = NumberedCopyUseLease(record, (descriptor, *claims, *floor))
         except (OSError, ValueError, RuntimeError) as error:
             yield NumberedCopyUseRefused(str(error))
         else:
@@ -2126,13 +2333,13 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     if made_inode is not None and callable(on_create):
                         on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
-                    _locks[descriptor] = path
+                    _register_build_lock(descriptor, path)
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
                                                      descriptor=descriptor, temporary=not stable)
                     return path
                 except BaseException:
-                    _ = _locks.pop(descriptor, None)
+                    _forget_build_lock(descriptor)
                     if isinstance(original, LinkedEditableRepository) or spec.kind == "copy":
                         if allocated is not None:
                             print(f"kept for a manual removal list: {path} (build_folders, checkout setup failed)",
@@ -2554,8 +2761,8 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
             if created:
                 _unlink_transient_lock(lease)
             return KeptCopyRemovalLease()
-        _ = opened.callback(_locks.pop, descriptor, None)
-        _locks[descriptor] = path
+        _ = opened.callback(_forget_build_lock, descriptor)
+        _register_build_lock(descriptor, path)
         _ = stack.enter_context(opened.pop_all())
     return lease
 
