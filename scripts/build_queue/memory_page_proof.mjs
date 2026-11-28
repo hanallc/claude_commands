@@ -2174,9 +2174,16 @@ try {
         })()`);
         await mouse('mouseMoved', edge);
         const edgePreview = await evaluate(`new Promise(resolve => {
+          let scrollTop = ${before};
+          let lastProgress = ${started};
           function check() {
+            const now = performance.now();
+            if (scrollY < scrollTop) {
+              scrollTop = scrollY;
+              lastProgress = now;
+            }
             const destination = queueDrag.destination;
-            if (destination?.kind !== 'QueueHeadDrop' && performance.now() - ${started} < 3000) {
+            if (destination?.kind !== 'QueueHeadDrop' && queueDrag.scrollFrame !== null && now - lastProgress < 3000) {
               requestAnimationFrame(check);
               return;
             }
