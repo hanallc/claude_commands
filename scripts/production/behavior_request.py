@@ -13,8 +13,8 @@ from typing import cast
 from scripts.agents import catch_up
 from scripts.lib import transcripts
 from scripts.lib.showrunner_state import state_root
-from scripts.production import record_store, staff, the_list, update_registration
-from scripts.review_links import images, review_events, review_link
+from scripts.production import delivery_state, record_store, staff, the_list, update_registration
+from scripts.review_links import change_page, image_store, images, review_events, review_link
 
 
 @dataclass(frozen=True)
@@ -109,6 +109,39 @@ def transcript_words(path: Path) -> Iterator[NateWords]:
             yield from typed_turn(row)
 
 
+def list_question_words(item: the_list.ListItem, keeper: staff.StaffId) -> Iterator[NateWords]:
+    questions = {question.question_id: question for question in item.questions}
+    questions.update((event.what.question.question_id, event.what.question)
+                     for event in item.log if isinstance(event.what, the_list.QuestionClosed))
+    status = change_page.DeliveryStatus(review_link.review_root())
+    for event in item.log:
+        receipt = event.what
+        if event.source != the_list.PAGE_SOURCE or not isinstance(receipt, the_list.QuestionRequestReceipt):
+            continue
+        question = questions.get(receipt.question_id)
+        if receipt.request.action != "question" or question is None or question.words != receipt.request.words:
+            continue
+        saved = the_list.list_question_target(keeper, item, question.recipient_id(keeper)).saved(question)
+        try:
+            attempt = change_page.read_question_attempt(status.path(saved.page(), saved.source.row))
+        except (OSError, ValueError):
+            continue
+        if (attempt.state is delivery_state.QuestionSendState.SENT
+                and isinstance(attempt.receipt, delivery_state.QuestionSendReceipt) and saved.matches(attempt)):
+            yield NateWords(question.words, event.time)
+
+
+def list_image_words(event: the_list.ImageAnswerChange, item: str, keeper: staff.StaffId) -> Iterator[NateWords]:
+    if event.source != the_list.IMAGE_ANSWER_SOURCE or not event.signed:
+        return
+    line = event.what.partition("\n")[0]
+    identity = line.partition(": ")[0].removeprefix("Image ")
+    if (not image_store.IDENTITY.fullmatch(identity) or line != images.approval_line(identity)
+            or not images.matches_list_approval(review_link.review_root(), identity, item, keeper, event)):
+        return
+    yield NateWords(line, event.time)
+
+
 def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
     item = the_list.load(keeper, path.stem)
     for event in item.log:
@@ -116,9 +149,9 @@ def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
         if (event.source == the_list.PAGE_SOURCE and isinstance(feedback, the_list.PageFeedback)
                 and feedback.action == "tell" and feedback.state == "sent"):
             yield NateWords(feedback.words, event.time)
-        elif (isinstance(event, the_list.ImageAnswerChange) and event.source == the_list.IMAGE_ANSWER_SOURCE
-              and event.signed):
-            yield NateWords(event.what, event.time)
+        elif isinstance(event, the_list.ImageAnswerChange):
+            yield from list_image_words(event, item.id, keeper)
+    yield from list_question_words(item, keeper)
     for question in item.questions:
         answer = question.answer
         if answer is None:
@@ -149,11 +182,9 @@ def source_words(path: Path) -> Iterator[NateWords]:
         yield from transcript_words(path)
         return
     if path.suffix == ".json":
-        decision = images.read_image_decision(review_link.review_root(), path)
-        if isinstance(decision, images.ImageDecision):
-            yield NateWords(decision.answer, decision.time)
-            if decision.feedback:
-                yield NateWords(decision.feedback, decision.time)
+        approval = images.verified_image_approval(review_link.review_root(), path)
+        if isinstance(approval, images.VerifiedImageApproval):
+            yield NateWords(approval.line, approval.time)
         return
     if path.suffix != ".md" or path.is_symlink() or not path.is_file():
         return

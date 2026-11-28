@@ -205,7 +205,10 @@ print(getfile(update_registration))
 
 Use these sources:
 1. List records and their questions and answers in {state_root}/*/list/L*.md.
-   Cite Images answers in the log only if the source is "nate via Images" and `image_answer.signed` is true.
+   Cite Nate's List question when its List page receipt matches a saved send receipt in state `sent`.
+   For a signed Images answer, check that the source is "nate via Images" and `image_answer.signed` is true.
+   Check the completed Images page delivery for the same List item, keeper, key, and words.
+   Quote only its approval line, `Image <id>: your image is approved.`
 2. Question records and change review verdicts.
    Read `{checker_root}/scripts/production/update_registration.py` for the question record code.
    Follow the store paths in the showrunner documents and the showrunner state root.
@@ -217,7 +220,9 @@ Use these sources:
 4. Commit messages in {repo}.
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 6. Nate's Images page answers in {image_answers}/*.json.
-   Use `image_text` for context. Quote only `answer` and `feedback`.
+   Check the completed Images page delivery for the same decision.
+   Count only a decision whose `answer` is `approved`.
+   Use `image_text` for context. Quote only its approval line, `Image <id>: your image is approved.`
 
 Check that Nate wrote the words and used them to set behavior.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
@@ -228,7 +233,7 @@ If you cannot complete the review, return `[{{"blocker":"what stopped the review
 For a complete review, return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
-For "requested", cite Nate's typed Claude turn, sent List Tell, or saved question answer or feedback.
+For "requested", cite Nate's typed Claude turn, sent List Tell or question, or saved question answer or feedback.
 You can cite Nate's Images page answer from the store or the List log.
 Quote one or more complete sentences or lines in order from one source message only.
 If several messages contain relevant words, quote the newest message that sets the behavior.

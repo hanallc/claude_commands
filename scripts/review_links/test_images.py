@@ -1082,8 +1082,7 @@ class ImagesTests(ImagesFixture):
                 times = [start + timedelta(days=index) for index in range(3)]
                 if linked:
                     source = the_list.folder(keeper.id) / f"{item.id}.md"
-                    self.assertEqual(behavior_request.verified_dates(source, {keep, remove}),
-                                     {keep: times[2].date(), remove: times[1].date()})
+                    self.assertEqual(behavior_request.verified_dates(source, {keep, remove}), {})
                     records = [entry for entry in the_list.load(keeper.id, item.id).log
                                if isinstance(entry, the_list.ImageAnswerChange)]
                     self.assertEqual([entry.time for entry in records], times)
@@ -1134,7 +1133,7 @@ class ImagesTests(ImagesFixture):
         words = "Keep the old rows."
         answer_time = datetime(2026, 11, 24, 23, 58, tzinfo=UTC)
         retry_time = answer_time + timedelta(days=1)
-        body = self.feedback_body(record, words)
+        body = self.feedback_body(record, words, "approved")
         with (patch.object(images, "datetime", wraps=datetime) as clock,
               patch.object(the_list, "save_image_answer", side_effect=OSError("disk unavailable"))):
             clock.configure_mock(**{"now.return_value": answer_time})
@@ -1148,7 +1147,8 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(updated.log[-1].time, answer_time)
         self.assertEqual(updated.updated, retry_time)
         source = the_list.folder(keeper.id) / f"{item.id}.md"
-        self.assertEqual(behavior_request.verified_dates(source, {words}), {words: answer_time.date()})
+        approval = images.approval_line(record["id"])
+        self.assertEqual(behavior_request.verified_dates(source, {approval, words}), {approval: answer_time.date()})
 
     def test_approved_and_feedback_send_the_answer_with_feedback_only_when_written(self) -> None:
         for action, first, feedback, lines in (
@@ -1180,7 +1180,7 @@ class ImagesTests(ImagesFixture):
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
-                self.assertNotIn(record["id"], images.render(self.status).decode())
+                self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
                 images.delete(self.root, record["id"])
                 directory = images.images_root(self.root)
                 (directory / f".review-link-image-answers-{record['id']}.json").unlink()
@@ -1305,7 +1305,7 @@ class ImagesTests(ImagesFixture):
             self.submit(body)
         self.assertEqual([recipient for recipient, _ in calls], [self.owner_id(), *([producer.id] * 4)])
         self.assertEqual(len({key for _, key in calls}), 1)
-        self.assertNotIn(record["id"], images.render(self.status).decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
 
     def test_conflicting_words_leave_the_accepted_request_open_for_the_producer(self) -> None:
         keeper, producer, item = self.list_item()
@@ -1721,7 +1721,7 @@ sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringi
         folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         self.assertTrue((folder / "image.png").is_file())
         self.assertIn("feedback_at", image_store.read_record(folder))
-        self.assertNotIn(record["id"], images.render(self.status).decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
         images.delete(self.root, record["id"])
         self.assertEqual(images.records(self.root), [])
 
@@ -3308,7 +3308,10 @@ class ImagePairTests(ImagesFixture):
         self.assertEqual(lines[1:4], ["Feedback: Good.",
                                       f"Before: http://127.0.0.1:8765/images/{record['id']}/before.png",
                                       f"After: http://127.0.0.1:8765/images/{record['id']}/after.webp"])
-        self.assertNotIn(record["id"], images.render(self.status).decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
+        path, = images.decision_root(self.root).glob(f"{record['id']}-*.json")
+        self.assertIsInstance(images.read_image_decision(self.root, path), images.ImageDecision)
+        self.assertEqual(behavior_request.verified_dates(path, {"feedback", "Good."}), {})
 
 
 class ImagesServerTests(ImagesFixture):
@@ -3438,7 +3441,7 @@ class ImagesServerTests(ImagesFixture):
         status, _, answer = self.http("POST", images.PAGE_PATH, body)
         self.assertEqual((status, cast(dict[str, str], json.loads(answer))), (200, {"state": "done"}))
         self.assertEqual(len(self.sent), 1)
-        self.assertNotIn(record["id"], self.http("GET", images.PAGE_PATH)[2].decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', self.http("GET", images.PAGE_PATH)[2].decode())
 
     def test_image_answer_reports_the_failed_producer_or_list_save(self) -> None:
         _, producer, item = self.list_item()
@@ -3482,6 +3485,9 @@ class ImagesServerTests(ImagesFixture):
                          [f"session:{self.owner.current_session}" if self.owner is not None else "",
                           f"session:{producer.current_session}"])
         self.assertTrue(all(words in message for _, _, message in self.sent))
+        entry = saved.log[-1]
+        assert isinstance(entry, the_list.ImageAnswerChange)
+        self.assertFalse(images.matches_list_approval(self.root, record["id"], item.id, keeper.id, entry))
 
     def test_held_linked_picture_answer_can_be_undone_or_released_once(self) -> None:
         keeper, _, item = self.list_item()
