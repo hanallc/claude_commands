@@ -364,6 +364,26 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         source = self.transcript(self.queued_turn(f"<pasted_content>\n{MOVE_REQUEST}\n</pasted_content>"))
         self.assertEqual(behavior_request.verified_dates(source, {MOVE_REQUEST}), {})
 
+    def test_transcript_rejects_queued_machine_prompts(self) -> None:
+        def queued(text: str, origin: object, mode: str, **fields: object) -> dict[str, object]:
+            return {"type": "attachment", "timestamp": "2026-11-26T07:30:00+00:00", "attachment": {
+                "type": "queued_command", "origin": origin, "commandMode": mode, "prompt": text,
+                "timestamp": "2026-11-25T23:30:00-08:00", **fields}}
+
+        timer = f'<system-reminder source="script">\nbob timer. {MOVE_REQUEST}\n</system-reminder>'
+        notice = f"<task-notification>\n<summary>{MOVE_REQUEST}</summary>\n</task-notification>"
+        message = f'<cross-session-message from="uds:/run/user/1000/peer.sock">\n{MOVE_REQUEST}\n</cross-session-message>'
+        for case, row in (
+            ("timer prompt", queued(timer, {"kind": "human"}, "prompt", humanTurn=True)),
+            ("task notice", queued(notice, {"kind": "task-notification"}, "task-notification")),
+            ("task notice without origin", queued(notice, None, "task-notification")),
+            ("peer message", queued(message, {"kind": "peer"}, "prompt", isMeta=True)),
+            ("coordinator", queued(MOVE_REQUEST, {"kind": "coordinator"}, "prompt")),
+        ):
+            with self.subTest(case=case):
+                source = self.transcript(row)
+                self.assertEqual(behavior_request.verified_dates(source, {MOVE_REQUEST}), {})
+
     def test_only_sent_list_tell_feedback_from_nate_verifies(self) -> None:
         store, item = self.new_list_record()
         fields, body = store.read(item)
