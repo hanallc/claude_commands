@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
@@ -23,6 +24,7 @@ from uuid import uuid4
 
 from scripts.agents.remote import local_machine
 from scripts.lib import conf, file_lock, main_publish
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, record_store, staff, the_list
 from scripts.production.staff_test_support import fixture_member
@@ -707,9 +709,18 @@ class NewItemServerTests(unittest.TestCase):
         self.addCleanup(cache.close)
         address = for_you.ConsoleAddress("127.0.0.1", server.port)
         received: list[tuple[str, str]] = []
+        delivered = threading.Condition()
 
         def capture(recipient: str, _sender: str, message: str, **_options: str) -> None:
-            received.append((recipient, message.splitlines()[-1]))
+            with delivered:
+                received.append((recipient, message.splitlines()[-1]))
+                delivered.notify_all()
+
+        def next_delivery() -> tuple[str, str]:
+            # The reply leaves before the delivery thread sends the notice.
+            with delivered:
+                self.assertTrue(delivered.wait_for(lambda: bool(received), TEST_HANG_GUARD_SECS))
+                return received.pop()
 
         with (mock.patch.object(server.server, "review_cache", cache),
               mock.patch.object(server.server, "delivery_status", case.status),
@@ -724,7 +735,7 @@ class NewItemServerTests(unittest.TestCase):
                           redirect_stdout(output), redirect_stderr(errors)):
                         outcome = new_item.main([item_type, assignee.name, "Check the command filing."])
                     self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
-                    command_owner, command = received.pop()
+                    command_owner, command = next_delivery()
                     self.assertEqual(command_owner, f"session:{owner.current_session}")
                     self.assertIn("List item ", output.getvalue())
                     self.assertTrue(output.getvalue().endswith(f". Reply command goes to {owner.name}, this session.\n"))
@@ -743,7 +754,7 @@ class NewItemServerTests(unittest.TestCase):
                     self.assertEqual(receipt["reply_owner"], owner.id)
                     row = the_list.load(morty.id, f"L{receipt['list_number']}")
                     self.assertEqual((row.owner, row.producer), (assignee.id, owner.id))
-                    window_owner, command = received.pop()
+                    window_owner, command = next_delivery()
                     self.assertEqual(window_owner, f"session:{owner.current_session}")
                     token = self.run_reply_command(command, "The window reply works.")
                     self.assertNotIn(token.encode(), reply.body)
@@ -755,7 +766,7 @@ class NewItemServerTests(unittest.TestCase):
                                          "--session", owner.current_session])
             self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
             self.assertNotIn("this session", output.getvalue())
-            command_owner, command = received.pop()
+            command_owner, command = next_delivery()
             self.assertEqual(command_owner, f"session:{owner.current_session}")
             token = self.run_reply_command(command, "Only the owner received the command.")
             self.assertNotIn(token, output.getvalue())
