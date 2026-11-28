@@ -30,11 +30,11 @@ The gate checks the finding for each changed test.
 Source verification applies only to `requested` findings.
 The check accepts typed Claude turns, sent List Tell feedback, and saved List or Question answers from Nate.
 The check accepts a List question from Nate when its List page receipt matches a saved send receipt in state `sent`.
-The check requires a signed Images answer with a matching, completed server delivery to all recipients.
+The check counts only a signed Images Approved answer with a matching, completed server delivery to all recipients.
 For a List entry, the server record must match the List item, keeper, delivery key, and words.
-The approval line counts as approval. The feedback counts as separate words from Nate.
+Only the approval line counts as Nate's words. Images feedback is not a source.
 The Images store keeps standalone answers in `.review-link-image-decisions/*.json` under the configured review links directory.
-The check reads `answer` and `feedback` as Nate's words when the archived decision matches the server delivery.
+The check reads an Approved `answer` as Nate's words when the archived decision matches the server delivery.
 The reviewer uses `image_text` for context.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
 The check reports the date from the source. A `requested` finding needs a question if the source cannot prove the author or quote.

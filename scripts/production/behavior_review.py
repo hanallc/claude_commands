@@ -222,7 +222,7 @@ Use these sources:
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 6. Nate's Images page answers in {image_answers}/*.json.
    Check the completed Images page delivery for the same decision.
-   Use `image_text` for context. Quote only `answer` and `feedback`.
+   Use `image_text` for context. Quote only an Approved `answer`.
 
 Check that Nate wrote the words and used them to set behavior.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
