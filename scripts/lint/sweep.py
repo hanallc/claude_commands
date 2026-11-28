@@ -24,6 +24,7 @@ except FileNotFoundError:
 
 import fcntl
 import hashlib
+from heapq import heapify, heappop, heappush
 import io
 import json
 import math
@@ -40,7 +41,7 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from contextvars import ContextVar
 from copy import copy
 from dataclasses import asdict, dataclass, field, replace
@@ -49,7 +50,7 @@ from enum import Enum
 from functools import cache, cached_property
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
+from typing import TYPE_CHECKING, Literal, NoReturn, TypeGuard, cast, overload, override
 
 from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
@@ -980,6 +981,7 @@ def build_trees(root: str, *, lint_settings: conf.ConfigRead | UseConfiguredValu
 
 def _build_trees(root: str, depth: int, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    profile_markers: tuple[str, ...] = (FINGERPRINT_DIR,),
 ) -> list[str]:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
@@ -991,7 +993,7 @@ def _build_trees(root: str, depth: int, *,
             check_mac_floor_reader()
             if directory != root and is_cargo_target(directory, lint_settings=lint_settings):
                 continue
-            if os.path.isdir(os.path.join(directory, FINGERPRINT_DIR)):
+            if any(os.path.isdir(os.path.join(directory, marker)) for marker in profile_markers):
                 trees.append(directory)
                 continue
             try:
@@ -2255,8 +2257,12 @@ def unit_age(group: Group, now: float) -> tuple[float, float]:
     return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
 
 
+class LeasedCargoGroup(Enum):
+    MAC_OUTPUT = "the caller holds the output locks for this group"
+
+
 def remove_checked_entry(checked: removal_guard.CheckedEntry,
-                         lease: build_folders.FreeFolderRemovalLease) -> ConfirmedDeletion:
+                         lease: build_folders.FreeFolderRemovalLease | LeasedCargoGroup) -> ConfirmedDeletion:
     freed = removed = 0
     device_bytes: dict[int, int] = {}
 
@@ -2275,7 +2281,9 @@ def remove_checked_entry(checked: removal_guard.CheckedEntry,
 
     failures = 0
     try:
-        if not lease.remove_tree(checked.path, checked.info, wait=False, delete=delete):
+        if isinstance(lease, LeasedCargoGroup):
+            removal_guard.remove(checked, account=account)
+        elif not lease.remove_tree(checked.path, checked.info, wait=False, delete=delete):
             failures = 1
     except (OSError, removal_guard.Refused) as error:
         print(f"kept {checked.path}: {removal_guard.single_line(error)}")
@@ -4214,6 +4222,27 @@ def wait_for_mac_floor_lock(path: Path) -> Generator[AcquiredMacFloorLock]:
 
 
 @dataclass(frozen=True)
+class MacCullSettings:
+    configuration: conf.ConfigRead
+    idle_seconds: float
+
+    @classmethod
+    def read(cls, configuration: conf.ConfigRead) -> MacCullSettings:
+        def idle_hours(value: str) -> int:
+            hours = conf.positive_whole(value)
+            if hours < 48:
+                raise ValueError("must be at least 48 hours")
+            return hours
+
+        hours = configuration.value("cull_idle_hours", idle_hours, recover_invalid=False)
+        return cls(configuration, hours * 3600)
+
+
+class MacFloorReview(Enum):
+    ONLY = "list output for review without removing it"
+
+
+@dataclass(frozen=True)
 class MacFloor:
     """List only marked output inside the approved Mac roots."""
 
@@ -4223,6 +4252,7 @@ class MacFloor:
     busy_mirrors: frozenset[Path] = frozenset()
     leased_mirrors: frozenset[Path] = frozenset()
     floor_lock: AcquiredMacFloorLock | AcquireFloorLock = AcquireFloorLock.LOCALLY
+    cull: MacCullSettings | MacFloorReview = MacFloorReview.ONLY
 
     def allows(self, target: str) -> bool:
         path = Path(target)
@@ -4266,6 +4296,373 @@ class MacFloor:
         claims = floor_claims.read_claims(conf.read("mac_test").number("probe_timeout_s"))
         return {target: LockHeld("Mac claim is busy or unreadable") for target in uncovered
                 if claims.holds(target, self.mirror)}
+
+
+class MacOutputLocation(Enum):
+    MIRROR = "a registered mirror target"
+    BUILD = "build output outside the source checkout"
+    NUMBERED_COPY = "numbered copy output used to determine repository age"
+
+
+@dataclass(frozen=True)
+class MacBuildOutput:
+    path: Path
+    repository: str
+    location: MacOutputLocation
+    root: Path
+
+
+class MacRunTrim(Enum):
+    LEASED_MIRROR = "trim the current run's mirror target"
+
+
+class WorkspaceReview(Enum):
+    ONLY = "list workspace output for review"
+
+
+class MacOutputRemoval(Enum):
+    IN_USE = "a process uses an entry selected for removal"
+    CHANGED = "the Cargo group changed after the scan"
+    REPOSITORY_BUSY = "a run or claim prevents further removal in this repository"
+
+
+MAC_LOOSE_CARGO_DIRS = (FINGERPRINT_DIR, "build", "deps", INCREMENTAL_DIR)
+
+
+@dataclass(frozen=True)
+class MacOutputObservation:
+    identity: removal_guard.Identity
+    accessed: dict[str, float]
+    last_use: float
+    locks: tuple[str, ...]
+
+
+def mac_child_directories(path: Path) -> list[Path]:
+    try:
+        with os.scandir(path) as entries:
+            return sorted(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
+    except FileNotFoundError:
+        return []
+
+
+def mac_build_outputs(mirror: Path) -> list[MacBuildOutput]:
+    """Find registered mirror targets and the build layout's output folders."""
+    outputs: list[MacBuildOutput] = []
+    if mirror.resolve() == mirror:
+        for checkout in mac_child_directories(mirror):
+            outputs.extend(mac_mirror_output(checkout, mirror))
+    build = Path.home().resolve() / "build"
+    if build.is_symlink():
+        return outputs
+    for repo in mac_child_directories(build):
+        check_mac_floor_reader()
+        if repo.name in build_folders.BUILD_ROOT_EXCEPTIONS:
+            continue
+        outputs.extend(mac_repository_build_outputs(repo, build))
+    return outputs
+
+
+def mac_mirror_output(checkout: Path, mirror: Path) -> tuple[MacBuildOutput, ...]:
+    marker = checkout / floor_claims.MIRROR_MARK
+    target = checkout / "target"
+    if (removal_guard.is_real_directory(checkout) and marker.is_file() and not marker.is_symlink()
+            and removal_guard.is_real_directory(target)):
+        return (MacBuildOutput(target, checkout.name, MacOutputLocation.MIRROR, mirror),)
+    return ()
+
+
+def mac_repository_build_outputs(repo: Path, build: Path) -> list[MacBuildOutput]:
+    # A legacy target can sit directly under ~/build.
+    if (repo / RUSTC_INFO).is_file() and not (repo / RUSTC_INFO).is_symlink():
+        return [MacBuildOutput(repo, repo.name, MacOutputLocation.BUILD, build)]
+    outputs: list[MacBuildOutput] = []
+    for unit in mac_child_directories(repo):
+        if unit.name == "main":
+            outputs.append(MacBuildOutput(unit, repo.name, MacOutputLocation.BUILD, build))
+            continue
+        for folder in mac_child_directories(unit):
+            form = build_folders.parse_resolved_form(folder, build)
+            if isinstance(form, build_folders.WorktreeOutput):
+                outputs.append(MacBuildOutput(folder, repo.name, MacOutputLocation.BUILD, build))
+            elif isinstance(form, build_folders.BuildCopy):
+                target = folder / "target"
+                if removal_guard.is_real_directory(target) and is_cargo_target(str(target)):
+                    outputs.append(MacBuildOutput(target, repo.name, MacOutputLocation.NUMBERED_COPY, build))
+    return outputs
+
+
+@contextmanager
+def check_mac_output_entry(output: MacBuildOutput, path: Path) -> Generator[removal_guard.CheckedEntry]:
+    """Pin the approved root and each directory to the selected output entry."""
+    home = Path.home().resolve(strict=True)
+    root = output.root
+    if (not path.is_relative_to(output.path) or not output.path.is_relative_to(root)
+            or root == output.path or root == home or not root.is_relative_to(home)
+            or root.resolve(strict=True) != root or ".." in path.parts
+            or any(part.casefold() == GIT_DIR for part in path.parts)):
+        raise removal_guard.Refused(removal_guard.RefusalReason.OUTSIDE_ROOT, str(path))
+    if output.location is MacOutputLocation.BUILD and any(
+            os.path.lexists(parent / GIT_DIR) for parent in output.path.parents if parent.is_relative_to(root)):
+        raise removal_guard.ChangedEntry("the output belongs to a source folder")
+    components = path.relative_to(root).parts
+    with ExitStack() as opened:
+        parent = os.open(root, removal_guard.DIRECTORY_FLAGS)
+        _ = opened.callback(os.close, parent)
+        root_identity = removal_guard.identity(os.fstat(parent))
+        if root_identity[0] != home.stat().st_dev:
+            raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT, str(root))
+        mount = removal_guard.mount_id(parent)
+        ancestors: list[tuple[int, str, removal_guard.Identity]] = []
+        for component in components[:-1]:
+            child = os.open(component, removal_guard.DIRECTORY_FLAGS, dir_fd=parent)
+            _ = opened.callback(os.close, child)
+            identity = removal_guard.identity(os.fstat(child))
+            if identity[0] != root_identity[0] or removal_guard.mount_id(child) != mount:
+                raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT, str(path))
+            ancestors.append((parent, component, identity))
+            parent = child
+        info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if info.st_dev != root_identity[0]:
+            raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT, str(path))
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise removal_guard.Refused(removal_guard.RefusalReason.UNVERIFIED_PATH, str(path))
+        yield removal_guard.CheckedEntry(path, parent, path.name, info, removal_guard.Form.MAIN,
+                                         root, root_identity, tuple(ancestors), mount)
+
+
+def observe_mac_output(output: MacBuildOutput) -> MacOutputObservation:
+    """Read file atimes before the group scanner reads dep-info files."""
+    path = output.path
+    with check_mac_output_entry(output, path) as checked:
+        if not stat.S_ISDIR(checked.info.st_mode) or not build_folders.may_remove_folder_tree(path):
+            raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT, str(path))
+        if not is_cargo_target(str(path)):
+            raise removal_guard.Refused(removal_guard.RefusalReason.UNVERIFIED_PATH, "missing Cargo output markers")
+        locks: set[str] = set()
+        accessed: dict[str, float] = {}
+
+        def unreadable(error: OSError) -> None:
+            raise error
+
+        last_use = 0.0
+        for directory, folders, files, descriptor in os.fwalk(
+                path.name, dir_fd=checked.parent, follow_symlinks=False, onerror=unreadable):
+            check_mac_floor_reader()
+            folder_info = os.fstat(descriptor)
+            if folder_info.st_dev != checked.info.st_dev or removal_guard.mount_id(descriptor) != checked.mount:
+                raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT, str(path.parent / directory))
+            if any(name.casefold() in (GIT_DIR, "cargo.toml") for name in (*folders, *files)):
+                raise removal_guard.ChangedEntry("the output contains a source checkout")
+            observed_folder = path.parent / directory
+            locks.update(str(observed_folder / name) for name in (*folders, *files)
+                         if name in (*LOCK_NAMES, scratch.STYLE_LOCK_NAME)
+                         or observed_folder / name == path / DOC_DIR / DOC_LOCK_NAME)
+            for name in files:
+                entry = str(observed_folder / name)
+                if entry in locks:
+                    continue
+                info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode):
+                    last_use = max(last_use, info.st_mtime)
+                    if name not in (CACHE_TAG, RUSTC_INFO, USE_STAMP):
+                        accessed[entry] = info.st_atime
+        checked.recheck()
+    if output.location is MacOutputLocation.MIRROR:
+        with suppress(FileNotFoundError):
+            record = cast(object, floor_claims.read_mirror_record(path.parent / floor_claims.MIRROR_RECORD))
+            if not isinstance(record, dict):
+                raise ValueError("invalid mirror record")
+            run = cast(Mapping[str, object], record).get("last_use")
+            if _finite_number(run):
+                last_use = max(last_use, run)
+    return MacOutputObservation(removal_guard.identity(checked.info), accessed, last_use, tuple(sorted(locks)))
+
+
+@contextmanager
+def mac_output_locks(outputs: Mapping[MacBuildOutput, MacOutputObservation],
+                     ) -> Generator[dict[Path, build_folders.FreeFolderRemovalLease] | MacOutputRemoval]:
+    """Hold the folder leases, busy marks, and all existing output locks."""
+    paths = {output.path for output in outputs}
+    folders = set(paths)
+    build = Path.home().resolve() / "build"
+    for output in outputs:
+        if output.location is not MacOutputLocation.MIRROR:
+            folders.update(parent for parent in output.path.parents if parent != build and parent.is_relative_to(build))
+    leases: dict[Path, build_folders.FreeFolderRemovalLease] = {}
+    with ExitStack() as resources:
+        for folder in sorted(folders):
+            lease = resources.enter_context(build_folders.folder_removal_lease(
+                folder, children=folder in paths, wait=False))
+            if isinstance(lease, build_folders.RefusedRemovalLease):
+                yield MacOutputRemoval.REPOSITORY_BUSY
+                return
+            leases[folder] = lease
+        scope = scratch.BusyMarkScope()
+        for folder in sorted(folders):
+            if not resources.enter_context(scratch.busy_locks(folder, create=False, scope=scope)):
+                yield MacOutputRemoval.REPOSITORY_BUSY
+                return
+        for lock in sorted({lock for observed in outputs.values() for lock in observed.locks}):
+            if not stat.S_ISREG(os.lstat(lock).st_mode) or (descriptor := try_lock(lock, create=False)) is None:
+                yield MacOutputRemoval.REPOSITORY_BUSY
+                return
+            _ = resources.callback(os.close, descriptor)
+            if not os.path.samestat(os.fstat(descriptor), os.lstat(lock)):
+                yield MacOutputRemoval.REPOSITORY_BUSY
+                return
+        yield leases
+
+
+def mac_output_in_use(path: Path, *, entries: Sequence[Path] = ()) -> bool:
+    """Keep a folder when another process uses it or the check is unavailable."""
+    from scripts.lint import tmp_sweep
+
+    uses = tmp_sweep.lsof_paths(str(path), require_complete=True)
+    if isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
+        return True
+    if any(Path(name).is_relative_to(path)
+           and (not entries or any(Path(name).is_relative_to(entry) for entry in entries)
+                or how == tmp_sweep.WORKS_IN and any(entry.is_relative_to(name) for entry in entries))
+           and (pid != os.getpid() or how == tmp_sweep.WORKS_IN)
+           for name, pid, how in uses.paths):
+        return True
+    return sys.platform == "darwin" and not isinstance(mac_build_process_use(path), NoBuildProcessUse)
+
+
+def remove_mac_output_entries(output: MacBuildOutput, observed: MacOutputObservation,
+                              paths: Sequence[Path], lease: build_folders.FreeFolderRemovalLease | LeasedCargoGroup,
+                              ) -> ConfirmedDeletion | MacOutputRemoval:
+    """Verify every entry in the group before the shared guard removes any entry."""
+    removed = freed = failures = 0
+    with ExitStack() as opened:
+        target = opened.enter_context(check_mac_output_entry(output, output.path))
+        if removal_guard.identity(target.info) != observed.identity:
+            raise removal_guard.ChangedEntry("the target changed after the scan")
+        checked = [opened.enter_context(check_mac_output_entry(output, path)) for path in paths]
+        for entry in checked:
+            _ = removal_guard.fingerprint(entry.path, entry)
+        target.recheck()
+        if mac_output_in_use(output.path, entries=paths):
+            return MacOutputRemoval.IN_USE
+        for entry in checked:
+            check_mac_floor_reader()
+            result = remove_checked_entry(entry, lease)
+            freed += result.bytes
+            removed += result.removed
+            failures += result.failures
+            if result.failures:
+                break
+    return ConfirmedDeletion(freed, failures, removed)
+
+
+def scan_mac_trim(root: str, observed: MacOutputObservation, lint_settings: conf.ConfigRead) -> Scan:
+    """Give each loose file in a Cargo directory its own group."""
+    trees = _build_trees(root, lint_settings.whole("sweep_max_tree_depth"), lint_settings=lint_settings,
+                         profile_markers=MAC_LOOSE_CARGO_DIRS)
+    scan = Scan(discovered_targets=(root,))
+    owners = group_roots(trees, scan, lint_settings=lint_settings)
+    loose_roots = {os.path.join(tree, name): tree for tree in trees for name in MAC_LOOSE_CARGO_DIRS}
+    for path in observed.accessed:
+        directory = path
+        while directory != root and directory not in owners:
+            if directory in loose_roots:
+                group = Group(kind="orphan", build_tree=loose_roots[directory])
+                attach(path, group, owners)
+                scan.groups.append(group)
+                break
+            directory = os.path.dirname(directory)
+    walk(root, None, owners, scan, lint_settings=lint_settings)
+    return scan
+
+
+@dataclass(frozen=True)
+class MacTrimOutcome:
+    deletion: ConfirmedDeletion
+    remaining_bytes: int
+
+
+MacGroupRemoval = Callable[
+    [MacBuildOutput, MacOutputObservation, Group, Sequence[Path]], ConfirmedDeletion | MacOutputRemoval]
+
+
+def remove_mac_trim_group(output: MacBuildOutput, observed: MacOutputObservation,
+                          group: Group, paths: Sequence[Path]) -> ConfirmedDeletion | MacOutputRemoval:
+    if not group_unchanged(group):
+        return MacOutputRemoval.CHANGED
+    return remove_mac_output_entries(output, observed, paths, LeasedCargoGroup.MAC_OUTPUT)
+
+
+def trim_mac_outputs(outputs: Mapping[MacBuildOutput, MacOutputObservation], budget: int, recent_minutes: float,
+                     *, lint_settings: conf.ConfigRead, stop: Callable[[], bool],
+                     remove_group: MacGroupRemoval = remove_mac_trim_group) -> MacTrimOutcome:
+    """Remove one Cargo group at a time until the outputs meet their budget."""
+    left = 0
+    recent = time.time() - recent_minutes * 60
+    groups: list[tuple[MacBuildOutput, Group]] = []
+    scans: dict[MacBuildOutput, Scan] = {}
+    remaining: dict[MacBuildOutput, dict[InodeKey, int]] = {}
+    for output, observed in outputs.items():
+        root = str(output.path)
+        scan = scan_mac_trim(root, observed, lint_settings)
+        scans[output] = scan
+        left += sum(scan.blocks.values())
+        remaining[output] = dict(scan.target_links[root])
+        for group in scan.groups:
+            group.last_used = max((observed.accessed.get(path, 0.0) for path in group.observed), default=0.0)
+            groups.append((output, group))
+    groups.sort(key=lambda item: (item[1].last_used > recent, item[1].last_used, item[1].compiled))
+    freed = removed = failures = 0
+    reached_floor = False
+    for output, group in groups:
+        if left <= budget:
+            break
+        reached_floor = stop()
+        if reached_floor:
+            break
+        paths = tuple(Path(path) for path in sorted(set(group.entries)) if path in group.observed)
+        if not paths:
+            continue
+        result = remove_group(output, outputs[output], group, paths)
+        if result is MacOutputRemoval.REPOSITORY_BUSY:
+            break
+        if isinstance(result, MacOutputRemoval):
+            continue
+        freed += result.bytes
+        removed += result.removed
+        failures += result.failures
+        if result.failures:
+            break
+        left -= freed_by(group, scans[output], remaining[output]).bytes
+    if left > budget and not reached_floor:
+        print(f"lint sweep: over budget: {left} bytes, budget {budget} bytes")
+    return MacTrimOutcome(ConfirmedDeletion(freed, failures, removed), left)
+
+
+def trim_mac_run(target: Path, budget: int, recent_minutes: float, *, lint_settings: conf.ConfigRead) -> int:
+    """Trim only the registered mirror that the caller still leases."""
+    try:
+        mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path()
+        checkout = target.parent
+        if target.name != "target" or checkout.parent != mirror:
+            return 2
+        if not target.exists():
+            return 0
+        marker = checkout / floor_claims.MIRROR_MARK
+        if not marker.is_file() or marker.is_symlink():
+            return 1
+        with build_folders.mac_mirror_hold(checkout, build_folders.MacMirrorHold.UPGRADE):
+            output = MacBuildOutput(target, checkout.name, MacOutputLocation.MIRROR, mirror)
+            outputs = {output: observe_mac_output(output)}
+            with mac_output_locks(outputs) as locks:
+                if isinstance(locks, MacOutputRemoval):
+                    print(f"kept {target}: output locks are busy")
+                    return 1
+                result = trim_mac_outputs(outputs, budget, recent_minutes, lint_settings=lint_settings,
+                                          stop=lambda: False)
+        return int(bool(result.deletion.failures) or result.remaining_bytes > budget)
+    except (OSError, ValueError, conf.Unusable, removal_guard.Refused) as error:
+        print(f"kept {target}: {removal_guard.single_line(error)}")
+        return 1
 
 
 class NatedevFloor(Enum):
@@ -4384,6 +4781,261 @@ class FloorOutcome:
     @property
     def status(self) -> int:
         return self.assessment.status
+
+
+def mac_repository_is_held(outputs: Sequence[MacBuildOutput], names: frozenset[str],
+                           claims: floor_claims.ClaimSnapshot, policy: MacFloor) -> bool:
+    """Protect all outputs of a repository with a claim or a busy mirror."""
+    if "*" in claims.repositories or names & claims.repositories:
+        return True
+    if any(mirror.name in names for mirror in policy.busy_mirrors):
+        return True
+    return any(claims.holds(str(output.path), policy.mirror)
+               or mac_output_in_use(output.path)
+               for output in outputs)
+
+
+@contextmanager
+def mac_floor_mirror_leases(mirrors: set[Path]) -> Generator[bool]:
+    """Take mirror leases for one removal group when no run is waiting."""
+    with ExitStack() as leases:
+        try:
+            for mirror in sorted(mirrors):
+                _ = leases.enter_context(build_folders.mac_mirror_hold(
+                    mirror, build_folders.MacMirrorHold.EXCLUSIVE, root=mirror.parent))
+        except BlockingIOError:
+            leases.close()
+            yield False
+            return
+        protected = leases.enter_context(copies.mirror_lease_set(mirrors))
+        if protected:
+            leases.close()
+        yield not protected
+
+
+def run_after_mac_floor_group(mirror_path: str, argv: list[str]) -> NoReturn:
+    """Wait for the current floor group, then start the mirror command."""
+    mirror = floor_claims.mirror_local_path(mirror_path)
+    try:
+        with build_folders.mac_mirror_hold(mirror, build_folders.MacMirrorHold.SHARED, root=mirror.parent) as group:
+            if isinstance(group, int):
+                os.set_inheritable(group, True)
+                descriptors = tuple(dict.fromkeys((*floor_claims.inherited_mirror_descriptors(), group)))
+                os.environ[floor_claims.MIRROR_LEASE_FDS] = ",".join(map(str, descriptors))
+            os.execvp(argv[0], argv)
+    except TimeoutError as error:
+        raise SystemExit(str(error)) from None
+
+
+@dataclass(frozen=True)
+class RefreshedMacRepositoryAge:
+    """The repository's age changed before removal started."""
+
+    last_use: float
+
+
+@dataclass(frozen=True)
+class MacWholeFolderRemoved:
+    """Read the repository ages again before selecting more output."""
+
+    deletion: ConfirmedDeletion
+
+
+def cull_mac_floor(policy: MacFloor, settings: MacCullSettings, floor: int, free: int, home: str, dry_run: bool,
+                   *, lint_settings: conf.ConfigRead) -> FloorOutcome:
+    """Visit the least recently used repositories first while the disk is short."""
+    from scripts.lint import tmp_sweep
+
+    aliases = {key.removeprefix("repo_word."): value
+               for key, value in conf.read_or_repository("build_folders").values().items()
+               if key.startswith("repo_word.")}
+    def collect(outputs: Sequence[MacBuildOutput]) -> dict[str, list[MacBuildOutput]]:
+        repositories: dict[str, list[MacBuildOutput]] = {}
+        for output in outputs:
+            repositories.setdefault(aliases.get(output.repository, output.repository), []).append(output)
+        return repositories
+
+    def names(repository: str) -> frozenset[str]:
+        return frozenset({repository, *(name for name, alias in aliases.items() if alias == repository)})
+
+    targets = mac_build_outputs(policy.mirror)
+    by_repository = collect(targets)
+    cutoff = time.time() - settings.idle_seconds
+    recent_minutes = lint_settings.number(RECENT_KEY)
+    before = free
+    busy: set[str] = set()
+    failures = removed = 0
+
+    def ordered_repositories(repositories: Mapping[str, list[MacBuildOutput]]) -> list[tuple[float, str]]:
+        idle: list[tuple[float, str]] = []
+        for repository, outputs in repositories.items():
+            if all(output.location is MacOutputLocation.NUMBERED_COPY for output in outputs):
+                continue
+            try:
+                if mac_repository_is_held(outputs, names(repository), policy.claims, policy):
+                    busy.update(str(output.path) for output in outputs)
+                    continue
+                last_use = max(observe_mac_output(output).last_use for output in outputs)
+                idle.append((last_use, repository))
+            except (OSError, ValueError, removal_guard.Refused) as error:
+                print(f"kept {repository}: {removal_guard.single_line(error)}")
+                busy.update(str(output.path) for output in outputs)
+        heapify(idle)
+        return idle
+
+    def floor_reached() -> bool:
+        nonlocal free
+        free = free_bytes(home)
+        return free >= floor
+
+    idle = ordered_repositories(by_repository)
+    while idle:
+        check_mac_floor_reader()
+        if floor_reached():
+            break
+        last_use, repository = heappop(idle)
+        outputs = by_repository[repository]
+        if dry_run:
+            for output in outputs:
+                if output.location is not MacOutputLocation.NUMBERED_COPY:
+                    print(f"lint sweep: the floor lists {output.path}, last used {when(last_use)}")
+            continue
+        try:
+            result = cull_mac_repository(repository, outputs, names(repository), policy, settings,
+                                         last_use, cutoff, recent_minutes, lint_settings, floor_reached, busy)
+            if isinstance(result, RefreshedMacRepositoryAge):
+                heappush(idle, (result.last_use, repository))
+                continue
+            deletion = result.deletion if isinstance(result, MacWholeFolderRemoved) else result
+            removed += deletion.bytes
+            failures += deletion.failures
+            if isinstance(result, MacWholeFolderRemoved):
+                if floor_reached():
+                    break
+                pending = {repository, *(name for _, name in idle)}
+                by_repository = {name: paths for name, paths in collect(mac_build_outputs(policy.mirror)).items()
+                                 if name in pending}
+                idle = ordered_repositories(by_repository)
+        except (OSError, ValueError, removal_guard.Refused) as error:
+            print(f"kept {repository}: {removal_guard.single_line(error)}")
+            failures += 1
+    free = free_bytes(home)
+    return FloorOutcome(tmp_sweep.CompletedSweepAssessment(int(bool(failures) and free < floor)),
+                        removed, before, free, len(busy), held_targets=tuple(sorted(busy)),
+                        targets=SearchedFloorTargets(str(output.path) for output in targets
+                                                     if output.location is not MacOutputLocation.NUMBERED_COPY))
+
+
+def cull_mac_repository(
+    repository: str, outputs: Sequence[MacBuildOutput], names: frozenset[str], policy: MacFloor, settings: MacCullSettings,
+    last_use: float, cutoff: float, recent_minutes: float, lint_settings: conf.ConfigRead, floor_reached: Callable[[], bool],
+    busy: set[str],
+) -> ConfirmedDeletion | RefreshedMacRepositoryAge | MacWholeFolderRemoved:
+    """Release the repository's lease after each removal."""
+    mirrors = {policy.mirror / name for name in names if Path(name).name == name}
+    removable = [output for output in outputs if output.location is not MacOutputLocation.NUMBERED_COPY]
+    available = list(outputs)
+    timeout = settings.configuration.number("probe_timeout_s")
+
+    def repository_is_held() -> bool:
+        claims = floor_claims.read_claims(timeout)
+        held = mac_repository_is_held(available, names, claims, policy)
+        if held:
+            busy.update(str(output.path) for output in available)
+        return held
+
+    @contextmanager
+    def group_lease() -> Generator[bool]:
+        with mac_floor_mirror_leases(mirrors) as acquired:
+            if not acquired:
+                busy.update(str(output.path) for output in available)
+            yield acquired
+
+    def remove_group(output: MacBuildOutput, observed: MacOutputObservation, group: Group,
+                     paths: Sequence[Path]) -> ConfirmedDeletion | MacOutputRemoval:
+        with group_lease() as acquired:
+            if not acquired:
+                return MacOutputRemoval.REPOSITORY_BUSY
+            with mac_output_locks({output: observed}) as locked:
+                if isinstance(locked, MacOutputRemoval) or observe_mac_output(output).locks != observed.locks:
+                    busy.add(str(output.path))
+                    return MacOutputRemoval.REPOSITORY_BUSY
+                if repository_is_held():
+                    return MacOutputRemoval.REPOSITORY_BUSY
+                return remove_mac_trim_group(output, observed, group, paths)
+
+    def trim_recent(observations: Mapping[MacBuildOutput, MacOutputObservation]) -> ConfirmedDeletion:
+        configuration = settings.configuration
+        values = configuration.values()
+        keys = (f"mac_budget_gib.{name}" for name in (repository, *sorted(names)))
+        key = next((key for key in keys if key in values), "mac_budget_gib")
+        budget = int(configuration.number(key) * GIB)
+        return trim_mac_outputs(observations, budget, recent_minutes, lint_settings=lint_settings,
+                                stop=floor_reached, remove_group=remove_group).deletion
+
+    build = Path.home().resolve() / "build"
+
+    def repository_outputs() -> list[MacBuildOutput]:
+        current = [item for mirror in sorted(mirrors) for item in mac_mirror_output(mirror, policy.mirror)]
+        if not build.is_symlink():
+            for name in sorted(names - build_folders.BUILD_ROOT_EXCEPTIONS):
+                repo = build / name
+                if repo.parent == build and removal_guard.is_real_directory(repo):
+                    current.extend(mac_repository_build_outputs(repo, build))
+        return current
+
+    recent: dict[MacBuildOutput, MacOutputObservation] = {}
+    for output in removable:
+        if floor_reached():
+            break
+        # A recent repository loses only groups, each under its own hold, so its scan needs none.
+        # Only a whole-folder removal reads its checks under the exclusive hold.
+        seen = repository_outputs()
+        if output not in seen:
+            continue
+        observations = {item: observe_mac_output(item) for item in seen}
+        seen_age = max(item.last_use for item in observations.values())
+        if seen_age != last_use:
+            return RefreshedMacRepositoryAge(seen_age)
+        if seen_age >= cutoff:
+            available = seen
+            recent = {item: age for item, age in observations.items()
+                      if item.location is not MacOutputLocation.NUMBERED_COPY}
+            break
+        with group_lease() as acquired:
+            if not acquired:
+                break
+            current = repository_outputs()
+            if output not in current:
+                continue
+            observed = {item: observe_mac_output(item) for item in current}
+            with mac_output_locks(observed) as locked:
+                if isinstance(locked, MacOutputRemoval):
+                    busy.update(str(item.path) for item in current)
+                    break
+                checked = {item: observe_mac_output(item) for item in current}
+                if any(checked[item].identity != prior.identity or checked[item].locks != prior.locks
+                       for item, prior in observed.items()):
+                    busy.update(str(item.path) for item in current)
+                    break
+                current_age = max(item.last_use for item in checked.values())
+                if current_age != last_use:
+                    return RefreshedMacRepositoryAge(current_age)
+                if current_age >= cutoff:
+                    available = current
+                    recent = {item: age for item, age in checked.items()
+                              if item.location is not MacOutputLocation.NUMBERED_COPY}
+                    break
+                if repository_is_held():
+                    break
+                result = remove_mac_output_entries(output, checked[output], (output.path,), locked[output.path])
+                if isinstance(result, MacOutputRemoval):
+                    busy.add(str(output.path))
+                    break
+                return MacWholeFolderRemoved(result) if not result.failures and result.removed else result
+    if recent:
+        return trim_recent(recent)
+    return ConfirmedDeletion(0, 0)
 
 
 def mac_floor_settings(
@@ -4765,6 +5417,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         write_floor_record(record_path, replace(current, lock_alert=transition.lock_alert))
         except OSError as error:
             print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
+        if isinstance(policy, MacFloor) and isinstance(policy.cull, MacCullSettings):
+            outcome = cull_mac_floor(policy, policy.cull, floor, free, home, dry_run, lint_settings=lint_settings)
+            target_search = outcome.targets
+            held_targets.update(outcome.held_targets)
+            return outcome
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
         known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
@@ -5456,7 +6113,8 @@ def assess_and_report(argv: list[str]) -> int:
     try:
         status = assess(argv)
         check_mac_floor_reader()
-        plan.report()
+        if plan.rows or ("--host", "mac") not in zip(argv, argv[1:]):
+            plan.report()
         return status
     except InterruptedError:
         raise
@@ -5493,11 +6151,6 @@ def assess(argv: list[str]) -> int:
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
-    try:
-        guard = removal_guard.read()
-        assess_form_folders(guard, BUILD_LIST.get(), Path(target_dir).absolute() if target_dir else None)
-    except removal_guard.Refused as refusal:
-        print(f"kept build folders: {refusal}")
     if host == "mac":
         if not floor_only:
             print("lint sweep: --host mac requires --floor-only", file=sys.stderr)
@@ -5505,6 +6158,7 @@ def assess(argv: list[str]) -> int:
         try:
             with conf.diagnostics(report=False):
                 mac_settings = conf.read("mac_test")
+                cull = MacCullSettings.read(mac_settings)
                 mirror_root = MacMirrorRoot.read(mac_settings)
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
@@ -5514,14 +6168,20 @@ def assess(argv: list[str]) -> int:
                               if not dry_run and isinstance(MAC_FLOOR_SESSION.get(), MacFloorSession)
                               else AcquireFloorLock.LOCALLY)
                 check_mac_floor_reader()
-                leases = resources.enter_context(copies.mirror_sweep_leases(mirror_root.local_path()))
+                mirror = mirror_root.local_path()
+                if mirror.resolve() != mirror:
+                    raise conf.Unusable("Mac mirror root has a symbolic link")
                 claims = floor_claims.read_claims(timeout)
                 return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path(),
-                                                  leases.busy, leases.held, floor_lock))
+                                  policy=MacFloor(mac_roots, claims, mirror, floor_lock=floor_lock, cull=cull))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2
+    try:
+        guard = removal_guard.read()
+        assess_form_folders(guard, BUILD_LIST.get(), Path(target_dir).absolute() if target_dir else None)
+    except removal_guard.Refused as refusal:
+        print(f"kept build folders: {refusal}")
     config = str(conf.path("lint"))
     try:
         settings_read = conf.read("lint")
@@ -5577,8 +6237,18 @@ def assess_scope(run: Callable[[], tmp_sweep.SweepAssessment],
 def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
                     recent_minutes: float, *,
                     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-                    proc: str = PROC_DIR) -> int:
+                    proc: str = PROC_DIR,
+                    mac_trim: MacRunTrim | WorkspaceReview = WorkspaceReview.ONLY) -> int:
     """Publish the workspace list when the caller has no list of its own."""
+    if isinstance(mac_trim, MacRunTrim):
+        if target_dir is None or dry_run:
+            return 2
+        budget, _ = budget_bytes(dict(os.environ), budget_config, None)
+        if budget is None:
+            return 2
+        if isinstance(lint_settings, UseConfiguredValue):
+            lint_settings = budget_config
+        return trim_mac_run(Path(target_dir), budget, recent_minutes, lint_settings=lint_settings)
     if dry_run or isinstance(BUILD_LIST.get(), removal_guard.RemovalList):
         return assess_workspace(target_dir, budget_config, dry_run, recent_minutes,
                                 lint_settings=lint_settings, proc=proc)
