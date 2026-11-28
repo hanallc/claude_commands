@@ -622,7 +622,8 @@ signal.pause()
         children: tuple[int, ...] = ()
         try:
             assert receiver.stdin is not None and receiver.stdout is not None
-            self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+            self.assertTrue(select.select([receiver.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "The receiver did not start")
             children = tuple(map(int, cast(str, receiver.stdout.readline()).split()))
             self.assertEqual(len(children), 2)
             self.assertEqual(os.getsid(unrelated.pid), os.getsid(receiver.pid))
@@ -632,11 +633,12 @@ signal.pause()
 
             receiver.stdin.close()
             try:
-                status = receiver.wait(timeout=5)
+                status = receiver.wait(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 self.fail("The receiver stayed alive after the channel closed")
             self.assertNotEqual(status, 0)
-            self.assertTrue(select.select([receiver.stdout], [], [], 5)[0], "A child kept the channel open")
+            self.assertTrue(select.select([receiver.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "A child kept the channel open")
             self.assertEqual(receiver.stdout.read(1), "")
             children = ()
             self.assertIsNone(unrelated.poll())
@@ -644,14 +646,14 @@ signal.pause()
             with subprocess.Popen(self.mirror_receiver("next-session", sys.executable, "-c", "pass"), stdin=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True) as next_receiver:
                 try:
-                    self.assertEqual(next_receiver.wait(timeout=5), 0)
+                    self.assertEqual(next_receiver.wait(timeout=TEST_HANG_GUARD_SECS), 0)
                 finally:
                     if next_receiver.poll() is None:
                         next_receiver.kill()
         finally:
             if receiver.poll() is None:
                 receiver.kill()
-            _ = receiver.wait(timeout=5)
+                _ = receiver.wait(timeout=5)
             for pid in reversed(children):
                 with suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
@@ -660,7 +662,7 @@ signal.pause()
                     stream.close()
             if unrelated.poll() is None:
                 unrelated.kill()
-            _ = unrelated.wait(timeout=5)
+                _ = unrelated.wait(timeout=5)
 
     @unittest.skipUnless(sys.platform == "linux", "The test uses pidfds to confirm process exit")
     def test_cut_receiver_ends_its_child_after_the_leader_exits(self) -> None:
@@ -683,7 +685,8 @@ signal.pause()
               ExitStack() as descriptors):
             try:
                 assert receiver.stdin is not None and receiver.stdout is not None
-                self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+                self.assertTrue(select.select([receiver.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
+                                "The receiver did not start")
                 leader, child = map(int, cast(str, receiver.stdout.readline()).split())
                 child_exit = os.pidfd_open(child)
                 _ = descriptors.callback(os.close, child_exit)
@@ -692,15 +695,16 @@ signal.pause()
                 _ = descriptors.callback(os.close, leader_exit)
                 _ = receiver.stdin.write("x")
                 receiver.stdin.flush()
-                self.assertTrue(select.select([leader_exit], [], [], 5)[0], "The leader did not exit")
+                self.assertTrue(select.select([leader_exit], [], [], TEST_HANG_GUARD_SECS)[0], "The leader did not exit")
                 with self.assertRaisesRegex(copies.CopyError, "cut-session"):
                     with copies.local_mirror_lease(self.mirror, "busy-check"):
                         self.fail("The active child lost its lease")
                 self.assertEqual(os.getpgid(leader), leader, "The receiver reaped the leader")
 
                 receiver.stdin.close()
-                self.assertEqual(receiver.wait(timeout=5), 23)
-                self.assertTrue(select.select([child_exit], [], [], 5)[0], "The child survived the channel cut")
+                self.assertEqual(receiver.wait(timeout=TEST_HANG_GUARD_SECS), 23)
+                self.assertTrue(select.select([child_exit], [], [], TEST_HANG_GUARD_SECS)[0],
+                                "The child survived the channel cut")
                 with copies.local_mirror_lease(self.mirror, "after-cut"):
                     pass
             finally:

@@ -32,6 +32,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+from tempfile import TemporaryDirectory
 from threading import Thread
 from time import monotonic, sleep, time, time_ns
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
@@ -2984,6 +2985,72 @@ def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[st
         os.close(status_read)
 
 
+def _copy_guest_fact_cache(source: Path, target: Path) -> None:
+    """Replace the target with a complete copy of the cache."""
+    with TemporaryDirectory(dir=target.parent) as folder:
+        temporary = Path(folder) / target.name
+        _ = shutil.copyfile(source, temporary)
+        os.replace(temporary, target)
+
+
+def _publish_guest_fact_cache(source: Path, kept: Path, original: os.stat_result | None) -> None:
+    """Publish a changed run cache while holding the kept cache lock."""
+    try:
+        try:
+            current = source.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(current.st_mode):
+            return
+        if original is not None and (current.st_ino, current.st_size, current.st_mtime_ns) == (
+                original.st_ino, original.st_size, original.st_mtime_ns):
+            return
+        # The limited command can replace a parent folder with a link.
+        if source.resolve(strict=True) != source:
+            return
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        with kept.with_suffix('.lock').open('ab') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            _copy_guest_fact_cache(source, kept)
+    except OSError as error:
+        print(f'Guest fact cache copy out failed: {error}', file=sys.stderr)
+
+
+@contextmanager
+def _guest_fact_cache(repository: str, environment: Mapping[str, str]) -> Generator[None]:
+    """Copy the kept facts into the run and publish its new snapshot when the run ends."""
+    if 'GATE_STATE_DIR' in environment:
+        print('Guest fact cache is off because GATE_STATE_DIR is set.', file=sys.stderr)
+        yield
+        return
+
+    from scripts.production import affected_modules, land_runs
+
+    state = Path(land_runs.DEFAULT_STATE_DIR)
+    home = Path(environment['HOME'])
+    source = home.joinpath(*state.parts[1:], affected_modules.FACT_CACHE_NAME)
+    with ExitStack() as lease:
+        try:
+            if source.resolve() != source:
+                raise ValueError('The run cache path contains a link.')
+            main = lease.enter_context(build_folders.leased_build_folder(build_folders.MainOutput(repository)))
+            build_folders.mark_folder_use(main)
+            kept = main / state.name / source.name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            if kept.exists():
+                _copy_guest_fact_cache(kept, source)
+            original = None
+            with suppress(FileNotFoundError):
+                original = source.stat()
+            _ = lease.callback(_publish_guest_fact_cache, source, kept, original)
+        except (OSError, ValueError) as error:
+            print(f'Guest fact cache copy in failed: {error}', file=sys.stderr)
+        yield
+
+
 def run_guest(request_path: Path) -> int:
     """Take a numbered copy, then run the gate or the argv of the request in it."""
     from scripts.lib import build_copies
@@ -3017,7 +3084,8 @@ def run_guest(request_path: Path) -> int:
                 refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
                 if refusal:
                     return refuse_run(refusal, request['attempt'])
-                return run_limited(tmp, command, copy.path, environment, request['attempt'])
+                with _guest_fact_cache(copy.repository, environment):
+                    return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
