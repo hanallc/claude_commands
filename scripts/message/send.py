@@ -1881,6 +1881,13 @@ def recorded_delivery(message: Message, repeat: timedelta | None, at: datetime, 
     return ClaimGranted()
 
 
+def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *,
+                   live: bool = False, aliases: tuple[str, ...] = ()) -> str | None:
+    """Return the reason when an earlier delivery has confirmed acceptance."""
+    evidence = recorded_delivery(message, repeat, at, live=live, aliases=aliases)
+    return evidence.reason if isinstance(evidence, RepeatAccepted) else None
+
+
 def record_acceptance(message: Message, at: datetime) -> None:
     """Only a confirmed transport or recoverable queue/kept handoff enters the repeat window."""
     if message.key is not None:
